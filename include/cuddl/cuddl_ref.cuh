@@ -3,7 +3,7 @@
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 
-namespace cuddl::experimental {
+namespace cuddl {
 
 struct pairwise_counts {
     uint32_t lower{};
@@ -48,4 +48,4 @@ class sketch_ref {
     register_type* registers_;
 };
 
-}  // namespace cuddl::experimental
+}  // namespace cuddl

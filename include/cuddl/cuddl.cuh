@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace cuddl::experimental {
+namespace cuddl {
 namespace detail {
 
 constexpr uint32_t block_size = 256;
@@ -168,15 +168,15 @@ class sketch {
         ref_type other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        pairwise_counts* device_output = nullptr;
-        CUDDL_CUDA_CALL(cudaMalloc(&device_output, sizeof(pairwise_counts)));
-        compare_async(other, device_output, stream);
+        register_type* storage = nullptr;
+        CUDDL_CUDA_CALL(cudaMalloc(&storage, sizeof(pairwise_counts)));
+        std::unique_ptr<register_type, detail::cuda_deleter> device_output{storage};
+        compare_async(other, reinterpret_cast<pairwise_counts*>(device_output.get()), stream);
         pairwise_counts result{};
         CUDDL_CUDA_CALL(cudaMemcpyAsync(
-            &result, device_output, sizeof(result), cudaMemcpyDeviceToHost, stream.get()
+            &result, device_output.get(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()
         ));
         stream.sync();
-        CUDDL_CUDA_CALL(cudaFree(device_output));
         return result;
     }
 
@@ -184,4 +184,4 @@ class sketch {
     std::unique_ptr<register_type, detail::cuda_deleter> registers_;
 };
 
-}  // namespace cuddl::experimental
+}  // namespace cuddl

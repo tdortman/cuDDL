@@ -10,10 +10,10 @@
 namespace {
 
 TEST(SketchTest, ConstructsAndComparesPackedKmers) {
-    static_assert(std::is_trivially_copyable_v<cuddl::experimental::sketch_ref<25, 2048>>);
+    static_assert(std::is_trivially_copyable_v<cuddl::sketch_ref<25, 2048>>);
 
-    cuddl::experimental::sketch<25, 2048> left;
-    cuddl::experimental::sketch<25, 2048> right;
+    cuddl::sketch<25, 2048> left;
+    cuddl::sketch<25, 2048> right;
 
     uint64_t* items = nullptr;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&items, sizeof(*items)));
