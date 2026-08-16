@@ -260,10 +260,13 @@ int main(int argc, char** argv) {
                 run_local_merge();
             }
             CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-            CUDDL_CUDA_CALL(cudaProfilerStart());
             for (int repetition = 0; repetition < profile_repetitions; ++repetition) {
                 if (profile_global) {
-                    CUDDL_CUDA_CALL(cudaMemset(global_sketch, 0, bucket_count * sizeof(*global_sketch)));
+                    CUDDL_CUDA_CALL(
+                        cudaMemset(global_sketch, 0, bucket_count * sizeof(*global_sketch)));
+                }
+                CUDDL_CUDA_CALL(cudaProfilerStart());
+                if (profile_global) {
                     global_atomic_kernel<<<block_count, block_size>>>(
                         device_inputs, item_count, global_sketch);
                     CUDDL_CUDA_CALL(cudaGetLastError());
@@ -272,12 +275,13 @@ int main(int argc, char** argv) {
                 } else {
                     run_local_merge();
                 }
+                CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+                CUDDL_CUDA_CALL(cudaProfilerStop());
             }
-            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-            CUDDL_CUDA_CALL(cudaProfilerStop());
             std::printf(
                 "profile=%s items=%llu blocks=%u repetitions=%d device=%s "
-                "compute_capability=%d.%d seed=%llu k=%u buckets=%u\n",
+                "compute_capability=%d.%d seed=%llu k=%u buckets=%u free_bytes=%llu "
+                "total_bytes=%llu cap_bytes=%llu\n",
                 profile_global ? "global" : profile_cta ? "cta" : "merge",
                 static_cast<unsigned long long>(item_count),
                 block_count,
@@ -287,7 +291,10 @@ int main(int argc, char** argv) {
                 properties.minor,
                 static_cast<unsigned long long>(seed),
                 kmer_length,
-                bucket_count);
+                bucket_count,
+                static_cast<unsigned long long>(free_bytes),
+                static_cast<unsigned long long>(total_bytes),
+                static_cast<unsigned long long>(memory_cap));
             CUDDL_CUDA_CALL(cudaFree(partial_sketches));
             CUDDL_CUDA_CALL(cudaFree(local_sketch));
             CUDDL_CUDA_CALL(cudaFree(global_sketch));
