@@ -251,10 +251,15 @@ int main(int argc, char** argv) {
 
         if (profile_mode_count == 1) {
             constexpr int profile_repetitions = 20;
-            if (profile_merge) {
+            if (profile_global) {
+                run_global();
+            } else if (profile_cta) {
                 run_local_build();
-                CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            } else {
+                run_local_build();
+                run_local_merge();
             }
+            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
             CUDDL_CUDA_CALL(cudaProfilerStart());
             for (int repetition = 0; repetition < profile_repetitions; ++repetition) {
                 if (profile_global) {
