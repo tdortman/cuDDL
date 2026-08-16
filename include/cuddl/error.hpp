@@ -9,7 +9,6 @@
 #include <source_location>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -30,11 +29,6 @@ struct SourceLocation {
         };
     }
 
-    [[nodiscard]] static SourceLocation
-    fastx(std::string_view file, uint32_t line, uint32_t column) {
-        return SourceLocation{std::string(file), line, column};
-    }
-
     [[nodiscard]] std::string to_string() const {
         return std::format("{}:{}:{}", file, line, column);
     }
@@ -42,15 +36,6 @@ struct SourceLocation {
 
 struct CudaError {
     cudaError_t code{};
-    SourceLocation location;
-    std::string message;
-};
-
-struct IoError {
-    std::string message;
-};
-
-struct FastxParseError {
     SourceLocation location;
     std::string message;
 };
@@ -66,15 +51,13 @@ struct ResourceError {
 /// @brief Error category for @ref Result failures.
 enum class ErrorCategory : uint8_t {
     cuda,
-    io,
-    fastx_parse,
     invalid_argument,
     resource,
 };
 
 /// @brief Error payload carried in @ref Result on failure.
 struct Error {
-    std::variant<CudaError, IoError, FastxParseError, InvalidArgumentError, ResourceError> kind;
+    std::variant<CudaError, InvalidArgumentError, ResourceError> kind;
 
     [[nodiscard]] ErrorCategory category() const noexcept {
         return static_cast<ErrorCategory>(kind.index());
@@ -88,14 +71,6 @@ struct Error {
 
     [[nodiscard]] const CudaError* as_cuda() const noexcept {
         return std::get_if<CudaError>(&kind);
-    }
-
-    [[nodiscard]] const IoError* as_io() const noexcept {
-        return std::get_if<IoError>(&kind);
-    }
-
-    [[nodiscard]] const FastxParseError* as_fastx_parse() const noexcept {
-        return std::get_if<FastxParseError>(&kind);
     }
 
     [[nodiscard]] const InvalidArgumentError* as_invalid_argument() const noexcept {
@@ -116,18 +91,6 @@ struct Error {
         }};
     }
 
-    [[nodiscard]] static Error io(std::string message) {
-        return Error{IoError{std::move(message)}};
-    }
-
-    [[nodiscard]] static Error fastx_parse(SourceLocation site, std::string_view detail) {
-        const std::string location_text = site.to_string();
-        return Error{FastxParseError{
-            std::move(site),
-            std::format("{}: {}", location_text, detail),
-        }};
-    }
-
     [[nodiscard]] static Error invalid_argument(std::string message) {
         return Error{InvalidArgumentError{std::move(message)}};
     }
@@ -137,10 +100,8 @@ struct Error {
     }
 };
 static_assert(static_cast<size_t>(ErrorCategory::cuda) == 0);
-static_assert(static_cast<size_t>(ErrorCategory::io) == 1);
-static_assert(static_cast<size_t>(ErrorCategory::fastx_parse) == 2);
-static_assert(static_cast<size_t>(ErrorCategory::invalid_argument) == 3);
-static_assert(static_cast<size_t>(ErrorCategory::resource) == 4);
+static_assert(static_cast<size_t>(ErrorCategory::invalid_argument) == 1);
+static_assert(static_cast<size_t>(ErrorCategory::resource) == 2);
 
 /**
  * @brief Fallible API result: @c cuda::std::expected<T, Error> with cuDDL factories.
