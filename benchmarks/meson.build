@@ -7,6 +7,10 @@ benchmarks = {
     'construction-bakeoff': {
         'src': 'construction_bakeoff.cu',
     },
+    'tier-floor-construction': {
+        'src': 'tier_floor_construction.cu',
+        'deps': [cli11_dep],
+    },
     'comparison-bakeoff': {
         'src': 'comparison_bakeoff.cu',
     },

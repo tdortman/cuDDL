@@ -23,6 +23,15 @@ if build_benchmarks
         ],
     )
     test(
+        'tier-floor-construction-equivalence',
+        python,
+        args: [
+            files('tier_floor_construction_test.py'),
+            meson.project_build_root() / 'benchmarks' / 'tier-floor-construction',
+        ],
+        timeout: 120,
+    )
+    test(
         'comparison-bakeoff-equivalence',
         python,
         args: [
