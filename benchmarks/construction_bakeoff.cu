@@ -275,11 +275,19 @@ int main(int argc, char** argv) {
             }
             CUDDL_CUDA_CALL(cudaDeviceSynchronize());
             CUDDL_CUDA_CALL(cudaProfilerStop());
-            std::printf("profile=%s items=%llu blocks=%u repetitions=%d\n",
-                        profile_global ? "global" : profile_cta ? "cta" : "merge",
-                        static_cast<unsigned long long>(item_count),
-                        block_count,
-                        profile_repetitions);
+            std::printf(
+                "profile=%s items=%llu blocks=%u repetitions=%d device=%s "
+                "compute_capability=%d.%d seed=%llu k=%u buckets=%u\n",
+                profile_global ? "global" : profile_cta ? "cta" : "merge",
+                static_cast<unsigned long long>(item_count),
+                block_count,
+                profile_repetitions,
+                properties.name,
+                properties.major,
+                properties.minor,
+                static_cast<unsigned long long>(seed),
+                kmer_length,
+                bucket_count);
             CUDDL_CUDA_CALL(cudaFree(partial_sketches));
             CUDDL_CUDA_CALL(cudaFree(local_sketch));
             CUDDL_CUDA_CALL(cudaFree(global_sketch));
