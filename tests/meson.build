@@ -4,7 +4,7 @@ benchmark_dep = subproject('google-benchmark').get_variable('google_benchmark_de
 
 test_exe = executable(
     'test-cuddl',
-    [],
+    files('cuddl_test.cu'),
     dependencies: [cuddl_dep, benchmark_dep, gtest_dep, gtest_main_dep],
     cuda_args: cuda_args,
     install: false,

@@ -195,4 +195,12 @@ constexpr __host__ __device__ __forceinline__ uint64_t hash64(uint64_t key) {
     return key;
 }
 
+__host__ __device__ constexpr uint64_t splitmix64(uint64_t value) noexcept {
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
 }  // namespace cuddl::detail
