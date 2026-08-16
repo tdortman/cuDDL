@@ -158,19 +158,15 @@ __global__ void atomic_floor_kernel(
 ) {
     constexpr auto local_buckets = BucketCount < 8192 ? BucketCount : 8192;
     __shared__ uint32_t sketch[local_buckets];
-    __shared__ uint32_t occupied;
-    __shared__ uint32_t initial_minimum;
+    __shared__ uint32_t winner_counts[64];
     __shared__ uint32_t floor;
     auto const tile_count = BucketCount / local_buckets;
     auto const tile = blockIdx.x / (gridDim.x / tile_count);
     auto const cta = blockIdx.x % (gridDim.x / tile_count);
-    if (threadIdx.x == 0) {
-        occupied = 0;
-        initial_minimum = std::numeric_limits<uint16_t>::max();
-        floor = 0;
-    }
+    if (threadIdx.x == 0) floor = 0;
     for (auto bucket = threadIdx.x; bucket < local_buckets; bucket += blockDim.x)
         sketch[bucket] = 0;
+    for (auto value = threadIdx.x; value < 64; value += blockDim.x) winner_counts[value] = 0;
     __syncthreads();
 
     auto const cta_count = gridDim.x / tile_count;
@@ -183,20 +179,21 @@ __global__ void atomic_floor_kernel(
             auto const bucket = hash & (BucketCount - 1U);
             auto const incoming = score(hash);
             if (bucket / local_buckets == tile) {
-                if (incoming >= floor) {
+                auto* address = sketch + (bucket % local_buckets);
+                auto const previous = atomicCAS(address, 0U, pack(incoming, 1));
+                if (previous == 0) {
                     atomicAdd(reinterpret_cast<unsigned long long*>(counters), 1ULL);
-                    auto* address = sketch + (bucket % local_buckets);
-                    auto const before = atomicCAS(address, 0U, pack(incoming, 1));
-                    bool changed;
-                    if (before == 0) {
-                        changed = true;
-                        atomicMin(&initial_minimum, static_cast<uint32_t>(incoming));
-                        atomicAdd(&occupied, 1U);
-                    } else {
-                        changed = update(address, incoming);
-                    }
-                    if (changed) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(counters + 1), 1ULL);
+                    atomicAdd(winner_counts + (incoming >> 10U), 1U);
+                } else if ((incoming >> 10U) >= floor) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(counters), 1ULL);
+                    if (update(address, incoming)) {
                         atomicAdd(reinterpret_cast<unsigned long long*>(counters + 1), 1ULL);
+                        auto const old_winner = winner(previous);
+                        if (incoming > old_winner) {
+                            atomicSub(winner_counts + (old_winner >> 10U), 1U);
+                            atomicAdd(winner_counts + (incoming >> 10U), 1U);
+                        }
                     }
                 } else {
                     atomicAdd(reinterpret_cast<unsigned long long*>(counters + 2), 1ULL);
@@ -204,8 +201,9 @@ __global__ void atomic_floor_kernel(
             }
         }
         __syncthreads();
-        if (threadIdx.x == 0 && floor == 0 && occupied == local_buckets)
-            floor = initial_minimum;
+        if (threadIdx.x == 0) {
+            while (floor < 63 && winner_counts[floor] == 0) ++floor;
+        }
         __syncthreads();
     }
 
