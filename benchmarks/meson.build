@@ -1,29 +1,9 @@
-benchmark_dep = subproject('google-benchmark').get_variable('google_benchmark_dep')
-cuco_dep = subproject('cuco').get_variable('cuco_dep')
-
-bench_deps = [benchmark_dep, cuddl_dep]
-
-benchmarks = {
-    'construction-bakeoff': {
-        'src': 'construction_bakeoff.cu',
-    },
-    'tier-floor-construction': {
-        'src': 'tier_floor_construction.cu',
-        'deps': [cli11_dep],
-    },
-    'comparison-bakeoff': {
-        'src': 'comparison_bakeoff.cu',
-    },
-}
-
-foreach name, config : benchmarks
-    extra_cuda_args = config.get('extra_args', [])
-    deps = config.get('deps', [])
-    executable(
-        name,
-        config['src'],
-        dependencies: bench_deps + deps,
-        cuda_args: cuda_args + extra_cuda_args,
-        install: false,
-    )
-endforeach
+# Raw-FASTA end-to-end gate binary. Per the benchmark contract this is a dedicated CLI11
+# target (it measures the full parse -> sketch -> compare pipeline), not a google-benchmark one.
+executable(
+    'cuddl-benchmark-fasta',
+    'cuddl_benchmark_fasta.cu',
+    dependencies: [cuddl_dep, cli11_dep],
+    cuda_args: cuda_args,
+    install: false,
+)

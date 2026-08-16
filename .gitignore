@@ -10,6 +10,7 @@ build
 /subprojects/moderngpu.wrap
 /subprojects/openssl.wrap
 /subprojects/gossip.wrap
+/subprojects/zlib.wrap
 
 *.*-rep
 *.sqlite
@@ -32,3 +33,4 @@ build/test_artifacts/
 *.large.fa
 *.large.fasta
 *.large.fastq
+results
