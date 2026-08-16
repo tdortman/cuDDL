@@ -1,0 +1,9 @@
+[wrap-file]
+directory = bbmap
+source_url = https://downloads.sourceforge.net/project/bbmap/BBMap_40.02.tar.gz
+source_filename = BBMap_40.02.tar.gz
+source_hash = d5d571f22ccfb6e9892b58a8af3dc5eb1c804a5e67732f863e2fba6d50a5369d
+patch_directory = bbtools
+
+[provide]
+dependency_names = bbtools

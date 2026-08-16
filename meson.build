@@ -23,10 +23,12 @@ cuda_args = [
     '--generate-line-info',
 ] + cuda_arch_args
 
-
+# The FASTA parser reuses cuSBF's FASTX reader, pulled in as a pinned Meson subproject. cuSBF's
+# exported `cusbf_dep` carries its headers and propagates its own zlib dependency, so no direct
+# sibling include path or zlib wiring is needed here.
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [],
+    dependencies: [subproject('cusbf').get_variable('cusbf_dep')],
 )
 
 build_examples = (
@@ -45,6 +47,14 @@ build_tests = (
 
 if build_benchmarks or build_examples
     cli11_dep = subproject('cli11').get_variable('cli11_dep')
+endif
+
+# BBTools is a pure-Java release vendored as a Meson subproject; its shell
+# wrappers (comparesketch.sh, loglog.sh) serve as the BBTools metric oracle for
+# benchmark acceptance. Only needed when benchmarks build.
+bbtools_dir = ''
+if build_benchmarks
+    bbtools_dir = subproject('bbtools').get_variable('bbtools_dir')
 endif
 
 if build_examples

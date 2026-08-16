@@ -77,6 +77,10 @@
 
             texliveFull
             tex-fmt
+
+            # BBTools is vendored as a Meson subproject (pure Java, no Nix store
+            # path needed); only its JRE runtime belongs in the dev shell.
+            jre_headless
           ];
         in
         {
