@@ -11,3 +11,15 @@ test_exe = executable(
 )
 
 test('cuddl-tests', test_exe)
+
+if build_benchmarks
+    python = import('python').find_installation()
+    test(
+        'construction-bakeoff-equivalence',
+        python,
+        args: [
+            files('construction_bakeoff_test.py'),
+            meson.project_build_root() / 'benchmarks' / 'construction-bakeoff',
+        ],
+    )
+endif

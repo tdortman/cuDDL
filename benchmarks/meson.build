@@ -3,7 +3,11 @@ cuco_dep = subproject('cuco').get_variable('cuco_dep')
 
 bench_deps = [benchmark_dep, cuddl_dep]
 
-benchmarks = {}
+benchmarks = {
+    'construction-bakeoff': {
+        'src': 'construction_bakeoff.cu',
+    },
+}
 
 foreach name, config : benchmarks
     extra_cuda_args = config.get('extra_args', [])
