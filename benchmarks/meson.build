@@ -13,7 +13,6 @@ foreach name, config : benchmarks
         config['src'],
         dependencies: bench_deps + deps,
         cuda_args: cuda_args + extra_cuda_args,
-        link_args: extra_link_args,
         install: false,
     )
 endforeach
