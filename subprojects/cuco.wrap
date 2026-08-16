@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/NVIDIA/cuCollections.git
+revision = 4b26118c99866221f99f35f4e3bc74afdbe063bc
+depth = 1
+patch_directory = cuco
