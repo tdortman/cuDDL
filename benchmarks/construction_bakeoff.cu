@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
         std::vector<std::uint64_t> inputs(item_count);
         for (std::uint64_t index = 0; index < item_count; ++index) {
             auto const forward = splitmix64(index ^ seed) & kmer_mask;
-            inputs[index] = max(forward, reverse_complement(forward));
+            inputs[index] = std::max(forward, reverse_complement(forward));
         }
 
         std::uint64_t* device_inputs = nullptr;
