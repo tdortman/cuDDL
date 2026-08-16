@@ -1,6 +1,7 @@
 #include <cuddl/cuda_error.hpp>
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <array>
@@ -176,6 +177,15 @@ int main(int argc, char** argv) {
     try {
         auto const item_count = parse_items(argc, argv);
         auto const check_only = has_flag(argc, argv, "--check");
+        auto const profile_global = has_flag(argc, argv, "--profile-global");
+        auto const profile_cta = has_flag(argc, argv, "--profile-cta");
+        auto const profile_merge = has_flag(argc, argv, "--profile-merge");
+        auto const profile_mode_count =
+            static_cast<int>(profile_global) + static_cast<int>(profile_cta) +
+            static_cast<int>(profile_merge);
+        if (profile_mode_count > 1) {
+            throw std::runtime_error("select only one --profile-* mode");
+        }
         int device = 0;
         CUDDL_CUDA_CALL(cudaGetDevice(&device));
         cudaDeviceProp properties{};
@@ -238,6 +248,39 @@ int main(int argc, char** argv) {
             run_local_build();
             run_local_merge();
         };
+
+        if (profile_mode_count == 1) {
+            constexpr int profile_repetitions = 20;
+            if (profile_merge) {
+                run_local_build();
+                CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            }
+            CUDDL_CUDA_CALL(cudaProfilerStart());
+            for (int repetition = 0; repetition < profile_repetitions; ++repetition) {
+                if (profile_global) {
+                    CUDDL_CUDA_CALL(cudaMemset(global_sketch, 0, bucket_count * sizeof(*global_sketch)));
+                    global_atomic_kernel<<<block_count, block_size>>>(
+                        device_inputs, item_count, global_sketch);
+                    CUDDL_CUDA_CALL(cudaGetLastError());
+                } else if (profile_cta) {
+                    run_local_build();
+                } else {
+                    run_local_merge();
+                }
+            }
+            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            CUDDL_CUDA_CALL(cudaProfilerStop());
+            std::printf("profile=%s items=%llu blocks=%u repetitions=%d\n",
+                        profile_global ? "global" : profile_cta ? "cta" : "merge",
+                        static_cast<unsigned long long>(item_count),
+                        block_count,
+                        profile_repetitions);
+            CUDDL_CUDA_CALL(cudaFree(partial_sketches));
+            CUDDL_CUDA_CALL(cudaFree(local_sketch));
+            CUDDL_CUDA_CALL(cudaFree(global_sketch));
+            CUDDL_CUDA_CALL(cudaFree(device_inputs));
+            return EXIT_SUCCESS;
+        }
 
         run_global();
         run_local();
