@@ -7,6 +7,9 @@ benchmarks = {
     'construction-bakeoff': {
         'src': 'construction_bakeoff.cu',
     },
+    'comparison-bakeoff': {
+        'src': 'comparison_bakeoff.cu',
+    },
 }
 
 foreach name, config : benchmarks

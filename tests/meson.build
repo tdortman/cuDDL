@@ -22,4 +22,12 @@ if build_benchmarks
             meson.project_build_root() / 'benchmarks' / 'construction-bakeoff',
         ],
     )
+    test(
+        'comparison-bakeoff-equivalence',
+        python,
+        args: [
+            files('comparison_bakeoff_test.py'),
+            meson.project_build_root() / 'benchmarks' / 'comparison-bakeoff',
+        ],
+    )
 endif
