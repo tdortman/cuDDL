@@ -93,7 +93,6 @@ __global__ void tier_floor_kernel(
     __shared__ uint16_t floor;
     __shared__ uint32_t successes;
     __shared__ uint32_t rescan_generation;
-    __shared__ uint16_t warp_min[32];
     auto const tile_count = BucketCount / local_buckets;
     auto const tile = blockIdx.x / (gridDim.x / tile_count);
     auto const cta = blockIdx.x % (gridDim.x / tile_count);
@@ -134,23 +133,79 @@ __global__ void tier_floor_kernel(
         }
         __syncthreads();
         if (rescan_generation != generation) {
-            auto local = std::numeric_limits<uint16_t>::max();
-            for (auto bucket = threadIdx.x; bucket < local_buckets; bucket += blockDim.x) {
-                local = min(local, winner(sketch[bucket]));
-            }
-            for (auto offset = 16; offset != 0; offset /= 2) {
-                local = min(local, __shfl_down_sync(0xffffffffU, local, offset));
-            }
-            if ((threadIdx.x & 31U) == 0) warp_min[threadIdx.x / 32U] = local;
-            __syncthreads();
             if (threadIdx.x == 0) {
-                auto minimum = std::numeric_limits<uint16_t>::max();
-                for (auto warp = 0U; warp < blockDim.x / 32U; ++warp)
-                    minimum = min(minimum, warp_min[warp]);
-                floor = minimum;
+                auto local = std::numeric_limits<uint16_t>::max();
+                for (auto bucket = 0U; bucket < local_buckets; ++bucket)
+                    local = min(local, winner(sketch[bucket]));
+                floor = local;
                 atomicAdd(reinterpret_cast<unsigned long long*>(counters + 3), 1ULL);
             }
         }
+        __syncthreads();
+    }
+
+    auto* output = partials + static_cast<uint64_t>(cta) * BucketCount + tile * local_buckets;
+    for (auto bucket = threadIdx.x; bucket < local_buckets; bucket += blockDim.x)
+        output[bucket] = sketch[bucket];
+}
+
+template <uint32_t BucketCount>
+__global__ void atomic_floor_kernel(
+    uint64_t const* inputs,
+    uint64_t item_count,
+    uint32_t* partials,
+    uint64_t* counters
+) {
+    constexpr auto local_buckets = BucketCount < 8192 ? BucketCount : 8192;
+    __shared__ uint32_t sketch[local_buckets];
+    __shared__ uint32_t occupied;
+    __shared__ uint32_t initial_minimum;
+    __shared__ uint32_t floor;
+    auto const tile_count = BucketCount / local_buckets;
+    auto const tile = blockIdx.x / (gridDim.x / tile_count);
+    auto const cta = blockIdx.x % (gridDim.x / tile_count);
+    if (threadIdx.x == 0) {
+        occupied = 0;
+        initial_minimum = std::numeric_limits<uint16_t>::max();
+        floor = 0;
+    }
+    for (auto bucket = threadIdx.x; bucket < local_buckets; bucket += blockDim.x)
+        sketch[bucket] = 0;
+    __syncthreads();
+
+    auto const cta_count = gridDim.x / tile_count;
+    auto const begin = (static_cast<uint64_t>(cta) * item_count) / cta_count;
+    auto const end = (static_cast<uint64_t>(cta + 1U) * item_count) / cta_count;
+    for (auto base = begin; base < end; base += blockDim.x) {
+        auto const index = base + threadIdx.x;
+        if (index < end) {
+            auto const hash = splitmix64(inputs[index] ^ seed);
+            auto const bucket = hash & (BucketCount - 1U);
+            auto const incoming = score(hash);
+            if (bucket / local_buckets == tile) {
+                if (incoming >= floor) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(counters), 1ULL);
+                    auto* address = sketch + (bucket % local_buckets);
+                    auto const before = atomicCAS(address, 0U, pack(incoming, 1));
+                    bool changed;
+                    if (before == 0) {
+                        changed = true;
+                        atomicMin(&initial_minimum, static_cast<uint32_t>(incoming));
+                        atomicAdd(&occupied, 1U);
+                    } else {
+                        changed = update(address, incoming);
+                    }
+                    if (changed) {
+                        atomicAdd(reinterpret_cast<unsigned long long*>(counters + 1), 1ULL);
+                    }
+                } else {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(counters + 2), 1ULL);
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && floor == 0 && occupied == local_buckets)
+            floor = initial_minimum;
         __syncthreads();
     }
 
@@ -215,10 +270,12 @@ bool run(
     auto const partial_bytes = static_cast<size_t>(ctas) * BucketCount * sizeof(uint32_t);
     uint32_t* global = nullptr;
     uint32_t* local = nullptr;
+    uint32_t* atomic_local = nullptr;
     uint32_t* partials = nullptr;
     uint64_t* counters = nullptr;
     CUDDL_CUDA_CALL(cudaMalloc(&global, BucketCount * sizeof(uint32_t)));
     CUDDL_CUDA_CALL(cudaMalloc(&local, BucketCount * sizeof(uint32_t)));
+    CUDDL_CUDA_CALL(cudaMalloc(&atomic_local, BucketCount * sizeof(uint32_t)));
     CUDDL_CUDA_CALL(cudaMalloc(&partials, partial_bytes));
     CUDDL_CUDA_CALL(cudaMalloc(&counters, 4 * sizeof(uint64_t)));
     auto global_launch = [&] {
@@ -237,10 +294,25 @@ bool run(
             <<<(BucketCount + block_size - 1U) / block_size, block_size>>>(partials, ctas, local);
         CUDDL_CUDA_CALL(cudaGetLastError());
     };
+    auto atomic_floor_launch = [&] {
+        CUDDL_CUDA_CALL(cudaMemset(counters, 0, 4 * sizeof(uint64_t)));
+        constexpr auto tile_count = BucketCount / (BucketCount < 8192 ? BucketCount : 8192);
+        atomic_floor_kernel<BucketCount><<<ctas * tile_count, block_size>>>(
+            inputs, item_count, partials, counters
+        );
+        CUDDL_CUDA_CALL(cudaGetLastError());
+        merge_kernel<BucketCount>
+            <<<(BucketCount + block_size - 1U) / block_size, block_size>>>(
+                partials, ctas, atomic_local
+            );
+        CUDDL_CUDA_CALL(cudaGetLastError());
+    };
     global_launch();
     local_launch();
+    atomic_floor_launch();
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    std::vector<uint32_t> cpu(BucketCount), global_host(BucketCount), local_host(BucketCount);
+    std::vector<uint32_t> cpu(BucketCount), global_host(BucketCount), local_host(BucketCount),
+        atomic_host(BucketCount);
     for (auto input : host_inputs) {
         auto const hash = splitmix64(input ^ seed);
         auto& state = cpu[hash & (BucketCount - 1U)];
@@ -256,29 +328,40 @@ bool run(
     CUDDL_CUDA_CALL(
         cudaMemcpy(local_host.data(), local, BucketCount * sizeof(uint32_t), cudaMemcpyDeviceToHost)
     );
+    CUDDL_CUDA_CALL(cudaMemcpy(
+        atomic_host.data(),
+        atomic_local,
+        BucketCount * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost
+    ));
     std::array<uint64_t, 4> metrics{};
     CUDDL_CUDA_CALL(cudaMemcpy(metrics.data(), counters, sizeof(metrics), cudaMemcpyDeviceToHost));
     auto const global_equivalent = cpu == global_host;
     auto const local_equivalent = cpu == local_host;
-    auto const equivalent = global_equivalent;
+    auto const atomic_equivalent = cpu == atomic_host;
+    auto const equivalent = global_equivalent && local_equivalent && atomic_equivalent;
     if (check) {
         std::printf(
-            "check,buckets=%u,equivalent=%s,global_equivalent=%s,local_equivalent=%s,attempted=%"
-            "llu,successful=%llu,rejected=%llu,rescans=%llu\n",
+            "check,buckets=%u,equivalent=%s,global_equivalent=%s,local_equivalent=%s,"
+            "atomic_equivalent=%s,atomic_attempted=%llu,atomic_successful=%llu,"
+            "atomic_rejected=%llu\n",
             BucketCount,
             equivalent ? "true" : "false",
             global_equivalent ? "true" : "false",
             local_equivalent ? "true" : "false",
+            atomic_equivalent ? "true" : "false",
             static_cast<unsigned long long>(metrics[0]),
             static_cast<unsigned long long>(metrics[1]),
-            static_cast<unsigned long long>(metrics[2]),
-            static_cast<unsigned long long>(metrics[3])
+            static_cast<unsigned long long>(metrics[2])
         );
     } else {
         constexpr int repetitions = 9;
         event_timer timer;
         std::vector<double> global_times;
         std::vector<double> local_times;
+        std::vector<double> atomic_times;
+        std::vector<std::array<uint64_t, 4>> local_metrics;
+        std::vector<std::array<uint64_t, 4>> atomic_metrics;
         for (int repetition = 0; repetition < repetitions; ++repetition) {
             timer.start();
             global_launch();
@@ -286,37 +369,83 @@ bool run(
             timer.start();
             local_launch();
             local_times.push_back(timer.stop());
+            std::array<uint64_t, 4> local_sample_metrics{};
+            CUDDL_CUDA_CALL(cudaMemcpy(
+                local_sample_metrics.data(),
+                counters,
+                sizeof(local_sample_metrics),
+                cudaMemcpyDeviceToHost
+            ));
+            local_metrics.push_back(local_sample_metrics);
+            timer.start();
+            atomic_floor_launch();
+            atomic_times.push_back(timer.stop());
+            std::array<uint64_t, 4> sample_metrics{};
+            CUDDL_CUDA_CALL(cudaMemcpy(
+                sample_metrics.data(), counters, sizeof(sample_metrics), cudaMemcpyDeviceToHost
+            ));
+            atomic_metrics.push_back(sample_metrics);
         }
         std::ranges::sort(global_times);
+        auto const raw_local_times = local_times;
         std::ranges::sort(local_times);
+        auto const raw_atomic_times = atomic_times;
+        std::ranges::sort(atomic_times);
         auto const global_ms = global_times[repetitions / 2];
         auto const local_ms = local_times[repetitions / 2];
-        auto const rejected = metrics[2];
-        auto const considered = metrics[0] + rejected;
-        auto const rejection_rate =
-            considered == 0 ? 0.0 : static_cast<double>(rejected) / considered;
+        auto const atomic_ms = atomic_times[repetitions / 2];
+        auto const local_median_index = static_cast<size_t>(
+            std::ranges::find(raw_local_times, local_ms) - raw_local_times.begin()
+        );
+        auto const& local_median_metrics = local_metrics[local_median_index];
+        auto const local_rejected = local_median_metrics[2];
+        auto const local_considered = local_median_metrics[0] + local_rejected;
+        auto const local_rejection_rate =
+            local_considered == 0
+            ? 0.0
+            : static_cast<double>(local_rejected) / local_considered;
+        auto const median_index = static_cast<size_t>(
+            std::ranges::find(raw_atomic_times, atomic_ms) - raw_atomic_times.begin()
+        );
+        auto const& median_metrics = atomic_metrics[median_index];
+        auto const atomic_rejected = median_metrics[2];
+        auto const atomic_considered = median_metrics[0] + atomic_rejected;
+        auto const atomic_rejection_rate =
+            atomic_considered == 0
+            ? 0.0
+            : static_cast<double>(atomic_rejected) / atomic_considered;
         std::printf(
             "result,buckets=%u,ctas=%u,local_buckets=%u,cadence=%u,global_ms=%.6f,tier_floor_ms=%."
-            "6f,global_speedup=%.6f,equivalent=%s,attempted=%llu,successful=%llu,rejected=%llu,"
-            "rejection_rate=%.6f,rescans=%llu\n",
+            "6f,atomic_floor_ms=%.6f,tier_over_global=%.6f,atomic_over_global=%.6f,equivalent=%s,"
+            "atomic_equivalent=%s,tier_attempted=%llu,tier_successful=%llu,tier_rejected=%llu,"
+            "tier_rejection_rate=%.6f,tier_rescans=%llu,atomic_attempted=%llu,"
+            "atomic_successful=%llu,atomic_rejected=%llu,atomic_rejection_rate=%.6f\n",
             BucketCount,
             ctas,
             BucketCount < 8192 ? BucketCount : 8192,
             rescan_cadence,
             global_ms,
             local_ms,
+            atomic_ms,
             local_ms / global_ms,
+            atomic_ms / global_ms,
             equivalent ? "true" : "false",
-            static_cast<unsigned long long>(metrics[0]),
-            static_cast<unsigned long long>(metrics[1]),
-            static_cast<unsigned long long>(rejected),
-            rejection_rate,
-            static_cast<unsigned long long>(metrics[3])
+            atomic_equivalent ? "true" : "false",
+            static_cast<unsigned long long>(local_median_metrics[0]),
+            static_cast<unsigned long long>(local_median_metrics[1]),
+            static_cast<unsigned long long>(local_rejected),
+            local_rejection_rate,
+            static_cast<unsigned long long>(local_median_metrics[3]),
+            static_cast<unsigned long long>(median_metrics[0]),
+            static_cast<unsigned long long>(median_metrics[1]),
+            static_cast<unsigned long long>(atomic_rejected),
+            atomic_rejection_rate
         );
     }
     CUDDL_CUDA_CALL(cudaFree(counters));
     CUDDL_CUDA_CALL(cudaFree(partials));
     CUDDL_CUDA_CALL(cudaFree(local));
+    CUDDL_CUDA_CALL(cudaFree(atomic_local));
     CUDDL_CUDA_CALL(cudaFree(global));
     return equivalent;
 }
@@ -328,17 +457,19 @@ int main(int argc, char** argv) {
         CLI::App app{"Tier-floor construction prototype"};
         uint64_t item_count = 1ULL << 24;
         uint32_t rescan_cadence = 128;
+        uint32_t ctas = 0;
         bool check = false;
         app.add_option("--items", item_count)->check(CLI::PositiveNumber);
         app.add_option("--rescan-cadence", rescan_cadence)
             ->check(CLI::IsMember({0, 32, 128, 512, 2048}));
+        app.add_option("--ctas", ctas);
         app.add_flag("--check", check);
         CLI11_PARSE(app, argc, argv);
         int device = 0;
         cudaDeviceProp properties{};
         CUDDL_CUDA_CALL(cudaGetDevice(&device));
         CUDDL_CUDA_CALL(cudaGetDeviceProperties(&properties, device));
-        auto const ctas = static_cast<uint32_t>(properties.multiProcessorCount * 2);
+        if (ctas == 0) ctas = static_cast<uint32_t>(properties.multiProcessorCount * 2);
         std::vector<uint64_t> host_inputs(item_count);
         for (uint64_t i = 0; i < item_count; ++i) host_inputs[i] = splitmix64(i);
         uint64_t* inputs = nullptr;
