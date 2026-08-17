@@ -13,20 +13,17 @@
 Two figures:
 
 - `throughput`: items/s (from the nvbench CSV) against item count for the two estimators.
-- `accuracy`: relative cardinality error (from the benchmark's accuracy side-channel) against
-  item count.
+- `accuracy`: relative cardinality error (from the nvbench CSV summaries) against item count.
 
-Reads the benchmark's nvbench CSV (`--nvbench-csv`) and the accuracy rows it prints to stdout
-(`--accuracy`), then renders both figures. Styling comes from `./scripts/plot_utils.py`.
+Both come from the single benchmark `--csv` output. Styling comes from
+`./scripts/plot_utils.py`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Annotated
 
-import pandas as pd
 import plot_utils as pu
 import typer
 
@@ -35,27 +32,9 @@ app = typer.Typer(
 )
 
 
-def parse_accuracy(lines: Iterator[str]) -> pd.DataFrame:
-    """Collect `cuddl,count=..,rel_error=..` and `cuco_hll,..` rows from the benchmark stdout."""
-    rows: list[dict[str, str]] = []
-    for line in lines:
-        line = line.strip()
-        if not (line.startswith(("cuddl,", "cuco_hll,"))):
-            continue
-        fields: dict[str, str] = {}
-        head, _, body = line.partition(",")
-        fields["benchmark"] = head
-        for pair in body.split(","):
-            key, _, value = pair.partition("=")
-            fields[key] = value
-        rows.append(fields)
-    return pd.DataFrame(rows)
-
-
 @app.command()
 def plot(
     nvbench_csv: Annotated[Path, typer.Option(help="Benchmark --csv output")],
-    accuracy: Annotated[Path, typer.Option(help="Benchmark stdout saved to a file")],
     output_dir: Annotated[Path, typer.Option(help="Where to write the figures")] = Path(
         "results/hll"
     ),
@@ -68,10 +47,8 @@ def plot(
     bench["Gigaelem/s"] = bench["Elem/s (elem/sec)"] / pu.THROUGHPUT_SCALE
     bench = bench.rename(columns={"Iters": "Items", "Benchmark": "Estimator"})
 
-    # Accuracy from the benchmark's printed rows.
-    with accuracy.open() as f:
-        acc = parse_accuracy(f)
-    acc["Items"] = acc["count"].astype("int64")
+    # Accuracy from the same CSV, in the summary columns attached by the benchmark.
+    acc = bench.rename(columns={"Distinct": "distinct", "Rel Error": "rel_error"})
     acc["rel_error"] = acc["rel_error"].astype("float64")
 
     # --- Throughput figure ---------------------------------------------------
@@ -81,7 +58,7 @@ def plot(
         ("cuco_hll_construction", "#A23B72", "^"),
     ]:
         data = bench[bench["Estimator"] == estimator]
-        ax.semilogx(
+        ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
             data["Gigaelem/s"],
             color=color,
@@ -96,16 +73,16 @@ def plot(
     # --- Accuracy figure -----------------------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, color, marker in [
-        ("cuddl", "#2E86AB", "o"),
-        ("cuco_hll", "#A23B72", "^"),
+        ("cuddl_construction", "#2E86AB", "o"),
+        ("cuco_hll_construction", "#A23B72", "^"),
     ]:
-        data = acc[acc["benchmark"] == estimator]
-        ax.semilogx(
+        data = acc[acc["Estimator"] == estimator]
+        ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
             data["rel_error"] * 100.0,
             color=color,
             marker=marker,
-            label=pu.paper_text(estimator),
+            label=pu.paper_text(estimator.split("_")[0]),
         )
     pu.format_axis(ax, xlabel="Items", ylabel="Relative cardinality error (%)")
     pu.create_legend(ax)

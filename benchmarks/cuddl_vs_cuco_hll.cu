@@ -14,13 +14,35 @@
 #include <cuda/std/cstdint>
 
 #include <cmath>
-#include <cstdio>
 #include <vector>
 
 namespace {
 
 constexpr size_t k_bucket_count = 2048;
 constexpr size_t k_hll_precision = 11;  // 2^11 = 2048 HLL registers
+
+/// @brief Attaches cardinality accuracy to the nvbench CSV as shared summary columns.
+///
+/// Both estimators write to the same tags so each quantity appears as a single column
+/// across the two benchmark entries in the CSV.
+void add_accuracy_summaries(
+    nvbench::state& state,
+    size_t distinct,
+    double estimate,
+    double rel_err
+) {
+    auto& distinct_summary = state.add_summary("distinct");
+    distinct_summary.set_string("name", "Distinct");
+    distinct_summary.set_int64("value", static_cast<nvbench::int64_t>(distinct));
+
+    auto& estimate_summary = state.add_summary("estimate");
+    estimate_summary.set_string("name", "Estimate");
+    estimate_summary.set_float64("value", estimate);
+
+    auto& rel_err_summary = state.add_summary("rel_error");
+    rel_err_summary.set_string("name", "Rel Error");
+    rel_err_summary.set_float64("value", rel_err);
+}
 
 /// @brief Generates deterministic packed k-mers and their distinct count via library hashing.
 std::vector<uint64_t> make_inputs(size_t count, size_t& distinct) {
@@ -63,17 +85,11 @@ void cuddl_construction(nvbench::state& state) {
         timer.stop();
     });
 
-    // Report the cardinality estimate accuracy as a side-channel the plotter can read.
-    auto const estimate = sketch.cardinality().value();
+    // Attach the cardinality estimate accuracy to the nvbench CSV as summaries.
+    auto const estimate = CUDDL_UNWRAP(sketch.cardinality());
     auto const rel_err =
         std::fabs(estimate - static_cast<double>(distinct)) / static_cast<double>(distinct);
-    std::printf(
-        "cuddl,count=%zu,distinct=%zu,estimate=%.1f,rel_error=%.6f\n",
-        count,
-        distinct,
-        estimate,
-        rel_err
-    );
+    add_accuracy_summaries(state, distinct, estimate, rel_err);
 
     cudaFree(d_input);
 }
@@ -106,13 +122,7 @@ void cuco_hll_construction(nvbench::state& state) {
     auto const estimate = static_cast<double>(hll.estimate());
     auto const rel_err =
         std::fabs(estimate - static_cast<double>(distinct)) / static_cast<double>(distinct);
-    std::printf(
-        "cuco_hll,count=%zu,distinct=%zu,estimate=%.1f,rel_error=%.6f\n",
-        count,
-        distinct,
-        estimate,
-        rel_err
-    );
+    add_accuracy_summaries(state, distinct, estimate, rel_err);
 
     cudaFree(d_input);
 }
