@@ -1,7 +1,7 @@
 // nvbench comparison of cuDDL against cuCollections HyperLogLog.
 //
 // Both are GPU cardinality estimators. cuDDL uses a DynamicDemiLog register sketch
-// (`BucketCount` packed uint32 registers); cuCollections HyperLogLog uses `2^precision` byte
+// (`BucketCount` packed uint32 registers); cuCollections HyperLogLog also uses uint32
 // registers. Construction and cardinality estimation are timed separately at a matched register
 // count (2048).
 
@@ -23,6 +23,23 @@ template <typename T>
 __forceinline__ void do_not_optimise(T& value) {
     asm volatile("" : "+m,r"(value) : : "memory");
 }
+
+void add_value(nvbench::state& state, char const* name, double value) {
+    auto& summary = state.add_summary(name);
+    summary.set_string("name", name);
+    summary.set_float64("value", value);
+}
+
+void add_median_time(nvbench::state& state) {
+    auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
+    add_value(state, "Median GPU Time", median);
+}
+
+void add_median_throughput(nvbench::state& state, size_t count) {
+    auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
+    add_value(state, "Median Throughput", static_cast<double>(count) / median);
+}
+
 
 /// @brief Generates deterministic packed k-mers.
 std::vector<uint64_t> make_inputs(size_t count) {
@@ -60,6 +77,7 @@ void cuddl_construction(nvbench::state& state) {
         cuddl::require_void(sketch.add_async(d_input, d_input + count, stream));
         timer.stop();
     });
+    add_median_throughput(state, count);
 
     cudaFree(d_input);
 }
@@ -69,14 +87,22 @@ NVBENCH_BENCH(cuddl_construction)
 void cuddl_cardinality(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
     auto const host = make_inputs(count);
-
+    uint64_t* d_input = nullptr;
+    cudaMalloc(&d_input, count * sizeof(uint64_t));
+    cudaMemcpy(d_input, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuddl::sketch<25, k_bucket_count> sketch;
-    cuddl::require_void(sketch.add(host.data(), host.data() + host.size()));
+    cuddl::require_void(sketch.add(d_input, d_input + count));
 
-    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-        auto estimate = CUDDL_UNWRAP(sketch.cardinality());
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        auto estimate = CUDDL_UNWRAP(
+            sketch.cardinality(cuda::stream_ref{launch.get_stream()})
+        );
         do_not_optimise(estimate);
     });
+    add_median_time(state);
+    add_value(state, "Exact", static_cast<double>(count));
+    add_value(state, "Estimate", CUDDL_UNWRAP(sketch.cardinality()));
+    cudaFree(d_input);
 }
 NVBENCH_BENCH(cuddl_cardinality)
     .add_int64_power_of_two_axis("Iters", {20, 21, 22, 23, 24, 25, 26, 27, 28});
@@ -102,6 +128,7 @@ void cuco_hll_construction(nvbench::state& state) {
         hll.add_async(d_input, d_input + count, stream);
         timer.stop();
     });
+    add_median_throughput(state, count);
 
     cudaFree(d_input);
 }
@@ -112,15 +139,105 @@ NVBENCH_BENCH(cuco_hll_construction)
 void cuco_hll_cardinality(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
     auto const host = make_inputs(count);
-
+    uint64_t* d_input = nullptr;
+    cudaMalloc(&d_input, count * sizeof(uint64_t));
+    cudaMemcpy(d_input, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuco::hyperloglog<uint64_t> hll(cuco::precision{k_hll_precision});
-    hll.add(host.begin(), host.end());
+    hll.add(d_input, d_input + count);
 
-    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-        auto estimate = hll.estimate();
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        auto estimate = hll.estimate(cuda::stream_ref{launch.get_stream()});
         do_not_optimise(estimate);
     });
+    add_median_time(state);
+    add_value(state, "Exact", static_cast<double>(count));
+    add_value(state, "Estimate", hll.estimate());
+    cudaFree(d_input);
 }
 
 NVBENCH_BENCH(cuco_hll_cardinality)
+    .add_int64_power_of_two_axis("Iters", {20, 21, 22, 23, 24, 25, 26, 27, 28});
+
+void cuddl_similarity(nvbench::state& state) {
+    auto const count = static_cast<size_t>(state.get_int64("Iters"));
+    auto const shared = count / 2;
+    auto const left = make_inputs(count);
+    auto right = make_inputs(shared);
+    auto const unique = make_inputs(count + shared);
+    right.insert(right.end(), unique.begin() + count, unique.end());
+
+    uint64_t* d_left = nullptr;
+    uint64_t* d_right = nullptr;
+    cudaMalloc(&d_left, left.size() * sizeof(uint64_t));
+    cudaMalloc(&d_right, right.size() * sizeof(uint64_t));
+    cudaMemcpy(d_left, left.data(), left.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_right, right.data(), right.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cuddl::sketch<25, k_bucket_count> left_sketch;
+    cuddl::sketch<25, k_bucket_count> right_sketch;
+    cuddl::require_void(left_sketch.add(d_left, d_left + left.size()));
+    cuddl::require_void(right_sketch.add(d_right, d_right + right.size()));
+
+    auto const summary = CUDDL_UNWRAP(left_sketch.compare(right_sketch.ref()));
+    auto similarity = *left_sketch.ref().containment(summary);
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        auto timed_summary = CUDDL_UNWRAP(
+            left_sketch.compare(
+                right_sketch.ref(), cuda::stream_ref{launch.get_stream()}
+            )
+        );
+        auto equal = timed_summary.counts.equal;
+        do_not_optimise(equal);
+    });
+    add_median_time(state);
+    add_value(state, "Exact Similarity", 0.5);
+    add_value(state, "Similarity", similarity);
+    cudaFree(d_right);
+    cudaFree(d_left);
+}
+
+NVBENCH_BENCH(cuddl_similarity)
+    .add_int64_power_of_two_axis("Iters", {20, 21, 22, 23, 24, 25, 26, 27, 28});
+
+void cuco_hll_similarity(nvbench::state& state) {
+    auto const count = static_cast<size_t>(state.get_int64("Iters"));
+    auto const shared = count / 2;
+    auto const left = make_inputs(count);
+    auto right = make_inputs(shared);
+    auto const unique = make_inputs(count + shared);
+    right.insert(right.end(), unique.begin() + count, unique.end());
+
+    uint64_t* d_left = nullptr;
+    uint64_t* d_right = nullptr;
+    cudaMalloc(&d_left, left.size() * sizeof(uint64_t));
+    cudaMalloc(&d_right, right.size() * sizeof(uint64_t));
+    cudaMemcpy(d_left, left.data(), left.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_right, right.data(), right.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cuco::hyperloglog<uint64_t> left_hll(cuco::precision{k_hll_precision});
+    cuco::hyperloglog<uint64_t> right_hll(cuco::precision{k_hll_precision});
+    left_hll.add(d_left, d_left + left.size());
+    right_hll.add(d_right, d_right + right.size());
+    auto const left_estimate = static_cast<double>(left_hll.estimate());
+    auto const right_estimate = static_cast<double>(right_hll.estimate());
+    cuco::hyperloglog<uint64_t> union_hll(cuco::precision{k_hll_precision});
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        auto const stream = cuda::stream_ref{launch.get_stream()};
+        union_hll.clear(stream);
+        union_hll.merge(left_hll, stream);
+        union_hll.merge(right_hll, stream);
+    });
+    add_median_time(state);
+    union_hll.clear();
+    union_hll.merge(left_hll);
+    union_hll.merge(right_hll);
+    auto const union_estimate = union_hll.estimate();
+    auto const intersection_estimate = left_estimate + right_estimate - union_estimate;
+    auto const similarity = intersection_estimate / left_estimate;
+    add_value(state, "Exact Similarity", 0.5);
+    add_value(state, "Similarity", similarity);
+    cudaFree(d_right);
+    cudaFree(d_left);
+}
+
+NVBENCH_BENCH(cuco_hll_similarity)
     .add_int64_power_of_two_axis("Iters", {20, 21, 22, 23, 24, 25, 26, 27, 28});
