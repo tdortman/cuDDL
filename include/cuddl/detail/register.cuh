@@ -93,9 +93,9 @@ __host__ __device__ constexpr uint64_t restore(uint16_t stored) noexcept {
  * observation (an increment attempted on an already-saturated counter) sets the sketch-level
  * saturation flag through @p saturation using an idempotent store.
  *
- * @return Whether the packed register changed.
  */
-__device__ inline bool update(uint32_t* address, uint16_t incoming, uint32_t* saturation) noexcept {
+__device__ inline void
+update(uint32_t* address, uint16_t incoming, uint32_t* saturation) noexcept {
     auto observed = *address;
     while (incoming >= winner(observed)) {
         uint32_t replacement;
@@ -105,17 +105,16 @@ __device__ inline bool update(uint32_t* address, uint16_t incoming, uint32_t* sa
             if (saturation != nullptr) {
                 atomicExch(saturation, 1U);
             }
-            return false;
+            return;
         } else {
             replacement = pack(incoming, static_cast<uint16_t>(count(observed) + 1U));
         }
         auto const previous = atomicCAS(address, observed, replacement);
         if (previous == observed) {
-            return true;
+            return;
         }
         observed = previous;
     }
-    return false;
 }
 
 }  // namespace cuddl::detail

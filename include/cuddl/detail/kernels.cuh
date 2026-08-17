@@ -88,9 +88,15 @@ __global__ __launch_bounds__(block_size, 4) void add_kernel(
 ) {
     auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto offset = index; offset < count; offset += stride) {
-        auto const hash = hash_kmer(first[offset]);
-        update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
+    for (auto offset = index; offset < count; offset += stride * 2U) {
+        _Pragma("unroll")
+        for (uint32_t item = 0; item < 2U; ++item) {
+            auto const current = offset + stride * item;
+            if (current < count) {
+                auto const hash = hash_kmer(first[current]);
+                update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
+            }
+        }
     }
 }
 
