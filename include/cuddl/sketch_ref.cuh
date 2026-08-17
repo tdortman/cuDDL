@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/stream_ref>
 #include <cuda/std/cstdint>
+#include <cuda/stream_ref>
 
 #include <algorithm>
 #include <cmath>
@@ -32,9 +32,8 @@ class sketch_ref {
     using register_type = uint32_t;
 
     /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
-    __host__ __device__ constexpr sketch_ref(
-        register_type* registers, uint32_t* saturation
-    ) noexcept
+    __host__
+        __device__ constexpr sketch_ref(register_type* registers, uint32_t* saturation) noexcept
         : registers_(registers), saturation_(saturation) {}
 
     /// @brief Pointer to the first packed register.
@@ -58,10 +57,12 @@ class sketch_ref {
     }
 
     /// @brief Resets every register and the saturation flag to zero as one logical operation.
-    [[nodiscard]] Result<void>
-    clear_async(cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}) const noexcept {
+    [[nodiscard]] Result<void> clear_async(
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const noexcept {
         auto const registers_bytes = BucketCount * sizeof(register_type);
-        if (auto const result = cuda_try(cudaMemsetAsync(registers_, 0, registers_bytes, stream.get()));
+        if (auto const result =
+                cuda_try(cudaMemsetAsync(registers_, 0, registers_bytes, stream.get()));
             !result) {
             return result;
         }
@@ -127,8 +128,7 @@ class sketch_ref {
         uint32_t* saturation_out,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::winner_counts_kernel<BucketCount>
-            <<<1, detail::block_size, 0, stream.get()>>>(
+        detail::winner_counts_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
             registers_, saturation_, counts_out, saturation_out
         );
         return cuda_try(cudaGetLastError());
@@ -137,8 +137,7 @@ class sketch_ref {
     /// @brief Weighted k-mer identity from a raw pair summary (unpadded formula).
     ///
     /// Returns `std::nullopt` when the divisor is zero.
-    [[nodiscard]] std::optional<double>
-    wkid(pairwise_summary const& summary) const noexcept {
+    [[nodiscard]] std::optional<double> wkid(pairwise_summary const& summary) const noexcept {
         auto const equal = summary.counts.equal;
         auto const divisor = equal + std::min(summary.counts.lower, summary.counts.higher);
         if (divisor == 0U) {
@@ -148,8 +147,7 @@ class sketch_ref {
     }
 
     /// @brief Average nucleotide identity estimate from a raw pair summary.
-    [[nodiscard]] std::optional<double>
-    ani(pairwise_summary const& summary) const noexcept {
+    [[nodiscard]] std::optional<double> ani(pairwise_summary const& summary) const noexcept {
         auto const identity = wkid(summary);
         if (!identity) {
             return std::nullopt;
@@ -160,8 +158,9 @@ class sketch_ref {
     /// @brief Fraction of `this`'s content shared with the other sketch.
     ///
     /// `equal / (equal + higher)`; `std::nullopt` when the divisor is zero.
-    [[nodiscard]] std::optional<double>
-    containment(pairwise_summary const& summary) const noexcept {
+    [[nodiscard]] std::optional<double> containment(
+        pairwise_summary const& summary
+    ) const noexcept {
         auto const divisor = summary.counts.equal + summary.counts.higher;
         if (divisor == 0U) {
             return std::nullopt;
@@ -172,8 +171,9 @@ class sketch_ref {
     /// @brief Fraction of the other sketch's content present in `this`, clamped to `[0, 1]`.
     ///
     /// `(equal + higher) / (equal + lower)`; `std::nullopt` when the divisor is zero.
-    [[nodiscard]] std::optional<double>
-    completeness(pairwise_summary const& summary) const noexcept {
+    [[nodiscard]] std::optional<double> completeness(
+        pairwise_summary const& summary
+    ) const noexcept {
         auto const divisor = summary.counts.equal + summary.counts.lower;
         if (divisor == 0U) {
             return std::nullopt;

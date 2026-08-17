@@ -1,16 +1,15 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/std/cstdint>
-#include <cuda/std/cstddef>
 #include <cub/block/block_reduce.cuh>
+#include <cuda/std/cstddef>
+#include <cuda/std/cstdint>
 
 #include <cuddl/detail/cardinality.cuh>
 #include <cuddl/detail/comparison.cuh>
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/register.cuh>
 #include <cuddl/pairwise_counts.cuh>
-
 
 namespace cuddl::detail {
 
@@ -40,8 +39,7 @@ namespace {
 
 /// @brief Combines two per-thread payloads, summing only the fields selected by @p Mask.
 template <uint32_t Mask>
-__device__ summary_payload
-combine_payloads(summary_payload a, summary_payload const& b) noexcept {
+__device__ summary_payload combine_payloads(summary_payload a, summary_payload const& b) noexcept {
     if constexpr ((Mask & summary_mask::pairwise) != 0U) {
         a.counts += b.counts;
     }
@@ -82,8 +80,12 @@ combine_cardinality(cardinality_payload const& a, cardinality_payload const& b) 
  * @p saturation records whether any register's winner count saturated.
  */
 template <size_t BucketCount>
-__global__ void
-add_kernel(uint64_t const* const first, size_t const count, uint32_t* const registers, uint32_t* const saturation) {
+__global__ void add_kernel(
+    uint64_t const* const first,
+    size_t const count,
+    uint32_t* const registers,
+    uint32_t* const saturation
+) {
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (auto index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
          index += stride) {
@@ -110,7 +112,8 @@ __global__ void summary_kernel(
     __shared__ typename block_reduce::TempStorage storage;
 
     summary_payload local{};
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount; bucket += block_size) {
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += block_size) {
         auto const left_reg = left[bucket];
         auto const right_reg = right[bucket];
         if constexpr ((Mask & summary_mask::pairwise) != 0U) {
@@ -152,7 +155,8 @@ __global__ void cardinality_kernel(
     __shared__ typename block_reduce::TempStorage storage;
 
     cardinality_payload local{};
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount; bucket += block_size) {
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += block_size) {
         auto const reg = registers[bucket];
         if (winner(reg) == 0U) {
             ++local.empty;
@@ -177,7 +181,8 @@ __global__ void winner_counts_kernel(
     uint16_t* const counts_out,
     uint32_t* const saturation_out
 ) {
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount; bucket += block_size) {
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += block_size) {
         counts_out[bucket] = count(registers[bucket]);
     }
     if (threadIdx.x == 0) {
@@ -185,5 +190,4 @@ __global__ void winner_counts_kernel(
     }
 }
 
-} // namespace cuddl::detail
-
+}  // namespace cuddl::detail

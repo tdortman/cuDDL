@@ -2,7 +2,6 @@
 
 #include <cuda/std/cstdint>
 
-
 namespace cuddl::detail {
 
 /// @brief SplitMix64 finalizer, applied to a packed k-mer XOR the domain seed.
@@ -29,5 +28,4 @@ __host__ __device__ constexpr size_t bucket_of(uint64_t hash) noexcept {
     return hash & (BucketCount - 1);
 }
 
-} // namespace cuddl::detail
-
+}  // namespace cuddl::detail
