@@ -10,12 +10,14 @@
 # ///
 """Plot cuDDL vs cuCollections HyperLogLog benchmarks.
 
-Two figures:
+Three figures:
 
 - `throughput`: construction items/s against item count.
 - `cardinality`: cardinality-estimation time against item count.
+- `cardinality_estimates`: exact, cuDDL, and cuCollections estimated counts.
+- `similarity`: similarity-estimation time against item count.
 
-Both come from the single benchmark `--csv` output. Styling comes from
+All come from the single benchmark `--csv` output. Styling comes from
 `./scripts/plot_utils.py`.
 """
 
@@ -37,20 +39,20 @@ def plot(
         "results/hll"
     ),
 ):
-    """Render the construction throughput and cardinality-time figures."""
+    """Render throughput, cardinality, estimate-accuracy, and similarity figures."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bench = pu.load_csv(nvbench_csv)
     bench = bench.rename(columns={"Iters": "Items", "Benchmark": "Estimator"})
     construction = bench[bench["Estimator"].str.endswith("_construction")].copy()
-    construction["Gigaelem/s"] = construction["Elem/s (elem/sec)"] / pu.THROUGHPUT_SCALE
+    construction["Gigaelem/s"] = construction["Median Throughput"] / pu.THROUGHPUT_SCALE
     cardinality = bench[bench["Estimator"].str.endswith("_cardinality")]
 
     # --- Throughput figure ---------------------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for estimator, color, marker in [
-        ("cuddl_construction", "#2E86AB", "o"),
-        ("cuco_hll_construction", "#A23B72", "^"),
+    for estimator, label, color, marker in [
+        ("cuddl_construction", "cuDDL", "#2E86AB", "o"),
+        ("cuco_hll_construction", "cuco HLL", "#A23B72", "^"),
     ]:
         data = construction[construction["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
@@ -58,7 +60,7 @@ def plot(
             data["Gigaelem/s"],
             color=color,
             marker=marker,
-            label=pu.paper_text(estimator.split("_")[0]),
+            label=label,
         )
     pu.format_axis(ax, xlabel="Items", ylabel="Giga elements / s")
     pu.create_legend(ax)
@@ -67,17 +69,17 @@ def plot(
 
     # --- Cardinality-estimation figure --------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for estimator, color, marker in [
-        ("cuddl_cardinality", "#2E86AB", "o"),
-        ("cuco_hll_cardinality", "#A23B72", "^"),
+    for estimator, label, color, marker in [
+        ("cuddl_cardinality", "cuDDL", "#2E86AB", "o"),
+        ("cuco_hll_cardinality", "cuco HLL", "#A23B72", "^"),
     ]:
         data = cardinality[cardinality["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
-            data["GPU Time (sec)"] * 1e6,
+            data["Median GPU Time"] * 1e6,
             color=color,
             marker=marker,
-            label=pu.paper_text(estimator.split("_")[0]),
+            label=label,
         )
     pu.format_axis(ax, xlabel="Items", ylabel="Cardinality estimation time (µs)")
     pu.create_legend(ax)
@@ -85,6 +87,57 @@ def plot(
         fig, output_dir / "cardinality.pdf", message="Wrote cardinality plot"
     )
     typer.echo(f"Wrote {output_dir / 'cardinality.pdf'}")
+
+    # --- Cardinality-accuracy figure ----------------------------------------
+    fig, ax = pu.setup_figure(figsize=(12, 8))
+    exact = cardinality.groupby("Items", as_index=False)["Exact"].first()
+    ax.loglog(  # ty: ignore[unresolved-attribute]
+        exact["Items"],
+        exact["Exact"],
+        color="#333333",
+        linestyle="--",
+        label="Exact",
+    )
+    for estimator, label, color, marker in [
+        ("cuddl_cardinality", "cuDDL", "#2E86AB", "o"),
+        ("cuco_hll_cardinality", "cuco HLL", "#A23B72", "^"),
+    ]:
+        data = cardinality[cardinality["Estimator"] == estimator]
+        ax.loglog(  # ty: ignore[unresolved-attribute]
+            data["Items"],
+            data["Estimate"],
+            color=color,
+            marker=marker,
+            label=label,
+        )
+    pu.format_axis(ax, xlabel="Exact distinct count", ylabel="Estimated distinct count")
+    pu.create_legend(ax)
+    pu.save_figure(
+        fig,
+        output_dir / "cardinality_estimates.pdf",
+        message="Wrote cardinality estimate plot",
+    )
+    typer.echo(f"Wrote {output_dir / 'cardinality_estimates.pdf'}")
+
+    # --- Similarity-estimation figure ---------------------------------------
+    similarity = bench[bench["Estimator"].str.endswith("_similarity")]
+    fig, ax = pu.setup_figure(figsize=(12, 8))
+    for estimator, label, color, marker in [
+        ("cuddl_similarity", "cuDDL", "#2E86AB", "o"),
+        ("cuco_hll_similarity", "cuco HLL", "#A23B72", "^"),
+    ]:
+        data = similarity[similarity["Estimator"] == estimator]
+        ax.semilogx(  # ty: ignore[unresolved-attribute]
+            data["Items"],
+            data["Median GPU Time"] * 1e6,
+            color=color,
+            marker=marker,
+            label=label,
+        )
+    pu.format_axis(ax, xlabel="Items per set", ylabel="Similarity estimation time (µs)")
+    pu.create_legend(ax)
+    pu.save_figure(fig, output_dir / "similarity.pdf", message="Wrote similarity plot")
+    typer.echo(f"Wrote {output_dir / 'similarity.pdf'}")
 
 
 if __name__ == "__main__":
