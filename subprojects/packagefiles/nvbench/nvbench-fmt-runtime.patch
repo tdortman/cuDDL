@@ -1,0 +1,13 @@
+diff --git a/nvbench/state.cxx b/nvbench/state.cxx
+index 23166e7..8122b77 100644
+--- a/nvbench/state.cxx
++++ b/nvbench/state.cxx
+@@ -217,7 +217,7 @@ std::string state::get_axis_values_as_string(bool color) const
+                      "{}{}={}",
+                      buffer.size() == 0 ? "" : " ",
+                      fmt::format(style(key_format), "{}", key),
+-                     fmt::format(style(value_format), value_fmtstr, value));
++                     fmt::format(style(value_format), fmt::runtime(value_fmtstr), value));
+     };
+ 
+   if (m_device)

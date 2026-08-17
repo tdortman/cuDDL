@@ -1,0 +1,32 @@
+diff --git a/cmake/NVBenchCUPTI.cmake b/cmake/NVBenchCUPTI.cmake
+index 552a5d7..0c5a348 100644
+--- a/cmake/NVBenchCUPTI.cmake
++++ b/cmake/NVBenchCUPTI.cmake
+@@ -12,7 +12,7 @@ else()
+   set(nvbench_cupti_root "${CUDAToolkit_LIBRARY_ROOT}")
+ endif()
+ 
+-set(nvbench_cupti_library_hints "${nvbench_cupti_root}/lib64")
++set(nvbench_cupti_library_hints "${nvbench_cupti_root}/lib64" "${nvbench_cupti_root}/lib")
+ if (WIN32)
+   list(APPEND nvbench_cupti_library_hints
+     "${nvbench_cupti_root}/lib/x64"
+@@ -111,11 +111,16 @@ function(nvbench_add_cupti_dep dep_name)
+ endfunction()
+ 
+ nvbench_add_cupti_dep(cupti)
++find_path(NVBench_CUPTI_INCLUDE_DIR cupti.h
++  HINTS
++    "${nvbench_cupti_root}/include/include"
++    "${nvbench_cupti_root}/include"
++)
+ target_include_directories(nvbench::cupti INTERFACE
+-  "${nvbench_cupti_root}/include"
++  "${NVBench_CUPTI_INCLUDE_DIR}"
+ )
+ 
+-if (NOT EXISTS "${nvbench_cupti_root}/include/cupti_profiler_host.h")
++if (NOT EXISTS "${NVBench_CUPTI_INCLUDE_DIR}/cupti_profiler_host.h")
+   # Profile Host API does not exist yet, need NVPERF libraries
+   # for NVPW_* API used in nvbench::cupti_profiler
+   nvbench_add_cupti_dep(nvperf_target)

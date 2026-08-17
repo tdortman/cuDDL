@@ -213,6 +213,25 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
     }
 }
 
+// Truth-anchored check: the estimator's absolute value must approach the true distinct cardinality,
+// not the per-bucket ratio (`truth / BucketCount`). This guards the global bucket-count factor in
+// MeanM, which the scalar-oracle test (shares MeanM) cannot catch.
+TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
+    for (size_t n : {1u << 16, 1u << 18, 1u << 20}) {
+        auto const inputs = make_inputs(n, 0x7777'7777'7777'7777ULL + n);
+        // make_inputs from a 64-bit SplitMix stream masked into 2^50 space; collisions are
+        // negligible at these sizes, so the distinct count is ~n.
+        cuddl::sketch<k_default, b_default> gpu;
+        ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
+        auto const estimate = gpu.cardinality().value();
+        EXPECT_GT(estimate, 0.0);
+        // Without the global bucket-count factor the estimate would be ~n / 2048.
+        EXPECT_NEAR(estimate, static_cast<double>(n), 0.1 * static_cast<double>(n))
+            << "cardinality should approach the true distinct count, got " << estimate;
+        EXPECT_GT(estimate, static_cast<double>(n) / 2.0);
+    }
+}
+
 TEST(SketchTest, WinnerCountsAndSaturationMatchScalarOracle) {
     // A repeated k-mer so a single bucket sees many equal observations.
     auto const packed_kmer = 0x1234'5678'9abc'def0ULL & ((1ULL << (2 * k_default)) - 1);

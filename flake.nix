@@ -40,6 +40,12 @@
               nsight_systems
               nsight_compute
 
+              # NVML and CUPTI are required by nvbench (benchmark GPU monitoring).
+              cuda_nvml_dev.include # nvml.h
+              cuda_nvml_dev.stubs # libnvidia-ml.so stub
+              cuda_cupti.lib # libcupti.so
+              cuda_cupti.include # cupti.h
+
               # I do not know why cuRAND headers are necessary
               # for clangd to not freak out about STL headers when cuda_crt is
               # also present but at least it's a somewhat cheap dependency...
@@ -109,6 +115,7 @@
                   - -D__CLANGD__
                   - -I${cuda.path}/include
                   - -I$(pwd)/include
+                  - -I$(pwd)/subprojects/nvbench
                   - -I$(pwd)/subprojects/cuco/include
                   - -I$(pwd)/subprojects/googletest-1.17.0/googletest/include
                   - -D__LIBCUDAXX__STD_VER=${cuda.version.major}

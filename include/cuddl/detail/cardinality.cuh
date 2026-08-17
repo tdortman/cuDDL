@@ -26,8 +26,9 @@ linear_counting(double bucket_count, double empty_count) noexcept {
 /**
  * @brief MeanM estimate from the arithmetic mean of restored hash magnitudes.
  *
- * Reconstructs the approximate hash magnitude per filled bucket and estimates cardinality as
- * `2^64 / dbar`, corrected linearly for empty buckets.
+ * Reconstructs the approximate hash magnitude per filled bucket, estimates the count that beats
+ * each winning register as `2^64 / dbar`, then scales by the bucket count and applies the
+ * empty-bucket linear correction.
  */
 __host__ __device__ inline double
 mean_m(double bucket_count, double filled, double sum_restored) noexcept {
@@ -35,8 +36,11 @@ mean_m(double bucket_count, double filled, double sum_restored) noexcept {
         return 0.0;
     }
     auto const dbar = sum_restored / filled;
-    auto const core = cuda::std::ldexp(1.0, 64) / dbar;
-    return core * ((filled + bucket_count) / (2.0 * bucket_count));
+    // `2^64 / dbar` is the expected count of hashes that beat the winning register magnitude in
+    // one bucket; scaling by `bucket_count` recovers the total distinct estimate across buckets,
+    // then the empty-bucket linear correction applies as `(filled + bucket_count) / 2`.
+    auto const per_bucket = cuda::std::ldexp(1.0, 64) / dbar;
+    return per_bucket * ((filled + bucket_count) / 2.0);
 }
 
 /**

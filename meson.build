@@ -53,8 +53,24 @@ endif
 # wrappers (comparesketch.sh, loglog.sh) serve as the BBTools metric oracle for
 # benchmark acceptance. Only needed when benchmarks build.
 bbtools_dir = ''
+nvbench_dep = disabler()
 if build_benchmarks
     bbtools_dir = subproject('bbtools').get_variable('bbtools_dir')
+    cmake = import('cmake')
+
+    nvbench_opts = cmake.subproject_options()
+    nvbench_opts.add_cmake_defines({'CMAKE_CXX_STANDARD': '20'})
+    # nvbench is imported as a CMake subproject; its `nvbench` and `nvbench.main` targets are
+    # exposed through Meson's cmake module. NVML and CUPTI are provided by the dev shell's
+    # CUDA toolkit. C++20 is forced: building at nvbench's default C++17 trips a GCC 15.3
+    # consteval-lambda regression in `state.cxx`.
+    nvbench_cmake = cmake.subproject(
+        'nvbench',
+        required: true,
+        options: nvbench_opts,
+    )
+    nvbench_dep = nvbench_cmake.dependency('nvbench')
+    nvbench_main = nvbench_cmake.dependency('nvbench.main')
 endif
 
 if build_examples

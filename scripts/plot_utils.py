@@ -4,18 +4,17 @@ This module provides common constants, styles, and helper functions used across
 multiple plotting scripts to reduce code duplication and ensure visual consistency.
 """
 
+import io
 import math
 import re
 import sys
-import io
 from pathlib import Path
-from typing import Optional
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import typer
-import matplotlib as mpl
 
 mpl.rcParams.update(
     {
@@ -38,9 +37,9 @@ def paper_text(text: str, *, bold: bool = False) -> str:
 
 
 FILTER_STYLES = {
-    "cusbf": {"color": "#2E86AB", "marker": "o"},
+    "cuddl": {"color": "#2E86AB", "marker": "o"},
     "superbloom_cpu": {"color": "#7B4397", "marker": "D"},
-    "cucobloom": {"color": "#A23B72", "marker": "s"},
+    "cuco_hll": {"color": "#A23B72", "marker": "s"},
     "cuckoogpu": {"color": "#F18F01", "marker": "^"},
     "gqf": {"color": "#6A994E", "marker": "v"},
     "tcf": {"color": "#BC4749", "marker": "p"},
@@ -52,36 +51,17 @@ FILTER_STYLES = {
 }
 
 FILTER_COLORS = {
-    "cusbf": FILTER_STYLES["cusbf"]["color"],
-    "superbloom_cpu": FILTER_STYLES["superbloom_cpu"]["color"],
-    "cucobloom": FILTER_STYLES["cucobloom"]["color"],
-    "cuckoogpu": FILTER_STYLES["cuckoogpu"]["color"],
-    "gqf": FILTER_STYLES["gqf"]["color"],
-    "tcf": FILTER_STYLES["tcf"]["color"],
-    "proteincusbf": FILTER_STYLES["proteincusbf"]["color"],
-    "proteincucobloom": FILTER_STYLES["proteincucobloom"]["color"],
-    "proteincuckoogpu": FILTER_STYLES["proteincuckoogpu"]["color"],
-    "proteingqf": FILTER_STYLES["proteingqf"]["color"],
-    "proteintcf": FILTER_STYLES["proteintcf"]["color"],
+    "cuddl": FILTER_STYLES["cuddl"]["color"],
+    "cuco_hll": FILTER_STYLES["cuco_hll"]["color"]
 }
 
 FILTER_DISPLAY_NAMES = {
-    "cusbf": "cuSBF",
-    "superbloom_cpu": "Super Bloom",
-    "cucobloom": "GBBF",
-    "cuckoogpu": "Cuckoo-GPU",
-    "gqf": "GQF",
-    "tcf": "TCF",
-    "proteincusbf": "cuSBF (Protein)",
-    "proteincucobloom": "GBBF (Protein)",
-    "proteincuckoogpu": "Cuckoo-GPU (Protein)",
-    "proteingqf": "GQF (Protein)",
-    "proteintcf": "TCF (Protein)",
+    "cuddl": "cuDDL",
+    "cuco_hll": "HLL"
 }
 
 OPERATION_COLORS = {
-    "Insert": FILTER_COLORS["cusbf"],
-    "Query": FILTER_COLORS["cucobloom"],
+    "Build": FILTER_COLORS["cuddl"],
 }
 
 
@@ -133,7 +113,7 @@ def format_power_of_two(n: int) -> str:
     return rf"$\left(n=2^{{{power}}}\right)$"
 
 
-def format_capacity_title(base_title: str, capacity: Optional[int]) -> str:
+def format_capacity_title(base_title: str, capacity: int | None) -> str:
     """Format a title with capacity as power of 2.
 
     Args:
@@ -187,7 +167,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
         raise typer.Exit(1)
 
 
-def resolve_output_dir(output_dir: Optional[Path], script_path: Path) -> Path:
+def resolve_output_dir(output_dir: Path | None, script_path: Path) -> Path:
     """Resolve and create the output directory.
 
     Args:
@@ -209,11 +189,11 @@ def format_axis(
     ax: plt.Axes,
     xlabel: str,
     ylabel: str,
-    title: Optional[str] = None,
-    xscale: Optional[str] = "log",
-    yscale: Optional[str] = None,
-    xlim: Optional[tuple] = None,
-    ylim: Optional[tuple] = None,
+    title: str | None = None,
+    xscale: str | None = "log",
+    yscale: str | None = None,
+    xlim: tuple | None = None,
+    ylim: tuple | None = None,
     grid: bool = True,
 ) -> None:
     """Apply consistent formatting to a matplotlib axis.
@@ -257,7 +237,7 @@ def format_axis(
 def save_figure(
     fig_or_path,
     output_path: Path,
-    message: Optional[str] = None,
+    message: str | None = None,
     close: bool = True,
 ) -> None:
     """Save a figure with consistent options and print success message.
@@ -296,7 +276,7 @@ def save_figure(
             plt.close(fig_or_path)
 
 
-def get_filter_style(filter_type: str, positive_negative: Optional[str] = None) -> dict:
+def get_filter_style(filter_type: str, positive_negative: str | None = None) -> dict:
     """Get the style dictionary for a filter type.
 
     Args:
@@ -322,7 +302,7 @@ def get_filter_style(filter_type: str, positive_negative: Optional[str] = None) 
 
 def setup_figure(
     figsize: tuple[int, int] = (12, 8),
-    title: Optional[str] = None,
+    title: str | None = None,
     nrows: int = 1,
     ncols: int = 1,
     sharex: bool = False,
@@ -400,7 +380,7 @@ def normalize_benchmark_name(name: str) -> str:
     return name.lower()
 
 
-def parse_fixture_benchmark_name(name: str) -> Optional[tuple[str, str, int]]:
+def parse_fixture_benchmark_name(name: str) -> tuple[str, str, int] | None:
     """Parse benchmark names in fixture format.
 
     Supported formats:
@@ -446,17 +426,17 @@ def clustered_bar_chart(
     data: dict[str, dict[str, float]],
     colors: dict[str, str],
     bar_width: float = 0.25,
-    group_stride: Optional[float] = None,
+    group_stride: float | None = None,
     category_stride: float = 1.0,
     show_values: bool = True,
     value_decimals: int = 0,
-    value_fontsize: Optional[float] = None,
-    hatches: Optional[dict[str, str]] = None,
-    alphas: Optional[dict[str, float]] = None,
-    labels: Optional[dict[str, str]] = None,
-    series: Optional[list[str]] = None,
-    series_data: Optional[dict[str, dict[str, dict[str, float]]]] = None,
-    series_styles: Optional[dict[str, dict[str, object]]] = None,
+    value_fontsize: float | None = None,
+    hatches: dict[str, str] | None = None,
+    alphas: dict[str, float] | None = None,
+    labels: dict[str, str] | None = None,
+    series: list[str] | None = None,
+    series_data: dict[str, dict[str, dict[str, float]]] | None = None,
+    series_styles: dict[str, dict[str, object]] | None = None,
 ) -> None:
     """Create a clustered bar chart.
 

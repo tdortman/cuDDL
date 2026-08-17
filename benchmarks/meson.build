@@ -7,3 +7,16 @@ executable(
     cuda_args: cuda_args,
     install: false,
 )
+
+# nvbench comparison of cuDDL construction/cardinality against cuCollections HyperLogLog. Links
+# nvbench::main so it brings its own entry point, and carries the library plus cuco for the HLL.
+if build_benchmarks
+    cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
+    executable(
+        'cuddl-hll-comparison',
+        'cuddl_vs_cuco_hll.cu',
+        dependencies: [cuddl_dep, cuco_bench_dep, nvbench_dep, nvbench_main],
+        cuda_args: cuda_args,
+        install: false,
+    )
+endif
