@@ -19,7 +19,7 @@ __host__ inline uint32_t construction_blocks(cudaStream_t stream = nullptr) noex
         cudaSuccess) {
         multiprocessors = 0;
     }
-    auto const blocks = static_cast<uint32_t>(multiprocessors * 4U);
+    auto const blocks = static_cast<uint32_t>(multiprocessors * 16U);
     return blocks == 0U ? 1U : blocks;
 }
 

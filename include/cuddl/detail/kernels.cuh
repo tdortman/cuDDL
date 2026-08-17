@@ -86,11 +86,17 @@ __global__ void add_kernel(
     uint32_t* const registers,
     uint32_t* const saturation
 ) {
+    auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
-         index += stride) {
-        auto const hash = hash_kmer(first[index]);
-        update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
+    for (auto offset = index; offset < count; offset += stride * 4U) {
+        _Pragma("unroll")
+        for (uint32_t item = 0; item < 4U; ++item) {
+            auto const current = offset + stride * item;
+            if (current < count) {
+                auto const hash = hash_kmer(first[current]);
+                update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
+            }
+        }
     }
 }
 
