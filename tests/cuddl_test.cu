@@ -311,6 +311,18 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     EXPECT_LT(*wkid_disjoint, 0.05);
 }
 
+TEST(SketchTest, WkidPadsSparseDivisors) {
+    cuddl::sketch<k_default, b_default> sketch;
+    cuddl::pairwise_summary sparse{};
+    sparse.counts.equal = 1;
+    sparse.counts.lower = 2;
+    sparse.counts.higher = 4;
+
+    auto const wkid = sketch.ref().wkid(sparse);
+    ASSERT_TRUE(wkid.has_value());
+    EXPECT_DOUBLE_EQ(*wkid, 1.0 / 6.0);
+}
+
 TEST(ResultTest, ErrorCategoryEnumMatchesVariantOrder) {
     EXPECT_EQ(cuddl::Error{}.category(), cuddl::ErrorCategory::cuda);
     EXPECT_EQ(

@@ -134,8 +134,9 @@ class sketch_ref {
         return cuda_try(cudaGetLastError());
     }
 
-    /// @brief Weighted k-mer identity from a raw pair summary (unpadded formula).
+    /// @brief Weighted k-mer identity from a raw pair summary.
     ///
+    /// Pads non-zero divisors below six to suppress similarity from sparse random collisions.
     /// Returns `std::nullopt` when the divisor is zero.
     [[nodiscard]] std::optional<double> wkid(pairwise_summary const& summary) const noexcept {
         auto const equal = summary.counts.equal;
@@ -143,7 +144,7 @@ class sketch_ref {
         if (divisor == 0U) {
             return std::nullopt;
         }
-        return static_cast<double>(equal) / static_cast<double>(divisor);
+        return static_cast<double>(equal) / static_cast<double>(std::max(divisor, 6U));
     }
 
     /// @brief Average nucleotide identity estimate from a raw pair summary.
