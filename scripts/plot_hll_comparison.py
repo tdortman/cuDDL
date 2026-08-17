@@ -8,12 +8,12 @@
 #   "typer",
 # ]
 # ///
-"""Plot cuDDL vs cuCollections HyperLogLog construction benchmarks.
+"""Plot cuDDL vs cuCollections HyperLogLog benchmarks.
 
 Two figures:
 
-- `throughput`: items/s (from the nvbench CSV) against item count for the two estimators.
-- `accuracy`: relative cardinality error (from the nvbench CSV summaries) against item count.
+- `throughput`: construction items/s against item count.
+- `cardinality`: cardinality-estimation time against item count.
 
 Both come from the single benchmark `--csv` output. Styling comes from
 `./scripts/plot_utils.py`.
@@ -27,9 +27,7 @@ from typing import Annotated
 import plot_utils as pu
 import typer
 
-app = typer.Typer(
-    help="Plot cuDDL vs cuco HLL construction benchmark", no_args_is_help=True
-)
+app = typer.Typer(help="Plot cuDDL vs cuco HLL benchmarks", no_args_is_help=True)
 
 
 @app.command()
@@ -39,17 +37,14 @@ def plot(
         "results/hll"
     ),
 ):
-    """Render the throughput and accuracy figures."""
+    """Render the construction throughput and cardinality-time figures."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Throughput from the nvbench CSV.
     bench = pu.load_csv(nvbench_csv)
-    bench["Gigaelem/s"] = bench["Elem/s (elem/sec)"] / pu.THROUGHPUT_SCALE
     bench = bench.rename(columns={"Iters": "Items", "Benchmark": "Estimator"})
-
-    # Accuracy from the same CSV, in the summary columns attached by the benchmark.
-    acc = bench.rename(columns={"Distinct": "distinct", "Rel Error": "rel_error"})
-    acc["rel_error"] = acc["rel_error"].astype("float64")
+    construction = bench[bench["Estimator"].str.endswith("_construction")].copy()
+    construction["Gigaelem/s"] = construction["Elem/s (elem/sec)"] / pu.THROUGHPUT_SCALE
+    cardinality = bench[bench["Estimator"].str.endswith("_cardinality")]
 
     # --- Throughput figure ---------------------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
@@ -57,7 +52,7 @@ def plot(
         ("cuddl_construction", "#2E86AB", "o"),
         ("cuco_hll_construction", "#A23B72", "^"),
     ]:
-        data = bench[bench["Estimator"] == estimator]
+        data = construction[construction["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
             data["Gigaelem/s"],
@@ -70,24 +65,26 @@ def plot(
     pu.save_figure(fig, output_dir / "throughput.pdf", message="Wrote throughput plot")
     typer.echo(f"Wrote {output_dir / 'throughput.pdf'}")
 
-    # --- Accuracy figure -----------------------------------------------------
+    # --- Cardinality-estimation figure --------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, color, marker in [
-        ("cuddl_construction", "#2E86AB", "o"),
-        ("cuco_hll_construction", "#A23B72", "^"),
+        ("cuddl_cardinality", "#2E86AB", "o"),
+        ("cuco_hll_cardinality", "#A23B72", "^"),
     ]:
-        data = acc[acc["Estimator"] == estimator]
+        data = cardinality[cardinality["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
-            data["rel_error"] * 100.0,
+            data["GPU Time (sec)"] * 1e6,
             color=color,
             marker=marker,
             label=pu.paper_text(estimator.split("_")[0]),
         )
-    pu.format_axis(ax, xlabel="Items", ylabel="Relative cardinality error (%)")
+    pu.format_axis(ax, xlabel="Items", ylabel="Cardinality estimation time (µs)")
     pu.create_legend(ax)
-    pu.save_figure(fig, output_dir / "accuracy.pdf", message="Wrote accuracy plot")
-    typer.echo(f"Wrote {output_dir / 'accuracy.pdf'}")
+    pu.save_figure(
+        fig, output_dir / "cardinality.pdf", message="Wrote cardinality plot"
+    )
+    typer.echo(f"Wrote {output_dir / 'cardinality.pdf'}")
 
 
 if __name__ == "__main__":

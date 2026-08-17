@@ -8,8 +8,8 @@ executable(
     install: false,
 )
 
-# nvbench comparison of cuDDL construction/cardinality against cuCollections HyperLogLog. Links
-# nvbench::main so it brings its own entry point, and carries the library plus cuco for the HLL.
+# nvbench comparison of cuDDL construction and cardinality estimation against cuCollections
+# HyperLogLog. Links nvbench::main so it brings its own entry point.
 if build_benchmarks
     cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
     executable(
