@@ -203,12 +203,12 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
         oracle.pack_registers();
         auto const oracle_cardinality = oracle.cardinality();
 
-        EXPECT_TRUE(std::isfinite(gpu_cardinality.value()));
+        EXPECT_TRUE(std::isfinite(*gpu_cardinality));
         if (n == 0) {
-            EXPECT_EQ(gpu_cardinality.value(), 0.0);
+            EXPECT_EQ(*gpu_cardinality, 0.0);
         }
         EXPECT_NEAR(
-            gpu_cardinality.value(), oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality)
+            *gpu_cardinality, oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality)
         );
     }
 }
@@ -223,7 +223,9 @@ TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
         // negligible at these sizes, so the distinct count is ~n.
         cuddl::sketch<k_default, b_default> gpu;
         ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
-        auto const estimate = gpu.cardinality().value();
+        auto const card = gpu.cardinality();
+        ASSERT_TRUE(card.has_value());
+        auto const estimate = *card;
         EXPECT_GT(estimate, 0.0);
         // Without the global bucket-count factor the estimate would be ~n / 2048.
         EXPECT_NEAR(estimate, static_cast<double>(n), 0.1 * static_cast<double>(n))
@@ -261,12 +263,16 @@ TEST(SketchTest, SaturationFlagSetAtCounterOverflow) {
     cuddl::sketch<k_default, b_default> under;
     std::vector<uint64_t> few(1000, packed_kmer);
     ASSERT_TRUE(under.add(few.data(), few.data() + few.size()).has_value());
-    EXPECT_FALSE(under.winner_counts().value().second);
+    auto const under_wc = under.winner_counts();
+    ASSERT_TRUE(under_wc.has_value());
+    EXPECT_FALSE(under_wc->second);
 
     cuddl::sketch<k_default, b_default> over;
     std::vector<uint64_t> many(65536, packed_kmer);
     ASSERT_TRUE(over.add(many.data(), many.data() + many.size()).has_value());
-    EXPECT_TRUE(over.winner_counts().value().second);
+    auto const over_wc = over.winner_counts();
+    ASSERT_TRUE(over_wc.has_value());
+    EXPECT_TRUE(over_wc->second);
 }
 
 TEST(SketchTest, HostMetricsOnRawPair) {
@@ -280,7 +286,9 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     ASSERT_TRUE(sb.add(a.data(), a.data() + a.size()).has_value());
     ASSERT_TRUE(sc.add(c.data(), c.data() + c.size()).has_value());
 
-    auto const same = sa.compare(sb.ref()).value();
+    auto const same_result = sa.compare(sb.ref());
+    ASSERT_TRUE(same_result.has_value());
+    auto const same = *same_result;
     auto const ref_same = sa.ref();
     auto const wkid_same = ref_same.wkid(same);
     auto const ani_same = ref_same.ani(same);
@@ -295,8 +303,12 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     EXPECT_GT(*cont_same, 0.9);
     EXPECT_GT(*comp_same, 0.9);
 
-    auto const disjoint = sa.compare(sc.ref()).value();
-    EXPECT_LT(sa.ref().wkid(disjoint).value(), 0.05);
+    auto const disjoint_result = sa.compare(sc.ref());
+    ASSERT_TRUE(disjoint_result.has_value());
+    auto const disjoint = *disjoint_result;
+    auto const wkid_disjoint = sa.ref().wkid(disjoint);
+    ASSERT_TRUE(wkid_disjoint.has_value());
+    EXPECT_LT(*wkid_disjoint, 0.05);
 }
 
 TEST(ResultTest, ErrorCategoryEnumMatchesVariantOrder) {
