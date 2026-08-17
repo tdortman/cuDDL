@@ -103,6 +103,7 @@
             };
 
             shellHook = ''
+                  export PYTHONPATH=$(pwd)/scripts:$PYTHONPATH
                   if [ ! -e .clangd ]; then
                     cat > .clangd <<EOF
               CompileFlags:
