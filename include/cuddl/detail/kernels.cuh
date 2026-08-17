@@ -80,7 +80,7 @@ combine_cardinality(cardinality_payload const& a, cardinality_payload const& b) 
  * @p saturation records whether any register's winner count saturated.
  */
 template <size_t BucketCount>
-__global__ void add_kernel(
+__global__ __launch_bounds__(block_size, 4) void add_kernel(
     uint64_t const* const first,
     size_t const count,
     uint32_t* const registers,
@@ -88,15 +88,9 @@ __global__ void add_kernel(
 ) {
     auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto offset = index; offset < count; offset += stride * 4U) {
-        _Pragma("unroll")
-        for (uint32_t item = 0; item < 4U; ++item) {
-            auto const current = offset + stride * item;
-            if (current < count) {
-                auto const hash = hash_kmer(first[current]);
-                update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
-            }
-        }
+    for (auto offset = index; offset < count; offset += stride) {
+        auto const hash = hash_kmer(first[offset]);
+        update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
     }
 }
 
