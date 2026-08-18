@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <cuddl/error.hpp>
+#include <cuddl/hybrid_cardinality.cuh>
 #include <cuddl/pairwise_counts.cuh>
 #include <cuddl/sketch_ref.cuh>
 
@@ -208,6 +209,27 @@ class sketch {
         }
         return Result<double>::ok(host);
     }
+
+    /// @brief Experimental BBTools and paper-style HybridDDL estimates for comparison.
+    [[nodiscard]] Result<hybrid_cardinality_estimates> hybrid_cardinality(
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        detail::device_buffer<hybrid_cardinality_estimates> output(1);
+        if (auto const result = ref().hybrid_cardinality_async(output.pointer, stream); !result) {
+            return Result<hybrid_cardinality_estimates>::err(result.error());
+        }
+        if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
+            return Result<hybrid_cardinality_estimates>::err(result.error());
+        }
+        hybrid_cardinality_estimates host{};
+        if (auto const result =
+                cuda_try(cudaMemcpy(&host, output.pointer, sizeof(host), cudaMemcpyDeviceToHost));
+            !result) {
+            return Result<hybrid_cardinality_estimates>::err(result.error());
+        }
+        return Result<hybrid_cardinality_estimates>::ok(host);
+    }
+
 
     /// @brief Watches the winner-count extraction on the GPU (caller-owned outputs).
     [[nodiscard]] Result<void> winner_counts_async(

@@ -6,83 +6,46 @@
 
 namespace cuddl::detail {
 
-/// @brief Lower boundary of the hybridDDL blend zone, as a multiple of the bucket count.
-constexpr double blend_low_ratio = 0.2;
+/// @brief `2^64`, the range of the 64-bit hash used by the sketch.
+constexpr double hash_range = 0x1p64;
 
-/// @brief Upper boundary of the hybridDDL blend zone, as a multiple of the bucket count.
-constexpr double blend_high_ratio = 7.5;
-
-/// @brief Pure linear counting over @p V empty buckets of a size @p B sketch.
-///
-/// Returns zero for an empty sketch and infinity for a full sketch (no empty buckets).
+/**
+ * @brief Poisson maximum-likelihood estimate from empty and observed bucket minima.
+ *
+ * Empty buckets contribute a censored observation at the hash-range boundary. Filled buckets
+ * contribute their restored minimum directly. The resulting closed-form MLE is valid from sparse
+ * through saturated sketches and converges to MeanM when no bucket is empty.
+ */
 __host__ __device__ inline double
-linear_counting(double bucket_count, double empty_count) noexcept {
-    if (empty_count <= 0.0) {
-        return cuda::std::numeric_limits<double>::infinity();
+minimum_mle(double bucket_count, double empty_count, double sum_restored) noexcept {
+    auto const filled = bucket_count - empty_count;
+    if (filled <= 0.0) {
+        return 0.0;
     }
-    return bucket_count * cuda::std::log(bucket_count / empty_count);
+    return bucket_count * filled / (empty_count + sum_restored / hash_range);
 }
 
 /**
- * @brief MeanM estimate from the arithmetic mean of restored hash magnitudes.
- *
- * Reconstructs the approximate hash magnitude per filled bucket, estimates the count that beats
- * each winning register as `2^64 / dbar`, then scales by the bucket count and applies the
- * empty-bucket linear correction.
+ * @brief MeanM estimate retained as the full-sketch form of @ref minimum_mle.
  */
 __host__ __device__ inline double
 mean_m(double bucket_count, double filled, double sum_restored) noexcept {
     if (filled <= 0.0 || sum_restored <= 0.0) {
         return 0.0;
     }
-    auto const dbar = sum_restored / filled;
-    // `2^64 / dbar` is the expected count of hashes that beat the winning register magnitude in
-    // one bucket; scaling by `bucket_count` recovers the total distinct estimate across buckets,
-    // then the empty-bucket linear correction applies as `(filled + bucket_count) / 2`.
-    auto const per_bucket = cuda::std::ldexp(1.0, 64) / dbar;
-    return per_bucket * ((filled + bucket_count) / 2.0);
+    return bucket_count * filled * hash_range / sum_restored;
 }
 
 /**
- * @brief DDL's production hybridDDL cardinality estimator.
+ * @brief Public DDL cardinality estimate.
  *
- * Uses pure linear counting below `blend_low_ratio` buckets, a log-linear blend from linear
- * counting to MeanM across the transition region, and pure MeanM above `blend_high_ratio`
- * buckets. Zone selection uses a mantissa-free cardinality estimate (linear counting when any
- * bucket is empty, otherwise MeanM).
- *
- * @param bucket_count  Number of buckets in the sketch.
- * @param empty_count   Number of empty registers.
- * @param sum_restored  Sum of restored hash magnitudes over the filled registers.
- * @return The estimated distinct-element cardinality.
+ * Minimum MLE is the current production estimator. Keeping this dispatch point makes changing the
+ * estimator explicit without exposing implementation-specific cardinality APIs.
  */
 __host__ __device__ inline double
-hybrid_ddl(double bucket_count, double empty_count, double sum_restored) noexcept {
-    auto const filled = bucket_count - empty_count;
-    if (filled <= 0.0) {
-        return 0.0;
-    }
-    auto const low = blend_low_ratio * bucket_count;
-    auto const high = blend_high_ratio * bucket_count;
-    // Linear counting is undefined (infinite) when no bucket is empty; MeanM alone governs.
-    if (empty_count <= 0.0) {
-        return mean_m(bucket_count, filled, sum_restored);
-    }
-    // Zone selection mirrors the mantissa-free estimator: linear counting up to low occupancy.
-    auto const lc = linear_counting(bucket_count, empty_count);
-    if (lc <= low) {
-        return lc;
-    }
-    if (lc >= high) {
-        return mean_m(bucket_count, filled, sum_restored);
-    }
-    auto const mean = mean_m(bucket_count, filled, sum_restored);
-
-    using cuda::std::exp;
-    using cuda::std::log;
-
-    auto const t = (log(lc) - log(low)) / (log(high) - log(low));
-    return exp((1.0 - t) * log(lc) + t * log(mean));
+cardinality(double bucket_count, double empty_count, double sum_restored) noexcept {
+    return minimum_mle(bucket_count, empty_count, sum_restored);
 }
+
 
 }  // namespace cuddl::detail

@@ -12,6 +12,7 @@
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/error.hpp>
 #include <cuddl/pairwise_counts.cuh>
+#include <cuddl/hybrid_cardinality.cuh>
 
 namespace cuddl {
 
@@ -106,7 +107,7 @@ class sketch_ref {
         return summary_async<summary_mask::pairwise>(other, output, stream);
     }
 
-    /// @brief Computes this sketch's hybridDDL cardinality reduction on the GPU.
+    /// @brief Computes this sketch's cardinality reduction on the GPU.
     ///
     /// @p empty_out receives the empty-register count and @p estimate_out the cardinality estimate.
     [[nodiscard]] Result<void> cardinality_async(
@@ -118,6 +119,17 @@ class sketch_ref {
             <<<1, 64, 0, stream.get()>>>(registers_, empty_out, estimate_out);
         return cuda_try(cudaGetLastError());
     }
+
+    /// @brief Computes BBTools and paper-style HybridDDL estimates in one GPU register scan.
+    [[nodiscard]] Result<void> hybrid_cardinality_async(
+        hybrid_cardinality_estimates* output,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const noexcept {
+        detail::hybrid_cardinality_kernel<BucketCount>
+            <<<1, detail::block_size, 0, stream.get()>>>(registers_, output);
+        return cuda_try(cudaGetLastError());
+    }
+
 
     /// @brief Extracts per-register winner counts and the saturation flag to device outputs.
     ///

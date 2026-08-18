@@ -6,6 +6,7 @@
 #include <cuda/std/cstdint>
 
 #include <cuddl/detail/cardinality.cuh>
+#include <cuddl/detail/hybrid_cardinality.cuh>
 #include <cuddl/detail/comparison.cuh>
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/register.cuh>
@@ -137,7 +138,7 @@ __global__ void summary_kernel(
     if (threadIdx.x == 0) {
         output->counts = total.counts;
         if constexpr ((Mask & summary_mask::cardinality) != 0U) {
-            output->cardinality = hybrid_ddl(
+            output->cardinality = cardinality(
                 static_cast<double>(BucketCount),
                 static_cast<double>(total.empty),
                 total.restored_sum
@@ -147,9 +148,9 @@ __global__ void summary_kernel(
 }
 
 /**
- * @brief Computes the hybridDDL cardinality of a single constructed sketch.
+ * @brief Computes the cardinality of a single constructed sketch.
  *
- * @p empty_out receives the empty-register count; @p estimate_out receives the hybridDDL estimate.
+ * @p empty_out receives the empty-register count; @p estimate_out receives the estimate.
  */
 template <size_t BucketCount>
 __global__ void cardinality_kernel(
@@ -181,11 +182,88 @@ __global__ void cardinality_kernel(
     auto const total = warp_totals[0] + warp_totals[1];
     if (threadIdx.x == 0) {
         *empty_out = total.empty;
-        *estimate_out = hybrid_ddl(
+        *estimate_out = cardinality(
             static_cast<double>(BucketCount), static_cast<double>(total.empty), total.restored_sum
         );
     }
 }
+
+template <size_t BucketCount>
+__global__ void hybrid_cardinality_kernel(
+    uint32_t const* const registers, hybrid_cardinality_estimates* const estimates
+) {
+    __shared__ uint32_t bins[nlz_bins];
+    __shared__ double restored[block_size];
+    for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
+        bins[bin] = 0U;
+    }
+    restored[threadIdx.x] = 0.0;
+    __syncthreads();
+
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        auto const stored = winner(registers[bucket]);
+        if (stored == 0U) {
+            atomicAdd(bins, 1U);
+        } else {
+            atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
+            restored[threadIdx.x] += restore(stored);
+        }
+    }
+    __syncthreads();
+
+    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            restored[threadIdx.x] += restored[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *estimates = hybrid_estimates(bins, static_cast<double>(BucketCount), restored[0]);
+    }
+}
+
+template <size_t BucketCount, hybrid_variant Variant>
+__global__ void hybrid_cardinality_variant_kernel(
+    uint32_t const* const registers, double* const estimate
+) {
+    __shared__ uint32_t bins[nlz_bins];
+    __shared__ double restored[block_size];
+    for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
+        bins[bin] = 0U;
+    }
+    restored[threadIdx.x] = 0.0;
+    __syncthreads();
+
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        auto const stored = winner(registers[bucket]);
+        if (stored == 0U) {
+            atomicAdd(bins, 1U);
+        } else {
+            atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
+            restored[threadIdx.x] += restore(stored);
+        }
+    }
+    __syncthreads();
+
+    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            restored[threadIdx.x] += restored[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        auto const estimates =
+            hybrid_estimates(bins, static_cast<double>(BucketCount), restored[0]);
+        if constexpr (Variant == hybrid_variant::bbtools) {
+            *estimate = estimates.bbtools;
+        } else {
+            *estimate = estimates.paper;
+        }
+    }
+}
+
 
 /// @brief Extracts per-register winner counts and the sketch-level saturation flag.
 template <size_t BucketCount>

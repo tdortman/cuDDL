@@ -87,7 +87,7 @@ struct scalar_sketch {
                 sum += restore(w);
             }
         }
-        return cuddl::detail::hybrid_ddl(
+        return cuddl::detail::cardinality(
             static_cast<double>(BucketCount), static_cast<double>(empty), sum
         );
     }
@@ -207,9 +207,7 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
         if (n == 0) {
             EXPECT_EQ(*gpu_cardinality, 0.0);
         }
-        EXPECT_NEAR(
-            *gpu_cardinality, oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality)
-        );
+        EXPECT_NEAR(*gpu_cardinality, oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality));
     }
 }
 
@@ -231,6 +229,17 @@ TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
         EXPECT_NEAR(estimate, static_cast<double>(n), 0.1 * static_cast<double>(n))
             << "cardinality should approach the true distinct count, got " << estimate;
         EXPECT_GT(estimate, static_cast<double>(n) / 2.0);
+    }
+}
+
+TEST(SketchTest, CardinalityRemainsAccurateThroughSparseTransition) {
+    for (size_t n : {512U, 1024U, 2048U, 4096U, 8192U}) {
+        auto const inputs = make_inputs(n, 0x5555'5555'5555'5555ULL + n);
+        cuddl::sketch<k_default, b_default> gpu;
+        ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
+        auto const estimate = gpu.cardinality();
+        ASSERT_TRUE(estimate.has_value());
+        EXPECT_NEAR(*estimate, static_cast<double>(n), 0.1 * static_cast<double>(n));
     }
 }
 
