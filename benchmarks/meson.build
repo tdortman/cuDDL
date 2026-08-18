@@ -19,4 +19,12 @@ if build_benchmarks
         cuda_args: cuda_args,
         install: false,
     )
+
+    executable(
+        'cuddl-hll-accuracy',
+        'cuddl_hll_accuracy.cu',
+        dependencies: [cuddl_dep, cuco_bench_dep, cli11_dep],
+        cuda_args: cuda_args,
+        install: false,
+    )
 endif

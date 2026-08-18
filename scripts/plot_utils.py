@@ -38,26 +38,21 @@ def paper_text(text: str, *, bold: bool = False) -> str:
 
 FILTER_STYLES = {
     "cuddl": {"color": "#2E86AB", "marker": "o"},
-    "superbloom_cpu": {"color": "#7B4397", "marker": "D"},
+    "cuddl_bbtools": {"color": "#2A9D8F", "marker": "D"},
+    "cuddl_paper": {"color": "#E76F51", "marker": "v"},
     "cuco_hll": {"color": "#A23B72", "marker": "s"},
-    "cuckoogpu": {"color": "#F18F01", "marker": "^"},
-    "gqf": {"color": "#6A994E", "marker": "v"},
-    "tcf": {"color": "#BC4749", "marker": "p"},
-    "proteincusbf": {"color": "#4FA3C7", "marker": "o"},
-    "proteincucobloom": {"color": "#C15A8E", "marker": "s"},
-    "proteincuckoogpu": {"color": "#F5A623", "marker": "^"},
-    "proteingqf": {"color": "#8CB369", "marker": "v"},
-    "proteintcf": {"color": "#D66868", "marker": "p"},
 }
 
 FILTER_COLORS = {
-    "cuddl": FILTER_STYLES["cuddl"]["color"],
-    "cuco_hll": FILTER_STYLES["cuco_hll"]["color"]
+    name: FILTER_STYLES[name]["color"]
+    for name in ("cuddl", "cuddl_bbtools", "cuddl_paper", "cuco_hll")
 }
 
 FILTER_DISPLAY_NAMES = {
-    "cuddl": "cuDDL",
-    "cuco_hll": "HLL"
+    "cuddl": "cuDDL minimum MLE",
+    "cuddl_bbtools": "cuDDL BBTools HybridDDL",
+    "cuddl_paper": "cuDDL paper HybridDDL",
+    "cuco_hll": "HLL",
 }
 
 OPERATION_COLORS = {

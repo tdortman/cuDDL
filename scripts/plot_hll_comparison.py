@@ -13,7 +13,7 @@
 Three figures:
 
 - `throughput`: construction items/s against item count.
-- `cardinality`: cardinality-estimation time against item count.
+- `accuracy`: relative cardinality error against item count.
 - `cardinality_estimates`: exact, cuDDL, and cuCollections estimated counts.
 - `similarity`: similarity-estimation time against item count.
 
@@ -35,6 +35,9 @@ app = typer.Typer(help="Plot cuDDL vs cuco HLL benchmarks", no_args_is_help=True
 @app.command()
 def plot(
     nvbench_csv: Annotated[Path, typer.Option(help="Benchmark --csv output")],
+    accuracy_csv: Annotated[
+        Path | None, typer.Option(help="Independent accuracy-trial CSV")
+    ] = None,
     output_dir: Annotated[Path, typer.Option(help="Where to write the figures")] = Path(
         "results/hll"
     ),
@@ -48,12 +51,51 @@ def plot(
     construction["Gigaelem/s"] = construction["Median Throughput"] / pu.THROUGHPUT_SCALE
     cardinality = bench[bench["Estimator"].str.endswith("_cardinality")]
 
+    construction_estimators = [
+        (
+            "cuddl",
+            "cuDDL",
+            pu.FILTER_STYLES["cuddl"]["color"],
+            pu.FILTER_STYLES["cuddl"]["marker"],
+        ),
+        (
+            "cuco_hll",
+            "cuco HLL",
+            pu.FILTER_STYLES["cuco_hll"]["color"],
+            pu.FILTER_STYLES["cuco_hll"]["marker"],
+        ),
+    ]
+    estimators = [
+        (
+            "cuddl",
+            pu.FILTER_DISPLAY_NAMES["cuddl"],
+            pu.FILTER_STYLES["cuddl"]["color"],
+            pu.FILTER_STYLES["cuddl"]["marker"],
+        ),
+        (
+            "cuco_hll",
+            pu.FILTER_DISPLAY_NAMES["cuco_hll"],
+            pu.FILTER_STYLES["cuco_hll"]["color"],
+            pu.FILTER_STYLES["cuco_hll"]["marker"],
+        ),
+    ]
+    accuracy_estimators = [
+        (
+            estimator,
+            pu.FILTER_DISPLAY_NAMES[estimator],
+            pu.FILTER_STYLES[estimator]["color"],
+            pu.FILTER_STYLES[estimator]["marker"],
+        )
+        for estimator in ("cuddl", "cuddl_bbtools", "cuddl_paper", "cuco_hll")
+    ]
+    timing_estimators = [
+        *accuracy_estimators,
+    ]
+
     # --- Throughput figure ---------------------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for estimator, label, color, marker in [
-        ("cuddl_construction", "cuDDL", "#2E86AB", "o"),
-        ("cuco_hll_construction", "cuco HLL", "#A23B72", "^"),
-    ]:
+    for estimator, label, color, marker in construction_estimators:
+        estimator = f"{estimator}_construction"
         data = construction[construction["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
@@ -69,11 +111,10 @@ def plot(
 
     # --- Cardinality-estimation figure --------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for estimator, label, color, marker in [
-        ("cuddl_cardinality", "cuDDL", "#2E86AB", "o"),
-        ("cuco_hll_cardinality", "cuco HLL", "#A23B72", "^"),
-    ]:
-        data = cardinality[cardinality["Estimator"] == estimator]
+    for estimator, label, color, marker in timing_estimators:
+        data = cardinality[cardinality["Estimator"] == f"{estimator}_cardinality"]
+        if data.empty:
+            continue
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
             data["Median GPU Time"] * 1e6,
@@ -89,6 +130,35 @@ def plot(
     typer.echo(f"Wrote {output_dir / 'cardinality.pdf'}")
 
     # --- Cardinality-accuracy figure ----------------------------------------
+    accuracy = pu.load_csv(accuracy_csv) if accuracy_csv else cardinality.copy()
+    if accuracy_csv is None:
+        accuracy["Estimator"] = accuracy["Estimator"].str.removesuffix("_cardinality")
+        accuracy["Absolute Error"] = (
+            (accuracy["Estimate"] - accuracy["Exact"]) / accuracy["Exact"]
+        ).abs()
+
+    fig, ax = pu.setup_figure(figsize=(12, 8))
+    for estimator, label, color, marker in accuracy_estimators:
+        data = accuracy[accuracy["Estimator"] == estimator].copy()
+        data["Absolute Error"] *= 100.0
+        mean = data.groupby("Items")["Absolute Error"].mean()
+        ax.semilogx(  # ty: ignore[unresolved-attribute]
+            mean.index,
+            mean,
+            color=color,
+            marker=marker,
+            label=label,
+        )
+    pu.format_axis(
+        ax,
+        xlabel="Exact distinct count",
+        ylabel="Mean absolute estimation error (%)",
+    )
+    pu.create_legend(ax)
+    pu.save_figure(fig, output_dir / "accuracy.pdf", message="Wrote accuracy plot")
+    typer.echo(f"Wrote {output_dir / 'accuracy.pdf'}")
+
+    # --- Cardinality-accuracy figure ----------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     exact = cardinality.groupby("Items", as_index=False)["Exact"].first()
     ax.loglog(  # ty: ignore[unresolved-attribute]
@@ -98,10 +168,8 @@ def plot(
         linestyle="--",
         label="Exact",
     )
-    for estimator, label, color, marker in [
-        ("cuddl_cardinality", "cuDDL", "#2E86AB", "o"),
-        ("cuco_hll_cardinality", "cuco HLL", "#A23B72", "^"),
-    ]:
+    for estimator, label, color, marker in estimators:
+        estimator = f"{estimator}_cardinality"
         data = cardinality[cardinality["Estimator"] == estimator]
         ax.loglog(  # ty: ignore[unresolved-attribute]
             data["Items"],
@@ -122,10 +190,8 @@ def plot(
     # --- Similarity-estimation figure ---------------------------------------
     similarity = bench[bench["Estimator"].str.endswith("_similarity")]
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for estimator, label, color, marker in [
-        ("cuddl_similarity", "cuDDL", "#2E86AB", "o"),
-        ("cuco_hll_similarity", "cuco HLL", "#A23B72", "^"),
-    ]:
+    for estimator, label, color, marker in estimators:
+        estimator = f"{estimator}_similarity"
         data = similarity[similarity["Estimator"] == estimator]
         ax.semilogx(  # ty: ignore[unresolved-attribute]
             data["Items"],
