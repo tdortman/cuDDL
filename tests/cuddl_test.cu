@@ -367,8 +367,8 @@ TEST(FastaTest, InvalidBaseBreaksRollingWindow) {
     auto const path = write_tmp_fasta(">seq\nACGTNACGT\n");
     auto const res = cuddl::parse_fasta_file(path, 3);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res->bases, 8u);          // two ACGT runs
-    EXPECT_EQ(res->valid_kmers, 4u);    // one valid window per 4-base run: (4-3+1)=2 each
+    EXPECT_EQ(res->bases, 8u);        // two ACGT runs
+    EXPECT_EQ(res->valid_kmers, 4u);  // one valid window per 4-base run: (4-3+1)=2 each
     EXPECT_EQ(res->invalid_windows, 0u);
     std::remove(path.c_str());
 }
@@ -379,14 +379,15 @@ TEST(FastaTest, InvalidBaseBreaksPartialWindow) {
     auto const path = write_tmp_fasta(">seq\nACGNNACGT\n");
     auto const res = cuddl::parse_fasta_file(path, 5);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res->bases, 7u);          // ACG + ACGT
+    EXPECT_EQ(res->bases, 7u);  // ACG + ACGT
     EXPECT_EQ(res->valid_kmers, 0u);
     EXPECT_EQ(res->invalid_windows, 1u);
     std::remove(path.c_str());
 }
 
 TEST(FastaTest, NoKmerSpansInvalidBase) {
-    // k=2 over "ATNGT": the window resets at N; emitted k-mers are the canonical forms of AT and GT.
+    // k=2 over "ATNGT": the window resets at N; emitted k-mers are the canonical forms of AT and
+    // GT.
     auto const path = write_tmp_fasta(">s\nATNGT\n");
     auto const res = cuddl::parse_fasta_file(path, 2);
     ASSERT_TRUE(res.has_value());
