@@ -97,7 +97,7 @@ def plot(
     for estimator, label, color, marker in construction_estimators:
         estimator = f"{estimator}_construction"
         data = construction[construction["Estimator"] == estimator]
-        ax.semilogx(  # ty: ignore[unresolved-attribute]
+        ax.semilogx(
             data["Items"],
             data["Gigaelem/s"],
             color=color,
@@ -115,7 +115,7 @@ def plot(
         data = cardinality[cardinality["Estimator"] == f"{estimator}_cardinality"]
         if data.empty:
             continue
-        ax.semilogx(  # ty: ignore[unresolved-attribute]
+        ax.semilogx(
             data["Items"],
             data["Median GPU Time"] * 1e6,
             color=color,
@@ -142,7 +142,7 @@ def plot(
         data = accuracy[accuracy["Estimator"] == estimator].copy()
         data["Absolute Error"] *= 100.0
         mean = data.groupby("Items")["Absolute Error"].mean()
-        ax.semilogx(  # ty: ignore[unresolved-attribute]
+        ax.semilogx(
             mean.index,
             mean,
             color=color,
@@ -161,7 +161,7 @@ def plot(
     # --- Cardinality-accuracy figure ----------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     exact = cardinality.groupby("Items", as_index=False)["Exact"].first()
-    ax.loglog(  # ty: ignore[unresolved-attribute]
+    ax.loglog(
         exact["Items"],
         exact["Exact"],
         color="#333333",
@@ -171,7 +171,7 @@ def plot(
     for estimator, label, color, marker in estimators:
         estimator = f"{estimator}_cardinality"
         data = cardinality[cardinality["Estimator"] == estimator]
-        ax.loglog(  # ty: ignore[unresolved-attribute]
+        ax.loglog(
             data["Items"],
             data["Estimate"],
             color=color,
@@ -193,7 +193,7 @@ def plot(
     for estimator, label, color, marker in estimators:
         estimator = f"{estimator}_similarity"
         data = similarity[similarity["Estimator"] == estimator]
-        ax.semilogx(  # ty: ignore[unresolved-attribute]
+        ax.semilogx(
             data["Items"],
             data["Median GPU Time"] * 1e6,
             color=color,

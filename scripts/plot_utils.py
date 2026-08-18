@@ -302,7 +302,7 @@ def setup_figure(
     ncols: int = 1,
     sharex: bool = False,
     sharey: bool = False,
-) -> tuple[plt.Figure, plt.Axes | np.ndarray]:
+) -> tuple[plt.Figure, plt.Axes]:
     """Create a figure with consistent styling.
 
     Args:
