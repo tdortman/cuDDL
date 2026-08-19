@@ -243,23 +243,27 @@ void cuco_hll_similarity(nvbench::state& state) {
     cuco::hyperloglog<uint64_t> right_hll(cuco::precision{k_hll_precision});
     left_hll.add(d_left, d_left + left.size());
     right_hll.add(d_right, d_right + right.size());
-    auto const left_estimate = static_cast<double>(left_hll.estimate());
-    auto const right_estimate = static_cast<double>(right_hll.estimate());
     cuco::hyperloglog<uint64_t> union_hll(cuco::precision{k_hll_precision});
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto const stream = cuda::stream_ref{launch.get_stream()};
+        auto const left_estimate = static_cast<double>(left_hll.estimate(stream));
+        auto const right_estimate = static_cast<double>(right_hll.estimate(stream));
         union_hll.clear(stream);
         union_hll.merge(left_hll, stream);
         union_hll.merge(right_hll, stream);
+        auto const union_estimate = static_cast<double>(union_hll.estimate(stream));
+        auto similarity = (left_estimate + right_estimate - union_estimate) / left_estimate;
+        do_not_optimise(similarity);
     });
     add_median_time(state);
+    auto const left_estimate = static_cast<double>(left_hll.estimate());
+    auto const right_estimate = static_cast<double>(right_hll.estimate());
     union_hll.clear();
     union_hll.merge(left_hll);
     union_hll.merge(right_hll);
-    auto const union_estimate = union_hll.estimate();
-    auto const intersection_estimate = left_estimate + right_estimate - union_estimate;
-    auto const similarity = intersection_estimate / left_estimate;
+    auto const union_estimate = static_cast<double>(union_hll.estimate());
+    auto const similarity = (left_estimate + right_estimate - union_estimate) / left_estimate;
     add_value(state, "Exact Similarity", 0.5);
     add_value(state, "Similarity", similarity);
     cudaFree(d_right);
