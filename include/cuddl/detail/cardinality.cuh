@@ -10,11 +10,24 @@ namespace cuddl::detail {
 constexpr double hash_range = 0x1p64;
 
 /**
- * @brief Poisson maximum-likelihood estimate from empty and observed bucket minima.
+ * @brief Estimates the number of distinct hashes from the minimum hash in each bucket.
  *
- * Empty buckets contribute a censored observation at the hash-range boundary. Filled buckets
- * contribute their restored minimum directly. The resulting closed-form MLE is valid from sparse
- * through saturated sketches and converges to MeanM when no bucket is empty.
+ * Each distinct hash lands in one of @p bucket_count buckets. A bucket therefore receives about
+ * `cardinality / bucket_count` hashes. More hashes make its minimum smaller, so the observed
+ * minima tell us how many hashes must have produced them.
+ *
+ * The denominator combines all observations after scaling hash values to `[0, 1]`:
+ * - each empty bucket contributes `1`, meaning that its minimum lies beyond the hash range;
+ * - each filled bucket contributes its restored minimum divided by @ref hash_range.
+ *
+ * Dividing `bucket_count * filled_bucket_count` by that total gives the maximum-likelihood
+ * cardinality estimate. If no bucket is empty, this reduces to the usual MeanM estimate.
+ *
+ * @param bucket_count Total number of sketch buckets.
+ * @param empty_count Number of buckets that received no hashes.
+ * @param sum_restored Sum of the restored minimum hash from every filled bucket.
+ *
+ * @return Estimated distinct hash count, or zero when every bucket is empty.
  */
 __host__ __device__ inline double
 minimum_mle(double bucket_count, double empty_count, double sum_restored) noexcept {
