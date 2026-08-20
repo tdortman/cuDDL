@@ -189,7 +189,7 @@ __global__ void hybrid_cardinality_kernel(
     for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
         bins[bin] = 0U;
     }
-    restored[threadIdx.x] = 0.0;
+    double local_restored = 0.0;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
@@ -199,9 +199,10 @@ __global__ void hybrid_cardinality_kernel(
             atomicAdd(bins, 1U);
         } else {
             atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            restored[threadIdx.x] += restore(stored);
+            local_restored += restore(stored);
         }
     }
+    restored[threadIdx.x] = local_restored;
     __syncthreads();
 
     for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
@@ -223,7 +224,7 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
     for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
         bins[bin] = 0U;
     }
-    restored[threadIdx.x] = 0.0;
+    double local_restored = 0.0;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
@@ -233,9 +234,10 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
             atomicAdd(bins, 1U);
         } else {
             atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            restored[threadIdx.x] += restore(stored);
+            local_restored += restore(stored);
         }
     }
+    restored[threadIdx.x] = local_restored;
     __syncthreads();
 
     for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
