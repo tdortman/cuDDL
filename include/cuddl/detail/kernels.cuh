@@ -6,10 +6,11 @@
 #include <cuda/std/cstdint>
 
 #include <cuddl/detail/cardinality.cuh>
-#include <cuddl/detail/hybrid_cardinality.cuh>
 #include <cuddl/detail/comparison.cuh>
 #include <cuddl/detail/hash.cuh>
+#include <cuddl/detail/hybrid_cardinality.cuh>
 #include <cuddl/detail/register.cuh>
+#include <cuddl/device_span.cuh>
 #include <cuddl/pairwise_counts.cuh>
 
 namespace cuddl::detail {
@@ -38,13 +39,11 @@ struct summary_payload {
 
 namespace {
 
-/// @brief Combines two per-thread payloads, summing only the fields selected by @p Mask.
-template <uint32_t Mask>
+/// @brief Combines two per-thread payloads at compile time.
+template <bool IncludeCardinality>
 __device__ summary_payload combine_payloads(summary_payload a, summary_payload const& b) noexcept {
-    if constexpr ((Mask & summary_mask::pairwise) != 0U) {
-        a.counts += b.counts;
-    }
-    if constexpr ((Mask & summary_mask::cardinality) != 0U) {
+    a.counts += b.counts;
+    if constexpr (IncludeCardinality) {
         a.empty += b.empty;
         a.restored_sum += b.restored_sum;
     }
@@ -82,38 +81,32 @@ combine_cardinality(cardinality_payload const& a, cardinality_payload const& b) 
  */
 template <size_t BucketCount>
 __global__ __launch_bounds__(block_size, 4) void add_kernel(
-    uint64_t const* const first,
-    size_t const count,
-    uint32_t* const registers,
-    uint32_t* const saturation
+    device_span<uint64_t const> input,
+    device_span<uint32_t> registers,
+    uint32_t& saturation
 ) {
     auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto offset = index; offset < count; offset += stride * 2U) {
+    for (auto offset = index; offset < input.size(); offset += stride * 2U) {
         _Pragma("unroll")
         for (uint32_t item = 0; item < 2U; ++item) {
             auto const current = offset + stride * item;
-            if (current < count) {
-                auto const hash = hash_kmer(first[current]);
-                update(registers + bucket_of<BucketCount>(hash), score(hash), saturation);
+            if (current < input.size()) {
+                auto const hash = hash_kmer(input[current]);
+                update(&registers[bucket_of<BucketCount>(hash)], score(hash), saturation);
             }
         }
     }
 }
 
 /**
- * @brief Computes the raw pairwise summary of two constructed sketches.
- *
- * One CTA per pair. When the @ref summary_mask::pairwise field is selected it classifies every
- * bucket as lower/equal/higher/both-empty; when @ref summary_mask::cardinality is selected it
- * accumulates the query sketch's empty-register count and restored hash magnitudes and reduces
- * them through hybridDDL. Unselected fields are inert and reduce to zero.
+ * @brief Computes pairwise counts and optionally cardinality for two constructed sketches.
  */
-template <size_t BucketCount, uint32_t Mask>
+template <size_t BucketCount, bool IncludeCardinality>
 __global__ void summary_kernel(
-    uint32_t const* const left,
-    uint32_t const* const right,
-    pairwise_summary* const output
+    device_span<uint32_t const> left,
+    device_span<uint32_t const> right,
+    pairwise_summary& output
 ) {
     using block_reduce = cub::BlockReduce<summary_payload, block_size>;
     __shared__ typename block_reduce::TempStorage storage;
@@ -123,10 +116,8 @@ __global__ void summary_kernel(
          bucket += block_size) {
         auto const left_reg = left[bucket];
         auto const right_reg = right[bucket];
-        if constexpr ((Mask & summary_mask::pairwise) != 0U) {
-            classify(local.counts, left_reg, right_reg);
-        }
-        if constexpr ((Mask & summary_mask::cardinality) != 0U) {
+        classify(local.counts, left_reg, right_reg);
+        if constexpr (IncludeCardinality) {
             if (winner(left_reg) == 0U) {
                 ++local.empty;
             } else {
@@ -134,11 +125,11 @@ __global__ void summary_kernel(
             }
         }
     }
-    auto const total = block_reduce(storage).Reduce(local, combine_payloads<Mask>);
+    auto const total = block_reduce(storage).Reduce(local, combine_payloads<IncludeCardinality>);
     if (threadIdx.x == 0) {
-        output->counts = total.counts;
-        if constexpr ((Mask & summary_mask::cardinality) != 0U) {
-            output->cardinality = cardinality(
+        output.counts = total.counts;
+        if constexpr (IncludeCardinality) {
+            output.cardinality = cardinality(
                 static_cast<double>(BucketCount),
                 static_cast<double>(total.empty),
                 total.restored_sum
@@ -190,7 +181,8 @@ __global__ void cardinality_kernel(
 
 template <size_t BucketCount>
 __global__ void hybrid_cardinality_kernel(
-    uint32_t const* const registers, hybrid_cardinality_estimates* const estimates
+    uint32_t const* const registers,
+    hybrid_cardinality_estimates* const estimates
 ) {
     __shared__ uint32_t bins[nlz_bins];
     __shared__ double restored[block_size];
@@ -224,9 +216,8 @@ __global__ void hybrid_cardinality_kernel(
 }
 
 template <size_t BucketCount, hybrid_variant Variant>
-__global__ void hybrid_cardinality_variant_kernel(
-    uint32_t const* const registers, double* const estimate
-) {
+__global__ void
+hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const estimate) {
     __shared__ uint32_t bins[nlz_bins];
     __shared__ double restored[block_size];
     for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
@@ -263,7 +254,6 @@ __global__ void hybrid_cardinality_variant_kernel(
         }
     }
 }
-
 
 /// @brief Extracts per-register winner counts and the sketch-level saturation flag.
 template <size_t BucketCount>

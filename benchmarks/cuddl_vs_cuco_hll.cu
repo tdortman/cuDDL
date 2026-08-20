@@ -75,10 +75,10 @@ void cuddl_construction(nvbench::state& state) {
     // Reset the sketch each trial outside the timed add so throughput reflects only construction.
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
         auto const stream = cuda::stream_ref{launch.get_stream()};
-        cuddl::require_void(sketch.clear_async(stream));
+        CUDDL_UNWRAP(sketch.clear_async(stream));
 
         timer.start();
-        cuddl::require_void(sketch.add_async(d_input, d_input + count, stream));
+        CUDDL_UNWRAP(sketch.add_async({d_input, count}, stream));
         timer.stop();
     });
     add_median_throughput(state, count);
@@ -94,7 +94,7 @@ void cuddl_cardinality(nvbench::state& state) {
     cudaMalloc(&d_input, count * sizeof(uint64_t));
     cudaMemcpy(d_input, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuddl::sketch<25, k_bucket_count> sketch;
-    cuddl::require_void(sketch.add(d_input, d_input + count));
+    CUDDL_UNWRAP(sketch.add({d_input, count}));
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto estimate = CUDDL_UNWRAP(sketch.cardinality(cuda::stream_ref{launch.get_stream()}));
@@ -115,15 +115,15 @@ void cuddl_hybrid_cardinality(nvbench::state& state) {
     cudaMalloc(&d_input, count * sizeof(uint64_t));
     cudaMemcpy(d_input, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuddl::sketch<25, k_bucket_count> sketch;
-    cuddl::require_void(sketch.add(d_input, d_input + count));
+    CUDDL_UNWRAP(sketch.add({d_input, count}));
     cuddl::detail::device_buffer<double> output(1);
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         cuddl::detail::hybrid_cardinality_variant_kernel<k_bucket_count, Variant>
             <<<1, cuddl::detail::block_size, 0, launch.get_stream()>>>(
-                sketch.ref().data(), output.pointer
+                sketch.ref().data().data(), output.pointer
             );
-        cuddl::require_void(cuddl::cuda_try(cudaGetLastError()));
+        CUDDL_UNWRAP(cuddl::cuda_try(cudaGetLastError()));
     });
     add_median_time(state);
     cudaFree(d_input);
@@ -204,8 +204,8 @@ void cuddl_similarity(nvbench::state& state) {
     cudaMemcpy(d_right, right.data(), right.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuddl::sketch<25, k_bucket_count> left_sketch;
     cuddl::sketch<25, k_bucket_count> right_sketch;
-    cuddl::require_void(left_sketch.add(d_left, d_left + left.size()));
-    cuddl::require_void(right_sketch.add(d_right, d_right + right.size()));
+    CUDDL_UNWRAP(left_sketch.add({d_left, left.size()}));
+    CUDDL_UNWRAP(right_sketch.add({d_right, right.size()}));
 
     auto const summary = CUDDL_UNWRAP(left_sketch.compare(right_sketch.ref()));
     auto similarity = *left_sketch.ref().containment(summary);

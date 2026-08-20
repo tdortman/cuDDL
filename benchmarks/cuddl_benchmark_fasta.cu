@@ -50,9 +50,8 @@ struct run_result {
 
 /// @brief Fills metric fields of @p r from raw pairwise counts via the library metric methods.
 void fill_metrics(run_result& r, cuddl::pairwise_counts const& counts, uint32_t k) {
-    // sketch_ref's metric methods are pure host arithmetic on the summary; a null-pointer ref
-    // exercises the same formulas the owning sketch uses, avoiding a parallel implementation.
-    cuddl::sketch_ref<25, 2048> metrics(nullptr, nullptr);
+    uint32_t saturation{};
+    cuddl::sketch_ref<25, 2048> metrics{{}, saturation};
     cuddl::pairwise_summary summary;
     summary.counts = counts;
     auto const wkid = metrics.wkid(summary);
@@ -131,7 +130,7 @@ run_result run_gpu(
             );
             h2d += std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
             t = steady_clock_t::now();
-            CUDDL_UNWRAP(target.add(d, d + n));
+            CUDDL_UNWRAP(target.add({d, n}));
             construction +=
                 std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
             CUDDL_CUDA_CALL(cudaFree(d));

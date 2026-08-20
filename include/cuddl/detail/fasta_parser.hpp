@@ -102,9 +102,7 @@ void consume_sequence(
 inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t k) {
     auto file = cusbf::detail::FastxFileBuffer::load(path);
     if (!file) {
-        return Result<fasta_parse_result>::err(
-            Error::invalid_argument("cannot open FASTA file: " + path)
-        );
+        return Err(Error::invalid_argument("cannot open FASTA file: " + path));
     }
     auto const data = (*file)->data();
 
@@ -119,16 +117,14 @@ inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t 
     while (true) {
         auto next = reader.nextRecord(record);
         if (!next) {
-            return Result<fasta_parse_result>::err(
-                Error::invalid_argument("FASTA parse error near: " + path)
-            );
+            return Err(Error::invalid_argument("FASTA parse error near: " + path));
         }
         if (!*next) {
             break;  // end of stream
         }
         consume_sequence(record.sequence, k, result, window, window_len);
     }
-    return Result<fasta_parse_result>::ok(std::move(result));
+    return result;
 }
 
 }  // namespace cuddl::detail

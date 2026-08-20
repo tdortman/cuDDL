@@ -30,29 +30,30 @@ int main(int argc, char** argv) {
     using sketch_type = cuddl::sketch<25, 2048>;
     sketch_type left;
     sketch_type right;
-    auto const* device_input = thrust::raw_pointer_cast(input.data());
     auto const middle = count / 2;
 
     CUDDL_UNWRAP(left.clear());
-    CUDDL_UNWRAP(left.add(device_input, device_input + count));
+    CUDDL_UNWRAP(left.add(input));
     CUDDL_UNWRAP(right.clear_async());
-    CUDDL_UNWRAP(right.add_async(device_input + middle, device_input + count));
+    CUDDL_UNWRAP(right.add_async(
+        cuddl::device_span<uint64_t const>{
+            thrust::raw_pointer_cast(input.data()) + middle, input.size() - middle
+        }
+    ));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
 
     auto const left_ref = left.ref();
     auto const right_ref = right.ref();
     CUDDL_UNWRAP(left_ref.clear_async());
-    CUDDL_UNWRAP(left_ref.add_async(device_input, device_input + count));
+    CUDDL_UNWRAP(left_ref.add_async(
+        {thrust::raw_pointer_cast(input.data()), input.size()}
+    ));
 
     thrust::device_vector<cuddl::pairwise_summary> summaries(3);
     auto* summary_output = thrust::raw_pointer_cast(summaries.data());
-    CUDDL_UNWRAP(left.summary_async(right_ref, summary_output));
-    CUDDL_UNWRAP(
-        left_ref.summary_async<cuddl::summary_mask::pairwise | cuddl::summary_mask::cardinality>(
-            right_ref, summary_output + 1
-        )
-    );
-    CUDDL_UNWRAP(left_ref.compare_async(right_ref, summary_output + 2));
+    CUDDL_UNWRAP(left.summary_async(right_ref, summary_output[0]));
+    CUDDL_UNWRAP(left_ref.summary_async<true>(right_ref, summary_output[1]));
+    CUDDL_UNWRAP(left_ref.compare_async(right_ref, summary_output[2]));
 
     thrust::device_vector<uint64_t> empty(1);
     thrust::device_vector<double> estimate(1);

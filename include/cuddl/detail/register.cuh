@@ -94,17 +94,14 @@ __host__ __device__ constexpr uint64_t restore(uint16_t stored) noexcept {
  * saturation flag through @p saturation using an idempotent store.
  *
  */
-__device__ inline void
-update(uint32_t* address, uint16_t incoming, uint32_t* saturation) noexcept {
+__device__ inline void update(uint32_t* address, uint16_t incoming, uint32_t& saturation) noexcept {
     auto observed = *address;
     while (incoming >= winner(observed)) {
         uint32_t replacement;
         if (incoming > winner(observed)) {
             replacement = pack(incoming, 1U);
         } else if (count(observed) == max_winner_count) {
-            if (saturation != nullptr) {
-                atomicExch(saturation, 1U);
-            }
+            atomicExch(&saturation, 1U);
             return;
         } else {
             replacement = pack(incoming, static_cast<uint16_t>(count(observed) + 1U));

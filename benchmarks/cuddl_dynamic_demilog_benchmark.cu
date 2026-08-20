@@ -31,7 +31,7 @@ double run(std::vector<uint64_t> const& host, double& estimate) {
     );
     cuddl::sketch<25, bucket_count> sketch;
     auto const start = clock_type::now();
-    CUDDL_UNWRAP(sketch.add(device, device + host.size()));
+    CUDDL_UNWRAP(sketch.add({device, host.size()}));
     estimate = CUDDL_UNWRAP(sketch.cardinality());
     auto const seconds = std::chrono::duration<double>(clock_type::now() - start).count();
     CUDDL_CUDA_CALL(cudaFree(device));

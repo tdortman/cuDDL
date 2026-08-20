@@ -135,15 +135,6 @@ struct [[nodiscard]] Result<void> : cuda::std::expected<void, Error> {
     }
 };
 
-/// @brief Aborts when a @ref Result is unsuccessful (benchmarks and tests).
-inline void require_void(const Result<void>& result) {
-    if (!result) {
-        std::fputs(result.error().message().c_str(), stderr);
-        std::fputc('\n', stderr);
-        std::abort();
-    }
-}
-
 /// @brief Terminates the process when @p error is not @c cudaSuccess (for RAII teardown only).
 inline void cuda_abort_on_error(
     cudaError_t error,
@@ -183,7 +174,7 @@ inline void try_unwrap_success(Result<void>& result) {
 
 /// @brief Success return for @c Result<void>; same as @c return {}.
 [[nodiscard]] inline Result<void> Ok() noexcept {
-    return Result<void>::ok();
+    return {};
 }
 
 /// @brief Checks a CUDA runtime call and returns an error on failure.

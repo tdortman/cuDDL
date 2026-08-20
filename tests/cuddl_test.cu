@@ -138,7 +138,7 @@ TEST(SketchTest, ScoreEncodingClampsExtremeNlz) {
 TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
     auto const inputs = make_inputs(50000);
     cuddl::sketch<k_default, b_default> gpu;
-    ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + inputs.size()).has_value());
+    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}).has_value());
 
     scalar_sketch<b_default> oracle;
     oracle.add(inputs);
@@ -150,7 +150,7 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
     ASSERT_EQ(
         cudaSuccess,
         cudaMemcpy(
-            gpu_regs.data(), ref.data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
+            gpu_regs.data(), ref.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
         )
     );
     EXPECT_EQ(gpu_regs, oracle.registers);
@@ -166,8 +166,8 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
 
     cuddl::sketch<k_default, b_default> gpu_a;
     cuddl::sketch<k_default, b_default> gpu_b;
-    ASSERT_TRUE(gpu_a.add(a.data(), a.data() + a.size()).has_value());
-    ASSERT_TRUE(gpu_b.add(b_joined.data(), b_joined.data() + b_joined.size()).has_value());
+    ASSERT_TRUE(gpu_a.add({a.data(), a.size()}).has_value());
+    ASSERT_TRUE(gpu_b.add({b_joined.data(), b_joined.size()}).has_value());
 
     auto const gpu_summary = gpu_a.compare(gpu_b.ref());
     ASSERT_TRUE(gpu_summary.has_value());
@@ -193,7 +193,7 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
         auto const inputs = make_inputs(n, 0x3333'3333'3333'3333ULL + n);
         cuddl::sketch<k_default, b_default> gpu;
         if (n > 0) {
-            ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
+            ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
         }
         auto const gpu_cardinality = gpu.cardinality();
         ASSERT_TRUE(gpu_cardinality.has_value());
@@ -220,7 +220,7 @@ TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
         // make_inputs from a 64-bit SplitMix stream masked into 2^50 space; collisions are
         // negligible at these sizes, so the distinct count is ~n.
         cuddl::sketch<k_default, b_default> gpu;
-        ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
+        ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
         auto const card = gpu.cardinality();
         ASSERT_TRUE(card.has_value());
         auto const estimate = *card;
@@ -236,7 +236,7 @@ TEST(SketchTest, CardinalityRemainsAccurateThroughSparseTransition) {
     for (size_t n : {512U, 1024U, 2048U, 4096U, 8192U}) {
         auto const inputs = make_inputs(n, 0x5555'5555'5555'5555ULL + n);
         cuddl::sketch<k_default, b_default> gpu;
-        ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + n).has_value());
+        ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
         auto const estimate = gpu.cardinality();
         ASSERT_TRUE(estimate.has_value());
         EXPECT_NEAR(*estimate, static_cast<double>(n), 0.1 * static_cast<double>(n));
@@ -251,7 +251,7 @@ TEST(SketchTest, WinnerCountsAndSaturationMatchScalarOracle) {
     inputs.assign(repeat, packed_kmer);
 
     cuddl::sketch<k_default, b_default> gpu;
-    ASSERT_TRUE(gpu.add(inputs.data(), inputs.data() + inputs.size()).has_value());
+    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}).has_value());
     auto const gpu_wc = gpu.winner_counts();
     ASSERT_TRUE(gpu_wc.has_value());
 
@@ -271,14 +271,14 @@ TEST(SketchTest, SaturationFlagSetAtCounterOverflow) {
 
     cuddl::sketch<k_default, b_default> under;
     std::vector<uint64_t> few(1000, packed_kmer);
-    ASSERT_TRUE(under.add(few.data(), few.data() + few.size()).has_value());
+    ASSERT_TRUE(under.add({few.data(), few.size()}).has_value());
     auto const under_wc = under.winner_counts();
     ASSERT_TRUE(under_wc.has_value());
     EXPECT_FALSE(under_wc->second);
 
     cuddl::sketch<k_default, b_default> over;
     std::vector<uint64_t> many(65536, packed_kmer);
-    ASSERT_TRUE(over.add(many.data(), many.data() + many.size()).has_value());
+    ASSERT_TRUE(over.add({many.data(), many.size()}).has_value());
     auto const over_wc = over.winner_counts();
     ASSERT_TRUE(over_wc.has_value());
     EXPECT_TRUE(over_wc->second);
@@ -291,9 +291,9 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     cuddl::sketch<k_default, b_default> sa;
     cuddl::sketch<k_default, b_default> sb;
     cuddl::sketch<k_default, b_default> sc;
-    ASSERT_TRUE(sa.add(a.data(), a.data() + a.size()).has_value());
-    ASSERT_TRUE(sb.add(a.data(), a.data() + a.size()).has_value());
-    ASSERT_TRUE(sc.add(c.data(), c.data() + c.size()).has_value());
+    ASSERT_TRUE(sa.add({a.data(), a.size()}).has_value());
+    ASSERT_TRUE(sb.add({a.data(), a.size()}).has_value());
+    ASSERT_TRUE(sc.add({c.data(), c.size()}).has_value());
 
     auto const same_result = sa.compare(sb.ref());
     ASSERT_TRUE(same_result.has_value());

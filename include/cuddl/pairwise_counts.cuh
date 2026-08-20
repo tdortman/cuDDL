@@ -32,10 +32,7 @@ struct pairwise_counts {
     friend bool operator==(pairwise_counts const&, pairwise_counts const&) = default;
 };
 
-/// @brief Raw result payload of a pairwise summary reduction.
-///
-/// @p counts is populated when the pairwise field is selected; @p cardinality is the estimate for
-/// the query sketch when the cardinality field is selected.
+/// @brief Pairwise counts with an optional compile-time cardinality field.
 struct pairwise_summary {
     pairwise_counts counts{};
     double cardinality{};
@@ -43,12 +40,5 @@ struct pairwise_summary {
     friend bool operator==(pairwise_summary const&, pairwise_summary const&) = default;
 };
 
-/// @brief Compile-time field mask selecting which reductions a fused summary computes.
-struct summary_mask {
-    /// Selects the raw @ref pairwise_counts reduction.
-    static constexpr uint32_t pairwise = 1U << 0;
-    /// Selects the query sketch's hybridDDL cardinality reduction.
-    static constexpr uint32_t cardinality = 1U << 1;
-};
 
 }  // namespace cuddl

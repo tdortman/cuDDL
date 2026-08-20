@@ -4,6 +4,8 @@
 #include <cuda/std/cstdint>
 #include <cuda/stream_ref>
 
+#include <thrust/device_vector.h>
+#include <thrust/memory.h>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -24,7 +26,7 @@ struct device_buffer {
     device_buffer() = default;
 
     explicit device_buffer(size_t count) : pointer(nullptr) {
-        cuda_abort_on_error(cudaMalloc(&pointer, count * sizeof(T)));
+        CUDDL_CUDA_ABORT(cudaMalloc(&pointer, count * sizeof(T)));
     }
 
     device_buffer(device_buffer const&) = delete;
@@ -71,9 +73,9 @@ class sketch {
 
     /// @brief Allocates the register array plus saturation flag and clears it (aborts on failure).
     explicit sketch(cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}) {
-        cuda_abort_on_error(cudaMalloc(&storage_, (BucketCount + 1) * sizeof(register_type)));
-        require_void(ref().clear_async(stream));
-        cuda_abort_on_error(cudaStreamSynchronize(stream.get()));
+        CUDDL_CUDA_ABORT(cudaMalloc(&storage_, (BucketCount + 1) * sizeof(register_type)));
+        CUDDL_UNWRAP(ref().clear_async(stream));
+        CUDDL_CUDA_ABORT(cudaStreamSynchronize(stream.get()));
     }
 
     sketch(sketch const&) = delete;
@@ -101,7 +103,7 @@ class sketch {
 
     /// @brief Non-owning reference over this sketch's registers and saturation flag.
     [[nodiscard]] ref_type ref() const noexcept {
-        return ref_type(storage_, storage_ + BucketCount);
+        return ref_type({storage_, BucketCount}, storage_[BucketCount]);
     }
 
     [[nodiscard]] Result<void> clear_async(
@@ -120,55 +122,68 @@ class sketch {
     }
 
     [[nodiscard]] Result<void> add_async(
-        uint64_t const* first,
-        uint64_t const* last,
+        device_span<uint64_t const> input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().add_async(first, last, stream);
+        return ref().add_async(input, stream);
     }
 
     [[nodiscard]] Result<void> add(
-        uint64_t const* first,
-        uint64_t const* last,
+        device_span<uint64_t const> input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        if (auto const result = add_async(first, last, stream); !result) {
+        if (auto const result = add_async(input, stream); !result) {
             return result;
         }
         return cuda_try(cudaStreamSynchronize(stream.get()));
     }
 
-    /// @brief Computes a fused pairwise summary into caller-owned device storage.
-    template <uint32_t Mask = summary_mask::pairwise>
-    [[nodiscard]] Result<void> summary_async(
-        ref_type other,
-        pairwise_summary* output,
+    [[nodiscard]] Result<void> add_async(
+        thrust::device_vector<uint64_t> const& input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().template summary_async<Mask>(other, output, stream);
+        return add_async({thrust::raw_pointer_cast(input.data()), input.size()}, stream);
+    }
+
+    [[nodiscard]] Result<void> add(
+        thrust::device_vector<uint64_t> const& input,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const noexcept {
+        return add({thrust::raw_pointer_cast(input.data()), input.size()}, stream);
+    }
+
+    /// @brief Computes a fused pairwise summary into caller-owned device storage.
+    template <bool IncludeCardinality = false>
+    [[nodiscard]] Result<void> summary_async(
+        ref_type other,
+        pairwise_summary& output,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const noexcept {
+        return ref().template summary_async<IncludeCardinality>(other, output, stream);
     }
 
     /// @brief Host-side fused pairwise summary (allocates temporary device output, synchronises).
-    template <uint32_t Mask = summary_mask::pairwise>
+    template <bool IncludeCardinality = false>
     [[nodiscard]] Result<pairwise_summary> summary(
         ref_type other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         detail::device_buffer<pairwise_summary> output(1);
-        if (auto const result = ref().template summary_async<Mask>(other, output.pointer, stream);
+        if (auto const result =
+                ref().template summary_async<IncludeCardinality>(other, *output.pointer, stream);
             !result) {
-            return Result<pairwise_summary>::err(result.error());
+            return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
-            return Result<pairwise_summary>::err(result.error());
+            return Err(result.error());
         }
         pairwise_summary host{};
         if (auto const result =
                 cuda_try(cudaMemcpy(&host, output.pointer, sizeof(host), cudaMemcpyDeviceToHost));
             !result) {
-            return Result<pairwise_summary>::err(result.error());
+            return Err(result.error());
         }
-        return Result<pairwise_summary>::ok(host);
+        return host;
     }
 
     /// @brief Raw pairwise counts against @p other (host result).
@@ -176,7 +191,7 @@ class sketch {
         ref_type other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return summary<summary_mask::pairwise>(other, stream);
+        return summary(other, stream);
     }
 
     /// @brief Computes this sketch's hybridDDL cardinality reduction on the GPU.
@@ -196,18 +211,18 @@ class sketch {
         detail::device_buffer<double> estimate(1);
         if (auto const result = ref().cardinality_async(empty.pointer, estimate.pointer, stream);
             !result) {
-            return Result<double>::err(result.error());
+            return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
-            return Result<double>::err(result.error());
+            return Err(result.error());
         }
         double host = 0.0;
         if (auto const result =
                 cuda_try(cudaMemcpy(&host, estimate.pointer, sizeof(host), cudaMemcpyDeviceToHost));
             !result) {
-            return Result<double>::err(result.error());
+            return Err(result.error());
         }
-        return Result<double>::ok(host);
+        return host;
     }
 
     /// @brief Experimental BBTools and paper-style HybridDDL estimates for comparison.
@@ -216,20 +231,19 @@ class sketch {
     ) const {
         detail::device_buffer<hybrid_cardinality_estimates> output(1);
         if (auto const result = ref().hybrid_cardinality_async(output.pointer, stream); !result) {
-            return Result<hybrid_cardinality_estimates>::err(result.error());
+            return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
-            return Result<hybrid_cardinality_estimates>::err(result.error());
+            return Err(result.error());
         }
         hybrid_cardinality_estimates host{};
         if (auto const result =
                 cuda_try(cudaMemcpy(&host, output.pointer, sizeof(host), cudaMemcpyDeviceToHost));
             !result) {
-            return Result<hybrid_cardinality_estimates>::err(result.error());
+            return Err(result.error());
         }
-        return Result<hybrid_cardinality_estimates>::ok(host);
+        return host;
     }
-
 
     /// @brief Watches the winner-count extraction on the GPU (caller-owned outputs).
     [[nodiscard]] Result<void> winner_counts_async(
@@ -249,10 +263,10 @@ class sketch {
         if (auto const result =
                 ref().winner_counts_async(counts.pointer, saturation.pointer, stream);
             !result) {
-            return Result<std::pair<std::vector<uint16_t>, bool>>::err(result.error());
+            return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
-            return Result<std::pair<std::vector<uint16_t>, bool>>::err(result.error());
+            return Err(result.error());
         }
         std::vector<uint16_t> host_counts(BucketCount);
         uint32_t host_saturation = 0;
@@ -263,17 +277,15 @@ class sketch {
                 cudaMemcpyDeviceToHost
             ));
             !result) {
-            return Result<std::pair<std::vector<uint16_t>, bool>>::err(result.error());
+            return Err(result.error());
         }
         if (auto const result = cuda_try(cudaMemcpy(
                 &host_saturation, saturation.pointer, sizeof(uint32_t), cudaMemcpyDeviceToHost
             ));
             !result) {
-            return Result<std::pair<std::vector<uint16_t>, bool>>::err(result.error());
+            return Err(result.error());
         }
-        return Result<std::pair<std::vector<uint16_t>, bool>>::ok(
-            {std::move(host_counts), host_saturation != 0U}
-        );
+        return std::pair{std::move(host_counts), host_saturation != 0U};
     }
 
    private:

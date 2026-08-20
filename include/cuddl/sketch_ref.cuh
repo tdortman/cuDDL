@@ -8,6 +8,7 @@
 #include <cmath>
 #include <optional>
 
+#include <cuddl/device_span.cuh>
 #include <cuddl/detail/construction.cuh>
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/error.hpp>
@@ -33,17 +34,18 @@ class sketch_ref {
     using register_type = uint32_t;
 
     /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
-    __host__
-        __device__ constexpr sketch_ref(register_type* registers, uint32_t* saturation) noexcept
+    __host__ __device__ constexpr sketch_ref(
+        device_span<register_type> registers, uint32_t& saturation
+    ) noexcept
         : registers_(registers), saturation_(saturation) {}
 
-    /// @brief Pointer to the first packed register.
-    [[nodiscard]] __host__ __device__ constexpr register_type* data() const noexcept {
+    /// @brief Packed registers.
+    [[nodiscard]] __host__ __device__ constexpr device_span<register_type> data() const noexcept {
         return registers_;
     }
 
-    /// @brief Pointer to the sketch-level saturation flag.
-    [[nodiscard]] __host__ __device__ constexpr uint32_t* saturation_flag() const noexcept {
+    /// @brief Sketch-level saturation flag.
+    [[nodiscard]] __host__ __device__ constexpr uint32_t& saturation_flag() const noexcept {
         return saturation_;
     }
 
@@ -61,39 +63,36 @@ class sketch_ref {
     [[nodiscard]] Result<void> clear_async(
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        auto const registers_bytes = BucketCount * sizeof(register_type);
         if (auto const result =
-                cuda_try(cudaMemsetAsync(registers_, 0, registers_bytes, stream.get()));
+                cuda_try(cudaMemsetAsync(registers_.data(), 0, registers_.size_bytes(), stream.get()));
             !result) {
             return result;
         }
-        return cuda_try(cudaMemsetAsync(saturation_, 0, sizeof(uint32_t), stream.get()));
+        return cuda_try(cudaMemsetAsync(&saturation_, 0, sizeof(saturation_), stream.get()));
     }
 
-    /// @brief Constructs the sketch from packed k-mers in `[first, last)`.
+    /// @brief Constructs the sketch from packed k-mers in @p input.
     ///
-    /// The input range must remain valid until @p stream completes.
+    /// The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void> add_async(
-        uint64_t const* first,
-        uint64_t const* last,
+        device_span<uint64_t const> input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        auto const count = static_cast<size_t>(last - first);
         return detail::launch_construction<BucketCount>(
-            first, count, registers_, saturation_, stream.get()
+            input, registers_, saturation_, stream.get()
         );
     }
 
     /// @brief Computes the raw pairwise summary into caller-owned device storage.
     ///
     /// @p output must point at device memory valid until @p stream completes.
-    template <uint32_t Mask = summary_mask::pairwise>
+    template <bool IncludeCardinality = false>
     [[nodiscard]] Result<void> summary_async(
         sketch_ref other,
-        pairwise_summary* output,
+        pairwise_summary& output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::summary_kernel<BucketCount, Mask>
+        detail::summary_kernel<BucketCount, IncludeCardinality>
             <<<1, detail::block_size, 0, stream.get()>>>(registers_, other.registers_, output);
         return cuda_try(cudaGetLastError());
     }
@@ -101,10 +100,10 @@ class sketch_ref {
     /// @brief Computes raw pairwise counts into caller-owned device storage.
     [[nodiscard]] Result<void> compare_async(
         sketch_ref other,
-        pairwise_summary* output,
+        pairwise_summary& output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return summary_async<summary_mask::pairwise>(other, output, stream);
+        return summary_async(other, output, stream);
     }
 
     /// @brief Computes this sketch's cardinality reduction on the GPU.
@@ -116,7 +115,7 @@ class sketch_ref {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
         detail::cardinality_kernel<BucketCount>
-            <<<1, 64, 0, stream.get()>>>(registers_, empty_out, estimate_out);
+            <<<1, 64, 0, stream.get()>>>(registers_.data(), empty_out, estimate_out);
         return cuda_try(cudaGetLastError());
     }
 
@@ -126,7 +125,7 @@ class sketch_ref {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
         detail::hybrid_cardinality_kernel<BucketCount>
-            <<<1, detail::block_size, 0, stream.get()>>>(registers_, output);
+            <<<1, detail::block_size, 0, stream.get()>>>(registers_.data(), output);
         return cuda_try(cudaGetLastError());
     }
 
@@ -141,7 +140,7 @@ class sketch_ref {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
         detail::winner_counts_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
-            registers_, saturation_, counts_out, saturation_out
+            registers_.data(), &saturation_, counts_out, saturation_out
         );
         return cuda_try(cudaGetLastError());
     }
@@ -197,8 +196,8 @@ class sketch_ref {
     }
 
    private:
-    register_type* registers_ = nullptr;
-    uint32_t* saturation_ = nullptr;
+    device_span<register_type> registers_;
+    uint32_t& saturation_;
 };
 
 }  // namespace cuddl

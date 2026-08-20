@@ -6,6 +6,7 @@
 
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/error.hpp>
+#include <cuddl/device_span.cuh>
 
 namespace cuddl::detail {
 
@@ -28,17 +29,16 @@ construction_blocks(size_t count, cudaStream_t stream = nullptr) noexcept {
 /// @brief Launches direct global packed-CAS construction of a sketch.
 template <size_t BucketCount>
 __host__ inline Result<void> launch_construction(
-    uint64_t const* first,
-    size_t const count,
-    uint32_t* const registers,
-    uint32_t* const saturation,
+    device_span<uint64_t const> input,
+    device_span<uint32_t> registers,
+    uint32_t& saturation,
     cudaStream_t stream
 ) {
-    if (count == 0U) {
-        return Ok();
+    if (input.empty()) {
+        return {};
     }
-    add_kernel<BucketCount><<<construction_blocks(count, stream), block_size, 0, stream>>>(
-        first, count, registers, saturation
+    add_kernel<BucketCount><<<construction_blocks(input.size(), stream), block_size, 0, stream>>>(
+        input, registers, saturation
     );
     return cuda_try(cudaGetLastError());
 }

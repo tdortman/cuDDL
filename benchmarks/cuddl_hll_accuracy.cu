@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
                 ));
 
                 cuddl::sketch<25, k_bucket_count> cuddl;
-                CUDDL_UNWRAP(cuddl.add(device, device + count));
+                CUDDL_UNWRAP(cuddl.add({device, count}));
                 emit(csv, "cuddl", count, trial, exact, CUDDL_UNWRAP(cuddl.cardinality()));
                 auto const hybrids = CUDDL_UNWRAP(cuddl.hybrid_cardinality());
                 emit(csv, "cuddl_bbtools", count, trial, exact, hybrids.bbtools);
