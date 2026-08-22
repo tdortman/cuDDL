@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
 #include <cuda/std/cstddef>
@@ -12,6 +14,8 @@
 #include <cuddl/detail/register.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/pairwise_counts.cuh>
+
+namespace cg = cooperative_groups;
 
 namespace cuddl::detail {
 
@@ -148,40 +152,91 @@ __host__ __device__ constexpr uint16_t reference_score(uint32_t packed_register)
 }
 
 /**
+ * @brief Reduces four pairwise counters within one warp.
+ */
+inline __device__ pairwise_counts
+reduce_warp(cg::thread_block_tile<32> const warp, pairwise_counts counts) {
+    counts.lower = cg::reduce(warp, counts.lower, cg::plus<uint32_t>{});
+    counts.equal = cg::reduce(warp, counts.equal, cg::plus<uint32_t>{});
+    counts.higher = cg::reduce(warp, counts.higher, cg::plus<uint32_t>{});
+    counts.both_empty = cg::reduce(warp, counts.both_empty, cg::plus<uint32_t>{});
+    return counts;
+}
+
+/**
  * @brief Compares one compact query row with every row in a reference database.
  *
- * Each warp owns one reference row and writes exactly one stable-ID result.
+ * Each reference owns a compile-time number of warps and writes exactly one stable-ID result.
  */
-template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
-__global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
-    device_span<ReferenceRow const> rows,
+template <
+    size_t BucketCount,
+    uint32_t BlockSize,
+    uint32_t WarpsPerReference,
+    typename ReferenceRow,
+    typename SearchResult>
+__global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
+    ReferenceRow const* rows,
     uint32_t reference_count,
-    device_span<uint16_t const> query,
+    uint16_t const* query,
     SearchResult* results
 ) {
-    constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
-    using warp_reduce = cub::WarpReduce<pairwise_counts>;
-    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+    static_assert(BlockSize % 32U == 0U);
+    static_assert(
+        WarpsPerReference == 1U || WarpsPerReference == 2U || WarpsPerReference == 4U ||
+        WarpsPerReference == 8U
+    );
+    static_assert(BlockSize >= 32U * WarpsPerReference);
+    static_assert(BlockSize % (32U * WarpsPerReference) == 0U);
+    constexpr uint32_t warp_width = 32U;
+    constexpr uint32_t warps_per_block = BlockSize / warp_width;
+    constexpr uint32_t threads_per_reference = warp_width * WarpsPerReference;
+    constexpr uint32_t references_per_block = warps_per_block / WarpsPerReference;
 
-    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    __shared__ pairwise_counts warp_summaries[warps_per_block];
+    auto const block = cg::this_thread_block();
+    auto const warp = cg::tiled_partition<warp_width>(block);
+    auto const reference_in_block = static_cast<uint32_t>(threadIdx.x) / threads_per_reference;
+    auto const thread_in_reference = static_cast<uint32_t>(threadIdx.x) % threads_per_reference;
+    auto const warp_in_reference = thread_in_reference / warp_width;
     auto const reference_id =
-        static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
-    if (reference_id >= reference_count) {
+        static_cast<uint32_t>(blockIdx.x) * references_per_block + reference_in_block;
+    auto const valid_reference = reference_id < reference_count;
+
+    pairwise_counts local{};
+    if (valid_reference) {
+        auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
+        for (auto bucket = static_cast<size_t>(thread_in_reference); bucket < BucketCount;
+             bucket += threads_per_reference) {
+            classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
+        }
+    }
+    auto const warp_total = reduce_warp(warp, local);
+
+    if constexpr (WarpsPerReference == 1U) {
+        if (warp.thread_rank() == 0U && valid_reference) {
+            results[reference_id].reference_id = reference_id;
+            results[reference_id].summary.counts = warp_total;
+            results[reference_id].summary.cardinality = 0.0;
+        }
         return;
     }
 
-    pairwise_counts local{};
-    auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
-    for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
-        classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
+    if (warp.thread_rank() == 0U) {
+        warp_summaries[static_cast<uint32_t>(threadIdx.x) / warp_width] = warp_total;
     }
-    auto const total = warp_reduce(storage[warp]).Sum(local);
-    if (lane == 0U) {
-        results[reference_id].reference_id = reference_id;
-        results[reference_id].summary.counts = total;
-        results[reference_id].summary.cardinality = 0.0;
+    block.sync();
+
+    if (warp_in_reference == 0U) {
+        pairwise_counts partial{};
+        if (warp.thread_rank() < WarpsPerReference) {
+            partial = warp_summaries[reference_in_block * WarpsPerReference + warp.thread_rank()];
+        }
+        auto const reference_total = reduce_warp(warp, partial);
+        if (warp.thread_rank() == 0U && valid_reference) {
+            results[reference_id].reference_id = reference_id;
+            results[reference_id].summary.counts = reference_total;
+            results[reference_id].summary.cardinality = 0.0;
+        }
     }
 }
 

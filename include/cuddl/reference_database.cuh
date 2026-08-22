@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/std/cstdint>
-#include <cuda/stream_ref>
+#include <thrust/device_vector.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/memory.h>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
-#include <thrust/device_vector.h>
-#include <thrust/memory.h>
-#include <thrust/iterator/counting_iterator.h>
+#include <cuda/std/cstdint>
+#include <cuda/stream_ref>
 
 #include <cstddef>
 #include <limits>
@@ -66,8 +66,8 @@ struct reference_database_metadata {
     score_compatibility compatibility{};
     uint32_t reference_count{};
 
-    friend bool
-    operator==(reference_database_metadata const&, reference_database_metadata const&) = default;
+    friend bool operator==(reference_database_metadata const&, reference_database_metadata const&) =
+        default;
 };
 
 /// @brief Stable reference ID and exact query-relative pairwise summary.
@@ -75,7 +75,8 @@ struct reference_search_result {
     uint32_t reference_id{};
     pairwise_summary summary{};
 
-    friend bool operator==(reference_search_result const&, reference_search_result const&) = default;
+    friend bool operator==(reference_search_result const&, reference_search_result const&) =
+        default;
 };
 
 /// @brief Stable query/reference IDs and their exact query-relative pairwise summary.
@@ -109,8 +110,9 @@ struct indexed_search_options {
 namespace detail {
 
 template <uint32_t K, size_t BucketCount>
-[[nodiscard]] inline Result<void>
-validate_score_compatibility(score_compatibility const& compatibility) {
+[[nodiscard]] inline Result<void> validate_score_compatibility(
+    score_compatibility const& compatibility
+) {
     if (compatibility.kmer_length != K) {
         return Err(Error::invalid_argument("k-mer length does not match the database type"));
     }
@@ -132,7 +134,9 @@ validate_score_compatibility(score_compatibility const& compatibility) {
         return Err(Error::invalid_argument("canonicalisation policy must be specified"));
     }
     if (compatibility.key_mask != std::numeric_limits<uint16_t>::max()) {
-        return Err(Error::invalid_argument("compact exhaustive search requires full 16-bit scores"));
+        return Err(
+            Error::invalid_argument("compact exhaustive search requires full 16-bit scores")
+        );
     }
     return Ok();
 }
@@ -255,8 +259,9 @@ class reference_database_ref {
         return 0;
     }
 
-    [[nodiscard]] static constexpr uint32_t
-    single_query_result_count(uint32_t reference_count) noexcept {
+    [[nodiscard]] static constexpr uint32_t single_query_result_count(
+        uint32_t reference_count
+    ) noexcept {
         return reference_count;
     }
 
@@ -373,20 +378,76 @@ class reference_database_ref {
             return Err(Error::invalid_argument("result storage must be device accessible"));
         }
 
-        constexpr uint32_t warp_width = 32;
-        constexpr uint32_t references_per_block = detail::block_size / warp_width;
-        auto const blocks =
-            (metadata_.reference_count + references_per_block - 1U) / references_per_block;
-        if (packed_) {
-            detail::exhaustive_search_kernel<BucketCount>
-                <<<blocks, detail::block_size, 0, stream.get()>>>(
-                    packed_rows_, metadata_.reference_count, query, results.data()
-                );
+        if constexpr (BucketCount == 2048U) {
+            // ponytail: fixed crossover tuned on the RTX 5070 Ti; retune for other GPU families.
+            constexpr uint32_t small_reference_limit = 2560U;
+            constexpr uint32_t small_block_size = 256U;
+            constexpr uint32_t small_warps_per_reference = 8U;
+            constexpr uint32_t large_block_size = 128U;
+            constexpr uint32_t large_warps_per_reference = 2U;
+            if (metadata_.reference_count <= small_reference_limit) {
+                constexpr uint32_t references_per_block =
+                    small_block_size / (32U * small_warps_per_reference);
+                auto const blocks =
+                    (metadata_.reference_count + references_per_block - 1U) / references_per_block;
+                if (packed_) {
+                    detail::exhaustive_search_kernel<
+                        BucketCount,
+                        small_block_size,
+                        small_warps_per_reference><<<blocks, small_block_size, 0, stream.get()>>>(
+                        packed_rows_.data(), metadata_.reference_count, query.data(), results.data()
+                    );
+                } else {
+                    detail::exhaustive_search_kernel<
+                        BucketCount,
+                        small_block_size,
+                        small_warps_per_reference><<<blocks, small_block_size, 0, stream.get()>>>(
+                        rows_.data(), metadata_.reference_count, query.data(), results.data()
+                    );
+                }
+            } else {
+                constexpr uint32_t references_per_block =
+                    large_block_size / (32U * large_warps_per_reference);
+                auto const blocks =
+                    (metadata_.reference_count + references_per_block - 1U) / references_per_block;
+                if (packed_) {
+                    detail::exhaustive_search_kernel<
+                        BucketCount,
+                        large_block_size,
+                        large_warps_per_reference><<<blocks, large_block_size, 0, stream.get()>>>(
+                        packed_rows_.data(), metadata_.reference_count, query.data(), results.data()
+                    );
+                } else {
+                    detail::exhaustive_search_kernel<
+                        BucketCount,
+                        large_block_size,
+                        large_warps_per_reference><<<blocks, large_block_size, 0, stream.get()>>>(
+                        rows_.data(), metadata_.reference_count, query.data(), results.data()
+                    );
+                }
+            }
         } else {
-            detail::exhaustive_search_kernel<BucketCount>
-                <<<blocks, detail::block_size, 0, stream.get()>>>(
-                    rows_, metadata_.reference_count, query, results.data()
+            constexpr uint32_t fallback_block_size = 128U;
+            constexpr uint32_t fallback_warps_per_reference = 2U;
+            constexpr uint32_t references_per_block =
+                fallback_block_size / (32U * fallback_warps_per_reference);
+            auto const blocks =
+                (metadata_.reference_count + references_per_block - 1U) / references_per_block;
+            if (packed_) {
+                detail::exhaustive_search_kernel<
+                    BucketCount,
+                    fallback_block_size,
+                    fallback_warps_per_reference><<<blocks, fallback_block_size, 0, stream.get()>>>(
+                    packed_rows_.data(), metadata_.reference_count, query.data(), results.data()
                 );
+            } else {
+                detail::exhaustive_search_kernel<
+                    BucketCount,
+                    fallback_block_size,
+                    fallback_warps_per_reference><<<blocks, fallback_block_size, 0, stream.get()>>>(
+                    rows_.data(), metadata_.reference_count, query.data(), results.data()
+                );
+            }
         }
         return cuda_try(cudaGetLastError());
     }
