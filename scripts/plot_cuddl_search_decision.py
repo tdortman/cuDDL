@@ -6,6 +6,7 @@
 """Plot indexed-versus-exhaustive search decisions from the summary CSV."""
 
 import math
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated
 
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plot_utils as pu
 import typer
-from matplotlib.lines import Line2D
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
 REQUIRED_COLUMNS = {
     "status",
@@ -76,12 +77,10 @@ def main(
         raise typer.BadParameter("CSV contains non-positive search timings")
 
     data["hot_fraction"] = data["skew"].map(skew_fraction)
-    data["p50_log2_speedup"] = (data["exhaustive_p50_ms"] / data["indexed_p50_ms"]).map(
-        math.log2
-    )
-    data["p95_log2_speedup"] = (data["exhaustive_p95_ms"] / data["indexed_p95_ms"]).map(
-        math.log2
-    )
+    data["p50_speedup"] = data["exhaustive_p50_ms"] / data["indexed_p50_ms"]
+    data["p95_speedup"] = data["exhaustive_p95_ms"] / data["indexed_p95_ms"]
+    data["p50_log2_speedup"] = data["p50_speedup"].map(math.log2)
+    data["p95_log2_speedup"] = data["p95_speedup"].map(math.log2)
     unknown_outcomes = sorted(set(data["kill_gate_outcome"]) - VALID_OUTCOMES)
     if unknown_outcomes:
         raise typer.BadParameter(
@@ -95,119 +94,124 @@ def main(
     if data.duplicated(workload_columns).any():
         raise typer.BadParameter("CSV contains duplicate workloads")
 
+    panel_columns = [
+        (fill_ratio, query_count)
+        for fill_ratio in fill_ratios
+        for query_count in query_counts
+    ]
+    percentile_columns = (
+        ("p50_log2_speedup", "p50"),
+        ("p95_log2_speedup", "p95"),
+    )
+    hot_fractions = sorted(data["hot_fraction"].unique())
+    log2_values = pd.concat(
+        [data[column] for column, _ in percentile_columns], ignore_index=True
+    )
+    maximum_log2 = max(1.0, float(log2_values.abs().max()))
+    colour_map = LinearSegmentedColormap.from_list(
+        "search_decision",
+        ["#f4a582", "#ffffff", "#92c5de"],
+    )
+    colour_norm = TwoSlopeNorm(
+        vmin=-maximum_log2,
+        vcenter=0.0,
+        vmax=maximum_log2,
+    )
+
+    if len(hot_fractions) == 1:
+        half_step = 0.05
+    else:
+        half_step = min(right - left for left, right in pairwise(hot_fractions)) / 2.0
+    x_edges = [
+        hot_fractions[0] - half_step,
+        *[(left + right) / 2.0 for left, right in pairwise(hot_fractions)],
+        hot_fractions[-1] + half_step,
+    ]
+    y_edges = [index - 0.5 for index in range(len(references) + 1)]
+
     fig, axes = plt.subplots(
-        len(fill_ratios),
-        len(query_counts),
-        figsize=(4.2 * len(query_counts), 3.0 * len(fill_ratios) + 2.4),
+        len(percentile_columns),
+        len(panel_columns),
+        figsize=(3.2 * len(panel_columns), 5.8),
         sharex=True,
         sharey=True,
         squeeze=False,
     )
-    colours = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    reference_colours = {
-        reference: colours[index % len(colours)]
-        for index, reference in enumerate(references)
-    }
+    mesh = None
     skew_ticks = [value / 100.0 for value in range(0, 51, 10)]
-
-    for panel_row, fill_ratio in enumerate(fill_ratios):
-        for panel_column, query_count in enumerate(query_counts):
-            ax = axes[panel_row][panel_column]
+    for percentile_row, (column, percentile) in enumerate(percentile_columns):
+        for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
+            ax = axes[percentile_row][panel_column]
             panel = data[
                 (data["fill_ratio"] == fill_ratio)
                 & (data["query_count"] == query_count)
             ]
-            for reference in references:
-                curve = panel[panel["reference_count"] == reference].sort_values(
-                    "hot_fraction"
+            matrix = (
+                panel.pivot(
+                    index="reference_count",
+                    columns="hot_fraction",
+                    values=column,
                 )
-                if curve.empty:
-                    continue
-                markevery = max(1, len(curve) // 10)
-                colour = reference_colours[reference]
-                ax.plot(
-                    curve["hot_fraction"],
-                    curve["p50_log2_speedup"],
-                    color=colour,
-                    linewidth=pu.LINE_WIDTH,
-                    marker="o",
-                    markersize=pu.MARKER_SIZE - 1,
-                    markevery=markevery,
-                )
-                ax.plot(
-                    curve["hot_fraction"],
-                    curve["p95_log2_speedup"],
-                    color=colour,
-                    linewidth=pu.LINE_WIDTH,
-                    linestyle="--",
-                    marker="o",
-                    markersize=pu.MARKER_SIZE - 1,
-                    markevery=markevery,
-                )
-
-            ax.axhline(
-                0.0,
-                color="#202020",
-                linewidth=pu.REFERENCE_LINE_WIDTH,
-                linestyle=":",
+                .reindex(index=references, columns=hot_fractions)
+                .to_numpy(dtype=float)
+            )
+            mesh = ax.pcolormesh(
+                x_edges,
+                y_edges,
+                matrix,
+                cmap=colour_map,
+                norm=colour_norm,
+                shading="flat",
+                edgecolors="white",
+                linewidth=0.8,
             )
             ax.set_xlim(0.0, 0.5)
+            ax.set_ylim(len(references) - 0.5, -0.5)
             ax.set_xticks(skew_ticks)
             ax.set_xticklabels(
                 [f"{value:.0%}" for value in skew_ticks],
                 fontsize=pu.TICK_LABEL_FONT_SIZE,
             )
+            ax.set_yticks(range(len(references)))
+            ax.set_yticklabels(
+                [f"{int(reference):,}" for reference in references],
+                fontsize=pu.TICK_LABEL_FONT_SIZE,
+            )
             ax.set_title(
-                pu.paper_text(f"{int(query_count):,} queries", bold=True),
+                pu.paper_text(
+                    f"{fill_ratio:.0%} fill, {int(query_count):,} q",
+                    bold=True,
+                ),
                 fontsize=pu.TITLE_FONT_SIZE,
             )
             if panel_column == 0:
                 ax.set_ylabel(
-                    pu.paper_text(f"{fill_ratio:.0%} fill\nlog2 time ratio"),
+                    pu.paper_text(f"{percentile}\nReferences"),
                     fontsize=pu.AXIS_LABEL_FONT_SIZE,
                 )
-            if panel_row == len(fill_ratios) - 1:
+            if percentile_row == len(percentile_columns) - 1:
                 ax.set_xlabel(
                     pu.paper_text("Hot-bucket fraction"),
                     fontsize=pu.AXIS_LABEL_FONT_SIZE,
                 )
-            ax.tick_params(axis="y", labelsize=pu.TICK_LABEL_FONT_SIZE)
-            ax.grid(axis="y", linestyle="--", alpha=pu.GRID_ALPHA)
-            ax.set_axisbelow(True)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
+            else:
+                ax.tick_params(axis="x", labelbottom=False)
+            ax.tick_params(axis="both", length=0)
+            ax.spines[:].set_visible(False)
 
-    reference_handles = [
-        Line2D(
-            [0],
-            [0],
-            color=reference_colours[reference],
-            linewidth=pu.LINE_WIDTH,
-            marker="o",
-            label=f"{int(reference):,} refs",
-        )
-        for reference in references
-    ]
-    percentile_handles = [
-        Line2D(
-            [0],
-            [0],
-            color="#202020",
-            linewidth=pu.LINE_WIDTH,
-            linestyle=linestyle,
-            marker="o",
-            label=percentile,
-        )
-        for percentile, linestyle in (("p50", "-"), ("p95", "--"))
-    ]
-    fig.legend(
-        handles=[*reference_handles, *percentile_handles],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.85),
-        ncol=min(3, len(reference_handles) + len(percentile_handles)),
-        fontsize=pu.DEFAULT_FONT_SIZE,
-        frameon=False,
+    if mesh is None:
+        raise typer.BadParameter("CSV has no heatmap workloads")
+    colorbar = fig.colorbar(
+        mesh,
+        ax=axes.ravel().tolist(),
+        fraction=0.025,
+        pad=0.025,
     )
+    colorbar.set_label(
+        pu.paper_text("log2(exhaustive / indexed time)"),
+        fontsize=pu.AXIS_LABEL_FONT_SIZE,
+    )
+    colorbar.ax.tick_params(labelsize=pu.TICK_LABEL_FONT_SIZE)
     fig.suptitle(
         pu.paper_text("Indexed versus exhaustive search", bold=True),
         fontsize=pu.TITLE_FONT_SIZE,
@@ -217,18 +221,19 @@ def main(
         0.5,
         0.87,
         pu.paper_text(
-            "Above 0 favours indexed; below 0 favours exhaustive.\n"
-            "Values are log2 time ratios. Solid p50, dashed p95."
+            "Blue = indexed faster; orange = exhaustive faster.\n"
+            "Colour is log2(exhaustive / indexed); p50 and p95 are separate rows."
         ),
         fontsize=pu.DEFAULT_FONT_SIZE,
         ha="center",
     )
     fig.subplots_adjust(
-        left=0.16,
-        right=0.98,
+        left=0.12,
+        right=0.84,
+        bottom=0.14,
         top=0.70,
-        hspace=0.32,
-        wspace=0.16,
+        hspace=0.35,
+        wspace=0.18,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     pu.save_figure(fig, output, pad_inches=0.10)
