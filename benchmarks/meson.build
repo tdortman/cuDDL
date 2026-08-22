@@ -41,3 +41,11 @@ executable(
     cuda_args: cuda_args,
     install: false,
 )
+
+executable(
+    'cuddl-search-decision-benchmark',
+    'cuddl_search_decision_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
