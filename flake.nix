@@ -35,6 +35,7 @@
               cccl
               cuda_profiler_api.include
               cuda_cuobjdump
+              cuda_nvdisasm
 
               cuda_gdb.bin
               nsight_systems
