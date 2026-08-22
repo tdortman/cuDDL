@@ -27,7 +27,7 @@ using database_type = cuddl::reference_database<25, 2048>;
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
 constexpr uint64_t k_fixture_seed = 4242;
-constexpr double k_hot_fraction = 0.5;
+constexpr nvbench::int64_t k_max_hot_percentage = 50;
 constexpr uint32_t k_minimum_matches = 5;
 constexpr uint64_t k_score_count = uint64_t{1} << 16U;
 constexpr uint64_t k_index_cell_count = k_bucket_count * k_score_count;
@@ -35,13 +35,13 @@ constexpr uint32_t k_score_period = std::numeric_limits<uint16_t>::max();
 
 std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
 std::vector<nvbench::int64_t> const fill_permilles{250, 1000};
-std::vector<std::string> const skews{"uniform", "hot"};
+std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
 std::vector<nvbench::int64_t> const query_counts{1, 32};
 
 struct workload {
     uint32_t reference_count{};
     double fill_ratio{};
-    std::string skew;
+    double hot_fraction{};
     uint32_t query_count{};
 };
 
@@ -77,12 +77,16 @@ struct minimum_matches_predicate {
 [[nodiscard]] workload read_workload(nvbench::state& state, bool includes_queries) {
     auto const references = state.get_int64("References");
     auto const fill_permille = state.get_int64("FillPermille");
+    auto const hot_percentage = state.get_int64("HotPercent");
     auto const queries = includes_queries ? state.get_int64("Queries") : 1;
     if (references <= 0 || references > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("reference count exceeds the supported 32-bit range");
     }
     if (fill_permille <= 0 || fill_permille > 1000) {
         throw std::runtime_error("fill permille must be in [1, 1000]");
+    }
+    if (hot_percentage < 0 || hot_percentage > k_max_hot_percentage) {
+        throw std::runtime_error("hot skew must be in [0%, 50%]");
     }
     if (queries <= 0 || queries > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("query count exceeds the supported 32-bit range");
@@ -94,7 +98,7 @@ struct minimum_matches_predicate {
     return {
         .reference_count = static_cast<uint32_t>(references),
         .fill_ratio = static_cast<double>(fill_permille) / 1000.0,
-        .skew = state.get_string("Skew"),
+        .hot_fraction = static_cast<double>(hot_percentage) / 100.0,
         .query_count = static_cast<uint32_t>(queries),
     };
 }
@@ -113,7 +117,7 @@ void add_common_metadata(nvbench::state& state, workload const& value, size_t fr
     CUDDL_CUDA_CALL(cudaDriverGetVersion(&driver_version));
 
     add_value(state, "fixture_seed", static_cast<double>(k_fixture_seed));
-    add_value(state, "hot_fraction", k_hot_fraction);
+    add_value(state, "hot_fraction", value.hot_fraction);
     add_value(state, "minimum_matches", k_minimum_matches);
     add_value(state, "free_memory_before_bytes", static_cast<double>(free_memory_bytes));
     add_value(state, "cuda_runtime_version", runtime_version);
@@ -182,12 +186,9 @@ void add_common_metadata(nvbench::state& state, workload const& value, size_t fr
     auto const fill_count = std::clamp<size_t>(
         static_cast<size_t>(std::llround(settings.fill_ratio * k_bucket_count)), 1U, k_bucket_count
     );
-    auto const hot_count =
-        settings.skew == "hot"
-            ? std::clamp<size_t>(
-                  static_cast<size_t>(std::llround(k_hot_fraction * fill_count)), 1U, fill_count
-              )
-            : 0U;
+    auto const hot_count = std::clamp<size_t>(
+        static_cast<size_t>(std::llround(settings.hot_fraction * fill_count)), 0U, fill_count
+    );
 
     std::vector<size_t> buckets(fill_count);
     std::vector<uint32_t> shifts(fill_count);
@@ -720,7 +721,7 @@ void indexed_search(nvbench::state& state) {
 NVBENCH_BENCH(compact_build)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("FillPermille", fill_permilles)
-    .add_string_axis("Skew", skews)
+    .add_int64_axis("HotPercent", hot_percentages)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -730,7 +731,7 @@ NVBENCH_BENCH(compact_build)
 NVBENCH_BENCH(indexed_build)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("FillPermille", fill_permilles)
-    .add_string_axis("Skew", skews)
+    .add_int64_axis("HotPercent", hot_percentages)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -740,7 +741,7 @@ NVBENCH_BENCH(indexed_build)
 NVBENCH_BENCH(exhaustive_search)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("FillPermille", fill_permilles)
-    .add_string_axis("Skew", skews)
+    .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
@@ -751,7 +752,7 @@ NVBENCH_BENCH(exhaustive_search)
 NVBENCH_BENCH(indexed_search)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("FillPermille", fill_permilles)
-    .add_string_axis("Skew", skews)
+    .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)

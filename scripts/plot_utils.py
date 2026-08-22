@@ -234,6 +234,7 @@ def save_figure(
     output_path: Path,
     message: str | None = None,
     close: bool = True,
+    pad_inches: float = 0.03,
 ) -> None:
     """Save a figure with consistent options and print success message.
 
@@ -242,10 +243,11 @@ def save_figure(
         output_path: Path to save the figure
         message: Optional custom success message (default: 'Saved {path}')
         close: Whether to close the figure after saving
+        pad_inches: Padding around the tight figure bounding box.
     """
     save_kwargs = {
         "bbox_inches": "tight",
-        "pad_inches": 0.03,
+        "pad_inches": pad_inches,
         "transparent": True,
         "format": "pdf",
         "dpi": 600,

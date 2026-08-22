@@ -135,7 +135,7 @@ def sample_times(path: Path, state: dict[str, Any]) -> list[float]:
 
 def state_key(state: dict[str, Any], include_queries: bool) -> tuple[str, ...]:
     axes = axis_values(state)
-    key = (axes["References"], axes["FillPermille"], axes["Skew"])
+    key = (axes["References"], axes["FillPermille"], axes["HotPercent"])
     return (*key, axes["Queries"]) if include_queries else key
 
 
@@ -181,7 +181,8 @@ def main(
     }
     devices = {device["id"]: device for device in document["devices"]}
     search_keys = sorted(
-        set(states["exhaustive_search"]) | set(states["indexed_search"])
+        set(states["exhaustive_search"]) | set(states["indexed_search"]),
+        key=lambda key: tuple(int(value) for value in key),
     )
     rows: list[dict[str, Any]] = []
 
@@ -220,7 +221,7 @@ def main(
             "global_memory_bytes": device["global_memory_size"],
             "reference_count": axes["References"],
             "fill_ratio": int(axes["FillPermille"]) / 1000.0,
-            "skew": axes["Skew"],
+            "skew": f"{int(axes['HotPercent'])}%",
             "query_count": axes["Queries"],
             "warmup": representative["cold_warmup_runs"],
             "kill_gate_rule": "indexed wins only when both p50 and p95 are strictly lower",
