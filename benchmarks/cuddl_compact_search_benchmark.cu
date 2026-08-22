@@ -267,6 +267,389 @@ void launch_cooperative_exhaustive(
     CUDDL_CUDA_CALL(cudaGetLastError());
 }
 
+std::vector<nvbench::int64_t> const
+    parameter_reference_counts{
+        1, 64, 1024, 2048, 2560, 3072, 4096, 8192, 16384, 65536, 200687
+    };
+std::vector<std::string> const parameter_row_types{"compact", "packed"};
+std::vector<std::string> const parameter_launches{
+    "cub_b32_w1", "cub_b64_w1", "cub_b128_w1", "cub_b256_w1", "cub_b512_w1", "cub_b1024_w1",
+    "cg_b32_w1",  "cg_b64_w1",  "cg_b128_w1",  "cg_b256_w1",  "cg_b512_w1",  "cg_b1024_w1",
+    "cg_b64_w2",  "cg_b128_w2", "cg_b256_w2",  "cg_b512_w2",  "cg_b1024_w2", "cg_b128_w4",
+    "cg_b256_w4", "cg_b512_w4", "cg_b1024_w4", "cg_b256_w8",  "cg_b512_w8",  "cg_b1024_w8",
+};
+
+std::vector<uint32_t> pack_rows(std::vector<uint16_t> const& rows) {
+    std::vector<uint32_t> packed(rows.size());
+    for (size_t index = 0; index < rows.size(); ++index) {
+        packed[index] = cuddl::detail::pack(rows[index], rows[index] == 0U ? 0U : 1U);
+    }
+    return packed;
+}
+
+template <uint32_t BlockSize, typename ReferenceRow>
+__global__ __launch_bounds__(BlockSize) void parameterised_cub_exhaustive_search_kernel(
+    ReferenceRow const* rows,
+    uint32_t reference_count,
+    uint16_t const* query,
+    cuddl::reference_search_result* results
+) {
+    static_assert(BlockSize % 32U == 0U);
+    constexpr uint32_t warp_width = 32U;
+    constexpr uint32_t warps_per_block = BlockSize / warp_width;
+    using warp_reduce = cub::WarpReduce<cuddl::pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const reference_id = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    if (reference_id >= reference_count) {
+        return;
+    }
+
+    cuddl::pairwise_counts local{};
+    auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
+    for (auto bucket = static_cast<size_t>(lane); bucket < k_bucket_count; bucket += warp_width) {
+        cuddl::detail::classify(
+            local, query[bucket], cuddl::detail::reference_score(rows[row_offset + bucket])
+        );
+    }
+    auto const total = warp_reduce(storage[warp]).Sum(local);
+    if (lane == 0U) {
+        write_search_result(results, reference_id, total);
+    }
+}
+
+template <uint32_t BlockSize, uint32_t WarpsPerReference, typename ReferenceRow>
+__global__ __launch_bounds__(BlockSize) void parameterised_cooperative_exhaustive_search_kernel(
+    ReferenceRow const* rows,
+    uint32_t reference_count,
+    uint16_t const* query,
+    cuddl::reference_search_result* results
+) {
+    static_assert(BlockSize % 32U == 0U);
+    static_assert(
+        WarpsPerReference == 1U || WarpsPerReference == 2U || WarpsPerReference == 4U ||
+        WarpsPerReference == 8U
+    );
+    static_assert(BlockSize >= 32U * WarpsPerReference);
+    static_assert(BlockSize % (32U * WarpsPerReference) == 0U);
+    constexpr uint32_t warp_width = 32U;
+    constexpr uint32_t warps_per_block = BlockSize / warp_width;
+    constexpr uint32_t threads_per_reference = warp_width * WarpsPerReference;
+    constexpr uint32_t references_per_block = warps_per_block / WarpsPerReference;
+
+    __shared__ cuddl::pairwise_counts warp_summaries[warps_per_block];
+    auto const block = cg::this_thread_block();
+    auto const warp = cg::tiled_partition<warp_width>(block);
+    auto const reference_in_block = static_cast<uint32_t>(threadIdx.x) / threads_per_reference;
+    auto const thread_in_reference = static_cast<uint32_t>(threadIdx.x) % threads_per_reference;
+    auto const warp_in_reference = thread_in_reference / warp_width;
+    auto const reference_id =
+        static_cast<uint32_t>(blockIdx.x) * references_per_block + reference_in_block;
+    auto const valid_reference = reference_id < reference_count;
+
+    cuddl::pairwise_counts local{};
+    if (valid_reference) {
+        auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
+        for (auto bucket = static_cast<size_t>(thread_in_reference); bucket < k_bucket_count;
+             bucket += threads_per_reference) {
+            cuddl::detail::classify(
+                local, query[bucket], cuddl::detail::reference_score(rows[row_offset + bucket])
+            );
+        }
+    }
+    auto const warp_total = reduce_warp(warp, local);
+
+    if constexpr (WarpsPerReference == 1U) {
+        if (warp.thread_rank() == 0U && valid_reference) {
+            write_search_result(results, reference_id, warp_total);
+        }
+        return;
+    }
+
+    if (warp.thread_rank() == 0U) {
+        warp_summaries[static_cast<uint32_t>(threadIdx.x) / warp_width] = warp_total;
+    }
+    block.sync();
+
+    if (warp_in_reference == 0U) {
+        cuddl::pairwise_counts partial{};
+        if (warp.thread_rank() < WarpsPerReference) {
+            partial = warp_summaries[reference_in_block * WarpsPerReference + warp.thread_rank()];
+        }
+        auto const reference_total = reduce_warp(warp, partial);
+        if (warp.thread_rank() == 0U && valid_reference) {
+            write_search_result(results, reference_id, reference_total);
+        }
+    }
+}
+
+template <uint32_t BlockSize, typename ReferenceRow>
+void launch_parameterised_cub(
+    thrust::device_vector<ReferenceRow> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    constexpr uint32_t references_per_block = BlockSize / 32U;
+    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
+    parameterised_cub_exhaustive_search_kernel<BlockSize><<<blocks, BlockSize, 0, stream>>>(
+        thrust::raw_pointer_cast(rows.data()),
+        reference_count,
+        thrust::raw_pointer_cast(query.data()),
+        thrust::raw_pointer_cast(results.data())
+    );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+}
+
+template <uint32_t BlockSize, uint32_t WarpsPerReference, typename ReferenceRow>
+void launch_parameterised_cooperative(
+    thrust::device_vector<ReferenceRow> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    constexpr uint32_t references_per_block = BlockSize / (32U * WarpsPerReference);
+    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
+    parameterised_cooperative_exhaustive_search_kernel<BlockSize, WarpsPerReference>
+        <<<blocks, BlockSize, 0, stream>>>(
+            thrust::raw_pointer_cast(rows.data()),
+            reference_count,
+            thrust::raw_pointer_cast(query.data()),
+            thrust::raw_pointer_cast(results.data())
+        );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+}
+
+template <typename ReferenceRow>
+void launch_parameterised(
+    std::string const& launch,
+    thrust::device_vector<ReferenceRow> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    auto const block_begin = launch.find("_b") + 2U;
+    auto const warp_begin = launch.find("_w") + 2U;
+    auto const block_size = static_cast<uint32_t>(
+        std::stoul(launch.substr(block_begin, warp_begin - 2U - block_begin))
+    );
+    auto const warps = static_cast<uint32_t>(std::stoul(launch.substr(warp_begin)));
+    auto const is_cub = launch.starts_with("cub_");
+
+    if (is_cub) {
+        if (warps != 1U) {
+            throw std::runtime_error("CUB parameterisation requires one warp per reference");
+        }
+        switch (block_size) {
+            case 32U:
+                launch_parameterised_cub<32U>(rows, reference_count, query, results, stream);
+                return;
+            case 64U:
+                launch_parameterised_cub<64U>(rows, reference_count, query, results, stream);
+                return;
+            case 128U:
+                launch_parameterised_cub<128U>(rows, reference_count, query, results, stream);
+                return;
+            case 256U:
+                launch_parameterised_cub<256U>(rows, reference_count, query, results, stream);
+                return;
+            case 512U:
+                launch_parameterised_cub<512U>(rows, reference_count, query, results, stream);
+                return;
+            case 1024U:
+                launch_parameterised_cub<1024U>(rows, reference_count, query, results, stream);
+                return;
+            default:
+                throw std::runtime_error("unknown CUB parameterised block size");
+        }
+    }
+
+    switch (block_size) {
+        case 32U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<32U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        case 64U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<64U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 2U) {
+                launch_parameterised_cooperative<64U, 2U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        case 128U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<128U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 2U) {
+                launch_parameterised_cooperative<128U, 2U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 4U) {
+                launch_parameterised_cooperative<128U, 4U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        case 256U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<256U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 2U) {
+                launch_parameterised_cooperative<256U, 2U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 4U) {
+                launch_parameterised_cooperative<256U, 4U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 8U) {
+                launch_parameterised_cooperative<256U, 8U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        case 512U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<512U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 2U) {
+                launch_parameterised_cooperative<512U, 2U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 4U) {
+                launch_parameterised_cooperative<512U, 4U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 8U) {
+                launch_parameterised_cooperative<512U, 8U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        case 1024U:
+            if (warps == 1U) {
+                launch_parameterised_cooperative<1024U, 1U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 2U) {
+                launch_parameterised_cooperative<1024U, 2U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 4U) {
+                launch_parameterised_cooperative<1024U, 4U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            if (warps == 8U) {
+                launch_parameterised_cooperative<1024U, 8U>(
+                    rows, reference_count, query, results, stream
+                );
+                return;
+            }
+            break;
+        default:
+            break;
+    }
+    throw std::runtime_error("unknown cooperative parameterised launch");
+}
+
+template <typename ReferenceRow>
+void run_parameterised_exhaustive(
+    nvbench::state& state,
+    std::vector<ReferenceRow> const& rows,
+    std::vector<uint16_t> const& query,
+    thrust::host_vector<cuddl::reference_search_result> const& expected,
+    uint32_t reference_count,
+    std::string const& launch
+) {
+    thrust::device_vector<ReferenceRow> device_rows(rows);
+    thrust::device_vector<uint16_t> device_query(query);
+    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
+    auto const execute = [&](cudaStream_t stream) {
+        launch_parameterised(launch, device_rows, reference_count, device_query, results, stream);
+    };
+
+    execute(cudaStream_t{nullptr});
+    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    thrust::host_vector<cuddl::reference_search_result> observed(results);
+    if (!std::equal(expected.begin(), expected.end(), observed.begin())) {
+        throw std::runtime_error("parameterised exhaustive search disagrees with scalar oracle");
+    }
+
+    state.exec([&](nvbench::launch& nvbench_launch) { execute(nvbench_launch.get_stream()); });
+}
+
+void compact_exhaustive_parameter_sweep(nvbench::state& state) {
+    auto const reference_count = static_cast<uint32_t>(state.get_int64("References"));
+    auto const row_type = state.get_string("Row");
+    auto const launch = state.get_string("Launch");
+    auto const fixture = make_indexed_fixture(reference_count);
+    thrust::host_vector<cuddl::reference_search_result> expected_host(reference_count);
+    for (uint32_t reference_id = 0; reference_id < reference_count; ++reference_id) {
+        expected_host[reference_id] = {
+            .reference_id = reference_id,
+            .summary = score_row_oracle(fixture.query, fixture.rows, reference_id),
+        };
+    }
+
+    state.add_element_count(reference_count, "Exact Comparisons");
+    if (row_type == "compact") {
+        run_parameterised_exhaustive(
+            state, fixture.rows, fixture.query, expected_host, reference_count, launch
+        );
+    } else if (row_type == "packed") {
+        run_parameterised_exhaustive(
+            state, pack_rows(fixture.rows), fixture.query, expected_host, reference_count, launch
+        );
+    } else {
+        throw std::runtime_error("unknown parameter sweep row type");
+    }
+    add_median_time(state);
+    add_median_throughput(state, reference_count);
+}
 }  // namespace
 
 void compact_exhaustive_search(nvbench::state& state) {
@@ -761,6 +1144,13 @@ NVBENCH_BENCH(compact_exhaustive_search)
 NVBENCH_BENCH(compact_exhaustive_launch_shape)
     .add_int64_axis("References", launch_reference_counts)
     .add_string_axis("Launch", launch_shapes)
+    .set_stopping_criterion("sample-count")
+    .set_min_samples(20)
+    .set_criterion_param_int64("target-samples", 20);
+NVBENCH_BENCH(compact_exhaustive_parameter_sweep)
+    .add_int64_axis("References", parameter_reference_counts)
+    .add_string_axis("Row", parameter_row_types)
+    .add_string_axis("Launch", parameter_launches)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20);
