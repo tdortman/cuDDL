@@ -37,7 +37,7 @@ executable(
 executable(
     'cuddl-compact-search-benchmark',
     'cuddl_compact_search_benchmark.cu',
-    dependencies: [cuddl_dep, cli11_dep],
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
     cuda_args: cuda_args,
     install: false,
 )

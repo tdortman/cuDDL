@@ -1,14 +1,11 @@
-#include <CLI/CLI.hpp>
 #include <cuddl/cuddl.cuh>
+
+#include <nvbench/nvbench.cuh>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
-#include <thrust/memory.h>
 
-#include <cstddef>
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -16,91 +13,85 @@ namespace {
 
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
+std::vector<nvbench::int64_t> const reference_powers{8, 10, 12, 14, 16, 18, 20};
 
 uint16_t make_score(uint64_t value) {
     auto const hash = cuddl::detail::splitmix64(value);
     return (hash & 7U) == 0U ? 0U : static_cast<uint16_t>((hash >> 48U) | 1U);
 }
 
+cuddl::pairwise_summary score_row_oracle(
+    std::vector<uint16_t> const& query, std::vector<uint16_t> const& reference
+) {
+    cuddl::pairwise_summary summary{};
+    for (size_t bucket = 0; bucket < query.size(); ++bucket) {
+        if (query[bucket] == 0U && reference[bucket] == 0U) {
+            ++summary.counts.both_empty;
+        } else if (query[bucket] < reference[bucket]) {
+            ++summary.counts.lower;
+        } else if (query[bucket] > reference[bucket]) {
+            ++summary.counts.higher;
+        } else {
+            ++summary.counts.equal;
+        }
+    }
+    return summary;
+}
+
+void add_value(nvbench::state& state, char const* name, double value) {
+    auto& summary = state.add_summary(name);
+    summary.set_string("name", name);
+    summary.set_float64("value", value);
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
-    try {
-        CLI::App app{"Compact exhaustive cuDDL database-search smoke benchmark"};
-        uint32_t reference_count = 4096;
-        uint32_t iterations = 20;
-        uint64_t seed = 42;
-        app.add_option("--references", reference_count, "Reference rows")
-            ->check(CLI::PositiveNumber);
-        app.add_option("--iterations", iterations, "Timed query repetitions")
-            ->check(CLI::PositiveNumber);
-        app.add_option("--seed", seed, "Deterministic score seed");
-        CLI11_PARSE(app, argc, argv);
+void compact_exhaustive_search(nvbench::state& state) {
+    auto const reference_count = static_cast<size_t>(state.get_int64("References"));
+    constexpr uint64_t seed = 42;
 
-        std::vector<uint16_t> rows(static_cast<size_t>(reference_count) * k_bucket_count);
-        std::vector<uint16_t> query(k_bucket_count);
-        for (size_t bucket = 0; bucket < k_bucket_count; ++bucket) {
-            query[bucket] = make_score(seed + bucket);
-        }
-        for (size_t offset = 0; offset < rows.size(); ++offset) {
-            rows[offset] = make_score(seed + k_bucket_count + offset);
-        }
-
-        thrust::device_vector<uint16_t> device_rows(rows);
-        thrust::device_vector<uint16_t> device_query(query);
-        thrust::device_vector<cuddl::reference_search_result> results(reference_count);
-        thrust::device_vector<uint8_t> workspace;
-        auto const compatibility =
-            cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
-        auto database =
-            CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
-                device_rows, compatibility
-            )));
-        CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-
-        auto const search = [&] {
-            CUDDL_UNWRAP(
-                database.search_async(device_query, compatibility, workspace, results)
-            );
-        };
-        search();
-        CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-
-        cudaEvent_t start{};
-        cudaEvent_t stop{};
-        CUDDL_CUDA_CALL(cudaEventCreate(&start));
-        CUDDL_CUDA_CALL(cudaEventCreate(&stop));
-        CUDDL_CUDA_CALL(cudaEventRecord(start));
-        for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
-            search();
-        }
-        CUDDL_CUDA_CALL(cudaEventRecord(stop));
-        CUDDL_CUDA_CALL(cudaEventSynchronize(stop));
-        float elapsed_ms = 0.0F;
-        CUDDL_CUDA_CALL(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        CUDDL_CUDA_CALL(cudaEventDestroy(stop));
-        CUDDL_CUDA_CALL(cudaEventDestroy(start));
-
-        cuddl::reference_search_result first{};
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            &first, thrust::raw_pointer_cast(results.data()), sizeof(first), cudaMemcpyDeviceToHost
-        ));
-        auto const bucket_total = first.summary.counts.lower + first.summary.counts.equal +
-                                  first.summary.counts.higher + first.summary.counts.both_empty;
-        if (first.reference_id != 0U || bucket_total != k_bucket_count) {
-            throw std::runtime_error("compact search produced an invalid exact result");
-        }
-
-        auto const exact_comparisons = static_cast<uint64_t>(reference_count) * iterations;
-        auto const throughput =
-            static_cast<double>(exact_comparisons) * 1000.0 / static_cast<double>(elapsed_ms);
-        std::cout << "references=" << reference_count << '\n'
-                  << "iterations=" << iterations << '\n'
-                  << "exact_comparisons=" << exact_comparisons << '\n'
-                  << std::fixed << std::setprecision(3) << "elapsed_ms=" << elapsed_ms << '\n'
-                  << "throughput_comparisons_per_second=" << throughput << '\n';
-    } catch (std::exception const& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+    std::vector<uint16_t> rows(reference_count * k_bucket_count);
+    std::vector<uint16_t> query(k_bucket_count);
+    for (size_t bucket = 0; bucket < k_bucket_count; ++bucket) {
+        query[bucket] = make_score(seed + bucket);
     }
+    for (size_t offset = 0; offset < rows.size(); ++offset) {
+        rows[offset] = make_score(seed + k_bucket_count + offset);
+    }
+
+    thrust::device_vector<uint16_t> device_rows(rows);
+    thrust::device_vector<uint16_t> device_query(query);
+    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
+    thrust::device_vector<uint8_t> workspace;
+    auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
+    auto database =
+        CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
+            device_rows, compatibility
+        )));
+    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+
+    CUDDL_UNWRAP(database.search_async(device_query, compatibility, workspace, results));
+    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    cuddl::reference_search_result first{};
+    CUDDL_CUDA_CALL(cudaMemcpy(
+        &first, thrust::raw_pointer_cast(results.data()), sizeof(first), cudaMemcpyDeviceToHost
+    ));
+    if (first.reference_id != 0U || first.summary != score_row_oracle(query, rows)) {
+        throw std::runtime_error("compact search disagrees with the scalar oracle");
+    }
+
+    state.add_element_count(reference_count, "Exact Comparisons");
+    state.add_global_memory_reads<uint16_t>(2 * reference_count * k_bucket_count);
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        CUDDL_UNWRAP(database.search_async(
+            device_query, compatibility, workspace, results, cuda::stream_ref{launch.get_stream()}
+        ));
+    });
+
+    auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
+    add_value(state, "Median GPU Time", median);
+    add_value(state, "Median Throughput", static_cast<double>(reference_count) / median);
 }
+
+NVBENCH_BENCH(compact_exhaustive_search)
+    .add_int64_power_of_two_axis("References", reference_powers);
