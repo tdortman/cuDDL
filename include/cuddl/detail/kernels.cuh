@@ -176,6 +176,122 @@ __global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
     }
 }
 
+/// @brief Counts every non-empty score row entry in its dense index cell.
+template <size_t BucketCount>
+__global__ void count_index_cells_kernel(device_span<uint16_t const> rows, uint32_t* cell_counts) {
+    constexpr uint64_t score_count = uint64_t{1} << 16U;
+    auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (; offset < rows.size(); offset += stride) {
+        auto const score = rows[offset];
+        if (score == 0U) {
+            continue;
+        }
+        auto const bucket = offset % BucketCount;
+        auto const cell = bucket * score_count + score;
+        atomicAdd(&cell_counts[cell], 1U);
+    }
+}
+
+/// @brief Scatters every non-empty score row entry into its dense CSR posting range.
+template <size_t BucketCount>
+__global__ void scatter_index_postings_kernel(
+    device_span<uint16_t const> rows,
+    uint32_t* cursors,
+    uint32_t* postings
+) {
+    constexpr uint64_t score_count = uint64_t{1} << 16U;
+    auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (; offset < rows.size(); offset += stride) {
+        auto const score = rows[offset];
+        if (score == 0U) {
+            continue;
+        }
+        auto const bucket = offset % BucketCount;
+        auto const cell = bucket * score_count + score;
+        auto const posting = atomicAdd(&cursors[cell], 1U);
+        postings[posting] = static_cast<uint32_t>(offset / BucketCount);
+    }
+}
+
+/// @brief Counts the query's non-empty posting matches for every reference.
+template <size_t BucketCount>
+__global__ void count_index_matches_kernel(
+    device_span<uint16_t const> query,
+    device_span<uint32_t const> offsets,
+    device_span<uint32_t const> postings,
+    uint32_t* match_counts
+) {
+    constexpr uint64_t score_count = uint64_t{1} << 16U;
+    auto const bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (bucket >= BucketCount) {
+        return;
+    }
+    auto const score = query[bucket];
+    if (score == 0U) {
+        return;
+    }
+    auto const cell = bucket * score_count + score;
+    auto const begin = offsets[cell];
+    auto const end = offsets[cell + 1U];
+    for (auto posting = begin; posting < end; ++posting) {
+        atomicAdd(&match_counts[postings[posting]], 1U);
+    }
+}
+
+/// @brief Stable CUB selection predicate over per-reference match counts.
+struct minimum_match_predicate {
+    uint32_t const* match_counts;
+    uint32_t minimum_matches;
+
+    [[nodiscard]] __host__ __device__ bool operator()(uint32_t reference_id) const noexcept {
+        return match_counts[reference_id] >= minimum_matches;
+    }
+};
+
+/// @brief Writes a known exhaustive result count without host-lifetime coupling.
+__global__ void write_result_count_kernel(uint32_t value, uint32_t* result_count) {
+    if (threadIdx.x == 0) {
+        *result_count = value;
+    }
+}
+
+/// @brief Exactly refines every stably selected reference over its full score row.
+template <size_t BucketCount, typename SearchResult>
+__global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
+    device_span<uint16_t const> rows,
+    device_span<uint16_t const> query,
+    uint32_t const* candidate_ids,
+    uint32_t const* candidate_count,
+    SearchResult* results
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    using warp_reduce = cub::WarpReduce<pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    if (candidate_index >= *candidate_count) {
+        return;
+    }
+
+    auto const reference_id = candidate_ids[candidate_index];
+    pairwise_counts local{};
+    auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
+    for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
+        classify(local, query[bucket], rows[row_offset + bucket]);
+    }
+    auto const total = warp_reduce(storage[warp]).Sum(local);
+    if (lane == 0U) {
+        results[candidate_index].reference_id = reference_id;
+        results[candidate_index].summary.counts = total;
+        results[candidate_index].summary.cardinality = 0.0;
+    }
+}
+
 /**
  * @brief Computes the cardinality of a single constructed sketch.
  *
