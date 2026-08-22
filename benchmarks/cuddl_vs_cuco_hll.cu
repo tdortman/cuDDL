@@ -13,6 +13,7 @@
 #include <cuda/std/cstdint>
 
 #include <vector>
+#include "common.cuh"
 
 namespace {
 
@@ -23,27 +24,6 @@ std::vector<nvbench::int64_t> const construction_powers{20, 21, 22, 23, 24, 25, 
 std::vector<nvbench::int64_t> const cardinality_powers{
     8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 };
-
-template <typename T>
-__forceinline__ void do_not_optimise(T& value) {
-    asm volatile("" : "+m,r"(value) : : "memory");
-}
-
-void add_value(nvbench::state& state, char const* name, double value) {
-    auto& summary = state.add_summary(name);
-    summary.set_string("name", name);
-    summary.set_float64("value", value);
-}
-
-void add_median_time(nvbench::state& state) {
-    auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
-    add_value(state, "Median GPU Time", median);
-}
-
-void add_median_throughput(nvbench::state& state, size_t count) {
-    auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
-    add_value(state, "Median Throughput", static_cast<double>(count) / median);
-}
 
 /// @brief Generates deterministic packed k-mers.
 std::vector<uint64_t> make_inputs(size_t count) {
