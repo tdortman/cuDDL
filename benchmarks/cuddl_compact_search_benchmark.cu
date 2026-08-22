@@ -1,24 +1,43 @@
 #include <cuddl/cuddl.cuh>
+#include <cuddl/detail/comparison.cuh>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#include <cub/warp/warp_reduce.cuh>
 #include <nvbench/nvbench.cuh>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 
 #include <algorithm>
 #include <cstdint>
 
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #include "common.cuh"
 
 namespace {
+namespace cg = cooperative_groups;
 
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
+constexpr uint32_t k_launch_block_size = 256;
 std::vector<nvbench::int64_t> const reference_powers{8, 10, 12, 14, 16, 18, 20};
 std::vector<nvbench::int64_t> const indexed_reference_powers{8, 10, 12, 14, 16, 18};
+std::vector<nvbench::int64_t> const
+    launch_reference_counts{1, 8, 64, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 200687};
+std::vector<std::string> const launch_shapes{
+    "current_cub_warp",
+    "raw_cub_warp",
+    "span_cub_warp",
+    "cg_1_warp",
+    "cg_2_warps",
+    "cg_4_warps",
+    "cg_8_warps",
+};
 
 uint16_t make_score(uint64_t value) {
     auto const hash = cuddl::detail::splitmix64(value);
@@ -84,6 +103,169 @@ cuddl::pairwise_summary score_row_oracle(
 ) {
     return score_row_oracle_rows(query.data(), references.data() + reference_id * query.size());
 }
+__device__ cuddl::pairwise_counts
+reduce_warp(cg::thread_block_tile<32> const warp, cuddl::pairwise_counts counts) {
+    counts.lower = cg::reduce(warp, counts.lower, cg::plus<uint32_t>{});
+    counts.equal = cg::reduce(warp, counts.equal, cg::plus<uint32_t>{});
+    counts.higher = cg::reduce(warp, counts.higher, cg::plus<uint32_t>{});
+    counts.both_empty = cg::reduce(warp, counts.both_empty, cg::plus<uint32_t>{});
+    return counts;
+}
+
+__device__ void write_search_result(
+    cuddl::reference_search_result* results,
+    uint32_t reference_id,
+    cuddl::pairwise_counts counts
+) {
+    results[reference_id].reference_id = reference_id;
+    results[reference_id].summary.counts = counts;
+    results[reference_id].summary.cardinality = 0.0;
+}
+template <typename Rows, typename Query>
+__global__ __launch_bounds__(k_launch_block_size) void cub_warp_exhaustive_search_kernel(
+    Rows rows,
+    uint32_t reference_count,
+    Query query,
+    cuddl::reference_search_result* results
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = k_launch_block_size / warp_width;
+    using warp_reduce = cub::WarpReduce<cuddl::pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const reference_id = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    if (reference_id >= reference_count) {
+        return;
+    }
+
+    cuddl::pairwise_counts local{};
+    auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
+    for (auto bucket = static_cast<size_t>(lane); bucket < k_bucket_count; bucket += warp_width) {
+        cuddl::detail::classify(local, query[bucket], rows[row_offset + bucket]);
+    }
+    auto const total = warp_reduce(storage[warp]).Sum(local);
+    if (lane == 0U) {
+        write_search_result(results, reference_id, total);
+    }
+}
+
+void launch_raw_cub_exhaustive(
+    thrust::device_vector<uint16_t> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    constexpr uint32_t references_per_block = k_launch_block_size / 32U;
+    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
+    cub_warp_exhaustive_search_kernel<<<blocks, k_launch_block_size, 0, stream>>>(
+        thrust::raw_pointer_cast(rows.data()),
+        reference_count,
+        thrust::raw_pointer_cast(query.data()),
+        thrust::raw_pointer_cast(results.data())
+    );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+}
+
+void launch_span_cub_exhaustive(
+    thrust::device_vector<uint16_t> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    constexpr uint32_t references_per_block = k_launch_block_size / 32U;
+    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
+    cub_warp_exhaustive_search_kernel<<<blocks, k_launch_block_size, 0, stream>>>(
+        cuddl::device_span<uint16_t const>{thrust::raw_pointer_cast(rows.data()), rows.size()},
+        reference_count,
+        cuddl::device_span<uint16_t const>{thrust::raw_pointer_cast(query.data()), query.size()},
+        thrust::raw_pointer_cast(results.data())
+    );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+}
+
+template <uint32_t WarpsPerReference>
+__global__ __launch_bounds__(k_launch_block_size) void cooperative_exhaustive_search_kernel(
+    uint16_t const* rows,
+    uint32_t reference_count,
+    uint16_t const* query,
+    cuddl::reference_search_result* results
+) {
+    static_assert(
+        WarpsPerReference == 1U || WarpsPerReference == 2U || WarpsPerReference == 4U ||
+        WarpsPerReference == 8U
+    );
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = k_launch_block_size / warp_width;
+    constexpr uint32_t threads_per_reference = warp_width * WarpsPerReference;
+    constexpr uint32_t references_per_block = warps_per_block / WarpsPerReference;
+
+    __shared__ cuddl::pairwise_counts warp_summaries[warps_per_block];
+    auto const block = cg::this_thread_block();
+    auto const warp = cg::tiled_partition<warp_width>(block);
+    auto const reference_in_block = static_cast<uint32_t>(threadIdx.x) / threads_per_reference;
+    auto const thread_in_reference = static_cast<uint32_t>(threadIdx.x) % threads_per_reference;
+    auto const warp_in_reference = thread_in_reference / warp_width;
+    auto const reference_id =
+        static_cast<uint32_t>(blockIdx.x) * references_per_block + reference_in_block;
+    auto const valid_reference = reference_id < reference_count;
+
+    cuddl::pairwise_counts local{};
+    if (valid_reference) {
+        auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
+        for (auto bucket = static_cast<size_t>(thread_in_reference); bucket < k_bucket_count;
+             bucket += threads_per_reference) {
+            cuddl::detail::classify(local, query[bucket], rows[row_offset + bucket]);
+        }
+    }
+    auto const warp_total = reduce_warp(warp, local);
+
+    if constexpr (WarpsPerReference == 1U) {
+        if (warp.thread_rank() == 0U && valid_reference) {
+            write_search_result(results, reference_id, warp_total);
+        }
+        return;
+    }
+
+    if (warp.thread_rank() == 0U) {
+        warp_summaries[static_cast<uint32_t>(threadIdx.x) / warp_width] = warp_total;
+    }
+    block.sync();
+
+    if (warp_in_reference == 0U) {
+        cuddl::pairwise_counts partial{};
+        if (warp.thread_rank() < WarpsPerReference) {
+            partial = warp_summaries[reference_in_block * WarpsPerReference + warp.thread_rank()];
+        }
+        auto const reference_total = reduce_warp(warp, partial);
+        if (warp.thread_rank() == 0U && valid_reference) {
+            write_search_result(results, reference_id, reference_total);
+        }
+    }
+}
+
+template <uint32_t WarpsPerReference>
+void launch_cooperative_exhaustive(
+    thrust::device_vector<uint16_t> const& rows,
+    uint32_t reference_count,
+    thrust::device_vector<uint16_t> const& query,
+    thrust::device_vector<cuddl::reference_search_result>& results,
+    cudaStream_t stream
+) {
+    constexpr uint32_t references_per_block = k_launch_block_size / (32U * WarpsPerReference);
+    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
+    cooperative_exhaustive_search_kernel<WarpsPerReference>
+        <<<blocks, k_launch_block_size, 0, stream>>>(
+            thrust::raw_pointer_cast(rows.data()),
+            reference_count,
+            thrust::raw_pointer_cast(query.data()),
+            thrust::raw_pointer_cast(results.data())
+        );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+}
 
 }  // namespace
 
@@ -132,6 +314,68 @@ void compact_exhaustive_search(nvbench::state& state) {
     auto const median = state.get_summary("nv/cold/time/gpu/median").get_float64("value");
     add_value(state, "Median GPU Time", median);
     add_value(state, "Median Throughput", static_cast<double>(reference_count) / median);
+}
+void compact_exhaustive_launch_shape(nvbench::state& state) {
+    auto const reference_count = static_cast<uint32_t>(state.get_int64("References"));
+    auto const launch_shape = state.get_string("Launch");
+    auto const fixture = make_indexed_fixture(reference_count);
+    thrust::device_vector<uint16_t> device_rows(fixture.rows);
+    thrust::device_vector<uint16_t> device_query(fixture.query);
+    thrust::device_vector<cuddl::reference_search_result> expected(reference_count);
+    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
+    thrust::device_vector<uint8_t> workspace;
+    auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
+    auto database =
+        CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
+            device_rows, compatibility
+        )));
+
+    auto const launch = [&](cudaStream_t stream) {
+        if (launch_shape == "current_cub_warp") {
+            CUDDL_UNWRAP(database.search_async(
+                device_query, compatibility, workspace, results, cuda::stream_ref{stream}
+            ));
+        } else if (launch_shape == "raw_cub_warp") {
+            launch_raw_cub_exhaustive(device_rows, reference_count, device_query, results, stream);
+        } else if (launch_shape == "span_cub_warp") {
+            launch_span_cub_exhaustive(device_rows, reference_count, device_query, results, stream);
+        } else if (launch_shape == "cg_1_warp") {
+            launch_cooperative_exhaustive<1U>(
+                device_rows, reference_count, device_query, results, stream
+            );
+        } else if (launch_shape == "cg_2_warps") {
+            launch_cooperative_exhaustive<2U>(
+                device_rows, reference_count, device_query, results, stream
+            );
+        } else if (launch_shape == "cg_4_warps") {
+            launch_cooperative_exhaustive<4U>(
+                device_rows, reference_count, device_query, results, stream
+            );
+        } else if (launch_shape == "cg_8_warps") {
+            launch_cooperative_exhaustive<8U>(
+                device_rows, reference_count, device_query, results, stream
+            );
+        } else {
+            throw std::runtime_error("unknown exhaustive launch shape");
+        }
+    };
+
+    CUDDL_UNWRAP(database.search_async(device_query, compatibility, workspace, expected));
+    launch(cudaStream_t{nullptr});
+    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    thrust::host_vector<cuddl::reference_search_result> expected_host(expected);
+    thrust::host_vector<cuddl::reference_search_result> results_host(results);
+    if (!std::equal(expected_host.begin(), expected_host.end(), results_host.begin())) {
+        throw std::runtime_error("cooperative exhaustive search disagrees with current search");
+    }
+
+    state.add_element_count(reference_count, "Exact Comparisons");
+    state.add_global_memory_reads<uint16_t>(
+        2ULL * static_cast<uint64_t>(reference_count) * k_bucket_count
+    );
+    state.exec([&](nvbench::launch& nvbench_launch) { launch(nvbench_launch.get_stream()); });
+    add_median_time(state);
+    add_median_throughput(state, reference_count);
 }
 
 void compact_indexed_build(nvbench::state& state) {
@@ -514,6 +758,12 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
 
 NVBENCH_BENCH(compact_exhaustive_search)
     .add_int64_power_of_two_axis("References", reference_powers);
+NVBENCH_BENCH(compact_exhaustive_launch_shape)
+    .add_int64_axis("References", launch_reference_counts)
+    .add_string_axis("Launch", launch_shapes)
+    .set_stopping_criterion("sample-count")
+    .set_min_samples(20)
+    .set_criterion_param_int64("target-samples", 20);
 NVBENCH_BENCH(compact_indexed_build)
     .add_int64_power_of_two_axis("References", indexed_reference_powers);
 NVBENCH_BENCH(compact_indexed_search)
