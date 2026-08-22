@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 #include <cuddl/detail/hash.cuh>
@@ -22,7 +23,7 @@
 
 namespace cuddl {
 
-/// @brief Construction parameters that must match between compact score rows.
+/// @brief Construction parameters shared by compatible compact and packed rows.
 struct score_compatibility {
     uint32_t kmer_length{};
     uint32_t bucket_count{};
@@ -60,7 +61,7 @@ struct score_compatibility {
     friend bool operator==(score_compatibility const&, score_compatibility const&) = default;
 };
 
-/// @brief Recorded metadata for an immutable compact reference database.
+/// @brief Recorded metadata for an immutable reference database.
 struct reference_database_metadata {
     score_compatibility compatibility{};
     uint32_t reference_count{};
@@ -124,7 +125,7 @@ inline constexpr uint64_t indexed_cell_count =
 }  // namespace detail
 
 /**
- * @brief Non-owning, trivially copyable view of contiguous compact reference rows.
+ * @brief Non-owning, trivially copyable view of one selected reference-row backing.
  *
  * Inputs, database rows, workspace, and results must remain valid until the supplied stream
  * completes.
@@ -137,6 +138,7 @@ class reference_database_ref {
 
    public:
     using score_type = uint16_t;
+    using register_type = uint32_t;
     using result_type = reference_search_result;
 
     __host__ __device__ constexpr reference_database_ref(
@@ -152,9 +154,41 @@ class reference_database_ref {
           index_postings_(index_postings),
           indexed_(indexed) {}
 
+    __host__ __device__ constexpr reference_database_ref(
+        device_span<register_type const> packed_rows,
+        device_span<uint32_t const> saturation_states,
+        reference_database_metadata metadata,
+        device_span<uint32_t const> index_offsets = {},
+        device_span<uint32_t const> index_postings = {},
+        bool indexed = false
+    ) noexcept
+        : packed_rows_(packed_rows),
+          saturation_states_(saturation_states),
+          metadata_(metadata),
+          index_offsets_(index_offsets),
+          index_postings_(index_postings),
+          packed_(true),
+          indexed_(indexed) {}
+
     [[nodiscard]] __host__ __device__ constexpr device_span<score_type const>
     data() const noexcept {
         return rows_;
+    }
+
+    /// @brief Packed winner/count rows, or an empty span for compact databases.
+    [[nodiscard]] __host__ __device__ constexpr device_span<register_type const>
+    packed_data() const noexcept {
+        return packed_rows_;
+    }
+
+    /// @brief Per-reference saturation states retained with packed rows.
+    [[nodiscard]] __host__ __device__ constexpr device_span<uint32_t const>
+    saturation_states() const noexcept {
+        return saturation_states_;
+    }
+
+    [[nodiscard]] __host__ __device__ constexpr bool preserves_multiplicity() const noexcept {
+        return packed_;
     }
 
     [[nodiscard]] constexpr reference_database_metadata metadata() const noexcept {
@@ -173,16 +207,23 @@ class reference_database_ref {
         return static_cast<size_t>(reference_count) * BucketCount * sizeof(score_type);
     }
 
+    [[nodiscard]] static constexpr size_t persistent_packed_row_bytes(
+        uint32_t reference_count
+    ) noexcept {
+        return static_cast<size_t>(reference_count) *
+               (BucketCount * sizeof(register_type) + sizeof(uint32_t));
+    }
+
     [[nodiscard]] constexpr size_t persistent_row_bytes() const noexcept {
-        return rows_.size_bytes();
+        return packed_ ? packed_rows_.size_bytes() + saturation_states_.size_bytes()
+                       : rows_.size_bytes();
     }
 
     [[nodiscard]] constexpr size_t persistent_index_bytes() const noexcept {
         return index_offsets_.size_bytes() + index_postings_.size_bytes();
     }
 
-    [[nodiscard]] static constexpr size_t
-    single_query_workspace_bytes(uint32_t) noexcept {
+    [[nodiscard]] static constexpr size_t single_query_workspace_bytes(uint32_t) noexcept {
         return 0;
     }
 
@@ -242,10 +283,8 @@ class reference_database_ref {
         device_span<result_type> results,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        auto const expected_scores =
-            static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        if (rows_.size() != expected_scores ||
-            (expected_scores != 0U && rows_.data() == nullptr)) {
+        auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
+        if (!rows_match_metadata(expected_scores)) {
             return Err(Error::invalid_argument("database extent does not match its metadata"));
         }
         if (query.size() != BucketCount || query.data() == nullptr) {
@@ -276,11 +315,17 @@ class reference_database_ref {
         constexpr uint32_t references_per_block = detail::block_size / warp_width;
         auto const blocks =
             (metadata_.reference_count + references_per_block - 1U) / references_per_block;
-        detail::exhaustive_search_kernel<BucketCount><<<
-            blocks,
-            detail::block_size,
-            0,
-            stream.get()>>>(rows_, metadata_.reference_count, query, results.data());
+        if (packed_) {
+            detail::exhaustive_search_kernel<BucketCount>
+                <<<blocks, detail::block_size, 0, stream.get()>>>(
+                    packed_rows_, metadata_.reference_count, query, results.data()
+                );
+        } else {
+            detail::exhaustive_search_kernel<BucketCount>
+                <<<blocks, detail::block_size, 0, stream.get()>>>(
+                    rows_, metadata_.reference_count, query, results.data()
+                );
+        }
         return cuda_try(cudaGetLastError());
     }
 
@@ -296,7 +341,7 @@ class reference_database_ref {
     ) const {
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
-        if (rows_.size() != expected_scores || (expected_scores != 0U && rows_.data() == nullptr)) {
+        if (!rows_match_metadata(expected_scores)) {
             return Err(Error::invalid_argument("database extent does not match its metadata"));
         }
         if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
@@ -401,25 +446,48 @@ class reference_database_ref {
         constexpr uint32_t references_per_block = detail::block_size / warp_width;
         auto const refinement_blocks =
             (metadata_.reference_count + references_per_block - 1U) / references_per_block;
-        detail::refine_index_candidates_kernel<BucketCount>
-            <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                rows_, query, candidate_ids, result_count.data(), results.data()
-            );
+        if (packed_) {
+            detail::refine_index_candidates_kernel<BucketCount>
+                <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
+                    packed_rows_, query, candidate_ids, result_count.data(), results.data()
+                );
+        } else {
+            detail::refine_index_candidates_kernel<BucketCount>
+                <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
+                    rows_, query, candidate_ids, result_count.data(), results.data()
+                );
+        }
         return cuda_try(cudaGetLastError());
     }
 
    private:
+    [[nodiscard]] __host__ __device__ constexpr bool rows_match_metadata(
+        size_t expected_scores
+    ) const noexcept {
+        if (packed_) {
+            return packed_rows_.size() == expected_scores &&
+                   saturation_states_.size() == metadata_.reference_count &&
+                   (expected_scores == 0U || packed_rows_.data() != nullptr) &&
+                   (metadata_.reference_count == 0U || saturation_states_.data() != nullptr);
+        }
+        return rows_.size() == expected_scores &&
+               (expected_scores == 0U || rows_.data() != nullptr);
+    }
+
     device_span<score_type const> rows_;
+    device_span<register_type const> packed_rows_;
+    device_span<uint32_t const> saturation_states_;
     reference_database_metadata metadata_;
     device_span<uint32_t const> index_offsets_;
     device_span<uint32_t const> index_postings_;
+    bool packed_{};
     bool indexed_{};
 };
 
 /**
- * @brief Move-only owner of one immutable contiguous compact reference database.
+ * @brief Move-only owner of one immutable contiguous reference database.
  *
- * Building enqueues the row copy on the supplied stream. The input and returned database must
+ * Building enqueues row copies on the supplied stream. Inputs and the returned database must
  * remain alive until that stream completes.
  */
 template <uint32_t K, size_t BucketCount>
@@ -431,6 +499,7 @@ class reference_database {
    public:
     using ref_type = reference_database_ref<K, BucketCount>;
     using score_type = typename ref_type::score_type;
+    using register_type = typename ref_type::register_type;
     using result_type = typename ref_type::result_type;
 
     reference_database(reference_database const&) = delete;
@@ -438,16 +507,20 @@ class reference_database {
 
     reference_database(reference_database&& other) noexcept
         : rows_(other.rows_),
+          saturation_states_(other.saturation_states_),
           index_offsets_(other.index_offsets_),
           index_postings_(other.index_postings_),
           index_posting_capacity_(other.index_posting_capacity_),
           metadata_(other.metadata_),
+          packed_(other.packed_),
           indexed_(other.indexed_) {
         other.rows_ = nullptr;
+        other.saturation_states_ = nullptr;
         other.index_offsets_ = nullptr;
         other.index_postings_ = nullptr;
         other.index_posting_capacity_ = 0;
         other.metadata_ = {};
+        other.packed_ = false;
         other.indexed_ = false;
     }
 
@@ -455,16 +528,20 @@ class reference_database {
         if (this != &other) {
             destroy();
             rows_ = other.rows_;
+            saturation_states_ = other.saturation_states_;
             index_offsets_ = other.index_offsets_;
             index_postings_ = other.index_postings_;
             index_posting_capacity_ = other.index_posting_capacity_;
             metadata_ = other.metadata_;
+            packed_ = other.packed_;
             indexed_ = other.indexed_;
             other.rows_ = nullptr;
+            other.saturation_states_ = nullptr;
             other.index_offsets_ = nullptr;
             other.index_postings_ = nullptr;
             other.index_posting_capacity_ = 0;
             other.metadata_ = {};
+            other.packed_ = false;
             other.indexed_ = false;
         }
         return *this;
@@ -480,49 +557,20 @@ class reference_database {
         score_compatibility compatibility,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) {
-        if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(compatibility);
-            !validation) {
-            return Err(validation.error());
-        }
-        if (rows.size() % BucketCount != 0U) {
-            return Err(Error::invalid_argument("score extent must contain complete rows"));
-        }
-        if (!rows.empty() && rows.data() == nullptr) {
-            return Err(Error::invalid_argument("score rows must be device accessible"));
-        }
-        auto const reference_count = rows.size() / BucketCount;
-        if (reference_count > std::numeric_limits<uint32_t>::max()) {
-            return Err(Error::resource("reference count exceeds stable 32-bit IDs"));
-        }
-
-        reference_database database;
-        database.metadata_ = {
-            .compatibility = compatibility,
-            .reference_count = static_cast<uint32_t>(reference_count),
-        };
-        if (rows.empty()) {
-            return Result<reference_database>::ok(std::move(database));
-        }
-        if (auto const allocation =
-                cuda_try(cudaMalloc(&database.rows_, rows.size_bytes()));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        if (auto const copy = cuda_try(cudaMemcpyAsync(
-                database.rows_,
-                rows.data(),
-                rows.size_bytes(),
-                cudaMemcpyDeviceToDevice,
-                stream.get()
-            ));
-            !copy) {
-            return Err(copy.error());
-        }
-        return Result<reference_database>::ok(std::move(database));
+        return build_rows_async(rows, {}, compatibility, stream);
     }
 
-    /// @brief Thrust overload for flat row-major device storage.
+    /// @brief Builds a multiplicity-preserving database from packed rows and saturation states.
+    [[nodiscard]] static Result<reference_database> build_async(
+        device_span<register_type const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) {
+        return build_rows_async(rows, saturation_states, compatibility, stream);
+    }
+
+    /// @brief Thrust overload for flat row-major compact device storage.
     [[nodiscard]] static Result<reference_database> build_async(
         thrust::device_vector<score_type> const& rows,
         score_compatibility compatibility,
@@ -533,150 +581,41 @@ class reference_database {
         );
     }
 
-    /// @brief Builds the immutable row store and its full 16-bit dense-offset index.
+    /// @brief Thrust overload for packed rows and per-reference saturation states.
+    [[nodiscard]] static Result<reference_database> build_async(
+        thrust::device_vector<register_type> const& rows,
+        thrust::device_vector<uint32_t> const& saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) {
+        return build_async(
+            {thrust::raw_pointer_cast(rows.data()), rows.size()},
+            {thrust::raw_pointer_cast(saturation_states.data()), saturation_states.size()},
+            compatibility,
+            stream
+        );
+    }
+
+    /// @brief Builds compact rows and their full 16-bit dense-offset index.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         device_span<score_type const> rows,
         score_compatibility compatibility,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) {
-        if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(compatibility);
-            !validation) {
-            return Err(validation.error());
-        }
-        if (rows.size() % BucketCount != 0U) {
-            return Err(Error::invalid_argument("score extent must contain complete rows"));
-        }
-        if (!rows.empty() && rows.data() == nullptr) {
-            return Err(Error::invalid_argument("score rows must be device accessible"));
-        }
-        auto const reference_count = rows.size() / BucketCount;
-        if (reference_count > std::numeric_limits<uint32_t>::max()) {
-            return Err(Error::resource("reference count exceeds stable 32-bit IDs"));
-        }
-        if (rows.size() > std::numeric_limits<uint32_t>::max()) {
-            return Err(Error::resource("index postings exceed 32-bit offsets"));
-        }
-
-        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
-        if (cell_count + 1U > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
-            return Err(Error::resource("dense index offset allocation overflows"));
-        }
-
-        auto built = build_async(rows, compatibility, stream);
-        if (!built) {
-            return Err(built.error());
-        }
-        auto database = std::move(*built);
-        auto const offset_bytes = static_cast<size_t>(cell_count + 1U) * sizeof(uint32_t);
-        if (auto const allocation = cuda_try(cudaMalloc(&database.index_offsets_, offset_bytes));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        if (rows.empty()) {
-            CUDDL_CUDA_TRY(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
-            database.indexed_ = true;
-            return Result<reference_database>::ok(std::move(database));
-        }
-
-        if (auto const allocation =
-                cuda_try(cudaMalloc(&database.index_postings_, rows.size() * sizeof(uint32_t)));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        database.index_posting_capacity_ = rows.size();
-
-        size_t scan_bytes = 0;
-        if (auto const query = cuda_try(
-                cub::DeviceScan::ExclusiveSum(
-                    nullptr,
-                    scan_bytes,
-                    database.index_offsets_,
-                    static_cast<int64_t>(cell_count + 1U),
-                    stream.get()
-                )
-            );
-            !query) {
-            return Err(query.error());
-        }
-        auto const cursor_offset = static_cast<size_t>(
-            detail::align_up(static_cast<uintptr_t>(scan_bytes), alignof(uint32_t))
-        );
-        auto const cursor_bytes = static_cast<size_t>(cell_count) * sizeof(uint32_t);
-        if (cursor_offset > std::numeric_limits<size_t>::max() - cursor_bytes) {
-            return Err(Error::resource("index construction workspace size overflows"));
-        }
-        auto const scratch_bytes = cursor_offset + cursor_bytes;
-        uint8_t* scratch = nullptr;
-        if (auto const allocation =
-                cuda_try(cudaMallocAsync(&scratch, scratch_bytes, stream.get()));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        auto* cursors = reinterpret_cast<uint32_t*>(scratch + cursor_offset);
-        auto fail = [&](Error const& error) -> Result<reference_database> {
-            auto const release = cuda_try(cudaFreeAsync(scratch, stream.get()));
-            if (!release) {
-                return Err(release.error());
-            }
-            return Err(error);
-        };
-        // CUB histogram scratch scales with the full-score domain; direct counting keeps scratch
-        // to the scan temporary storage and one cursor per cell.
-
-        if (auto const clear_counts =
-                cuda_try(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
-            !clear_counts) {
-            return fail(clear_counts.error());
-        }
-        auto const blocks =
-            static_cast<uint32_t>((rows.size() + detail::block_size - 1U) / detail::block_size);
-        detail::count_index_cells_kernel<BucketCount>
-            <<<blocks, detail::block_size, 0, stream.get()>>>(
-                database.ref().data(), database.index_offsets_
-            );
-        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
-            return fail(launch.error());
-        }
-        if (auto const scan = cuda_try(
-                cub::DeviceScan::ExclusiveSum(
-                    scratch,
-                    scan_bytes,
-                    database.index_offsets_,
-                    static_cast<int64_t>(cell_count + 1U),
-                    stream.get()
-                )
-            );
-            !scan) {
-            return fail(scan.error());
-        }
-        if (auto const copy = cuda_try(cudaMemcpyAsync(
-                cursors,
-                database.index_offsets_,
-                cursor_bytes,
-                cudaMemcpyDeviceToDevice,
-                stream.get()
-            ));
-            !copy) {
-            return fail(copy.error());
-        }
-
-        detail::scatter_index_postings_kernel<BucketCount>
-            <<<blocks, detail::block_size, 0, stream.get()>>>(
-                database.ref().data(), cursors, database.index_postings_
-            );
-        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
-            return fail(launch.error());
-        }
-        if (auto const release = cuda_try(cudaFreeAsync(scratch, stream.get())); !release) {
-            return Err(release.error());
-        }
-
-        database.indexed_ = true;
-        return Result<reference_database>::ok(std::move(database));
+        return build_indexed_rows_async(rows, {}, compatibility, stream);
     }
 
-    /// @brief Thrust overload for indexed flat row-major device storage.
+    /// @brief Builds packed rows and their full winner-score dense-offset index.
+    [[nodiscard]] static Result<reference_database> build_indexed_async(
+        device_span<register_type const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) {
+        return build_indexed_rows_async(rows, saturation_states, compatibility, stream);
+    }
+
+    /// @brief Thrust overload for indexed flat row-major compact device storage.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         thrust::device_vector<score_type> const& rows,
         score_compatibility compatibility,
@@ -687,14 +626,43 @@ class reference_database {
         );
     }
 
+    /// @brief Thrust overload for indexed packed rows and saturation states.
+    [[nodiscard]] static Result<reference_database> build_indexed_async(
+        thrust::device_vector<register_type> const& rows,
+        thrust::device_vector<uint32_t> const& saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) {
+        return build_indexed_async(
+            {thrust::raw_pointer_cast(rows.data()), rows.size()},
+            {thrust::raw_pointer_cast(saturation_states.data()), saturation_states.size()},
+            compatibility,
+            stream
+        );
+    }
+
     [[nodiscard]] ref_type ref() const noexcept {
         constexpr auto offset_count =
             static_cast<size_t>(detail::indexed_cell_count<BucketCount> + 1U);
+        auto const row_count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
+        auto const offsets =
+            device_span<uint32_t const>{index_offsets_, indexed_ ? offset_count : 0U};
+        auto const postings = device_span<uint32_t const>{index_postings_, index_posting_capacity_};
+        if (packed_) {
+            return ref_type(
+                {static_cast<register_type const*>(rows_), row_count},
+                {saturation_states_, metadata_.reference_count},
+                metadata_,
+                offsets,
+                postings,
+                indexed_
+            );
+        }
         return ref_type(
-            {rows_, static_cast<size_t>(metadata_.reference_count) * BucketCount},
+            {static_cast<score_type const*>(rows_), row_count},
             metadata_,
-            {index_offsets_, indexed_ ? offset_count : 0U},
-            {index_postings_, index_posting_capacity_},
+            offsets,
+            postings,
             indexed_
         );
     }
@@ -711,8 +679,18 @@ class reference_database {
         return indexed_;
     }
 
+    [[nodiscard]] bool preserves_multiplicity() const noexcept {
+        return packed_;
+    }
+
     [[nodiscard]] static constexpr size_t persistent_row_bytes(uint32_t reference_count) noexcept {
         return ref_type::persistent_row_bytes(reference_count);
+    }
+
+    [[nodiscard]] static constexpr size_t persistent_packed_row_bytes(
+        uint32_t reference_count
+    ) noexcept {
+        return ref_type::persistent_packed_row_bytes(reference_count);
     }
 
     [[nodiscard]] size_t persistent_row_bytes() const noexcept {
@@ -723,8 +701,9 @@ class reference_database {
         return ref().persistent_index_bytes();
     }
 
-    [[nodiscard]] static constexpr size_t
-    single_query_workspace_bytes(uint32_t reference_count) noexcept {
+    [[nodiscard]] static constexpr size_t single_query_workspace_bytes(
+        uint32_t reference_count
+    ) noexcept {
         return ref_type::single_query_workspace_bytes(reference_count);
     }
 
@@ -736,8 +715,9 @@ class reference_database {
         return ref().indexed_single_query_workspace_bytes();
     }
 
-    [[nodiscard]] static constexpr uint32_t
-    single_query_result_count(uint32_t reference_count) noexcept {
+    [[nodiscard]] static constexpr uint32_t single_query_result_count(
+        uint32_t reference_count
+    ) noexcept {
         return ref_type::single_query_result_count(reference_count);
     }
 
@@ -810,6 +790,231 @@ class reference_database {
    private:
     reference_database() = default;
 
+    template <typename Row>
+    [[nodiscard]] static Result<uint32_t> validate_rows(
+        device_span<Row const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility
+    ) {
+        static_assert(std::is_same_v<Row, score_type> || std::is_same_v<Row, register_type>);
+        if (auto const validation =
+                detail::validate_score_compatibility<K, BucketCount>(compatibility);
+            !validation) {
+            return Err(validation.error());
+        }
+        if (rows.size() % BucketCount != 0U) {
+            return Err(Error::invalid_argument("row extent must contain complete rows"));
+        }
+        if (!rows.empty() && rows.data() == nullptr) {
+            return Err(Error::invalid_argument("rows must be device accessible"));
+        }
+        auto const reference_count = rows.size() / BucketCount;
+        if (reference_count > std::numeric_limits<uint32_t>::max()) {
+            return Err(Error::resource("reference count exceeds stable 32-bit IDs"));
+        }
+        if constexpr (std::is_same_v<Row, register_type>) {
+            if (saturation_states.size() != reference_count) {
+                return Err(
+                    Error::invalid_argument(
+                        "saturation extent must match the packed reference rows"
+                    )
+                );
+            }
+            if (!saturation_states.empty() && saturation_states.data() == nullptr) {
+                return Err(Error::invalid_argument("saturation states must be device accessible"));
+            }
+        }
+        return static_cast<uint32_t>(reference_count);
+    }
+
+    template <typename Row>
+    [[nodiscard]] static Result<reference_database> build_rows_async(
+        device_span<Row const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream
+    ) {
+        auto const validated = validate_rows(rows, saturation_states, compatibility);
+        if (!validated) {
+            return Err(validated.error());
+        }
+
+        reference_database database;
+        database.metadata_ = {
+            .compatibility = compatibility,
+            .reference_count = *validated,
+        };
+        database.packed_ = std::is_same_v<Row, register_type>;
+        if (rows.empty()) {
+            return Result<reference_database>::ok(std::move(database));
+        }
+        if (auto const allocation = cuda_try(cudaMalloc(&database.rows_, rows.size_bytes()));
+            !allocation) {
+            return Err(allocation.error());
+        }
+        if (auto const copy = cuda_try(cudaMemcpyAsync(
+                database.rows_,
+                rows.data(),
+                rows.size_bytes(),
+                cudaMemcpyDeviceToDevice,
+                stream.get()
+            ));
+            !copy) {
+            return Err(copy.error());
+        }
+        if constexpr (std::is_same_v<Row, register_type>) {
+            if (auto const allocation = cuda_try(
+                    cudaMalloc(&database.saturation_states_, saturation_states.size_bytes())
+                );
+                !allocation) {
+                return Err(allocation.error());
+            }
+            if (auto const copy = cuda_try(cudaMemcpyAsync(
+                    database.saturation_states_,
+                    saturation_states.data(),
+                    saturation_states.size_bytes(),
+                    cudaMemcpyDeviceToDevice,
+                    stream.get()
+                ));
+                !copy) {
+                return Err(copy.error());
+            }
+        }
+        return Result<reference_database>::ok(std::move(database));
+    }
+
+    template <typename Row>
+    [[nodiscard]] static Result<reference_database> build_indexed_rows_async(
+        device_span<Row const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream
+    ) {
+        auto const validated = validate_rows(rows, saturation_states, compatibility);
+        if (!validated) {
+            return Err(validated.error());
+        }
+        if (rows.size() > std::numeric_limits<uint32_t>::max()) {
+            return Err(Error::resource("index postings exceed 32-bit offsets"));
+        }
+        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
+        if (cell_count + 1U > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            return Err(Error::resource("dense index offset allocation overflows"));
+        }
+
+        auto built = build_rows_async(rows, saturation_states, compatibility, stream);
+        if (!built) {
+            return Err(built.error());
+        }
+        auto database = std::move(*built);
+        auto const offset_bytes = static_cast<size_t>(cell_count + 1U) * sizeof(uint32_t);
+        if (auto const allocation = cuda_try(cudaMalloc(&database.index_offsets_, offset_bytes));
+            !allocation) {
+            return Err(allocation.error());
+        }
+        if (rows.empty()) {
+            CUDDL_CUDA_TRY(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
+            database.indexed_ = true;
+            return Result<reference_database>::ok(std::move(database));
+        }
+
+        if (auto const allocation =
+                cuda_try(cudaMalloc(&database.index_postings_, rows.size() * sizeof(uint32_t)));
+            !allocation) {
+            return Err(allocation.error());
+        }
+        database.index_posting_capacity_ = rows.size();
+
+        size_t scan_bytes = 0;
+        if (auto const query = cuda_try(
+                cub::DeviceScan::ExclusiveSum(
+                    nullptr,
+                    scan_bytes,
+                    database.index_offsets_,
+                    static_cast<int64_t>(cell_count + 1U),
+                    stream.get()
+                )
+            );
+            !query) {
+            return Err(query.error());
+        }
+        auto const cursor_offset = static_cast<size_t>(
+            detail::align_up(static_cast<uintptr_t>(scan_bytes), alignof(uint32_t))
+        );
+        auto const cursor_bytes = static_cast<size_t>(cell_count) * sizeof(uint32_t);
+        if (cursor_offset > std::numeric_limits<size_t>::max() - cursor_bytes) {
+            return Err(Error::resource("index construction workspace size overflows"));
+        }
+        auto const scratch_bytes = cursor_offset + cursor_bytes;
+        uint8_t* scratch = nullptr;
+        if (auto const allocation =
+                cuda_try(cudaMallocAsync(&scratch, scratch_bytes, stream.get()));
+            !allocation) {
+            return Err(allocation.error());
+        }
+        auto* cursors = reinterpret_cast<uint32_t*>(scratch + cursor_offset);
+        auto fail = [&](Error const& error) -> Result<reference_database> {
+            auto const release = cuda_try(cudaFreeAsync(scratch, stream.get()));
+            if (!release) {
+                return Err(release.error());
+            }
+            return Err(error);
+        };
+        // CUB histogram scratch scales with the full-score domain; direct counting keeps scratch
+        // to the scan temporary storage and one cursor per cell.
+
+        if (auto const clear_counts =
+                cuda_try(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
+            !clear_counts) {
+            return fail(clear_counts.error());
+        }
+        auto const blocks =
+            static_cast<uint32_t>((rows.size() + detail::block_size - 1U) / detail::block_size);
+        auto const stored_rows =
+            device_span<Row const>{static_cast<Row const*>(database.rows_), rows.size()};
+        detail::count_index_cells_kernel<BucketCount>
+            <<<blocks, detail::block_size, 0, stream.get()>>>(stored_rows, database.index_offsets_);
+        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
+            return fail(launch.error());
+        }
+        if (auto const scan = cuda_try(
+                cub::DeviceScan::ExclusiveSum(
+                    scratch,
+                    scan_bytes,
+                    database.index_offsets_,
+                    static_cast<int64_t>(cell_count + 1U),
+                    stream.get()
+                )
+            );
+            !scan) {
+            return fail(scan.error());
+        }
+        if (auto const copy = cuda_try(cudaMemcpyAsync(
+                cursors,
+                database.index_offsets_,
+                cursor_bytes,
+                cudaMemcpyDeviceToDevice,
+                stream.get()
+            ));
+            !copy) {
+            return fail(copy.error());
+        }
+
+        detail::scatter_index_postings_kernel<BucketCount>
+            <<<blocks, detail::block_size, 0, stream.get()>>>(
+                stored_rows, cursors, database.index_postings_
+            );
+        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
+            return fail(launch.error());
+        }
+        if (auto const release = cuda_try(cudaFreeAsync(scratch, stream.get())); !release) {
+            return Err(release.error());
+        }
+
+        database.indexed_ = true;
+        return Result<reference_database>::ok(std::move(database));
+    }
+
     void destroy() noexcept {
         if (index_postings_ != nullptr) {
             CUDDL_CUDA_ABORT(cudaFree(index_postings_));
@@ -819,17 +1024,23 @@ class reference_database {
             CUDDL_CUDA_ABORT(cudaFree(index_offsets_));
             index_offsets_ = nullptr;
         }
+        if (saturation_states_ != nullptr) {
+            CUDDL_CUDA_ABORT(cudaFree(saturation_states_));
+            saturation_states_ = nullptr;
+        }
         if (rows_ != nullptr) {
             CUDDL_CUDA_ABORT(cudaFree(rows_));
             rows_ = nullptr;
         }
     }
 
-    score_type* rows_ = nullptr;
+    void* rows_ = nullptr;
+    uint32_t* saturation_states_ = nullptr;
     uint32_t* index_offsets_ = nullptr;
     uint32_t* index_postings_ = nullptr;
     size_t index_posting_capacity_{};
     reference_database_metadata metadata_{};
+    bool packed_{};
     bool indexed_{};
 };
 

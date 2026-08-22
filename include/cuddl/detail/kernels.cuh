@@ -138,14 +138,23 @@ __global__ void summary_kernel(
     }
 }
 
+/// @brief Reads the search score from either supported exact row backing.
+__host__ __device__ constexpr uint16_t reference_score(uint16_t score) noexcept {
+    return score;
+}
+
+__host__ __device__ constexpr uint16_t reference_score(uint32_t packed_register) noexcept {
+    return winner(packed_register);
+}
+
 /**
  * @brief Compares one compact query row with every row in a reference database.
  *
  * Each warp owns one reference row and writes exactly one stable-ID result.
  */
-template <size_t BucketCount, typename SearchResult>
+template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
 __global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
-    device_span<uint16_t const> rows,
+    device_span<ReferenceRow const> rows,
     uint32_t reference_count,
     device_span<uint16_t const> query,
     SearchResult* results
@@ -166,7 +175,7 @@ __global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
     pairwise_counts local{};
     auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
     for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
-        classify(local, query[bucket], rows[row_offset + bucket]);
+        classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
     }
     auto const total = warp_reduce(storage[warp]).Sum(local);
     if (lane == 0U) {
@@ -176,14 +185,15 @@ __global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
     }
 }
 
-/// @brief Counts every non-empty score row entry in its dense index cell.
-template <size_t BucketCount>
-__global__ void count_index_cells_kernel(device_span<uint16_t const> rows, uint32_t* cell_counts) {
+/// @brief Counts every non-empty reference row entry in its dense index cell.
+template <size_t BucketCount, typename ReferenceRow>
+__global__ void
+count_index_cells_kernel(device_span<ReferenceRow const> rows, uint32_t* cell_counts) {
     constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (; offset < rows.size(); offset += stride) {
-        auto const score = rows[offset];
+        auto const score = reference_score(rows[offset]);
         if (score == 0U) {
             continue;
         }
@@ -193,10 +203,10 @@ __global__ void count_index_cells_kernel(device_span<uint16_t const> rows, uint3
     }
 }
 
-/// @brief Scatters every non-empty score row entry into its dense CSR posting range.
-template <size_t BucketCount>
+/// @brief Scatters every non-empty reference row entry into its dense CSR posting range.
+template <size_t BucketCount, typename ReferenceRow>
 __global__ void scatter_index_postings_kernel(
-    device_span<uint16_t const> rows,
+    device_span<ReferenceRow const> rows,
     uint32_t* cursors,
     uint32_t* postings
 ) {
@@ -204,7 +214,7 @@ __global__ void scatter_index_postings_kernel(
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (; offset < rows.size(); offset += stride) {
-        auto const score = rows[offset];
+        auto const score = reference_score(rows[offset]);
         if (score == 0U) {
             continue;
         }
@@ -257,10 +267,10 @@ __global__ void write_result_count_kernel(uint32_t value, uint32_t* result_count
     }
 }
 
-/// @brief Exactly refines every stably selected reference over its full score row.
-template <size_t BucketCount, typename SearchResult>
+/// @brief Exactly refines every selected reference over its full winner-score row.
+template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
 __global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
-    device_span<uint16_t const> rows,
+    device_span<ReferenceRow const> rows,
     device_span<uint16_t const> query,
     uint32_t const* candidate_ids,
     uint32_t const* candidate_count,
@@ -282,7 +292,7 @@ __global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
     pairwise_counts local{};
     auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
     for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
-        classify(local, query[bucket], rows[row_offset + bucket]);
+        classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
     }
     auto const total = warp_reduce(storage[warp]).Sum(local);
     if (lane == 0U) {

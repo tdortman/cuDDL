@@ -277,6 +277,260 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     }
 }
 
+TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearch) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    constexpr size_t reference_count = 4;
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    auto const stream = cuda::stream_ref{stream_};
+
+    std::vector<uint16_t> query(b_default);
+    std::vector<uint16_t> scores(reference_count * b_default);
+    std::vector<uint32_t> packed(scores.size());
+    std::vector<uint32_t> saturation{1U, 0U, 1U, 0U};
+    for (size_t bucket = 0; bucket < b_default; ++bucket) {
+        query[bucket] = std::array<uint16_t, 4>{0U, 7U, 5U, 9U}[bucket % 4];
+        scores[bucket] = 0U;
+        scores[b_default + bucket] = query[bucket];
+        scores[2 * b_default + bucket] = query[bucket] == 0U ? 3U : query[bucket] + 1U;
+        scores[3 * b_default + bucket] = query[bucket] == 0U ? 0U : query[bucket] - 1U;
+    }
+    for (size_t offset = 0; offset < scores.size(); ++offset) {
+        auto const count =
+            scores[offset] == 0U ? uint16_t{0} : static_cast<uint16_t>(offset % k_counter_max + 1U);
+        packed[offset] = pack(scores[offset], count);
+    }
+
+    thrust::device_vector<uint16_t> device_query(query);
+    thrust::device_vector<uint16_t> device_scores(scores);
+    thrust::device_vector<uint32_t> device_packed(packed);
+    thrust::device_vector<uint32_t> device_saturation(saturation);
+    auto compact_built = database_type::build_indexed_async(device_scores, compatibility, stream);
+    ASSERT_TRUE(compact_built.has_value()) << compact_built.error().message();
+    auto packed_built =
+        database_type::build_indexed_async(device_packed, device_saturation, compatibility, stream);
+    ASSERT_TRUE(packed_built.has_value()) << packed_built.error().message();
+    auto compact = std::move(*compact_built);
+    auto packed_database = std::move(*packed_built);
+
+    EXPECT_FALSE(compact.preserves_multiplicity());
+    EXPECT_TRUE(packed_database.preserves_multiplicity());
+    EXPECT_EQ(compact.persistent_row_bytes(), reference_count * b_default * sizeof(uint16_t));
+    EXPECT_EQ(
+        packed_database.persistent_row_bytes(),
+        reference_count * (b_default * sizeof(uint32_t) + sizeof(uint32_t))
+    );
+    EXPECT_TRUE(compact.ref().packed_data().empty());
+    EXPECT_EQ(packed_database.ref().packed_data().size(), packed.size());
+    EXPECT_EQ(packed_database.ref().saturation_states().size(), saturation.size());
+
+    thrust::device_vector<cuddl::reference_search_result> compact_exhaustive(reference_count);
+    thrust::device_vector<cuddl::reference_search_result> packed_exhaustive(reference_count);
+    thrust::device_vector<cuddl::reference_search_result> compact_indexed(reference_count);
+    thrust::device_vector<cuddl::reference_search_result> packed_indexed(reference_count);
+    thrust::device_vector<uint32_t> compact_result_count(1);
+    thrust::device_vector<uint32_t> packed_result_count(1);
+    auto workspace_bytes = compact.indexed_single_query_workspace_bytes();
+    ASSERT_TRUE(workspace_bytes.has_value()) << workspace_bytes.error().message();
+    thrust::device_vector<uint8_t> compact_workspace(*workspace_bytes);
+    thrust::device_vector<uint8_t> packed_workspace(*workspace_bytes);
+
+    ASSERT_TRUE(compact
+                    .search_async(
+                        device_query, compatibility, compact_workspace, compact_exhaustive, stream
+                    )
+                    .has_value());
+    ASSERT_TRUE(
+        packed_database
+            .search_async(device_query, compatibility, packed_workspace, packed_exhaustive, stream)
+            .has_value()
+    );
+    ASSERT_TRUE(compact
+                    .search_indexed_async(
+                        device_query,
+                        compatibility,
+                        compact_workspace,
+                        compact_indexed,
+                        compact_result_count,
+                        {},
+                        stream
+                    )
+                    .has_value());
+    ASSERT_TRUE(packed_database
+                    .search_indexed_async(
+                        device_query,
+                        compatibility,
+                        packed_workspace,
+                        packed_indexed,
+                        packed_result_count,
+                        {},
+                        stream
+                    )
+                    .has_value());
+
+    std::vector<cuddl::reference_search_result> compact_exhaustive_host(reference_count);
+    std::vector<cuddl::reference_search_result> packed_exhaustive_host(reference_count);
+    std::vector<cuddl::reference_search_result> compact_indexed_host(reference_count);
+    std::vector<cuddl::reference_search_result> packed_indexed_host(reference_count);
+    std::vector<uint32_t> recovered_packed(packed.size());
+    std::vector<uint32_t> recovered_saturation(saturation.size());
+    uint32_t compact_count = 0;
+    uint32_t packed_count = 0;
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            compact_exhaustive_host.data(),
+            thrust::raw_pointer_cast(compact_exhaustive.data()),
+            compact_exhaustive_host.size() * sizeof(compact_exhaustive_host.front()),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            packed_exhaustive_host.data(),
+            thrust::raw_pointer_cast(packed_exhaustive.data()),
+            packed_exhaustive_host.size() * sizeof(packed_exhaustive_host.front()),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            compact_indexed_host.data(),
+            thrust::raw_pointer_cast(compact_indexed.data()),
+            compact_indexed_host.size() * sizeof(compact_indexed_host.front()),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            packed_indexed_host.data(),
+            thrust::raw_pointer_cast(packed_indexed.data()),
+            packed_indexed_host.size() * sizeof(packed_indexed_host.front()),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            &compact_count,
+            thrust::raw_pointer_cast(compact_result_count.data()),
+            sizeof(compact_count),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            &packed_count,
+            thrust::raw_pointer_cast(packed_result_count.data()),
+            sizeof(packed_count),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            recovered_packed.data(),
+            packed_database.ref().packed_data().data(),
+            packed_database.ref().packed_data().size_bytes(),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            recovered_saturation.data(),
+            packed_database.ref().saturation_states().data(),
+            packed_database.ref().saturation_states().size_bytes(),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+
+    EXPECT_EQ(recovered_packed, packed);
+    EXPECT_EQ(recovered_saturation, saturation);
+    for (size_t reference_id = 0; reference_id < reference_count; ++reference_id) {
+        auto const expected = score_row_oracle(query, scores, reference_id);
+        EXPECT_EQ(compact_exhaustive_host[reference_id].reference_id, reference_id);
+        EXPECT_EQ(compact_exhaustive_host[reference_id].summary, expected);
+        EXPECT_EQ(packed_exhaustive_host[reference_id], compact_exhaustive_host[reference_id]);
+    }
+    ASSERT_EQ(compact_count, 1U);
+    ASSERT_EQ(packed_count, compact_count);
+    EXPECT_EQ(compact_indexed_host[0].reference_id, 1U);
+    EXPECT_EQ(packed_indexed_host[0], compact_indexed_host[0]);
+}
+
+TEST_F(ReferenceDatabaseTest, PackedRowsShareConstructionFailureContract) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    auto const stream = cuda::stream_ref{stream_};
+
+    thrust::device_vector<uint16_t> malformed_scores(b_default + 1U, 1U);
+    thrust::device_vector<uint32_t> malformed_packed(b_default + 1U, pack(1U, 1U));
+    thrust::device_vector<uint32_t> saturation(1U, 0U);
+    auto compact_malformed = database_type::build_async(
+        cuddl::device_span<uint16_t const>{
+            thrust::raw_pointer_cast(malformed_scores.data()), malformed_scores.size()
+        },
+        compatibility,
+        stream
+    );
+    auto packed_malformed = database_type::build_async(
+        cuddl::device_span<uint32_t const>{
+            thrust::raw_pointer_cast(malformed_packed.data()), malformed_packed.size()
+        },
+        cuddl::device_span<uint32_t const>{
+            thrust::raw_pointer_cast(saturation.data()), saturation.size()
+        },
+        compatibility,
+        stream
+    );
+    ASSERT_FALSE(compact_malformed.has_value());
+    ASSERT_FALSE(packed_malformed.has_value());
+    EXPECT_EQ(packed_malformed.error().category(), compact_malformed.error().category());
+    EXPECT_EQ(packed_malformed.error().message(), compact_malformed.error().message());
+
+    auto incompatible = compatibility;
+    incompatible.key_mask = 0x7fffU;
+    auto compact_incompatible =
+        database_type::build_async(cuddl::device_span<uint16_t const>{}, incompatible, stream);
+    auto packed_incompatible = database_type::build_async(
+        cuddl::device_span<uint32_t const>{},
+        cuddl::device_span<uint32_t const>{},
+        incompatible,
+        stream
+    );
+    ASSERT_FALSE(compact_incompatible.has_value());
+    ASSERT_FALSE(packed_incompatible.has_value());
+    EXPECT_EQ(packed_incompatible.error().category(), compact_incompatible.error().category());
+    EXPECT_EQ(packed_incompatible.error().message(), compact_incompatible.error().message());
+
+    thrust::device_vector<uint32_t> complete_packed(2U * b_default, pack(1U, 1U));
+    auto mismatched_saturation = database_type::build_async(
+        cuddl::device_span<uint32_t const>{
+            thrust::raw_pointer_cast(complete_packed.data()), complete_packed.size()
+        },
+        cuddl::device_span<uint32_t const>{
+            thrust::raw_pointer_cast(saturation.data()), saturation.size()
+        },
+        compatibility,
+        stream
+    );
+    ASSERT_FALSE(mismatched_saturation.has_value());
+    EXPECT_EQ(mismatched_saturation.error().category(), cuddl::ErrorCategory::invalid_argument);
+}
+
 TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     static_assert(std::is_trivially_copyable_v<typename database_type::ref_type>);
