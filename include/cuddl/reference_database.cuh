@@ -78,6 +78,29 @@ struct reference_search_result {
     friend bool operator==(reference_search_result const&, reference_search_result const&) = default;
 };
 
+/// @brief Stable query/reference IDs and their exact query-relative pairwise summary.
+struct batch_search_result {
+    uint32_t query_id{};
+    uint32_t reference_id{};
+    pairwise_summary summary{};
+
+    friend bool operator==(batch_search_result const&, batch_search_result const&) = default;
+};
+
+/// @brief Caller-owned storage requirements for one bounded query tile.
+struct batch_search_requirements {
+    uint32_t maximum_pair_count{};
+    size_t counter_bytes{};
+    size_t candidate_bytes{};
+    size_t temporary_bytes{};
+    size_t workspace_bytes{};
+    size_t result_bytes{};
+    size_t match_count_bytes{};
+
+    friend bool operator==(batch_search_requirements const&, batch_search_requirements const&) =
+        default;
+};
+
 /// @brief Per-search candidate threshold for the full 16-bit DDLIndex.
 struct indexed_search_options {
     uint32_t minimum_matches = 5;
@@ -140,6 +163,7 @@ class reference_database_ref {
     using score_type = uint16_t;
     using register_type = uint32_t;
     using result_type = reference_search_result;
+    using batch_result_type = batch_search_result;
 
     __host__ __device__ constexpr reference_database_ref(
         device_span<score_type const> rows,
@@ -273,6 +297,44 @@ class reference_database_ref {
             return Err(Error::resource("indexed single-query workspace size overflows"));
         }
         return arrays_bytes + alignment_slack + selection_bytes;
+    }
+
+    /// @brief Storage required to exhaustively search @p query_count compact rows.
+    [[nodiscard]] Result<cuddl::batch_search_requirements> batch_search_requirements(
+        uint32_t query_count
+    ) const {
+        auto const pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
+        return make_batch_requirements(pair_count, pair_count, false);
+    }
+
+    /// @brief Storage required to search @p query_count compact rows through the index.
+    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
+        uint32_t query_count
+    ) const {
+        if (!indexed_) {
+            return Err(Error::invalid_argument("database has no full 16-bit index"));
+        }
+        auto const pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
+        return make_batch_requirements(pair_count, pair_count, true);
+    }
+
+    /// @brief Storage required for one exhaustive all-to-all query tile.
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+        auto const pair_count = CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
+        return make_batch_requirements(0U, pair_count, false);
+    }
+
+    /// @brief Storage required for one indexed all-to-all query tile.
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+        if (!indexed_) {
+            return Err(Error::invalid_argument("database has no full 16-bit index"));
+        }
+        auto const dense_pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
+        auto const result_pair_count =
+            CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
+        return make_batch_requirements(dense_pair_count, result_pair_count, true);
     }
 
     /// @brief Compares one compact query row with every reference row on @p stream.
@@ -460,6 +522,547 @@ class reference_database_ref {
         return cuda_try(cudaGetLastError());
     }
 
+    /// @brief Exhaustively searches a bounded compact query tile.
+    [[nodiscard]] Result<void> search_batch_async(
+        device_span<score_type const> queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        static_cast<void>(workspace);
+        auto const query_count =
+            CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
+        auto const requirements = CUDDL_TRY(batch_search_requirements(query_count));
+        CUDDL_TRY(
+            validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
+        );
+        if (requirements.maximum_pair_count == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        if (packed_) {
+            return launch_batch_exhaustive<false>(
+                queries,
+                0U,
+                query_count,
+                query_id_offset,
+                packed_rows_,
+                requirements.maximum_pair_count,
+                results,
+                result_count,
+                result_match_counts,
+                stream
+            );
+        }
+        return launch_batch_exhaustive<false>(
+            queries,
+            0U,
+            query_count,
+            query_id_offset,
+            rows_,
+            requirements.maximum_pair_count,
+            results,
+            result_count,
+            result_match_counts,
+            stream
+        );
+    }
+
+    /**
+     * @brief Indexed search for a bounded compact query tile.
+     *
+     * After stream completion, a count larger than @p results reports insufficient pair capacity.
+     * In that case neither results nor optional diagnostics are modified.
+     */
+    [[nodiscard]] Result<void> search_batch_indexed_async(
+        device_span<score_type const> queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        auto const query_count =
+            CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
+        auto const requirements = CUDDL_TRY(indexed_batch_search_requirements(query_count));
+        CUDDL_TRY(validate_indexed_batch_inputs(
+            requirements, workspace, results, result_count, result_match_counts, options
+        ));
+        if (requirements.counter_bytes == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        if (packed_) {
+            return launch_batch_indexed<false>(
+                queries,
+                0U,
+                query_count,
+                query_id_offset,
+                packed_rows_,
+                requirements,
+                workspace,
+                results,
+                result_count,
+                result_match_counts,
+                options,
+                stream
+            );
+        }
+        return launch_batch_indexed<false>(
+            queries,
+            0U,
+            query_count,
+            query_id_offset,
+            rows_,
+            requirements,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            options,
+            stream
+        );
+    }
+
+    /// @brief Exhaustively searches one database-row tile against later database rows.
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        static_cast<void>(workspace);
+        CUDDL_TRY(validate_stored_rows());
+        auto const requirements =
+            CUDDL_TRY(all_to_all_search_requirements(first_query_id, query_count));
+        CUDDL_TRY(
+            validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
+        );
+        if (requirements.maximum_pair_count == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        if (packed_) {
+            return launch_batch_exhaustive<true>(
+                packed_rows_,
+                first_query_id,
+                query_count,
+                first_query_id,
+                packed_rows_,
+                requirements.maximum_pair_count,
+                results,
+                result_count,
+                result_match_counts,
+                stream
+            );
+        }
+        return launch_batch_exhaustive<true>(
+            rows_,
+            first_query_id,
+            query_count,
+            first_query_id,
+            rows_,
+            requirements.maximum_pair_count,
+            results,
+            result_count,
+            result_match_counts,
+            stream
+        );
+    }
+
+    /**
+     * @brief Indexed search for one database-row tile against later database rows.
+     *
+     * After stream completion, a count larger than @p results reports insufficient pair capacity.
+     * In that case neither results nor optional diagnostics are modified.
+     */
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        CUDDL_TRY(validate_stored_rows());
+        auto const requirements =
+            CUDDL_TRY(indexed_all_to_all_search_requirements(first_query_id, query_count));
+        CUDDL_TRY(validate_indexed_batch_inputs(
+            requirements, workspace, results, result_count, result_match_counts, options
+        ));
+        if (requirements.counter_bytes == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        if (packed_) {
+            return launch_batch_indexed<true>(
+                packed_rows_,
+                first_query_id,
+                query_count,
+                first_query_id,
+                packed_rows_,
+                requirements,
+                workspace,
+                results,
+                result_count,
+                result_match_counts,
+                options,
+                stream
+            );
+        }
+        return launch_batch_indexed<true>(
+            rows_,
+            first_query_id,
+            query_count,
+            first_query_id,
+            rows_,
+            requirements,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            options,
+            stream
+        );
+    }
+
+   private:
+    [[nodiscard]] Result<void> validate_stored_rows() const {
+        auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
+        if (!rows_match_metadata(expected_scores)) {
+            return Err(Error::invalid_argument("database extent does not match its metadata"));
+        }
+        return Ok();
+    }
+
+    [[nodiscard]] Result<uint32_t> dense_batch_pair_count(uint32_t query_count) const {
+        auto const pair_count = static_cast<uint64_t>(query_count) * metadata_.reference_count;
+        if (pair_count > std::numeric_limits<uint32_t>::max()) {
+            return Err(Error::resource("batch pair count exceeds 32-bit workspace IDs"));
+        }
+        return static_cast<uint32_t>(pair_count);
+    }
+
+    [[nodiscard]] Result<uint32_t>
+    all_to_all_pair_count(uint32_t first_query_id, uint32_t query_count) const {
+        if (first_query_id > metadata_.reference_count ||
+            query_count > metadata_.reference_count - first_query_id) {
+            return Err(Error::invalid_argument("all-to-all query tile is outside the database"));
+        }
+        if (query_count == 0U) {
+            return 0U;
+        }
+
+        uint64_t left = query_count;
+        uint64_t right = 2U * static_cast<uint64_t>(metadata_.reference_count) -
+                         2U * first_query_id - query_count - 1U;
+        if ((left & 1U) == 0U) {
+            left /= 2U;
+        } else {
+            right /= 2U;
+        }
+        auto const pair_count = left * right;
+        if (pair_count > std::numeric_limits<uint32_t>::max()) {
+            return Err(Error::resource("all-to-all tile exceeds 32-bit result counts"));
+        }
+        return static_cast<uint32_t>(pair_count);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements> make_batch_requirements(
+        uint32_t dense_pair_count,
+        uint32_t maximum_pair_count,
+        bool indexed
+    ) const {
+        cuddl::batch_search_requirements requirements{
+            .maximum_pair_count = maximum_pair_count,
+            .result_bytes = static_cast<size_t>(maximum_pair_count) * sizeof(batch_result_type),
+            .match_count_bytes = static_cast<size_t>(maximum_pair_count) * sizeof(uint32_t),
+        };
+        if (!indexed || dense_pair_count == 0U) {
+            return requirements;
+        }
+
+        size_t selection_bytes = 0;
+        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        auto const selection = cuda_try(
+            cub::DeviceSelect::If(
+                nullptr,
+                selection_bytes,
+                ids,
+                static_cast<uint32_t*>(nullptr),
+                static_cast<uint32_t*>(nullptr),
+                static_cast<int64_t>(dense_pair_count),
+                detail::batch_minimum_match_predicate{
+                    nullptr, 0U, metadata_.reference_count, 0U, false
+                }
+            )
+        );
+        if (!selection) {
+            return Err(selection.error());
+        }
+
+        requirements.counter_bytes = static_cast<size_t>(dense_pair_count) * sizeof(uint32_t);
+        requirements.candidate_bytes = static_cast<size_t>(dense_pair_count) * sizeof(uint32_t);
+        requirements.temporary_bytes = selection_bytes;
+        constexpr size_t alignment_slack = alignof(uint32_t) - 1U + 255U;
+        auto const arrays_bytes = requirements.counter_bytes + requirements.candidate_bytes;
+        if (selection_bytes > std::numeric_limits<size_t>::max() - arrays_bytes - alignment_slack) {
+            return Err(Error::resource("indexed batch workspace size overflows"));
+        }
+        requirements.workspace_bytes = arrays_bytes + alignment_slack + selection_bytes;
+        return requirements;
+    }
+
+    [[nodiscard]] Result<uint32_t> validate_batch_queries(
+        device_span<score_type const> queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset
+    ) const {
+        CUDDL_TRY(validate_stored_rows());
+        if (queries.size() % BucketCount != 0U) {
+            return Err(Error::invalid_argument("query tile must contain complete score rows"));
+        }
+        if (!queries.empty() && queries.data() == nullptr) {
+            return Err(Error::invalid_argument("query tile must be device accessible"));
+        }
+        auto const query_count = queries.size() / BucketCount;
+        if (query_count > std::numeric_limits<uint32_t>::max()) {
+            return Err(Error::resource("query tile exceeds stable 32-bit IDs"));
+        }
+        auto const count = static_cast<uint32_t>(query_count);
+        if (count != 0U && query_id_offset > std::numeric_limits<uint32_t>::max() - (count - 1U)) {
+            return Err(Error::resource("query IDs exceed the stable 32-bit range"));
+        }
+        if (auto const validation =
+                detail::validate_score_compatibility<K, BucketCount>(query_compatibility);
+            !validation) {
+            return Err(validation.error());
+        }
+        if (query_compatibility != metadata_.compatibility) {
+            return Err(Error::invalid_argument("query construction metadata is incompatible"));
+        }
+        return count;
+    }
+
+    [[nodiscard]] Result<void> validate_batch_outputs(
+        cuddl::batch_search_requirements const& requirements,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts,
+        bool require_full_capacity
+    ) const {
+        if (result_count.empty()) {
+            return Err(Error::resource("batch result count capacity is too small"));
+        }
+        if (result_count.data() == nullptr) {
+            return Err(Error::invalid_argument("batch result count must be device accessible"));
+        }
+        if (require_full_capacity && results.size() < requirements.maximum_pair_count) {
+            return Err(Error::resource("batch result capacity is too small"));
+        }
+        auto const written_capacity = results.size() < requirements.maximum_pair_count
+                                          ? results.size()
+                                          : requirements.maximum_pair_count;
+        if (written_capacity != 0U && results.data() == nullptr) {
+            return Err(Error::invalid_argument("batch results must be device accessible"));
+        }
+        if (!result_match_counts.empty()) {
+            if (result_match_counts.size() < written_capacity) {
+                return Err(Error::resource("batch match-count capacity is too small"));
+            }
+            if (result_match_counts.data() == nullptr) {
+                return Err(Error::invalid_argument("batch match counts must be device accessible"));
+            }
+        }
+        return Ok();
+    }
+
+    [[nodiscard]] Result<void> validate_indexed_batch_inputs(
+        cuddl::batch_search_requirements const& requirements,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options
+    ) const {
+        auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
+        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
+        if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
+            index_offsets_.data() == nullptr || index_postings_.size() != expected_scores ||
+            (expected_scores != 0U && index_postings_.data() == nullptr)) {
+            return Err(Error::invalid_argument("database has no valid full 16-bit index"));
+        }
+        if (options.minimum_matches > BucketCount) {
+            return Err(Error::invalid_argument("minimum matches exceeds the bucket count"));
+        }
+        if (workspace.size_bytes() < requirements.workspace_bytes) {
+            return Err(Error::resource("indexed batch workspace is too small"));
+        }
+        if (requirements.workspace_bytes != 0U && workspace.data() == nullptr) {
+            return Err(
+                Error::invalid_argument("indexed batch workspace must be device accessible")
+            );
+        }
+        return validate_batch_outputs(
+            requirements, results, result_count, result_match_counts, false
+        );
+    }
+
+    [[nodiscard]] static Result<void> write_batch_result_count(
+        uint32_t count,
+        device_span<uint32_t> result_count,
+        cuda::stream_ref stream
+    ) {
+        detail::write_result_count_kernel<<<1, 1, 0, stream.get()>>>(count, result_count.data());
+        return cuda_try(cudaGetLastError());
+    }
+
+    template <bool AllToAll, typename QueryRow, typename ReferenceRow>
+    [[nodiscard]] Result<void> launch_batch_exhaustive(
+        device_span<QueryRow const> queries,
+        size_t query_row_offset,
+        uint32_t query_count,
+        uint32_t query_id_offset,
+        device_span<ReferenceRow const> rows,
+        uint32_t pair_count,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
+    ) const {
+        constexpr uint32_t warp_width = 32;
+        constexpr uint32_t references_per_block = detail::block_size / warp_width;
+        auto const reference_blocks = static_cast<uint32_t>(
+            (static_cast<uint64_t>(metadata_.reference_count) + references_per_block - 1U) /
+            references_per_block
+        );
+        auto const query_blocks = query_count < 65535U ? query_count : 65535U;
+        dim3 const blocks{reference_blocks, query_blocks, 1U};
+        detail::batch_exhaustive_search_kernel<BucketCount, AllToAll>
+            <<<blocks, detail::block_size, 0, stream.get()>>>(
+                queries,
+                query_row_offset,
+                query_count,
+                query_id_offset,
+                rows,
+                metadata_.reference_count,
+                results.data(),
+                result_match_counts.empty() ? nullptr : result_match_counts.data()
+            );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        return write_batch_result_count(pair_count, result_count, stream);
+    }
+
+    template <bool AllToAll, typename QueryRow, typename ReferenceRow>
+    [[nodiscard]] Result<void> launch_batch_indexed(
+        device_span<QueryRow const> queries,
+        size_t query_row_offset,
+        uint32_t query_count,
+        uint32_t query_id_offset,
+        device_span<ReferenceRow const> rows,
+        cuddl::batch_search_requirements const& requirements,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
+    ) const {
+        auto const workspace_begin = reinterpret_cast<uintptr_t>(workspace.data());
+        auto const workspace_end = workspace_begin + workspace.size_bytes();
+        if (workspace_end < workspace_begin) {
+            return Err(Error::resource("indexed batch workspace address range overflows"));
+        }
+        auto address = detail::align_up(workspace_begin, alignof(uint32_t));
+        auto* match_counts = reinterpret_cast<uint32_t*>(address);
+        address += requirements.counter_bytes;
+        address = detail::align_up(address, alignof(uint32_t));
+        auto* candidate_ids = reinterpret_cast<uint32_t*>(address);
+        address += requirements.candidate_bytes;
+        address = detail::align_up(address, 256U);
+        if (address > workspace_end) {
+            return Err(Error::resource("indexed batch workspace layout exceeds its capacity"));
+        }
+        auto* selection_workspace = reinterpret_cast<void*>(address);
+        auto selection_bytes = static_cast<size_t>(workspace_end - address);
+        auto const dense_pair_count =
+            static_cast<uint32_t>(requirements.counter_bytes / sizeof(uint32_t));
+
+        CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, requirements.counter_bytes, stream.get()));
+        auto const query_buckets = static_cast<size_t>(query_count) * BucketCount;
+        auto const required_bucket_blocks =
+            (query_buckets + detail::block_size - 1U) / detail::block_size;
+        auto const bucket_blocks = static_cast<uint32_t>(
+            required_bucket_blocks < 65535U ? required_bucket_blocks : 65535U
+        );
+        detail::count_batch_index_matches_kernel<BucketCount>
+            <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
+                queries,
+                query_row_offset,
+                query_count,
+                index_offsets_,
+                index_postings_,
+                metadata_.reference_count,
+                match_counts
+            );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+
+        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        CUDDL_CUDA_TRY(
+            cub::DeviceSelect::If(
+                selection_workspace,
+                selection_bytes,
+                ids,
+                candidate_ids,
+                result_count.data(),
+                static_cast<int64_t>(dense_pair_count),
+                detail::batch_minimum_match_predicate{
+                    match_counts,
+                    options.minimum_matches,
+                    metadata_.reference_count,
+                    query_id_offset,
+                    AllToAll
+                },
+                stream.get()
+            )
+        );
+
+        auto const written_capacity = results.size() < requirements.maximum_pair_count
+                                          ? results.size()
+                                          : requirements.maximum_pair_count;
+        if (written_capacity == 0U) {
+            return Ok();
+        }
+        constexpr uint32_t warp_width = 32;
+        constexpr uint32_t candidates_per_block = detail::block_size / warp_width;
+        auto const capacity = static_cast<uint32_t>(written_capacity);
+        auto const refinement_blocks =
+            (capacity + candidates_per_block - 1U) / candidates_per_block;
+        detail::refine_batch_index_candidates_kernel<BucketCount>
+            <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
+                queries,
+                query_row_offset,
+                query_id_offset,
+                rows,
+                metadata_.reference_count,
+                match_counts,
+                candidate_ids,
+                result_count.data(),
+                capacity,
+                results.data(),
+                result_match_counts.empty() ? nullptr : result_match_counts.data()
+            );
+        return cuda_try(cudaGetLastError());
+    }
+
    private:
     [[nodiscard]] __host__ __device__ constexpr bool rows_match_metadata(
         size_t expected_scores
@@ -501,6 +1104,7 @@ class reference_database {
     using score_type = typename ref_type::score_type;
     using register_type = typename ref_type::register_type;
     using result_type = typename ref_type::result_type;
+    using batch_result_type = typename ref_type::batch_result_type;
 
     reference_database(reference_database const&) = delete;
     reference_database& operator=(reference_database const&) = delete;
@@ -715,6 +1319,28 @@ class reference_database {
         return ref().indexed_single_query_workspace_bytes();
     }
 
+    [[nodiscard]] Result<cuddl::batch_search_requirements> batch_search_requirements(
+        uint32_t query_count
+    ) const {
+        return ref().batch_search_requirements(query_count);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
+        uint32_t query_count
+    ) const {
+        return ref().indexed_batch_search_requirements(query_count);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+        return ref().all_to_all_search_requirements(first_query_id, query_count);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+        return ref().indexed_all_to_all_search_requirements(first_query_id, query_count);
+    }
+
     [[nodiscard]] static constexpr uint32_t single_query_result_count(
         uint32_t reference_count
     ) noexcept {
@@ -782,6 +1408,274 @@ class reference_database {
             {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
             {thrust::raw_pointer_cast(results.data()), results.size()},
             {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            options,
+            stream
+        );
+    }
+
+    [[nodiscard]] Result<void> search_batch_async(
+        device_span<score_type const> queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return ref().search_batch_async(
+            queries,
+            query_compatibility,
+            query_id_offset,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload for caller-owned exhaustive batch-search storage.
+    [[nodiscard]] Result<void> search_batch_async(
+        thrust::device_vector<score_type> const& queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        thrust::device_vector<uint32_t>& result_match_counts,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_batch_async(
+            {thrust::raw_pointer_cast(queries.data()), queries.size()},
+            query_compatibility,
+            query_id_offset,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
+            stream
+        );
+    }
+
+    /// @brief Thrust overload without optional match-count diagnostics.
+    [[nodiscard]] Result<void> search_batch_async(
+        thrust::device_vector<score_type> const& queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_batch_async(
+            {thrust::raw_pointer_cast(queries.data()), queries.size()},
+            query_compatibility,
+            query_id_offset,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {},
+            stream
+        );
+    }
+
+    [[nodiscard]] Result<void> search_batch_indexed_async(
+        device_span<score_type const> queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return ref().search_batch_indexed_async(
+            queries,
+            query_compatibility,
+            query_id_offset,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            options,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload for caller-owned indexed batch-search storage.
+    [[nodiscard]] Result<void> search_batch_indexed_async(
+        thrust::device_vector<score_type> const& queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        thrust::device_vector<uint32_t>& result_match_counts,
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_batch_indexed_async(
+            {thrust::raw_pointer_cast(queries.data()), queries.size()},
+            query_compatibility,
+            query_id_offset,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
+            options,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload without optional match-count diagnostics.
+    [[nodiscard]] Result<void> search_batch_indexed_async(
+        thrust::device_vector<score_type> const& queries,
+        score_compatibility const& query_compatibility,
+        uint32_t query_id_offset,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_batch_indexed_async(
+            {thrust::raw_pointer_cast(queries.data()), queries.size()},
+            query_compatibility,
+            query_id_offset,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {},
+            options,
+            stream
+        );
+    }
+
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return ref().search_all_to_all_async(
+            first_query_id,
+            query_count,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload for caller-owned exhaustive all-to-all storage.
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        thrust::device_vector<uint32_t>& result_match_counts,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_all_to_all_async(
+            first_query_id,
+            query_count,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
+            stream
+        );
+    }
+
+    /// @brief Thrust overload without optional match-count diagnostics.
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_all_to_all_async(
+            first_query_id,
+            query_count,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {},
+            stream
+        );
+    }
+
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        device_span<uint32_t> result_match_counts = {},
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return ref().search_all_to_all_indexed_async(
+            first_query_id,
+            query_count,
+            workspace,
+            results,
+            result_count,
+            result_match_counts,
+            options,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload for caller-owned indexed all-to-all storage.
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        thrust::device_vector<uint32_t>& result_match_counts,
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_all_to_all_indexed_async(
+            first_query_id,
+            query_count,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
+            options,
+            stream
+        );
+    }
+
+    /// @brief Thrust overload without optional match-count diagnostics.
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        thrust::device_vector<uint8_t>& workspace,
+        thrust::device_vector<batch_result_type>& results,
+        thrust::device_vector<uint32_t>& result_count,
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        return search_all_to_all_indexed_async(
+            first_query_id,
+            query_count,
+            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
+            {thrust::raw_pointer_cast(results.data()), results.size()},
+            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            {},
             options,
             stream
         );

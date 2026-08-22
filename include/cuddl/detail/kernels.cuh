@@ -303,6 +303,185 @@ __global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
 }
 
 /**
+ * @brief Exactly compares a query tile with a reference database.
+ *
+ * In all-to-all mode the query rows come from the database backing and only pairs with
+ * `query_id < reference_id` are emitted.
+ */
+template <
+    size_t BucketCount,
+    bool AllToAll,
+    typename QueryRow,
+    typename ReferenceRow,
+    typename SearchResult>
+__global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
+    device_span<QueryRow const> queries,
+    size_t query_row_offset,
+    uint32_t query_count,
+    uint32_t query_id_offset,
+    device_span<ReferenceRow const> rows,
+    uint32_t reference_count,
+    SearchResult* results,
+    uint32_t* result_match_counts
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    using count_reduce = cub::WarpReduce<pairwise_counts>;
+    using match_reduce = cub::WarpReduce<uint32_t>;
+    __shared__ typename count_reduce::TempStorage count_storage[warps_per_block];
+    __shared__ typename match_reduce::TempStorage match_storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    for (auto query = static_cast<uint64_t>(blockIdx.y); query < query_count;
+         query += static_cast<uint64_t>(gridDim.y)) {
+        auto const query_index = static_cast<uint32_t>(query);
+        auto const query_id = query_id_offset + query_index;
+        auto const first_reference = AllToAll ? static_cast<uint64_t>(query_id) + 1U : uint64_t{0};
+        auto const earlier_queries = query_index == 0U ? 0U : query_index - 1U;
+        auto const preceding_pairs =
+            AllToAll ? static_cast<size_t>(query_index) * (reference_count - query_id_offset - 1U) -
+                           static_cast<size_t>(query_index) * earlier_queries / 2U
+                     : static_cast<size_t>(query_index) * reference_count;
+        auto const query_offset =
+            (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+
+        auto reference =
+            first_reference + static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
+        auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
+        for (; reference < reference_count; reference += reference_stride) {
+            auto const reference_id = static_cast<uint32_t>(reference);
+            pairwise_counts local{};
+            uint32_t local_matches = 0;
+            auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
+            for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
+                 bucket += warp_width) {
+                auto const query_score = reference_score(queries[query_offset + bucket]);
+                auto const stored_score = reference_score(rows[reference_offset + bucket]);
+                classify(local, query_score, stored_score);
+                local_matches += query_score != 0U && query_score == stored_score;
+            }
+            auto const total = count_reduce(count_storage[warp]).Sum(local);
+            auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
+            if (lane == 0U) {
+                auto const result_index = preceding_pairs + reference_id - first_reference;
+                results[result_index].query_id = query_id;
+                results[result_index].reference_id = reference_id;
+                results[result_index].summary.counts = total;
+                results[result_index].summary.cardinality = 0.0;
+                if (result_match_counts != nullptr) {
+                    result_match_counts[result_index] = matches;
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+/// @brief Counts dense index matches for every query/reference pair in one tile.
+template <size_t BucketCount, typename QueryRow>
+__global__ void count_batch_index_matches_kernel(
+    device_span<QueryRow const> queries,
+    size_t query_row_offset,
+    uint32_t query_count,
+    device_span<uint32_t const> offsets,
+    device_span<uint32_t const> postings,
+    uint32_t reference_count,
+    uint32_t* match_counts
+) {
+    constexpr uint64_t score_count = uint64_t{1} << 16U;
+    auto query_bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    auto const query_buckets = static_cast<size_t>(query_count) * BucketCount;
+    for (; query_bucket < query_buckets; query_bucket += stride) {
+        auto const query_index = query_bucket / BucketCount;
+        auto const bucket = query_bucket % BucketCount;
+        auto const score =
+            reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket]);
+        if (score == 0U) {
+            continue;
+        }
+        auto const cell = bucket * score_count + score;
+        auto const begin = offsets[cell];
+        auto const end = offsets[cell + 1U];
+        for (auto posting = begin; posting < end; ++posting) {
+            atomicAdd(&match_counts[query_index * reference_count + postings[posting]], 1U);
+        }
+    }
+}
+
+/// @brief Stable query-major selection predicate for external or all-to-all batch search.
+struct batch_minimum_match_predicate {
+    uint32_t const* match_counts;
+    uint32_t minimum_matches;
+    uint32_t reference_count;
+    uint32_t query_id_offset;
+    bool all_to_all;
+
+    [[nodiscard]] __host__ __device__ bool operator()(uint32_t pair_id) const noexcept {
+        auto const query_index = pair_id / reference_count;
+        auto const reference_id = pair_id % reference_count;
+        return (!all_to_all || query_id_offset + query_index < reference_id) &&
+               match_counts[pair_id] >= minimum_matches;
+    }
+};
+
+/// @brief Exactly refines a bounded stable query-major candidate list.
+template <size_t BucketCount, typename QueryRow, typename ReferenceRow, typename SearchResult>
+__global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kernel(
+    device_span<QueryRow const> queries,
+    size_t query_row_offset,
+    uint32_t query_id_offset,
+    device_span<ReferenceRow const> rows,
+    uint32_t reference_count,
+    uint32_t const* match_counts,
+    uint32_t const* candidate_ids,
+    uint32_t const* candidate_count,
+    uint32_t result_capacity,
+    SearchResult* results,
+    uint32_t* result_match_counts
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    using warp_reduce = cub::WarpReduce<pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    if (*candidate_count > result_capacity) {
+        return;
+    }
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    if (candidate_index >= *candidate_count) {
+        return;
+    }
+
+    auto const pair_id = candidate_ids[candidate_index];
+    auto const query_index = pair_id / reference_count;
+    auto const reference_id = pair_id % reference_count;
+    pairwise_counts local{};
+    auto const query_offset = (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+    auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
+    for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
+        classify(
+            local,
+            reference_score(queries[query_offset + bucket]),
+            reference_score(rows[reference_offset + bucket])
+        );
+    }
+    auto const total = warp_reduce(storage[warp]).Sum(local);
+    if (lane == 0U) {
+        results[candidate_index].query_id = query_id_offset + query_index;
+        results[candidate_index].reference_id = reference_id;
+        results[candidate_index].summary.counts = total;
+        results[candidate_index].summary.cardinality = 0.0;
+        if (result_match_counts != nullptr) {
+            result_match_counts[candidate_index] = match_counts[pair_id];
+        }
+    }
+}
+
+/**
  * @brief Computes the cardinality of a single constructed sketch.
  *
  * @p empty_out receives the empty-register count; @p estimate_out receives the estimate.
