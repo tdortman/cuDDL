@@ -3,10 +3,13 @@
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <thrust/device_vector.h>
+#include <thrust/memory.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <fstream>
 #include <limits>
@@ -108,6 +111,42 @@ std::vector<uint64_t> make_inputs(size_t count, uint64_t seed = 0x1234'5678'9abc
     return out;
 }
 
+class ReferenceDatabaseTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream_));
+    }
+
+    void TearDown() override {
+        EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream_));
+    }
+
+    cudaStream_t stream_{};
+};
+
+cuddl::pairwise_summary score_row_oracle(
+    std::vector<uint16_t> const& query,
+    std::vector<uint16_t> const& rows,
+    size_t reference_id
+) {
+    cuddl::pairwise_summary summary{};
+    auto const row_offset = reference_id * query.size();
+    for (size_t bucket = 0; bucket < query.size(); ++bucket) {
+        auto const query_score = query[bucket];
+        auto const reference_score = rows[row_offset + bucket];
+        if (query_score == 0U && reference_score == 0U) {
+            ++summary.counts.both_empty;
+        } else if (query_score < reference_score) {
+            ++summary.counts.lower;
+        } else if (query_score > reference_score) {
+            ++summary.counts.higher;
+        } else {
+            ++summary.counts.equal;
+        }
+    }
+    return summary;
+}
+
 TEST(SketchTest, RefIsTriviallyCopyableAndKBeforeBucket) {
     static_assert(std::is_trivially_copyable_v<cuddl::sketch_ref<25, 2048>>);
     static_assert(std::is_trivially_copyable_v<cuddl::sketch<25, 2048>> == false);
@@ -186,6 +225,170 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
             gpu_summary->counts.both_empty,
         static_cast<size_t>(b_default)
     );
+}
+
+TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
+    constexpr size_t reference_count = 4;
+    auto const compatibility =
+        cuddl::score_compatibility::current<k_default, b_default>();
+
+    std::vector<uint16_t> query(b_default);
+    std::vector<uint16_t> rows(reference_count * b_default);
+    for (size_t bucket = 0; bucket < b_default; ++bucket) {
+        query[bucket] = std::array<uint16_t, 4>{0U, 7U, 5U, 9U}[bucket % 4];
+        rows[bucket] = 0U;
+        rows[b_default + bucket] = query[bucket];
+        rows[2 * b_default + bucket] = query[bucket] == 0U ? 3U : query[bucket] + 1U;
+        rows[3 * b_default + bucket] = query[bucket] == 0U ? 0U : query[bucket] - 1U;
+    }
+
+    thrust::device_vector<uint16_t> device_rows(rows);
+    thrust::device_vector<uint16_t> device_query(query);
+    thrust::device_vector<cuddl::reference_search_result> device_results(reference_count);
+    thrust::device_vector<uint8_t> workspace;
+    auto const stream = cuda::stream_ref{stream_};
+
+    auto built = cuddl::reference_database<k_default, b_default>::build_async(
+        device_rows, compatibility, stream
+    );
+    ASSERT_TRUE(built.has_value()) << built.error().message();
+    auto database = std::move(*built);
+    ASSERT_TRUE(
+        database
+            .search_async(device_query, compatibility, workspace, device_results, stream)
+            .has_value()
+    );
+
+    std::vector<cuddl::reference_search_result> results(reference_count);
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            results.data(),
+            thrust::raw_pointer_cast(device_results.data()),
+            results.size() * sizeof(results.front()),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+    for (size_t reference_id = 0; reference_id < reference_count; ++reference_id) {
+        EXPECT_EQ(results[reference_id].reference_id, reference_id);
+        EXPECT_EQ(results[reference_id].summary, score_row_oracle(query, rows, reference_id));
+    }
+}
+
+TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    static_assert(std::is_trivially_copyable_v<typename database_type::ref_type>);
+    static_assert(!std::is_trivially_copyable_v<database_type>);
+
+    auto const compatibility =
+        cuddl::score_compatibility::current<k_default, b_default>();
+    auto const stream = cuda::stream_ref{stream_};
+    auto built = database_type::build_async(
+        cuddl::device_span<uint16_t const>{}, compatibility, stream
+    );
+    ASSERT_TRUE(built.has_value()) << built.error().message();
+    auto database = std::move(*built);
+
+    EXPECT_EQ(database.reference_count(), 0U);
+    EXPECT_EQ(database.metadata().compatibility, compatibility);
+    EXPECT_EQ(database.persistent_row_bytes(), 0U);
+    EXPECT_EQ(database.single_query_workspace_bytes(), 0U);
+    EXPECT_EQ(database.single_query_result_count(), 0U);
+    EXPECT_EQ(database_type::persistent_row_bytes(3), 3 * b_default * sizeof(uint16_t));
+    EXPECT_EQ(database_type::single_query_workspace_bytes(3), 0U);
+    EXPECT_EQ(database_type::single_query_result_count(3), 3U);
+
+    thrust::device_vector<uint16_t> query(b_default, 0U);
+    auto const searched = database.search_async(
+        {thrust::raw_pointer_cast(query.data()), query.size()}, compatibility, {}, {}, stream
+    );
+    ASSERT_TRUE(searched.has_value()) << searched.error().message();
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+}
+
+TEST_F(ReferenceDatabaseTest, RejectsMalformedAndIncompatibleInputsWithoutOutput) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    auto const compatibility =
+        cuddl::score_compatibility::current<k_default, b_default>();
+    auto const stream = cuda::stream_ref{stream_};
+
+    thrust::device_vector<uint16_t> malformed_rows(b_default + 1, 1U);
+    auto malformed = database_type::build_async(
+        {thrust::raw_pointer_cast(malformed_rows.data()), malformed_rows.size()},
+        compatibility,
+        stream
+    );
+    ASSERT_FALSE(malformed.has_value());
+    EXPECT_EQ(malformed.error().category(), cuddl::ErrorCategory::invalid_argument);
+
+    auto unsupported = compatibility;
+    unsupported.key_mask = 0x7fffU;
+    auto unsupported_build = database_type::build_async(
+        cuddl::device_span<uint16_t const>{}, unsupported, stream
+    );
+    ASSERT_FALSE(unsupported_build.has_value());
+    EXPECT_EQ(unsupported_build.error().category(), cuddl::ErrorCategory::invalid_argument);
+
+    thrust::device_vector<uint16_t> rows(2 * b_default, 4U);
+    thrust::device_vector<uint16_t> query(b_default, 4U);
+    auto built = database_type::build_async(
+        {thrust::raw_pointer_cast(rows.data()), rows.size()}, compatibility, stream
+    );
+    ASSERT_TRUE(built.has_value()) << built.error().message();
+    auto database = std::move(*built);
+
+    cuddl::reference_search_result sentinel{};
+    sentinel.reference_id = 99U;
+    sentinel.summary.counts.lower = 123U;
+    thrust::device_vector<cuddl::reference_search_result> results(1, sentinel);
+
+    auto malformed_query = database.search_async(
+        {thrust::raw_pointer_cast(query.data()), query.size() - 1},
+        compatibility,
+        {},
+        {thrust::raw_pointer_cast(results.data()), results.size()},
+        stream
+    );
+    ASSERT_FALSE(malformed_query.has_value());
+    EXPECT_EQ(malformed_query.error().category(), cuddl::ErrorCategory::invalid_argument);
+
+    auto incompatible = compatibility;
+    ++incompatible.hash_seed;
+    auto incompatible_query = database.search_async(
+        {thrust::raw_pointer_cast(query.data()), query.size()},
+        incompatible,
+        {},
+        {thrust::raw_pointer_cast(results.data()), results.size()},
+        stream
+    );
+    ASSERT_FALSE(incompatible_query.has_value());
+    EXPECT_EQ(incompatible_query.error().category(), cuddl::ErrorCategory::invalid_argument);
+
+    auto insufficient = database.search_async(
+        {thrust::raw_pointer_cast(query.data()), query.size()},
+        compatibility,
+        {},
+        {thrust::raw_pointer_cast(results.data()), results.size()},
+        stream
+    );
+    ASSERT_FALSE(insufficient.has_value());
+    EXPECT_EQ(insufficient.error().category(), cuddl::ErrorCategory::resource);
+
+    cuddl::reference_search_result observed{};
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            &observed,
+            thrust::raw_pointer_cast(results.data()),
+            sizeof(observed),
+            cudaMemcpyDeviceToHost,
+            stream_
+        )
+    );
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+    EXPECT_EQ(observed, sentinel);
 }
 
 TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {

@@ -139,6 +139,44 @@ __global__ void summary_kernel(
 }
 
 /**
+ * @brief Compares one compact query row with every row in a reference database.
+ *
+ * Each warp owns one reference row and writes exactly one stable-ID result.
+ */
+template <size_t BucketCount, typename SearchResult>
+__global__ __launch_bounds__(block_size) void exhaustive_search_kernel(
+    device_span<uint16_t const> rows,
+    uint32_t reference_count,
+    device_span<uint16_t const> query,
+    SearchResult* results
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    using warp_reduce = cub::WarpReduce<pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const reference_id =
+        static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    if (reference_id >= reference_count) {
+        return;
+    }
+
+    pairwise_counts local{};
+    auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
+    for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
+        classify(local, query[bucket], rows[row_offset + bucket]);
+    }
+    auto const total = warp_reduce(storage[warp]).Sum(local);
+    if (lane == 0U) {
+        results[reference_id].reference_id = reference_id;
+        results[reference_id].summary.counts = total;
+        results[reference_id].summary.cardinality = 0.0;
+    }
+}
+
+/**
  * @brief Computes the cardinality of a single constructed sketch.
  *
  * @p empty_out receives the empty-register count; @p estimate_out receives the estimate.

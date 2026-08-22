@@ -33,3 +33,11 @@ executable(
     cuda_args: cuda_args,
     install: false,
 )
+
+executable(
+    'cuddl-compact-search-benchmark',
+    'cuddl_compact_search_benchmark.cu',
+    dependencies: [cuddl_dep, cli11_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
