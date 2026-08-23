@@ -37,6 +37,7 @@ std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
 std::vector<nvbench::int64_t> const fill_permilles{250, 1000};
 std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
 std::vector<nvbench::int64_t> const query_counts{1, 32};
+std::vector<std::string> const query_profiles{"copied", "boundary"};
 std::vector<nvbench::int64_t> const indexed_bucket_counts{1024, 2048};
 std::vector<nvbench::int64_t> const key_bits{15, 16};
 
@@ -45,6 +46,7 @@ struct workload {
     double fill_ratio{};
     double hot_fraction{};
     uint32_t query_count{};
+    bool boundary_probe{};
 };
 
 struct index_mode {
@@ -97,6 +99,7 @@ struct minimum_matches_predicate {
     auto const fill_permille = state.get_int64("FillPermille");
     auto const hot_percentage = state.get_int64("HotPercent");
     auto const queries = includes_queries ? state.get_int64("Queries") : 1;
+    auto const query_profile = includes_queries ? state.get_string("QueryProfile") : "copied";
     if (references <= 0 || references > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("reference count exceeds the supported 32-bit range");
     }
@@ -109,6 +112,9 @@ struct minimum_matches_predicate {
     if (queries <= 0 || queries > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("query count exceeds the supported 32-bit range");
     }
+    if (query_profile != "copied" && query_profile != "boundary") {
+        throw std::runtime_error("query profile must be copied or boundary");
+    }
     if (static_cast<uint64_t>(references) * static_cast<uint64_t>(queries) >
         std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("query/reference pairs exceed the supported 32-bit range");
@@ -118,6 +124,7 @@ struct minimum_matches_predicate {
         .fill_ratio = static_cast<double>(fill_permille) / 1000.0,
         .hot_fraction = static_cast<double>(hot_percentage) / 100.0,
         .query_count = static_cast<uint32_t>(queries),
+        .boundary_probe = query_profile == "boundary",
     };
 }
 [[nodiscard]] index_mode read_index_mode(nvbench::state& state) {
@@ -275,22 +282,24 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     }
 
     std::array<uint8_t, k_bucket_count> probe_matches{};
-    size_t first_half_matches = 0;
-    size_t second_half_matches = 0;
-    for (size_t index = hot_count; index < fill_count; ++index) {
-        auto const bucket = buckets[index];
-        if (bucket < k_bucket_count / 2U && first_half_matches < 2U) {
-            probe_matches[bucket] = 1U;
-            ++first_half_matches;
-        } else if (bucket >= k_bucket_count / 2U && second_half_matches < 3U) {
-            probe_matches[bucket] = 1U;
-            ++second_half_matches;
+    if (settings.boundary_probe) {
+        size_t first_half_matches = 0;
+        size_t second_half_matches = 0;
+        for (size_t index = hot_count; index < fill_count; ++index) {
+            auto const bucket = buckets[index];
+            if (bucket < k_bucket_count / 2U && first_half_matches < 2U) {
+                probe_matches[bucket] = 1U;
+                ++first_half_matches;
+            } else if (bucket >= k_bucket_count / 2U && second_half_matches < 3U) {
+                probe_matches[bucket] = 1U;
+                ++second_half_matches;
+            }
         }
-    }
-    if (first_half_matches != 2U || second_half_matches != 3U) {
-        throw std::runtime_error(
-            "fixture cannot place threshold matches across both bucket halves"
-        );
+        if (first_half_matches != 2U || second_half_matches != 3U) {
+            throw std::runtime_error(
+                "fixture cannot place threshold matches across both bucket halves"
+            );
+        }
     }
 
     fixture value{
@@ -336,7 +345,7 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
             value.rows.data() + static_cast<size_t>(reference_id) * k_bucket_count,
             k_bucket_count * sizeof(uint16_t)
         );
-        if (query_id != 0U) {
+        if (!settings.boundary_probe || query_id != 0U) {
             continue;
         }
         for (size_t index = 0; index < fill_count; ++index) {
@@ -1059,6 +1068,7 @@ NVBENCH_BENCH(exhaustive_search)
     .add_int64_axis("FillPermille", fill_permilles)
     .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
+    .add_string_axis("QueryProfile", query_profiles)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1070,6 +1080,7 @@ NVBENCH_BENCH(indexed_search)
     .add_int64_axis("FillPermille", fill_permilles)
     .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
+    .add_string_axis("QueryProfile", query_profiles)
     .add_int64_axis("IndexedBuckets", indexed_bucket_counts)
     .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")

@@ -22,6 +22,7 @@ REQUIRED_COLUMNS = {
     "fill_ratio",
     "skew",
     "query_count",
+    "query_profile",
     "index_mode",
     "threshold_zero_recall",
     "exhaustive_p50_ms",
@@ -31,6 +32,10 @@ REQUIRED_COLUMNS = {
     "kill_gate_outcome",
 }
 VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
+QUERY_PROFILE_LABELS = {
+    "copied": "copied reference rows",
+    "boundary": "query 0 is a five-match threshold-boundary probe",
+}
 
 
 def skew_fraction(value: object) -> float:
@@ -53,6 +58,13 @@ def main(
         str | None,
         typer.Option("--mode", help="Plot one index mode; default facets all modes"),
     ] = None,
+    query_profile: Annotated[
+        str,
+        typer.Option(
+            "--query-profile",
+            help="Query profile to plot",
+        ),
+    ] = "copied",
 ) -> None:
     """Render speedup curves across the hot-bucket fraction."""
     data = pu.load_csv(csv_path)
@@ -60,12 +72,30 @@ def main(
     if missing:
         raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
 
+    if data["query_profile"].isna().any():
+        raise typer.BadParameter("CSV contains missing query profiles")
+    unknown_profiles = sorted(set(data["query_profile"]) - set(QUERY_PROFILE_LABELS))
+    if unknown_profiles:
+        raise typer.BadParameter(
+            f"CSV contains unknown query profiles: {', '.join(unknown_profiles)}"
+        )
+    if query_profile not in QUERY_PROFILE_LABELS:
+        choices = ", ".join(QUERY_PROFILE_LABELS)
+        raise typer.BadParameter(
+            f"Unknown query profile {query_profile!r}; choose one of: {choices}"
+        )
+
     data = data.loc[data["status"] == "ok"].copy()
+    if query_profile not in set(data["query_profile"]):
+        raise typer.BadParameter(
+            f"CSV has no successful workloads for query profile {query_profile!r}"
+        )
+    data = data.loc[data["query_profile"] == query_profile].copy()
     if mode is not None:
         data = data.loc[data["index_mode"] == mode].copy()
     if data.empty:
         raise typer.BadParameter(
-            "CSV has no successful workloads for the selected mode"
+            "CSV has no successful workloads for the selected mode and query profile"
         )
     numeric = (
         "reference_count",
@@ -109,6 +139,7 @@ def main(
     workload_columns = [
         "fill_ratio",
         "query_count",
+        "query_profile",
         "hot_fraction",
         "reference_count",
         "index_mode",
@@ -266,11 +297,19 @@ def main(
     fig.suptitle(
         pu.paper_text("Indexed versus exhaustive search", bold=True),
         fontsize=pu.TITLE_FONT_SIZE,
-        y=0.99,
+        y=0.995,
     )
     fig.text(
         0.5,
-        0.965,
+        0.976,
+        pu.paper_text(f"Query profile: {QUERY_PROFILE_LABELS[query_profile]}."),
+        fontsize=pu.DEFAULT_FONT_SIZE,
+        ha="center",
+        va="top",
+    )
+    fig.text(
+        0.5,
+        0.957,
         pu.paper_text(
             "Blue = indexed faster; orange = exhaustive faster.\n"
             "Colour is log2(exhaustive / indexed); p50 and p95 are separate rows. "
@@ -278,12 +317,13 @@ def main(
         ),
         fontsize=pu.DEFAULT_FONT_SIZE,
         ha="center",
+        va="top",
     )
     fig.subplots_adjust(
         left=0.12,
         right=0.84,
         bottom=0.08,
-        top=0.93,
+        top=0.90,
         hspace=0.45,
         wspace=0.18,
     )

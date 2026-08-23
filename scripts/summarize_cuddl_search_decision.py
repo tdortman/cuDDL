@@ -18,6 +18,7 @@ import typer
 
 BUILD_BENCHMARKS = ("compact_build", "indexed_build")
 SEARCH_BENCHMARKS = ("exhaustive_search", "indexed_search")
+QUERY_PROFILES = {"copied", "boundary"}
 PAPER_REFERENCE_COUNT = 200687
 
 FIELDS = (
@@ -57,6 +58,7 @@ FIELDS = (
     "hot_fraction",
     "minimum_matches",
     "query_count",
+    "query_profile",
     "warmup",
     "exhaustive_repetitions",
     "indexed_repetitions",
@@ -170,7 +172,18 @@ def state_key(
         axes["HotPercent"],
     )
     if include_queries:
-        key = (*key, axes["Queries"])
+        try:
+            query_profile = axes["QueryProfile"]
+            key = (*key, axes["Queries"], query_profile)
+        except KeyError as error:
+            missing = ", ".join(
+                axis for axis in ("Queries", "QueryProfile") if axis not in axes
+            )
+            raise ValueError(
+                f"search benchmark state is missing required axis/axes: {missing}"
+            ) from error
+        if query_profile not in QUERY_PROFILES:
+            raise ValueError(f"unknown query profile: {query_profile!r}")
     return (*key, *mode_key(state)) if include_mode else key
 
 
@@ -185,10 +198,13 @@ def benchmark_states(
         raise ValueError(f"benchmark {name!r} is missing from input") from error
     include_queries = name in SEARCH_BENCHMARKS
     include_mode = name in ("indexed_build", "indexed_search")
-    return {
-        state_key(state, include_queries, include_mode): state
-        for state in benchmark["states"]
-    }
+    states = {}
+    for state in benchmark["states"]:
+        key = state_key(state, include_queries, include_mode)
+        if key in states:
+            raise ValueError(f"benchmark {name!r} contains duplicate state {key}")
+        states[key] = state
+    return states
 
 
 def timing_ms(path: Path, state: dict[str, Any]) -> tuple[float, float, int]:
@@ -227,7 +243,7 @@ def main(
     workload_keys = sorted(
         set(states["exhaustive_search"])
         | {key[:-2] for key in states["indexed_search"]},
-        key=lambda key: tuple(int(value) for value in key),
+        key=lambda key: (*tuple(int(value) for value in key[:-1]), key[-1]),
     )
     mode_keys = sorted(
         {key[-2:] for key in states["indexed_build"]}
@@ -270,7 +286,7 @@ def main(
             reference_count = int(workload_key[0])
             is_paper_scale = reference_count == PAPER_REFERENCE_COUNT
             row: dict[str, Any] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "timestamp_utc": datetime.fromtimestamp(
                     input_path.stat().st_mtime, timezone.utc
                 ).isoformat(),
@@ -283,7 +299,8 @@ def main(
                 "reference_count": axes["References"],
                 "fill_ratio": int(axes["FillPermille"]) / 1000.0,
                 "skew": f"{int(axes['HotPercent'])}%",
-                "query_count": axes.get("Queries", ""),
+                "query_count": workload_key[3],
+                "query_profile": workload_key[4],
                 "indexed_bucket_count": mode[0],
                 "key_bits": mode[1],
                 "key_mask": str((1 << int(mode[1])) - 1),
