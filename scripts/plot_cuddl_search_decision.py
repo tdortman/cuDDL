@@ -22,13 +22,15 @@ REQUIRED_COLUMNS = {
     "fill_ratio",
     "skew",
     "query_count",
+    "index_mode",
+    "threshold_zero_recall",
     "exhaustive_p50_ms",
     "exhaustive_p95_ms",
     "indexed_p50_ms",
     "indexed_p95_ms",
     "kill_gate_outcome",
 }
-VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive"}
+VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
 
 
 def skew_fraction(value: object) -> float:
@@ -47,6 +49,10 @@ def main(
     output: Annotated[
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-decision.pdf"),
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Plot one index mode; default facets all modes"),
+    ] = None,
 ) -> None:
     """Render speedup curves across the hot-bucket fraction."""
     data = pu.load_csv(csv_path)
@@ -55,13 +61,17 @@ def main(
         raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
 
     data = data.loc[data["status"] == "ok"].copy()
+    if mode is not None:
+        data = data.loc[data["index_mode"] == mode].copy()
     if data.empty:
-        raise typer.BadParameter("CSV has no successful workloads")
-
+        raise typer.BadParameter(
+            "CSV has no successful workloads for the selected mode"
+        )
     numeric = (
         "reference_count",
         "fill_ratio",
         "query_count",
+        "threshold_zero_recall",
         "exhaustive_p50_ms",
         "exhaustive_p95_ms",
         "indexed_p50_ms",
@@ -71,6 +81,11 @@ def main(
         data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
     except (TypeError, ValueError) as error:
         raise typer.BadParameter(f"CSV contains non-numeric benchmark values: {error}")
+    recall = data["threshold_zero_recall"]
+    if not recall.map(math.isfinite).all() or not recall.between(0.0, 1.0).all():
+        raise typer.BadParameter(
+            "CSV contains non-finite or out-of-range threshold-zero recall"
+        )
 
     timing_columns = [name for name in numeric if name.endswith("_ms")]
     if (data[timing_columns] <= 0).any().any():
@@ -90,9 +105,16 @@ def main(
     references = sorted(data["reference_count"].unique())
     fill_ratios = sorted(data["fill_ratio"].unique())
     query_counts = sorted(data["query_count"].unique())
-    workload_columns = ["fill_ratio", "query_count", "hot_fraction", "reference_count"]
+    modes = sorted(data["index_mode"].unique())
+    workload_columns = [
+        "fill_ratio",
+        "query_count",
+        "hot_fraction",
+        "reference_count",
+        "index_mode",
+    ]
     if data.duplicated(workload_columns).any():
-        raise typer.BadParameter("CSV contains duplicate workloads")
+        raise typer.BadParameter("CSV contains duplicate workloads per index mode")
 
     panel_columns = [
         (fill_ratio, query_count)
@@ -129,75 +151,99 @@ def main(
     ]
     y_edges = [index - 0.5 for index in range(len(references) + 1)]
 
+    row_count = len(modes) * len(percentile_columns)
     fig, axes = plt.subplots(
-        len(percentile_columns),
+        row_count,
         len(panel_columns),
-        figsize=(3.2 * len(panel_columns), 5.8),
+        figsize=(3.2 * len(panel_columns), 2.9 * row_count),
         sharex=True,
         sharey=True,
         squeeze=False,
     )
     mesh = None
     skew_ticks = [value / 100.0 for value in range(0, 51, 10)]
-    for percentile_row, (column, percentile) in enumerate(percentile_columns):
-        for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
-            ax = axes[percentile_row][panel_column]
-            panel = data[
-                (data["fill_ratio"] == fill_ratio)
-                & (data["query_count"] == query_count)
-            ]
-            matrix = (
-                panel.pivot(
-                    index="reference_count",
-                    columns="hot_fraction",
-                    values=column,
+    for mode_row, mode_name in enumerate(modes):
+        for percentile_row, (column, percentile) in enumerate(percentile_columns):
+            row = mode_row * len(percentile_columns) + percentile_row
+            for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
+                ax = axes[row][panel_column]
+                panel = data[
+                    (data["index_mode"] == mode_name)
+                    & (data["fill_ratio"] == fill_ratio)
+                    & (data["query_count"] == query_count)
+                ]
+                matrix = (
+                    panel.pivot(
+                        index="reference_count",
+                        columns="hot_fraction",
+                        values=column,
+                    )
+                    .reindex(index=references, columns=hot_fractions)
+                    .to_numpy(dtype=float)
                 )
-                .reindex(index=references, columns=hot_fractions)
-                .to_numpy(dtype=float)
-            )
-            mesh = ax.pcolormesh(
-                x_edges,
-                y_edges,
-                matrix,
-                cmap=colour_map,
-                norm=colour_norm,
-                shading="flat",
-                edgecolors="white",
-                linewidth=0.8,
-            )
-            ax.set_xlim(0.0, 0.5)
-            ax.set_ylim(len(references) - 0.5, -0.5)
-            ax.set_xticks(skew_ticks)
-            ax.set_xticklabels(
-                [f"{value:.0%}" for value in skew_ticks],
-                fontsize=pu.TICK_LABEL_FONT_SIZE,
-            )
-            ax.set_yticks(range(len(references)))
-            ax.set_yticklabels(
-                [f"{int(reference):,}" for reference in references],
-                fontsize=pu.TICK_LABEL_FONT_SIZE,
-            )
-            ax.set_title(
-                pu.paper_text(
-                    f"{fill_ratio:.0%} fill, {int(query_count):,} q",
-                    bold=True,
-                ),
-                fontsize=pu.TITLE_FONT_SIZE,
-            )
-            if panel_column == 0:
-                ax.set_ylabel(
-                    pu.paper_text(f"{percentile}\nReferences"),
-                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
+                recall_matrix = (
+                    panel.pivot(
+                        index="reference_count",
+                        columns="hot_fraction",
+                        values="threshold_zero_recall",
+                    )
+                    .reindex(index=references, columns=hot_fractions)
+                    .to_numpy(dtype=float)
                 )
-            if percentile_row == len(percentile_columns) - 1:
-                ax.set_xlabel(
-                    pu.paper_text("Hot-bucket fraction"),
-                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
+                mesh = ax.pcolormesh(
+                    x_edges,
+                    y_edges,
+                    matrix,
+                    cmap=colour_map,
+                    norm=colour_norm,
+                    shading="flat",
+                    edgecolors="white",
+                    linewidth=0.8,
                 )
-            else:
-                ax.tick_params(axis="x", labelbottom=False)
-            ax.tick_params(axis="both", length=0)
-            ax.spines[:].set_visible(False)
+                for reference_index, hot_index in zip(
+                    *((recall_matrix < 1.0).nonzero())
+                ):
+                    ax.plot(
+                        hot_fractions[hot_index],
+                        reference_index,
+                        marker="x",
+                        color="#b2182b",
+                        markersize=5,
+                        markeredgewidth=1.4,
+                    )
+                ax.set_xlim(0.0, 0.5)
+                ax.set_ylim(len(references) - 0.5, -0.5)
+                ax.set_xticks(skew_ticks)
+                ax.set_xticklabels(
+                    [f"{value:.0%}" for value in skew_ticks],
+                    fontsize=pu.TICK_LABEL_FONT_SIZE,
+                )
+                ax.set_yticks(range(len(references)))
+                ax.set_yticklabels(
+                    [f"{int(reference):,}" for reference in references],
+                    fontsize=pu.TICK_LABEL_FONT_SIZE,
+                )
+                ax.set_title(
+                    pu.paper_text(
+                        f"{mode_name}: {fill_ratio:.0%} fill, {int(query_count):,} q",
+                        bold=True,
+                    ),
+                    fontsize=pu.TITLE_FONT_SIZE,
+                )
+                if panel_column == 0:
+                    ax.set_ylabel(
+                        pu.paper_text(f"{percentile}\nReferences"),
+                        fontsize=pu.AXIS_LABEL_FONT_SIZE,
+                    )
+                if percentile_row == len(percentile_columns) - 1:
+                    ax.set_xlabel(
+                        pu.paper_text("Hot-bucket fraction"),
+                        fontsize=pu.AXIS_LABEL_FONT_SIZE,
+                    )
+                else:
+                    ax.tick_params(axis="x", labelbottom=False)
+                ax.tick_params(axis="both", length=0)
+                ax.spines[:].set_visible(False)
 
     if mesh is None:
         raise typer.BadParameter("CSV has no heatmap workloads")
@@ -215,14 +261,15 @@ def main(
     fig.suptitle(
         pu.paper_text("Indexed versus exhaustive search", bold=True),
         fontsize=pu.TITLE_FONT_SIZE,
-        y=0.97,
+        y=0.99,
     )
     fig.text(
         0.5,
-        0.87,
+        0.965,
         pu.paper_text(
             "Blue = indexed faster; orange = exhaustive faster.\n"
-            "Colour is log2(exhaustive / indexed); p50 and p95 are separate rows."
+            "Colour is log2(exhaustive / indexed); p50 and p95 are separate rows. "
+            "Red x = threshold-zero recall loss."
         ),
         fontsize=pu.DEFAULT_FONT_SIZE,
         ha="center",
@@ -230,9 +277,9 @@ def main(
     fig.subplots_adjust(
         left=0.12,
         right=0.84,
-        bottom=0.14,
-        top=0.70,
-        hspace=0.35,
+        bottom=0.08,
+        top=0.93,
+        hspace=0.45,
         wspace=0.18,
     )
     output.parent.mkdir(parents=True, exist_ok=True)

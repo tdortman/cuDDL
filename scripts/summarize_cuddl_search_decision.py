@@ -18,6 +18,8 @@ import typer
 
 BUILD_BENCHMARKS = ("compact_build", "indexed_build")
 SEARCH_BENCHMARKS = ("exhaustive_search", "indexed_search")
+PAPER_REFERENCE_COUNT = 200687
+
 FIELDS = (
     "schema_version",
     "timestamp_utc",
@@ -45,6 +47,8 @@ FIELDS = (
     "blacklist_identity",
     "blacklist_version",
     "key_mask",
+    "index_mode",
+    "key_bits",
     "fixture_seed",
     "reference_count",
     "fill_ratio",
@@ -77,14 +81,21 @@ FIELDS = (
     "compact_search_workspace_bytes",
     "indexed_search_workspace_bytes",
     "peak_temporary_bytes",
+    "offset_bytes",
+    "posting_bytes",
+    "top_bit_frequency",
     "populated_posting_lists",
     "posting_entries",
     "posting_visits",
     "atomic_updates",
     "selected_candidates",
+    "candidate_inflation",
     "exhaustive_exact_comparisons",
     "indexed_exact_comparisons",
     "exact_result_recall",
+    "threshold_zero_recall",
+    "oracle_threshold_pairs",
+    "recalled_pairs",
     "exhaustive_p50_ms",
     "exhaustive_p95_ms",
     "exhaustive_queries_per_second",
@@ -93,6 +104,7 @@ FIELDS = (
     "indexed_queries_per_second",
     "kill_gate_rule",
     "kill_gate_outcome",
+    "paper_scale_suitability",
     "status",
     "error",
 )
@@ -133,18 +145,50 @@ def sample_times(path: Path, state: dict[str, Any]) -> list[float]:
     return list(struct.unpack(f"<{count}f", payload))
 
 
-def state_key(state: dict[str, Any], include_queries: bool) -> tuple[str, ...]:
+def mode_key(state: dict[str, Any]) -> tuple[str, str]:
     axes = axis_values(state)
-    key = (axes["References"], axes["FillPermille"], axes["HotPercent"])
-    return (*key, axes["Queries"]) if include_queries else key
+    try:
+        buckets = axes["IndexedBuckets"]
+        bits = axes["KeyBits"]
+    except KeyError as error:
+        missing = ", ".join(
+            axis for axis in ("IndexedBuckets", "KeyBits") if axis not in axes
+        )
+        raise ValueError(
+            f"indexed benchmark state is missing required mode axis/axes: {missing}"
+        ) from error
+    return str(int(float(buckets))), str(int(bits))
+
+
+def state_key(
+    state: dict[str, Any], include_queries: bool, include_mode: bool = False
+) -> tuple[str, ...]:
+    axes = axis_values(state)
+    key = (
+        axes["References"],
+        axes["FillPermille"],
+        axes["HotPercent"],
+    )
+    if include_queries:
+        key = (*key, axes["Queries"])
+    return (*key, *mode_key(state)) if include_mode else key
 
 
 def benchmark_states(
     document: dict[str, Any], name: str
 ) -> dict[tuple[str, ...], dict[str, Any]]:
-    benchmark = next(item for item in document["benchmarks"] if item["name"] == name)
+    try:
+        benchmark = next(
+            item for item in document["benchmarks"] if item["name"] == name
+        )
+    except StopIteration as error:
+        raise ValueError(f"benchmark {name!r} is missing from input") from error
     include_queries = name in SEARCH_BENCHMARKS
-    return {state_key(state, include_queries): state for state in benchmark["states"]}
+    include_mode = name in ("indexed_build", "indexed_search")
+    return {
+        state_key(state, include_queries, include_mode): state
+        for state in benchmark["states"]
+    }
 
 
 def timing_ms(path: Path, state: dict[str, Any]) -> tuple[float, float, int]:
@@ -180,165 +224,231 @@ def main(
         for name in (*BUILD_BENCHMARKS, *SEARCH_BENCHMARKS)
     }
     devices = {device["id"]: device for device in document["devices"]}
-    search_keys = sorted(
-        set(states["exhaustive_search"]) | set(states["indexed_search"]),
+    workload_keys = sorted(
+        set(states["exhaustive_search"])
+        | {key[:-2] for key in states["indexed_search"]},
         key=lambda key: tuple(int(value) for value in key),
     )
+    mode_keys = sorted(
+        {key[-2:] for key in states["indexed_build"]}
+        | {key[-2:] for key in states["indexed_search"]},
+        key=lambda key: tuple(int(value) for value in key),
+    )
+    if not mode_keys:
+        raise ValueError(
+            "indexed benchmark states are required; no indexed mode states found"
+        )
     rows: list[dict[str, Any]] = []
 
-    for key in search_keys:
-        build_key = key[:3]
-        selected = {
-            "compact_build": states["compact_build"].get(build_key),
-            "indexed_build": states["indexed_build"].get(build_key),
-            "exhaustive_search": states["exhaustive_search"].get(key),
-            "indexed_search": states["indexed_search"].get(key),
-        }
-        missing = [name for name, state in selected.items() if state is None]
-        skipped = [
-            f"{name}: {state.get('skip_reason', 'skipped')}"
-            for name, state in selected.items()
-            if state is not None and state.get("is_skipped")
-        ]
-        status = "ok" if not missing and not skipped else "skipped"
-        error = "; ".join([*(f"missing {name}" for name in missing), *skipped])
-        representative = selected["indexed_search"] or selected["exhaustive_search"]
-        if representative is None:
-            raise ValueError(f"workload {key} has no search state")
-        device = devices[representative["device"]]
-        axes = axis_values(representative)
-        sm_version = int(device["sm_version"])
-        row: dict[str, Any] = {
-            "schema_version": 1,
-            "timestamp_utc": datetime.fromtimestamp(
-                input_path.stat().st_mtime, timezone.utc
-            ).isoformat(),
-            "benchmark_command": shlex.join(document["meta"]["argv"]),
-            "nvbench_version": document["meta"]["version"]["nvbench"]["string"],
-            "gpu_name": device["name"],
-            "compute_capability": f"{sm_version // 100}.{sm_version % 100 // 10}",
-            "multiprocessor_count": device["number_of_sms"],
-            "global_memory_bytes": device["global_memory_size"],
-            "reference_count": axes["References"],
-            "fill_ratio": int(axes["FillPermille"]) / 1000.0,
-            "skew": f"{int(axes['HotPercent'])}%",
-            "query_count": axes["Queries"],
-            "warmup": representative["cold_warmup_runs"],
-            "kill_gate_rule": "indexed wins only when both p50 and p95 are strictly lower",
-            "kill_gate_outcome": "inconclusive",
-            "status": status,
-            "error": error,
-        }
-        for tag in (
-            "free_memory_before_bytes",
-            "cuda_runtime_version",
-            "cuda_driver_version",
-            "cuda_compile_version",
-            "compiler",
-            "build_configuration",
-            "kmer_length",
-            "bucket_count",
-            "indexed_bucket_count",
-            "score_encoder_identity",
-            "exponent_bits",
-            "mantissa_bits",
-            "hash_identity",
-            "hash_seed",
-            "canonicalisation_policy",
-            "blacklist_identity",
-            "blacklist_version",
-            "key_mask",
-            "fixture_seed",
-            "filled_cells_per_row",
-            "hot_fraction",
-            "minimum_matches",
-        ):
-            row[tag] = summary_value(representative, tag)
+    for workload_key in workload_keys:
+        build_key = workload_key[:3]
+        for mode in mode_keys:
+            indexed_build_key = (*build_key, *mode)
+            indexed_search_key = (*workload_key, *mode)
+            selected = {
+                "compact_build": states["compact_build"].get(build_key),
+                "indexed_build": states["indexed_build"].get(indexed_build_key),
+                "exhaustive_search": states["exhaustive_search"].get(workload_key),
+                "indexed_search": states["indexed_search"].get(indexed_search_key),
+            }
+            missing = [name for name, state in selected.items() if state is None]
+            skipped = [
+                f"{name}: {state.get('skip_reason', 'skipped')}"
+                for name, state in selected.items()
+                if state is not None and state.get("is_skipped")
+            ]
+            status = "ok" if not missing and not skipped else "skipped"
+            error = "; ".join([*(f"missing {name}" for name in missing), *skipped])
+            representative = selected["indexed_search"] or selected["exhaustive_search"]
+            if representative is None:
+                representative = selected["indexed_build"] or selected["compact_build"]
+            if representative is None:
+                raise ValueError(f"workload {workload_key} has no benchmark state")
+            device = devices[representative["device"]]
+            axes = axis_values(representative)
+            sm_version = int(device["sm_version"])
+            reference_count = int(workload_key[0])
+            is_paper_scale = reference_count == PAPER_REFERENCE_COUNT
+            row: dict[str, Any] = {
+                "schema_version": 2,
+                "timestamp_utc": datetime.fromtimestamp(
+                    input_path.stat().st_mtime, timezone.utc
+                ).isoformat(),
+                "benchmark_command": shlex.join(document["meta"]["argv"]),
+                "nvbench_version": document["meta"]["version"]["nvbench"]["string"],
+                "gpu_name": device["name"],
+                "compute_capability": f"{sm_version // 100}.{sm_version % 100 // 10}",
+                "multiprocessor_count": device["number_of_sms"],
+                "global_memory_bytes": device["global_memory_size"],
+                "reference_count": axes["References"],
+                "fill_ratio": int(axes["FillPermille"]) / 1000.0,
+                "skew": f"{int(axes['HotPercent'])}%",
+                "query_count": axes.get("Queries", ""),
+                "indexed_bucket_count": mode[0],
+                "key_bits": mode[1],
+                "key_mask": str((1 << int(mode[1])) - 1),
+                "index_mode": f"b{mode[0]}_k{mode[1]}",
+                "warmup": representative["cold_warmup_runs"],
+                "kill_gate_rule": (
+                    "indexed wins only when threshold-zero recall is 1.0 and "
+                    "both p50 and p95 are strictly lower"
+                ),
+                "kill_gate_outcome": "inconclusive",
+                "paper_scale_suitability": (
+                    "not_paper_scale" if not is_paper_scale else "unavailable"
+                ),
+                "status": status,
+                "error": error,
+            }
+            for tag in (
+                "free_memory_before_bytes",
+                "cuda_runtime_version",
+                "cuda_driver_version",
+                "cuda_compile_version",
+                "compiler",
+                "build_configuration",
+                "kmer_length",
+                "bucket_count",
+                "score_encoder_identity",
+                "exponent_bits",
+                "mantissa_bits",
+                "hash_identity",
+                "hash_seed",
+                "canonicalisation_policy",
+                "blacklist_identity",
+                "blacklist_version",
+                "fixture_seed",
+                "filled_cells_per_row",
+                "hot_fraction",
+                "minimum_matches",
+            ):
+                row[tag] = summary_value(representative, tag)
 
-        if status == "ok":
-            compact_build = selected["compact_build"]
-            indexed_build = selected["indexed_build"]
-            exhaustive = selected["exhaustive_search"]
-            indexed = selected["indexed_search"]
-            assert compact_build and indexed_build and exhaustive and indexed
-            compact_build_p50, compact_build_p95, _ = timing_ms(
-                input_path, compact_build
-            )
-            indexed_build_p50, indexed_build_p95, _ = timing_ms(
-                input_path, indexed_build
-            )
-            exhaustive_p50, exhaustive_p95, exhaustive_count = timing_ms(
-                input_path, exhaustive
-            )
-            indexed_p50, indexed_p95, indexed_count = timing_ms(input_path, indexed)
-            query_count = int(axes["Queries"])
-            row.update(phase_metrics("compact_build", compact_build))
-            row.update(phase_metrics("indexed_build", indexed_build))
-            row.update(phase_metrics("exhaustive", exhaustive))
-            row["exhaustive_validation_ms"] = as_number(exhaustive, "validation_ms")
-            row.update(phase_metrics("indexed", indexed))
-            row["indexed_validation_ms"] = as_number(indexed, "validation_ms")
-            row.update(
-                {
-                    "compact_build_p50_ms": compact_build_p50,
-                    "compact_build_p95_ms": compact_build_p95,
-                    "indexed_build_p50_ms": indexed_build_p50,
-                    "indexed_build_p95_ms": indexed_build_p95,
-                    "compact_resident_bytes": as_number(
-                        compact_build, "resident_bytes"
-                    ),
-                    "indexed_resident_bytes": as_number(
-                        indexed_build, "resident_bytes"
-                    ),
-                    "compact_build_temporary_bytes": as_number(
-                        compact_build, "build_temporary_bytes"
-                    ),
-                    "indexed_build_temporary_bytes": as_number(
-                        indexed_build, "build_temporary_bytes"
-                    ),
-                    "compact_search_workspace_bytes": as_number(
-                        exhaustive, "search_workspace_bytes"
-                    ),
-                    "indexed_search_workspace_bytes": as_number(
-                        indexed, "search_workspace_bytes"
-                    ),
-                    "populated_posting_lists": as_number(
-                        indexed, "populated_posting_lists"
-                    ),
-                    "posting_entries": as_number(indexed, "posting_entries"),
-                    "posting_visits": as_number(indexed, "posting_visits"),
-                    "atomic_updates": as_number(indexed, "atomic_updates"),
-                    "selected_candidates": as_number(indexed, "selected_candidates"),
-                    "exhaustive_exact_comparisons": as_number(
-                        exhaustive, "exact_comparisons"
-                    ),
-                    "indexed_exact_comparisons": as_number(
-                        indexed, "exact_comparisons"
-                    ),
-                    "exact_result_recall": as_number(indexed, "exact_result_recall"),
-                    "exhaustive_p50_ms": exhaustive_p50,
-                    "exhaustive_p95_ms": exhaustive_p95,
-                    "exhaustive_queries_per_second": 1000.0
-                    * query_count
-                    / exhaustive_p50,
-                    "indexed_p50_ms": indexed_p50,
-                    "indexed_p95_ms": indexed_p95,
-                    "indexed_queries_per_second": 1000.0 * query_count / indexed_p50,
-                    "exhaustive_repetitions": exhaustive_count,
-                    "indexed_repetitions": indexed_count,
-                }
-            )
-            row["peak_temporary_bytes"] = max(
-                row["compact_build_temporary_bytes"],
-                row["indexed_build_temporary_bytes"],
-                row["compact_search_workspace_bytes"],
-                row["indexed_search_workspace_bytes"],
-            )
-            if indexed_p50 < exhaustive_p50 and indexed_p95 < exhaustive_p95:
-                row["kill_gate_outcome"] = "indexed_win"
-            elif exhaustive_p50 < indexed_p50 and exhaustive_p95 < indexed_p95:
-                row["kill_gate_outcome"] = "exhaustive_win"
-        rows.append(row)
+            if status == "ok":
+                compact_build = selected["compact_build"]
+                indexed_build = selected["indexed_build"]
+                exhaustive = selected["exhaustive_search"]
+                indexed = selected["indexed_search"]
+                assert compact_build and indexed_build and exhaustive and indexed
+                compact_build_p50, compact_build_p95, _ = timing_ms(
+                    input_path, compact_build
+                )
+                indexed_build_p50, indexed_build_p95, _ = timing_ms(
+                    input_path, indexed_build
+                )
+                exhaustive_p50, exhaustive_p95, exhaustive_count = timing_ms(
+                    input_path, exhaustive
+                )
+                indexed_p50, indexed_p95, indexed_count = timing_ms(input_path, indexed)
+                query_count = int(axes["Queries"])
+                recall = as_number(indexed, "threshold_zero_recall")
+                if math.isnan(recall):
+                    raise ValueError(
+                        "indexed search state is missing required "
+                        f"threshold_zero_recall: {indexed_search_key}"
+                    )
+                row.update(phase_metrics("compact_build", compact_build))
+                row.update(phase_metrics("indexed_build", indexed_build))
+                row.update(phase_metrics("exhaustive", exhaustive))
+                row["exhaustive_validation_ms"] = as_number(exhaustive, "validation_ms")
+                row.update(phase_metrics("indexed", indexed))
+                row["indexed_validation_ms"] = as_number(indexed, "validation_ms")
+                row.update(
+                    {
+                        "compact_build_p50_ms": compact_build_p50,
+                        "compact_build_p95_ms": compact_build_p95,
+                        "indexed_build_p50_ms": indexed_build_p50,
+                        "indexed_build_p95_ms": indexed_build_p95,
+                        "compact_resident_bytes": as_number(
+                            compact_build, "resident_bytes"
+                        ),
+                        "indexed_resident_bytes": as_number(
+                            indexed_build, "resident_bytes"
+                        ),
+                        "compact_build_temporary_bytes": as_number(
+                            compact_build, "build_temporary_bytes"
+                        ),
+                        "indexed_build_temporary_bytes": as_number(
+                            indexed_build, "build_temporary_bytes"
+                        ),
+                        "compact_search_workspace_bytes": as_number(
+                            exhaustive, "search_workspace_bytes"
+                        ),
+                        "indexed_search_workspace_bytes": as_number(
+                            indexed, "search_workspace_bytes"
+                        ),
+                        "offset_bytes": as_number(indexed, "offset_bytes"),
+                        "posting_bytes": as_number(indexed, "posting_bytes"),
+                        "top_bit_frequency": as_number(indexed, "top_bit_frequency"),
+                        "populated_posting_lists": as_number(
+                            indexed, "populated_posting_lists"
+                        ),
+                        "posting_entries": as_number(indexed, "posting_entries"),
+                        "posting_visits": as_number(indexed, "posting_visits"),
+                        "atomic_updates": as_number(indexed, "atomic_updates"),
+                        "selected_candidates": as_number(
+                            indexed, "selected_candidates"
+                        ),
+                        "candidate_inflation": as_number(
+                            indexed, "candidate_inflation"
+                        ),
+                        "exhaustive_exact_comparisons": as_number(
+                            exhaustive, "exact_comparisons"
+                        ),
+                        "indexed_exact_comparisons": as_number(
+                            indexed, "exact_comparisons"
+                        ),
+                        "exact_result_recall": as_number(
+                            indexed, "exact_result_recall"
+                        ),
+                        "threshold_zero_recall": recall,
+                        "oracle_threshold_pairs": as_number(
+                            indexed, "oracle_threshold_pairs"
+                        ),
+                        "recalled_pairs": as_number(indexed, "recalled_pairs"),
+                        "exhaustive_p50_ms": exhaustive_p50,
+                        "exhaustive_p95_ms": exhaustive_p95,
+                        "exhaustive_queries_per_second": 1000.0
+                        * query_count
+                        / exhaustive_p50,
+                        "indexed_p50_ms": indexed_p50,
+                        "indexed_p95_ms": indexed_p95,
+                        "indexed_queries_per_second": 1000.0
+                        * query_count
+                        / indexed_p50,
+                        "exhaustive_repetitions": exhaustive_count,
+                        "indexed_repetitions": indexed_count,
+                    }
+                )
+                row["peak_temporary_bytes"] = max(
+                    row["compact_build_temporary_bytes"],
+                    row["indexed_build_temporary_bytes"],
+                    row["compact_search_workspace_bytes"],
+                    row["indexed_search_workspace_bytes"],
+                )
+                recall_loss = not math.isfinite(recall) or recall < 1.0
+                indexed_win = (
+                    indexed_p50 < exhaustive_p50 and indexed_p95 < exhaustive_p95
+                )
+                exhaustive_win = (
+                    exhaustive_p50 < indexed_p50 and exhaustive_p95 < indexed_p95
+                )
+                if recall_loss:
+                    row["kill_gate_outcome"] = "recall_loss"
+                elif indexed_win:
+                    row["kill_gate_outcome"] = "indexed_win"
+                elif exhaustive_win:
+                    row["kill_gate_outcome"] = "exhaustive_win"
+                if not is_paper_scale:
+                    outcome = "not_paper_scale"
+                elif recall_loss:
+                    outcome = "recall_loss"
+                elif indexed_win:
+                    outcome = "suitable"
+                else:
+                    outcome = "no_speed_win" if exhaustive_win else "inconclusive"
+                row["paper_scale_suitability"] = outcome
+            rows.append(row)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="") as stream:
