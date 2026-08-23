@@ -211,7 +211,7 @@ def main(
                         markersize=5,
                         markeredgewidth=1.4,
                     )
-                ax.set_xlim(0.0, 0.5)
+                ax.set_xlim(x_edges[0], x_edges[-1])
                 ax.set_ylim(len(references) - 0.5, -0.5)
                 ax.set_xticks(skew_ticks)
                 ax.set_xticklabels(
@@ -224,9 +224,14 @@ def main(
                     fontsize=pu.TICK_LABEL_FONT_SIZE,
                 )
                 ax.set_title(
-                    pu.paper_text(
-                        f"{mode_name}: {fill_ratio:.0%} fill, {int(query_count):,} q",
-                        bold=True,
+                    "\n".join(
+                        (
+                            pu.paper_text(mode_name, bold=True),
+                            pu.paper_text(
+                                f"{fill_ratio:.0%} fill, {int(query_count):,} q",
+                                bold=True,
+                            ),
+                        )
                     ),
                     fontsize=pu.TITLE_FONT_SIZE,
                 )
