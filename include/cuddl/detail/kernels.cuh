@@ -238,41 +238,57 @@ __global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
     }
 }
 
-/// @brief Counts every non-empty reference row entry in its dense index cell.
+/// @brief Counts every non-empty indexed row entry in its dense index cell.
+///
+/// Raw score zero is discarded before masking so masked key zero remains valid.
 template <size_t BucketCount, typename ReferenceRow>
-__global__ void
-count_index_cells_kernel(ReferenceRow const* rows, size_t row_count, uint32_t* cell_counts) {
-    constexpr uint64_t score_count = uint64_t{1} << 16U;
+__global__ void count_index_cells_kernel(
+    ReferenceRow const* rows,
+    size_t indexed_row_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t* cell_counts
+) {
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (; offset < row_count; offset += stride) {
-        auto const score = reference_score(rows[offset]);
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    for (; offset < indexed_row_count; offset += stride) {
+        auto const reference_id = offset / indexed_bucket_count;
+        auto const bucket = offset % indexed_bucket_count;
+        auto const score = reference_score(rows[reference_id * BucketCount + bucket]);
         if (score == 0U) {
             continue;
         }
-        auto const bucket = offset % BucketCount;
-        auto const cell = bucket * score_count + score;
+        auto const key = static_cast<uint32_t>(score & key_mask);
+        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
         atomicAdd(&cell_counts[cell], 1U);
     }
 }
 
-/// @brief Scatters every non-empty reference row entry into its dense CSR posting range.
+/// @brief Scatters every non-empty indexed row entry into its dense CSR posting range.
 template <size_t BucketCount, typename ReferenceRow>
 __global__ void scatter_index_postings_kernel(
-    ReferenceRow const* rows, size_t row_count, uint32_t* cursors, uint32_t* postings
+    ReferenceRow const* rows,
+    size_t indexed_row_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t* cursors,
+    uint32_t* postings
 ) {
-    constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (; offset < row_count; offset += stride) {
-        auto const score = reference_score(rows[offset]);
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    for (; offset < indexed_row_count; offset += stride) {
+        auto const reference_id = offset / indexed_bucket_count;
+        auto const bucket = offset % indexed_bucket_count;
+        auto const score = reference_score(rows[reference_id * BucketCount + bucket]);
         if (score == 0U) {
             continue;
         }
-        auto const bucket = offset % BucketCount;
-        auto const cell = bucket * score_count + score;
+        auto const key = static_cast<uint32_t>(score & key_mask);
+        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
         auto const posting = atomicAdd(&cursors[cell], 1U);
-        postings[posting] = static_cast<uint32_t>(offset / BucketCount);
+        postings[posting] = static_cast<uint32_t>(reference_id);
     }
 }
 
@@ -282,18 +298,21 @@ __global__ void count_index_matches_kernel(
     uint16_t const* query,
     uint32_t const* offsets,
     uint32_t const* postings,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
     uint32_t* match_counts
 ) {
-    constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto const bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (bucket >= BucketCount) {
+    if (bucket >= indexed_bucket_count) {
         return;
     }
     auto const score = query[bucket];
     if (score == 0U) {
         return;
     }
-    auto const cell = bucket * score_count + score;
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    auto const key = static_cast<uint32_t>(score & key_mask);
+    auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
     auto const begin = offsets[cell];
     auto const end = offsets[cell + 1U];
     for (auto posting = begin; posting < end; ++posting) {
@@ -438,21 +457,24 @@ __global__ void count_batch_index_matches_kernel(
     uint32_t const* offsets,
     uint32_t const* postings,
     uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
     uint32_t* match_counts
 ) {
-    constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto query_bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    auto const query_buckets = static_cast<size_t>(query_count) * BucketCount;
+    auto const query_buckets = static_cast<size_t>(query_count) * indexed_bucket_count;
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
     for (; query_bucket < query_buckets; query_bucket += stride) {
-        auto const query_index = query_bucket / BucketCount;
-        auto const bucket = query_bucket % BucketCount;
+        auto const query_index = query_bucket / indexed_bucket_count;
+        auto const bucket = query_bucket % indexed_bucket_count;
         auto const score =
             reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket]);
         if (score == 0U) {
             continue;
         }
-        auto const cell = bucket * score_count + score;
+        auto const key = static_cast<uint32_t>(score & key_mask);
+        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
         auto const begin = offsets[cell];
         auto const end = offsets[cell + 1U];
         for (auto posting = begin; posting < end; ++posting) {

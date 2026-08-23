@@ -102,7 +102,7 @@ struct batch_search_requirements {
         default;
 };
 
-/// @brief Per-search candidate threshold for the full 16-bit DDLIndex.
+/// @brief Per-search candidate threshold for the indexed DDLIndex.
 struct indexed_search_options {
     uint32_t minimum_matches = 5;
 };
@@ -119,9 +119,6 @@ template <uint32_t K, size_t BucketCount>
     if (compatibility.bucket_count != BucketCount) {
         return Err(Error::invalid_argument("bucket count does not match the database type"));
     }
-    if (compatibility.indexed_bucket_count != BucketCount) {
-        return Err(Error::invalid_argument("compact exhaustive search requires every bucket"));
-    }
     if (compatibility.score_encoder_identity == 0U || compatibility.exponent_bits == 0U ||
         compatibility.mantissa_bits == 0U ||
         static_cast<uint32_t>(compatibility.exponent_bits) + compatibility.mantissa_bits != 16U) {
@@ -133,17 +130,56 @@ template <uint32_t K, size_t BucketCount>
     if (compatibility.canonicalisation_policy == 0U) {
         return Err(Error::invalid_argument("canonicalisation policy must be specified"));
     }
+    return Ok();
+}
+
+template <uint32_t K, size_t BucketCount>
+[[nodiscard]] inline Result<void> validate_non_indexed_score_compatibility(
+    score_compatibility const& compatibility
+) {
+    if (auto const validation = validate_score_compatibility<K, BucketCount>(compatibility);
+        !validation) {
+        return validation;
+    }
+    if (compatibility.indexed_bucket_count != BucketCount) {
+        return Err(Error::invalid_argument("non-indexed builds require every bucket"));
+    }
     if (compatibility.key_mask != std::numeric_limits<uint16_t>::max()) {
-        return Err(
-            Error::invalid_argument("compact exhaustive search requires full 16-bit scores")
-        );
+        return Err(Error::invalid_argument("non-indexed builds require an unmasked key"));
     }
     return Ok();
 }
 
-template <size_t BucketCount>
-inline constexpr uint64_t indexed_cell_count =
-    static_cast<uint64_t>(BucketCount) * (uint64_t{1} << 16U);
+template <uint32_t K, size_t BucketCount>
+[[nodiscard]] inline Result<void> validate_indexed_score_compatibility(
+    score_compatibility const& compatibility
+) {
+    if (auto const validation = validate_score_compatibility<K, BucketCount>(compatibility);
+        !validation) {
+        return validation;
+    }
+    auto const full_bucket_count = static_cast<uint32_t>(BucketCount);
+    if (compatibility.indexed_bucket_count != full_bucket_count &&
+        compatibility.indexed_bucket_count != full_bucket_count / 2U) {
+        return Err(Error::invalid_argument("indexed builds require a full or half bucket count"));
+    }
+    if (compatibility.key_mask != std::numeric_limits<uint16_t>::max() &&
+        compatibility.key_mask != 0x7fffU) {
+        return Err(Error::invalid_argument("indexed builds require a 16-bit or 15-bit key mask"));
+    }
+    return Ok();
+}
+
+[[nodiscard]] inline constexpr uint64_t indexed_cell_count(
+    score_compatibility const& compatibility
+) noexcept {
+    return static_cast<uint64_t>(compatibility.indexed_bucket_count) *
+           (static_cast<uint64_t>(compatibility.key_mask) + 1U);
+}
+[[nodiscard]] inline constexpr uint64_t
+indexed_posting_count(uint32_t reference_count, score_compatibility const& compatibility) noexcept {
+    return static_cast<uint64_t>(reference_count) * compatibility.indexed_bucket_count;
+}
 
 [[nodiscard]] inline uintptr_t align_up(uintptr_t address, size_t alignment) noexcept {
     return (address + alignment - 1U) & ~(static_cast<uintptr_t>(alignment) - 1U);
@@ -271,9 +307,7 @@ class reference_database_ref {
 
     /// @brief Caller-owned bytes required by one positive-threshold indexed query.
     [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes() const {
-        if (!indexed_) {
-            return Err(Error::invalid_argument("database has no full 16-bit index"));
-        }
+        CUDDL_TRY(validate_index_storage());
         if (metadata_.reference_count == 0U) {
             return size_t{0};
         }
@@ -316,9 +350,7 @@ class reference_database_ref {
     [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
         uint32_t query_count
     ) const {
-        if (!indexed_) {
-            return Err(Error::invalid_argument("database has no full 16-bit index"));
-        }
+        CUDDL_TRY(validate_index_storage());
         auto const pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
         return make_batch_requirements(pair_count, pair_count, true);
     }
@@ -333,9 +365,7 @@ class reference_database_ref {
     /// @brief Storage required for one indexed all-to-all query tile.
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        if (!indexed_) {
-            return Err(Error::invalid_argument("database has no full 16-bit index"));
-        }
+        CUDDL_TRY(validate_index_storage());
         auto const dense_pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
         auto const result_pair_count =
             CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
@@ -463,15 +493,10 @@ class reference_database_ref {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
         if (!rows_match_metadata(expected_scores)) {
             return Err(Error::invalid_argument("database extent does not match its metadata"));
         }
-        if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
-            index_offsets_.data() == nullptr || index_postings_.size() != expected_scores ||
-            (expected_scores != 0U && index_postings_.data() == nullptr)) {
-            return Err(Error::invalid_argument("database has no valid full 16-bit index"));
-        }
+        CUDDL_TRY(validate_index_storage());
         if (query.size() != BucketCount || query.data() == nullptr) {
             return Err(Error::invalid_argument("query must contain one complete score row"));
         }
@@ -483,8 +508,8 @@ class reference_database_ref {
         if (query_compatibility != metadata_.compatibility) {
             return Err(Error::invalid_argument("query construction metadata is incompatible"));
         }
-        if (options.minimum_matches > BucketCount) {
-            return Err(Error::invalid_argument("minimum matches exceeds the bucket count"));
+        if (options.minimum_matches > metadata_.compatibility.indexed_bucket_count) {
+            return Err(Error::invalid_argument("minimum matches exceeds indexed bucket count"));
         }
         if (results.size() < metadata_.reference_count) {
             return Err(Error::resource("indexed result capacity is too small"));
@@ -543,11 +568,18 @@ class reference_database_ref {
             static_cast<size_t>(metadata_.reference_count) * sizeof(uint32_t),
             stream.get()
         ));
-        auto const bucket_blocks =
-            static_cast<uint32_t>((BucketCount + detail::block_size - 1U) / detail::block_size);
+        auto const indexed_bucket_count = metadata_.compatibility.indexed_bucket_count;
+        auto const bucket_blocks = static_cast<uint32_t>(
+            (indexed_bucket_count + detail::block_size - 1U) / detail::block_size
+        );
         detail::count_index_matches_kernel<BucketCount>
             <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
-                query.data(), index_offsets_.data(), index_postings_.data(), match_counts
+                query.data(),
+                index_offsets_.data(),
+                index_postings_.data(),
+                indexed_bucket_count,
+                metadata_.compatibility.key_mask,
+                match_counts
             );
         CUDDL_CUDA_TRY(cudaGetLastError());
 
@@ -581,11 +613,7 @@ class reference_database_ref {
         } else {
             detail::refine_index_candidates_kernel<BucketCount>
                 <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                    rows_.data(),
-                    query.data(),
-                    candidate_ids,
-                    result_count.data(),
-                    results.data()
+                    rows_.data(), query.data(), candidate_ids, result_count.data(), results.data()
                 );
         }
         return cuda_try(cudaGetLastError());
@@ -812,6 +840,22 @@ class reference_database_ref {
         return Ok();
     }
 
+    [[nodiscard]] Result<void> validate_index_storage() const {
+        CUDDL_TRY((
+            detail::validate_indexed_score_compatibility<K, BucketCount>(metadata_.compatibility)
+        ));
+        auto const cell_count = detail::indexed_cell_count(metadata_.compatibility);
+        auto const expected_postings = static_cast<size_t>(
+            detail::indexed_posting_count(metadata_.reference_count, metadata_.compatibility)
+        );
+        if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
+            index_offsets_.data() == nullptr || index_postings_.size() != expected_postings ||
+            (expected_postings != 0U && index_postings_.data() == nullptr)) {
+            return Err(Error::invalid_argument("database has no valid retrieval index"));
+        }
+        return Ok();
+    }
+
     [[nodiscard]] Result<uint32_t> dense_batch_pair_count(uint32_t query_count) const {
         auto const pair_count = static_cast<uint64_t>(query_count) * metadata_.reference_count;
         if (pair_count > std::numeric_limits<uint32_t>::max()) {
@@ -962,15 +1006,9 @@ class reference_database_ref {
         device_span<uint32_t> result_match_counts,
         indexed_search_options options
     ) const {
-        auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
-        if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
-            index_offsets_.data() == nullptr || index_postings_.size() != expected_scores ||
-            (expected_scores != 0U && index_postings_.data() == nullptr)) {
-            return Err(Error::invalid_argument("database has no valid full 16-bit index"));
-        }
-        if (options.minimum_matches > BucketCount) {
-            return Err(Error::invalid_argument("minimum matches exceeds the bucket count"));
+        CUDDL_TRY(validate_index_storage());
+        if (options.minimum_matches > metadata_.compatibility.indexed_bucket_count) {
+            return Err(Error::invalid_argument("minimum matches exceeds indexed bucket count"));
         }
         if (workspace.size_bytes() < requirements.workspace_bytes) {
             return Err(Error::resource("indexed batch workspace is too small"));
@@ -1066,7 +1104,8 @@ class reference_database_ref {
             static_cast<uint32_t>(requirements.counter_bytes / sizeof(uint32_t));
 
         CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, requirements.counter_bytes, stream.get()));
-        auto const query_buckets = static_cast<size_t>(query_count) * BucketCount;
+        auto const query_buckets =
+            static_cast<size_t>(query_count) * metadata_.compatibility.indexed_bucket_count;
         auto const required_bucket_blocks =
             (query_buckets + detail::block_size - 1U) / detail::block_size;
         auto const bucket_blocks = static_cast<uint32_t>(
@@ -1080,6 +1119,8 @@ class reference_database_ref {
                 index_offsets_.data(),
                 index_postings_.data(),
                 metadata_.reference_count,
+                metadata_.compatibility.indexed_bucket_count,
+                metadata_.compatibility.key_mask,
                 match_counts
             );
         CUDDL_CUDA_TRY(cudaGetLastError());
@@ -1269,7 +1310,7 @@ class reference_database {
         );
     }
 
-    /// @brief Builds compact rows and their full 16-bit dense-offset index.
+    /// @brief Builds compact rows and their indexed dense-offset index.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         device_span<score_type const> rows,
         score_compatibility compatibility,
@@ -1278,7 +1319,7 @@ class reference_database {
         return build_indexed_rows_async(rows, {}, compatibility, stream);
     }
 
-    /// @brief Builds packed rows and their full winner-score dense-offset index.
+    /// @brief Builds packed rows and their indexed winner-score dense-offset index.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         device_span<register_type const> rows,
         device_span<uint32_t const> saturation_states,
@@ -1315,11 +1356,11 @@ class reference_database {
     }
 
     [[nodiscard]] ref_type ref() const noexcept {
-        constexpr auto offset_count =
-            static_cast<size_t>(detail::indexed_cell_count<BucketCount> + 1U);
+        auto const offset_count =
+            indexed_ ? static_cast<size_t>(detail::indexed_cell_count(metadata_.compatibility) + 1U)
+                     : 0U;
         auto const row_count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        auto const offsets =
-            device_span<uint32_t const>{index_offsets_, indexed_ ? offset_count : 0U};
+        auto const offsets = device_span<uint32_t const>{index_offsets_, offset_count};
         auto const postings = device_span<uint32_t const>{index_postings_, index_posting_capacity_};
         if (packed_) {
             return ref_type(
@@ -1757,13 +1798,22 @@ class reference_database {
     [[nodiscard]] static Result<uint32_t> validate_rows(
         device_span<Row const> rows,
         device_span<uint32_t const> saturation_states,
-        score_compatibility compatibility
+        score_compatibility compatibility,
+        bool indexed
     ) {
         static_assert(std::is_same_v<Row, score_type> || std::is_same_v<Row, register_type>);
-        if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(compatibility);
-            !validation) {
-            return Err(validation.error());
+        if (indexed) {
+            if (auto const validation =
+                    detail::validate_indexed_score_compatibility<K, BucketCount>(compatibility);
+                !validation) {
+                return Err(validation.error());
+            }
+        } else {
+            if (auto const validation =
+                    detail::validate_non_indexed_score_compatibility<K, BucketCount>(compatibility);
+                !validation) {
+                return Err(validation.error());
+            }
         }
         if (rows.size() % BucketCount != 0U) {
             return Err(Error::invalid_argument("row extent must contain complete rows"));
@@ -1791,21 +1841,17 @@ class reference_database {
     }
 
     template <typename Row>
-    [[nodiscard]] static Result<reference_database> build_rows_async(
+    [[nodiscard]] static Result<reference_database> build_storage_async(
         device_span<Row const> rows,
         device_span<uint32_t const> saturation_states,
         score_compatibility compatibility,
+        uint32_t reference_count,
         cuda::stream_ref stream
     ) {
-        auto const validated = validate_rows(rows, saturation_states, compatibility);
-        if (!validated) {
-            return Err(validated.error());
-        }
-
         reference_database database;
         database.metadata_ = {
             .compatibility = compatibility,
-            .reference_count = *validated,
+            .reference_count = reference_count,
         };
         database.packed_ = std::is_same_v<Row, register_type>;
         if (rows.empty()) {
@@ -1847,30 +1893,50 @@ class reference_database {
     }
 
     template <typename Row>
+    [[nodiscard]] static Result<reference_database> build_rows_async(
+        device_span<Row const> rows,
+        device_span<uint32_t const> saturation_states,
+        score_compatibility compatibility,
+        cuda::stream_ref stream
+    ) {
+        auto const validated = validate_rows(rows, saturation_states, compatibility, false);
+        if (!validated) {
+            return Err(validated.error());
+        }
+        return build_storage_async(rows, saturation_states, compatibility, *validated, stream);
+    }
+
+    template <typename Row>
     [[nodiscard]] static Result<reference_database> build_indexed_rows_async(
         device_span<Row const> rows,
         device_span<uint32_t const> saturation_states,
         score_compatibility compatibility,
         cuda::stream_ref stream
     ) {
-        auto const validated = validate_rows(rows, saturation_states, compatibility);
+        auto const validated = validate_rows(rows, saturation_states, compatibility, true);
         if (!validated) {
             return Err(validated.error());
         }
-        if (rows.size() > std::numeric_limits<uint32_t>::max()) {
+        auto const posting_capacity = detail::indexed_posting_count(*validated, compatibility);
+        if (posting_capacity > std::numeric_limits<uint32_t>::max()) {
             return Err(Error::resource("index postings exceed 32-bit offsets"));
         }
-        constexpr auto cell_count = detail::indexed_cell_count<BucketCount>;
-        if (cell_count + 1U > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+        if (posting_capacity > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            return Err(Error::resource("index posting allocation overflows"));
+        }
+        auto const cell_count = detail::indexed_cell_count(compatibility);
+        auto const offset_count = cell_count + 1U;
+        if (offset_count > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
             return Err(Error::resource("dense index offset allocation overflows"));
         }
 
-        auto built = build_rows_async(rows, saturation_states, compatibility, stream);
+        auto built =
+            build_storage_async(rows, saturation_states, compatibility, *validated, stream);
         if (!built) {
             return Err(built.error());
         }
         auto database = std::move(*built);
-        auto const offset_bytes = static_cast<size_t>(cell_count + 1U) * sizeof(uint32_t);
+        auto const offset_bytes = static_cast<size_t>(offset_count) * sizeof(uint32_t);
         if (auto const allocation = cuda_try(cudaMalloc(&database.index_offsets_, offset_bytes));
             !allocation) {
             return Err(allocation.error());
@@ -1881,12 +1947,12 @@ class reference_database {
             return Result<reference_database>::ok(std::move(database));
         }
 
-        if (auto const allocation =
-                cuda_try(cudaMalloc(&database.index_postings_, rows.size() * sizeof(uint32_t)));
+        auto const posting_bytes = static_cast<size_t>(posting_capacity) * sizeof(uint32_t);
+        if (auto const allocation = cuda_try(cudaMalloc(&database.index_postings_, posting_bytes));
             !allocation) {
             return Err(allocation.error());
         }
-        database.index_posting_capacity_ = rows.size();
+        database.index_posting_capacity_ = static_cast<size_t>(posting_capacity);
 
         size_t scan_bytes = 0;
         if (auto const query = cuda_try(
@@ -1923,22 +1989,25 @@ class reference_database {
             }
             return Err(error);
         };
-        // CUB histogram scratch scales with the full-score domain; direct counting keeps scratch
-        // to the scan temporary storage and one cursor per cell.
+        // Direct counting keeps index-construction scratch to scan storage and one cursor per cell.
 
         if (auto const clear_counts =
                 cuda_try(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
             !clear_counts) {
             return fail(clear_counts.error());
         }
-        auto const blocks =
-            static_cast<uint32_t>((rows.size() + detail::block_size - 1U) / detail::block_size);
+        auto const indexed_row_count = static_cast<size_t>(posting_capacity);
+        auto const blocks = static_cast<uint32_t>(
+            (posting_capacity + detail::block_size - 1U) / detail::block_size
+        );
         auto const stored_rows =
             device_span<Row const>{static_cast<Row const*>(database.rows_), rows.size()};
         detail::count_index_cells_kernel<BucketCount>
             <<<blocks, detail::block_size, 0, stream.get()>>>(
                 stored_rows.data(),
-                stored_rows.size(),
+                indexed_row_count,
+                compatibility.indexed_bucket_count,
+                compatibility.key_mask,
                 database.index_offsets_
             );
         if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
@@ -1970,7 +2039,9 @@ class reference_database {
         detail::scatter_index_postings_kernel<BucketCount>
             <<<blocks, detail::block_size, 0, stream.get()>>>(
                 stored_rows.data(),
-                stored_rows.size(),
+                indexed_row_count,
+                compatibility.indexed_bucket_count,
+                compatibility.key_mask,
                 cursors,
                 database.index_postings_
             );
