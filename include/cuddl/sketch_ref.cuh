@@ -93,7 +93,9 @@ class sketch_ref {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
         detail::summary_kernel<BucketCount, IncludeCardinality>
-            <<<1, detail::block_size, 0, stream.get()>>>(registers_, other.registers_, output);
+            <<<1, detail::block_size, 0, stream.get()>>>(
+                registers_.data(), other.registers_.data(), output
+            );
         return cuda_try(cudaGetLastError());
     }
 

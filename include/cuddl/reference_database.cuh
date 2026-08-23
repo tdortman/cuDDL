@@ -547,7 +547,7 @@ class reference_database_ref {
             static_cast<uint32_t>((BucketCount + detail::block_size - 1U) / detail::block_size);
         detail::count_index_matches_kernel<BucketCount>
             <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
-                query, index_offsets_, index_postings_, match_counts
+                query.data(), index_offsets_.data(), index_postings_.data(), match_counts
             );
         CUDDL_CUDA_TRY(cudaGetLastError());
 
@@ -572,12 +572,20 @@ class reference_database_ref {
         if (packed_) {
             detail::refine_index_candidates_kernel<BucketCount>
                 <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                    packed_rows_, query, candidate_ids, result_count.data(), results.data()
+                    packed_rows_.data(),
+                    query.data(),
+                    candidate_ids,
+                    result_count.data(),
+                    results.data()
                 );
         } else {
             detail::refine_index_candidates_kernel<BucketCount>
                 <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                    rows_, query, candidate_ids, result_count.data(), results.data()
+                    rows_.data(),
+                    query.data(),
+                    candidate_ids,
+                    result_count.data(),
+                    results.data()
                 );
         }
         return cuda_try(cudaGetLastError());
@@ -1009,11 +1017,11 @@ class reference_database_ref {
         dim3 const blocks{reference_blocks, query_blocks, 1U};
         detail::batch_exhaustive_search_kernel<BucketCount, AllToAll>
             <<<blocks, detail::block_size, 0, stream.get()>>>(
-                queries,
+                queries.data(),
                 query_row_offset,
                 query_count,
                 query_id_offset,
-                rows,
+                rows.data(),
                 metadata_.reference_count,
                 results.data(),
                 result_match_counts.empty() ? nullptr : result_match_counts.data()
@@ -1066,11 +1074,11 @@ class reference_database_ref {
         );
         detail::count_batch_index_matches_kernel<BucketCount>
             <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
-                queries,
+                queries.data(),
                 query_row_offset,
                 query_count,
-                index_offsets_,
-                index_postings_,
+                index_offsets_.data(),
+                index_postings_.data(),
                 metadata_.reference_count,
                 match_counts
             );
@@ -1109,10 +1117,10 @@ class reference_database_ref {
             (capacity + candidates_per_block - 1U) / candidates_per_block;
         detail::refine_batch_index_candidates_kernel<BucketCount>
             <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                queries,
+                queries.data(),
                 query_row_offset,
                 query_id_offset,
-                rows,
+                rows.data(),
                 metadata_.reference_count,
                 match_counts,
                 candidate_ids,
@@ -1928,7 +1936,11 @@ class reference_database {
         auto const stored_rows =
             device_span<Row const>{static_cast<Row const*>(database.rows_), rows.size()};
         detail::count_index_cells_kernel<BucketCount>
-            <<<blocks, detail::block_size, 0, stream.get()>>>(stored_rows, database.index_offsets_);
+            <<<blocks, detail::block_size, 0, stream.get()>>>(
+                stored_rows.data(),
+                stored_rows.size(),
+                database.index_offsets_
+            );
         if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
             return fail(launch.error());
         }
@@ -1957,7 +1969,10 @@ class reference_database {
 
         detail::scatter_index_postings_kernel<BucketCount>
             <<<blocks, detail::block_size, 0, stream.get()>>>(
-                stored_rows, cursors, database.index_postings_
+                stored_rows.data(),
+                stored_rows.size(),
+                cursors,
+                database.index_postings_
             );
         if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
             return fail(launch.error());

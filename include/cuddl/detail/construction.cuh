@@ -38,7 +38,10 @@ __host__ inline Result<void> launch_construction(
         return {};
     }
     add_kernel<BucketCount><<<construction_blocks(input.size(), stream), block_size, 0, stream>>>(
-        input, registers, saturation
+        input.data(),
+        input.size(),
+        registers.data(),
+        saturation
     );
     return cuda_try(cudaGetLastError());
 }

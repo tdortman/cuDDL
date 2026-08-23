@@ -12,7 +12,6 @@
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/hybrid_cardinality.cuh>
 #include <cuddl/detail/register.cuh>
-#include <cuddl/device_span.cuh>
 #include <cuddl/pairwise_counts.cuh>
 
 namespace cg = cooperative_groups;
@@ -85,17 +84,18 @@ combine_cardinality(cardinality_payload const& a, cardinality_payload const& b) 
  */
 template <size_t BucketCount>
 __global__ __launch_bounds__(block_size, 4) void add_kernel(
-    device_span<uint64_t const> input,
-    device_span<uint32_t> registers,
+    uint64_t const* input,
+    size_t input_size,
+    uint32_t* registers,
     uint32_t& saturation
 ) {
     auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto offset = index; offset < input.size(); offset += stride * 2U) {
+    for (auto offset = index; offset < input_size; offset += stride * 2U) {
         _Pragma("unroll")
         for (uint32_t item = 0; item < 2U; ++item) {
             auto const current = offset + stride * item;
-            if (current < input.size()) {
+            if (current < input_size) {
                 auto const hash = hash_kmer(input[current]);
                 update(&registers[bucket_of<BucketCount>(hash)], score(hash), saturation);
             }
@@ -108,9 +108,7 @@ __global__ __launch_bounds__(block_size, 4) void add_kernel(
  */
 template <size_t BucketCount, bool IncludeCardinality>
 __global__ void summary_kernel(
-    device_span<uint32_t const> left,
-    device_span<uint32_t const> right,
-    pairwise_summary& output
+    uint32_t const* left, uint32_t const* right, pairwise_summary& output
 ) {
     using block_reduce = cub::BlockReduce<summary_payload, block_size>;
     __shared__ typename block_reduce::TempStorage storage;
@@ -243,11 +241,11 @@ __global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
 /// @brief Counts every non-empty reference row entry in its dense index cell.
 template <size_t BucketCount, typename ReferenceRow>
 __global__ void
-count_index_cells_kernel(device_span<ReferenceRow const> rows, uint32_t* cell_counts) {
+count_index_cells_kernel(ReferenceRow const* rows, size_t row_count, uint32_t* cell_counts) {
     constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (; offset < rows.size(); offset += stride) {
+    for (; offset < row_count; offset += stride) {
         auto const score = reference_score(rows[offset]);
         if (score == 0U) {
             continue;
@@ -261,14 +259,12 @@ count_index_cells_kernel(device_span<ReferenceRow const> rows, uint32_t* cell_co
 /// @brief Scatters every non-empty reference row entry into its dense CSR posting range.
 template <size_t BucketCount, typename ReferenceRow>
 __global__ void scatter_index_postings_kernel(
-    device_span<ReferenceRow const> rows,
-    uint32_t* cursors,
-    uint32_t* postings
+    ReferenceRow const* rows, size_t row_count, uint32_t* cursors, uint32_t* postings
 ) {
     constexpr uint64_t score_count = uint64_t{1} << 16U;
     auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (; offset < rows.size(); offset += stride) {
+    for (; offset < row_count; offset += stride) {
         auto const score = reference_score(rows[offset]);
         if (score == 0U) {
             continue;
@@ -283,9 +279,9 @@ __global__ void scatter_index_postings_kernel(
 /// @brief Counts the query's non-empty posting matches for every reference.
 template <size_t BucketCount>
 __global__ void count_index_matches_kernel(
-    device_span<uint16_t const> query,
-    device_span<uint32_t const> offsets,
-    device_span<uint32_t const> postings,
+    uint16_t const* query,
+    uint32_t const* offsets,
+    uint32_t const* postings,
     uint32_t* match_counts
 ) {
     constexpr uint64_t score_count = uint64_t{1} << 16U;
@@ -325,8 +321,8 @@ __global__ void write_result_count_kernel(uint32_t value, uint32_t* result_count
 /// @brief Exactly refines every selected reference over its full winner-score row.
 template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
 __global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
-    device_span<ReferenceRow const> rows,
-    device_span<uint16_t const> query,
+    ReferenceRow const* rows,
+    uint16_t const* query,
     uint32_t const* candidate_ids,
     uint32_t const* candidate_count,
     SearchResult* results
@@ -370,11 +366,11 @@ template <
     typename ReferenceRow,
     typename SearchResult>
 __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
-    device_span<QueryRow const> queries,
+    QueryRow const* queries,
     size_t query_row_offset,
     uint32_t query_count,
     uint32_t query_id_offset,
-    device_span<ReferenceRow const> rows,
+    ReferenceRow const* rows,
     uint32_t reference_count,
     SearchResult* results,
     uint32_t* result_match_counts
@@ -436,11 +432,11 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
 /// @brief Counts dense index matches for every query/reference pair in one tile.
 template <size_t BucketCount, typename QueryRow>
 __global__ void count_batch_index_matches_kernel(
-    device_span<QueryRow const> queries,
+    QueryRow const* queries,
     size_t query_row_offset,
     uint32_t query_count,
-    device_span<uint32_t const> offsets,
-    device_span<uint32_t const> postings,
+    uint32_t const* offsets,
+    uint32_t const* postings,
     uint32_t reference_count,
     uint32_t* match_counts
 ) {
@@ -484,10 +480,10 @@ struct batch_minimum_match_predicate {
 /// @brief Exactly refines a bounded stable query-major candidate list.
 template <size_t BucketCount, typename QueryRow, typename ReferenceRow, typename SearchResult>
 __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kernel(
-    device_span<QueryRow const> queries,
+    QueryRow const* queries,
     size_t query_row_offset,
     uint32_t query_id_offset,
-    device_span<ReferenceRow const> rows,
+    ReferenceRow const* rows,
     uint32_t reference_count,
     uint32_t const* match_counts,
     uint32_t const* candidate_ids,
