@@ -179,4 +179,141 @@ hybrid_estimates(uint32_t const* bins, double bucket_count, double restored_sum)
     };
 }
 
+/**
+ * @brief Single-precision variant of the hybrid estimator tail.
+ *
+ * The 2,048-register hybrid scan is memory/latency bound on every GPU, but the
+ * serial estimator tail in @ref hybrid_estimates is FP64-heavy. Datacenter GPUs
+ * (H100/B200) execute those instructions at half FP32 rate, while consumer
+ * cards rate-limit FP64 to 1/64 of FP32. Keeping the scan and tail in
+ * FP32 avoids that consumer cliff; the ~1e-7 relative error is far below the
+ * ~2% standard error of a 2,048-register sketch.
+ */
+__device__ inline float interpolate_mean_m_cf_f32(float estimate) noexcept {
+    if (estimate <= ddl_cf_keys[0]) {
+        return ddl_mean_m_cf[0];
+    }
+    if (estimate >= ddl_cf_keys[ddl_cf_size - 1]) {
+        return ddl_mean_m_cf[ddl_cf_size - 1];
+    }
+    uint32_t low = 0;
+    uint32_t high = ddl_cf_size - 1;
+    while (low + 1 < high) {
+        auto const middle = (low + high) / 2;
+        if (ddl_cf_keys[middle] <= estimate) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    auto const fraction = (estimate - ddl_cf_keys[low]) / (ddl_cf_keys[high] - ddl_cf_keys[low]);
+    return ddl_mean_m_cf[low] + fraction * (ddl_mean_m_cf[high] - ddl_mean_m_cf[low]);
+}
+
+__device__ inline float lc_min_f32(uint32_t const* bins, float bucket_count) noexcept {
+    auto cumulative = bins[0];
+    if (cumulative > 0U) {
+        return bucket_count * cuda::std::log(bucket_count / cumulative);
+    }
+    for (int32_t tier = 0; tier + 1 < nlz_bins; ++tier) {
+        cumulative += bins[tier + 1];
+        if (cumulative > 0U) {
+            return cuda::std::ldexp(
+                bucket_count * cuda::std::log(bucket_count / cumulative), tier + 1
+            );
+        }
+    }
+    return 0.0f;
+}
+
+__device__ inline float dlc_f32(uint32_t const* bins, float bucket_count, float lc) noexcept {
+    auto const empty = static_cast<float>(bins[0]);
+    auto const minimum = max(1.0f, bucket_count * static_cast<float>(dlc_min_fraction));
+    auto const maximum = bucket_count - minimum;
+    auto cumulative = empty;
+    float weight_sum = 0.0f;
+    float weighted_log_sum = 0.0f;
+    for (int32_t tier = 0; tier + 1 < nlz_bins; ++tier) {
+        if (cumulative >= minimum && cumulative <= maximum) {
+            auto const occupied = bucket_count - cumulative;
+            auto const log_ratio = cuda::std::log(bucket_count / cumulative);
+            auto const tier_estimate = cuda::std::ldexp(bucket_count * log_ratio, tier);
+
+            auto const error = cuda::std::sqrt(2.0f / 3.14159265358979323846f) *
+                               cuda::std::sqrt(occupied / (bucket_count * cumulative)) / log_ratio;
+
+            // `1 / error` is positive here. `pow(x, 4.5)` is the same value as
+            // `x^4 * sqrt(x)` and avoids a generic pow path.
+            auto const inv_error = 1.0f / error;
+            auto const inv_squared = inv_error * inv_error;
+            auto const weight = inv_squared * inv_squared * cuda::std::sqrt(inv_error);
+            weight_sum += weight;
+            weighted_log_sum += weight * cuda::std::log(tier_estimate);
+        }
+        cumulative += bins[tier + 1];
+        if (cumulative >= bucket_count) {
+            break;
+        }
+    }
+    if (weight_sum == 0.0f) {
+        return lc;
+    }
+    auto const pure = cuda::std::exp(weighted_log_sum / weight_sum);
+    if (empty >= static_cast<float>(dlc_blend_high) * bucket_count) {
+        return lc;
+    }
+    if (empty > static_cast<float>(dlc_blend_low) * bucket_count) {
+        auto const t = (empty - static_cast<float>(dlc_blend_low) * bucket_count) /
+                       ((static_cast<float>(dlc_blend_high) - static_cast<float>(dlc_blend_low)) *
+                        bucket_count);
+        return t * lc + (1.0f - t) * pure;
+    }
+    return pure;
+}
+
+__device__ inline float hybrid_f32(
+    float low_estimate,
+    float zone_estimate,
+    float corrected_mean,
+    float bucket_count
+) noexcept {
+    auto const low = static_cast<float>(hybrid_low) * bucket_count;
+    auto const high = static_cast<float>(hybrid_high) * bucket_count;
+    if (zone_estimate <= low) {
+        return low_estimate;
+    }
+    if (zone_estimate >= high) {
+        return corrected_mean;
+    }
+    auto const t = cuda::std::log(zone_estimate / low) / cuda::std::log(high / low);
+    return (1.0f - t) * low_estimate + t * corrected_mean;
+}
+
+__device__ inline float
+bbtools_mean_m_f32(float bucket_count, float filled, float restored_sum) noexcept {
+    if (filled <= 0.0f || restored_sum <= 0.0f) {
+        return 0.0f;
+    }
+    auto const mean = restored_sum / filled;
+    auto const occupancy_correction = (filled + bucket_count) / (2.0f * bucket_count);
+    return static_cast<float>(hash_range) / mean * filled * occupancy_correction;
+}
+
+__device__ inline hybrid_cardinality_estimates
+hybrid_estimates_f32(uint32_t const* bins, float bucket_count, float restored_sum) noexcept {
+    auto const empty = static_cast<float>(bins[0]);
+    auto const filled = bucket_count - empty;
+    auto const raw_mean = bbtools_mean_m_f32(bucket_count, filled, restored_sum);
+    auto const lc = lc_min_f32(bins, bucket_count);
+    auto const dlc_estimate = dlc_f32(bins, bucket_count, lc);
+    auto const corrected_mean = raw_mean * interpolate_mean_m_cf_f32(dlc_estimate);
+    return {
+        static_cast<double>(hybrid_f32(lc, lc, corrected_mean, bucket_count)),
+        static_cast<double>(hybrid_f32(lc, dlc_estimate, corrected_mean, bucket_count)),
+        static_cast<double>(lc),
+        static_cast<double>(dlc_estimate),
+        static_cast<double>(raw_mean),
+    };
+}
+
 }  // namespace cuddl::detail

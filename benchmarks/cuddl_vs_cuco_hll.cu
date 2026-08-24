@@ -75,6 +75,7 @@ void cuddl_cardinality(nvbench::state& state) {
     cuddl::sketch<25, k_bucket_count> sketch;
     CUDDL_UNWRAP(sketch.add({d_input, count}));
 
+    // Host-visible API path: kernel launch, stream synchronisation, and device-to-host copy.
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto estimate = CUDDL_UNWRAP(sketch.cardinality(cuda::stream_ref{launch.get_stream()}));
         do_not_optimise(estimate);
@@ -94,14 +95,18 @@ void cuddl_hybrid_cardinality(nvbench::state& state) {
     cudaMemcpy(d_input, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cuddl::sketch<25, k_bucket_count> sketch;
     CUDDL_UNWRAP(sketch.add({d_input, count}));
-    cuddl::detail::device_buffer<double> output(1);
 
+    // Host-visible API path: kernel launch, stream synchronisation, and device-to-host copy.
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        cuddl::detail::hybrid_cardinality_variant_kernel<k_bucket_count, Variant>
-            <<<1, cuddl::detail::block_size, 0, launch.get_stream()>>>(
-                sketch.ref().data().data(), output.pointer
-            );
-        CUDDL_UNWRAP(cuddl::cuda_try(cudaGetLastError()));
+        auto const hybrids =
+            CUDDL_UNWRAP(sketch.hybrid_cardinality(cuda::stream_ref{launch.get_stream()}));
+        double estimate = 0.0;
+        if constexpr (Variant == cuddl::detail::hybrid_variant::bbtools) {
+            estimate = hybrids.bbtools;
+        } else {
+            estimate = hybrids.paper;
+        }
+        do_not_optimise(estimate);
     });
     add_median_time(state);
     cudaFree(d_input);
@@ -150,13 +155,14 @@ void cuco_hll_cardinality(nvbench::state& state) {
     cuco::hyperloglog<uint64_t> hll(cuco::precision{k_hll_precision});
     hll.add(d_input, d_input + count);
 
+    // Public API path: cuco copies the registers to the host, synchronises, and finalises there.
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto estimate = hll.estimate(cuda::stream_ref{launch.get_stream()});
         do_not_optimise(estimate);
     });
     add_median_time(state);
     add_value(state, "Exact", static_cast<double>(count));
-    add_value(state, "Estimate", hll.estimate());
+    add_value(state, "Estimate", static_cast<double>(hll.estimate()));
     cudaFree(d_input);
 }
 

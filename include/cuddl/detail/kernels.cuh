@@ -56,28 +56,6 @@ __device__ summary_payload combine_payloads(summary_payload a, summary_payload c
 
 }  // namespace
 
-/// @brief Per-thread accumulator for a standalone cardinality reduction.
-struct cardinality_payload {
-    uint64_t empty{};
-    double restored_sum{};
-
-    __device__ cardinality_payload& operator+=(cardinality_payload const& other) noexcept {
-        empty += other.empty;
-        restored_sum += other.restored_sum;
-        return *this;
-    }
-
-    friend __device__ cardinality_payload
-    operator+(cardinality_payload left, cardinality_payload const& right) noexcept {
-        return left += right;
-    }
-};
-
-inline __device__ cardinality_payload
-combine_cardinality(cardinality_payload const& a, cardinality_payload const& b) noexcept {
-    return a + b;
-}
-
 /**
  * @brief Constructs a sketch from packed k-mers using direct global packed CAS.
  *
@@ -1028,25 +1006,36 @@ __global__ void cardinality_kernel(
     uint64_t* const empty_out,
     double* const estimate_out
 ) {
-    using block_reduce = cub::BlockReduce<cardinality_payload, block_size>;
-    __shared__ typename block_reduce::TempStorage storage;
+    __shared__ uint32_t empty[block_size];
+    __shared__ float restored[block_size];
 
-    cardinality_payload local{};
+    uint32_t local_empty = 0U;
+    float local_restored = 0.0f;
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
-         bucket += block_size) {
+         bucket += blockDim.x) {
         auto const stored = winner(__ldcs(&registers[bucket]));
         if (stored == 0U) {
-            ++local.empty;
+            ++local_empty;
         } else {
-            local.restored_sum += restore_midpoint(stored);
+            local_restored += static_cast<float>(restore_midpoint(stored));
         }
     }
-    auto const total = block_reduce(storage).Reduce(local, combine_cardinality);
+    empty[threadIdx.x] = local_empty;
+    restored[threadIdx.x] = local_restored;
+    __syncthreads();
+
+    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            empty[threadIdx.x] += empty[threadIdx.x + stride];
+            restored[threadIdx.x] += restored[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
-        *empty_out = total.empty;
-        *estimate_out = cardinality(
-            static_cast<double>(BucketCount), static_cast<double>(total.empty), total.restored_sum
-        );
+        *empty_out = empty[0];
+        *estimate_out = static_cast<double>(cardinality_f32(
+            static_cast<float>(BucketCount), static_cast<float>(empty[0]), restored[0]
+        ));
     }
 }
 
@@ -1056,11 +1045,11 @@ __global__ void hybrid_cardinality_kernel(
     hybrid_cardinality_estimates* const estimates
 ) {
     __shared__ uint32_t bins[nlz_bins];
-    __shared__ double restored[block_size];
+    __shared__ float restored[block_size];
     for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
         bins[bin] = 0U;
     }
-    double local_restored = 0.0;
+    float local_restored = 0.0f;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
@@ -1070,7 +1059,7 @@ __global__ void hybrid_cardinality_kernel(
             atomicAdd(bins, 1U);
         } else {
             atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            local_restored += restore(stored);
+            local_restored += static_cast<float>(restore(stored));
         }
     }
     restored[threadIdx.x] = local_restored;
@@ -1083,7 +1072,7 @@ __global__ void hybrid_cardinality_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        *estimates = hybrid_estimates(bins, static_cast<double>(BucketCount), restored[0]);
+        *estimates = hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored[0]);
     }
 }
 
@@ -1091,11 +1080,11 @@ template <size_t BucketCount, hybrid_variant Variant>
 __global__ void
 hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const estimate) {
     __shared__ uint32_t bins[nlz_bins];
-    __shared__ double restored[block_size];
+    __shared__ float restored[block_size];
     for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
         bins[bin] = 0U;
     }
-    double local_restored = 0.0;
+    float local_restored = 0.0f;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
@@ -1105,7 +1094,7 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
             atomicAdd(bins, 1U);
         } else {
             atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            local_restored += restore(stored);
+            local_restored += static_cast<float>(restore(stored));
         }
     }
     restored[threadIdx.x] = local_restored;
@@ -1119,7 +1108,7 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
     }
     if (threadIdx.x == 0) {
         auto const estimates =
-            hybrid_estimates(bins, static_cast<double>(BucketCount), restored[0]);
+            hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored[0]);
         if constexpr (Variant == hybrid_variant::bbtools) {
             *estimate = estimates.bbtools;
         } else {

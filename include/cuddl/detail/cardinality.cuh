@@ -60,4 +60,34 @@ cardinality(double bucket_count, double empty_count, double sum_restored) noexce
     return minimum_mle(bucket_count, empty_count, sum_restored);
 }
 
+/**
+ * @brief Single-precision variants of the cardinality estimators.
+ *
+ * The reduction dominates the cardinality kernel. Keeping the restored-sum reduction and the
+ * scalar estimate in FP32 avoids the 1/64 FP32:FP64 throughput ratio on consumer Blackwell while
+ * preserving far more precision than the ~2% standard error of a 2,048-register sketch.
+ */
+__host__ __device__ inline float
+minimum_mle_f32(float bucket_count, float empty_count, float sum_restored) noexcept {
+    auto const filled = bucket_count - empty_count;
+    if (filled <= 0.0f) {
+        return 0.0f;
+    }
+    return bucket_count * filled /
+           (empty_count + sum_restored / static_cast<float>(hash_range));
+}
+
+__host__ __device__ inline float
+mean_m_f32(float bucket_count, float filled, float sum_restored) noexcept {
+    if (filled <= 0.0f || sum_restored <= 0.0f) {
+        return 0.0f;
+    }
+    return bucket_count * filled * static_cast<float>(hash_range) / sum_restored;
+}
+
+__host__ __device__ inline float
+cardinality_f32(float bucket_count, float empty_count, float sum_restored) noexcept {
+    return minimum_mle_f32(bucket_count, empty_count, sum_restored);
+}
+
 }  // namespace cuddl::detail
