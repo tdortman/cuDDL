@@ -2138,9 +2138,10 @@ TEST_F(ReferenceDatabaseTest, IndexedBuildRejectsUnrepresentableBounds) {
 TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
     for (size_t n : {0U, 1U, 2U, 8U, 64U, 512U, 4096U, 1u << 16, 1u << 22}) {
         auto const inputs = make_inputs(n, 0x3333'3333'3333'3333ULL + n);
+        thrust::device_vector<uint64_t> device_inputs(inputs.begin(), inputs.end());
         cuddl::sketch<k_default, b_default> gpu;
         if (n > 0) {
-            ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
+            ASSERT_TRUE(gpu.add(device_inputs).has_value());
         }
         auto const gpu_cardinality = gpu.cardinality();
         ASSERT_TRUE(gpu_cardinality.has_value());
@@ -2166,8 +2167,9 @@ TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
         auto const inputs = make_inputs(n, 0x7777'7777'7777'7777ULL + n);
         // make_inputs from a 64-bit SplitMix stream masked into 2^50 space; collisions are
         // negligible at these sizes, so the distinct count is ~n.
+        thrust::device_vector<uint64_t> device_inputs(inputs.begin(), inputs.end());
         cuddl::sketch<k_default, b_default> gpu;
-        ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
+        ASSERT_TRUE(gpu.add(device_inputs).has_value());
         auto const card = gpu.cardinality();
         ASSERT_TRUE(card.has_value());
         auto const estimate = *card;
@@ -2182,8 +2184,9 @@ TEST(SketchTest, CardinalityApproachesTrueDistinctCount) {
 TEST(SketchTest, CardinalityRemainsAccurateThroughSparseTransition) {
     for (size_t n : {512U, 1024U, 2048U, 4096U, 8192U}) {
         auto const inputs = make_inputs(n, 0x5555'5555'5555'5555ULL + n);
+        thrust::device_vector<uint64_t> device_inputs(inputs.begin(), inputs.end());
         cuddl::sketch<k_default, b_default> gpu;
-        ASSERT_TRUE(gpu.add({inputs.data(), n}).has_value());
+        ASSERT_TRUE(gpu.add(device_inputs).has_value());
         auto const estimate = gpu.cardinality();
         ASSERT_TRUE(estimate.has_value());
         EXPECT_NEAR(*estimate, static_cast<double>(n), 0.1 * static_cast<double>(n));
