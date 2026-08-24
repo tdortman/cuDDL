@@ -12,6 +12,7 @@
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/hybrid_cardinality.cuh>
 #include <cuddl/detail/register.cuh>
+#include <cuddl/helpers.cuh>
 #include <cuddl/pairwise_counts.cuh>
 
 namespace cg = cooperative_groups;
@@ -103,13 +104,126 @@ __global__ __launch_bounds__(block_size, 4) void add_kernel(
     }
 }
 
+/// @brief Largest sketch (in registers) whose per-CTA staging fits in default static shared memory.
+constexpr size_t shared_construction_max_buckets = (size_t{1} << 13);
+
+/// @brief Threads per CTA for the CTA-local construction kernel.
+constexpr uint32_t shared_construction_block_size = 768;
+
+/**
+ * @brief Constructs a sketch through a CTA-local shared-memory winner array with a deferred
+ * tie-count fix-up.
+ *
+ * Each shared word stores `(winner << 16) | count`, so the winner dominates the packed value and
+ * a plain fire-and-forget 32-bit atomic max applies the DDL winner rule. Every item keeps its
+ * atomic's return value for one slot; the deferred settle then compares the returned winner
+ * against the item's score and, on the rare install (`old < score`) or tie (`old == score`),
+ * increments the count through a CAS loop that re-validates the winner, so a stale increment can
+ * never land on a replaced winner. A saturated per-block counter records the sketch-level
+ * saturation flag, matching the sequential @ref update semantics. The per-item path is hash,
+ * score, one atomic max, and one deferred compare: no dependent load, no branch on the common
+ * path, no pair cache, and no separate count phase. The merge then applies the DDL winner/count
+ * rule to the global registers, and the result is bit-identical to @ref add_kernel.
+ *
+ * The host launches two CTAs per SM and the kernel walks the input with a runtime grid-stride
+ * loop over 256-bit chunks, so the grid is a single balanced wave for every input size and the
+ * per-CTA merge traffic stays minimal.
+ */
+template <size_t BucketCount>
+__global__ __launch_bounds__(shared_construction_block_size) void add_shared_kernel(
+    uint64_t const* input,
+    size_t input_size,
+    uint32_t* registers,
+    uint32_t& saturation,
+    bool vector_input
+) {
+    static_assert(BucketCount <= shared_construction_max_buckets);
+    __shared__ uint32_t state[BucketCount];
+    for (auto i = threadIdx.x; i < BucketCount; i += blockDim.x) {
+        state[i] = 0U;
+    }
+    __syncthreads();
+
+    uint32_t prev_bucket = 0U;
+    uint32_t prev_score = 0xffffU;  // primes the first settle off without a `have` flag
+    uint32_t prev_old = 0U;
+
+    auto const settle = [&] {
+        // This item installed the winner (old < score: count goes 0 -> 1) or tied it
+        // (old == score: count + 1). Re-validate the winner under CAS so an increment
+        // for a replaced winner is dropped, and saturate the per-block count exactly
+        // like the sequential update rule.
+        if ((prev_old >> 16U) <= prev_score) {
+            auto expected = state[prev_bucket];
+            while ((expected >> 16U) == prev_score) {
+                if ((expected & 0xffffU) == max_winner_count) {
+                    atomicExch(&saturation, 1U);
+                    break;
+                }
+                auto const actual = atomicCAS(&state[prev_bucket], expected, expected + 1U);
+                if (actual == expected) {
+                    break;
+                }
+                expected = actual;
+            }
+        }
+    };
+    auto const process = [&](uint64_t value) {
+        auto const hash = hash_kmer(value);
+        auto const incoming = static_cast<uint32_t>(score(hash));
+        auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
+        auto const old = atomicMax(&state[bucket], incoming << 16U);
+        settle();
+        prev_bucket = bucket;
+        prev_score = incoming;
+        prev_old = old;
+    };
+
+    auto const stride = static_cast<size_t>(gridDim.x) * blockDim.x * 4U;
+    auto const index = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4U;
+    for (auto offset = index; offset < input_size; offset += stride) {
+        if (vector_input && offset + 4U <= input_size) {
+            uint64_t values[4];
+            load_256_global_nc(input + offset, values);
+            _Pragma("unroll")
+            for (uint32_t item = 0; item < 4U; ++item) {
+                process(values[item]);
+            }
+        } else {
+            // Scalar path: unaligned input keeps striding exactly like the vector path; only
+            // the aligned input's final partial chunk (fewer than four items) ends the loop.
+            _Pragma("unroll")
+            for (uint32_t item = 0; item < 4U; ++item) {
+                if (offset + item < input_size) {
+                    process(input[offset + item]);
+                }
+            }
+            if (vector_input) {
+                break;
+            }
+        }
+    }
+    settle();
+    __syncthreads();
+
+    for (auto i = threadIdx.x; i < BucketCount; i += blockDim.x) {
+        auto const stored = state[i];
+        if ((stored >> 16U) != 0U) {
+            merge_register(
+                &registers[i],
+                pack(static_cast<uint16_t>(stored >> 16U), static_cast<uint16_t>(stored & 0xffffU)),
+                saturation
+            );
+        }
+    }
+}
+
 /**
  * @brief Computes pairwise counts and optionally cardinality for two constructed sketches.
  */
 template <size_t BucketCount, bool IncludeCardinality>
-__global__ void summary_kernel(
-    uint32_t const* left, uint32_t const* right, pairwise_summary& output
-) {
+__global__ void
+summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& output) {
     using block_reduce = cub::BlockReduce<summary_payload, block_size>;
     __shared__ typename block_reduce::TempStorage storage;
 

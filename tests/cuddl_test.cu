@@ -209,6 +209,69 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
     EXPECT_EQ(gpu_regs, oracle.registers);
 }
 
+TEST(SketchTest, UnalignedInputSpanningMultipleGridStrideIterationsMatchesScalarOracle) {
+    // An element-aligned but not 32-byte-aligned span forces the scalar path of
+    // add_shared_kernel; the span must exceed one grid-stride iteration so an early exit would
+    // drop inputs and diverge from the oracle. To make a dropped tail observable, the first
+    // stride's worth of items avoids one bucket entirely and the eight items beyond the stride
+    // are guaranteed winners in that bucket: a buggy kernel that stops after its first chunk
+    // leaves the bucket empty.
+    int multiprocessors = 0;
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0)
+    );
+    ASSERT_GT(multiprocessors, 0);
+    auto const stride = size_t{2} * static_cast<size_t>(multiprocessors) *
+                        static_cast<size_t>(cuddl::detail::shared_construction_block_size) * 4U;
+    auto const mask = (1ULL << (2 * k_default)) - 1;
+    auto const tail_value = 0xDEAD'BEEF'C0FF'EE00ULL & mask;
+    auto const tail_bucket = cuddl::detail::hash_kmer(tail_value) & (b_default - 1);
+    std::vector<uint64_t> inputs;
+    inputs.reserve(stride + 8U);
+    for (size_t kept = 0, attempt = 0; kept < stride; ++attempt) {
+        auto const value = cuddl::detail::splitmix64(0x1234'5678'9abc'def0ULL + attempt) & mask;
+        if ((cuddl::detail::hash_kmer(value) & (b_default - 1)) != tail_bucket) {
+            inputs.push_back(value);
+            ++kept;
+        }
+    }
+    for (size_t i = 0; i < 8U; ++i) {
+        inputs.push_back(tail_value);
+    }
+    thrust::device_vector<uint64_t> padded(inputs.size() + 1U);
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpy(
+            thrust::raw_pointer_cast(padded.data()) + 1,
+            inputs.data(),
+            inputs.size() * sizeof(uint64_t),
+            cudaMemcpyHostToDevice
+        )
+    );
+    auto const unaligned = cuddl::device_span<uint64_t const>{
+        thrust::raw_pointer_cast(padded.data()) + 1, inputs.size()
+    };
+
+    cuddl::sketch<k_default, b_default> gpu;
+    ASSERT_TRUE(gpu.add_async(unaligned, cudaStream_t{nullptr}).has_value());
+    ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
+
+    scalar_sketch<b_default> oracle;
+    oracle.add(inputs);
+    oracle.pack_registers();
+
+    std::vector<uint32_t> gpu_regs(b_default);
+    cuddl::sketch_ref<k_default, b_default> ref = gpu.ref();
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpy(
+            gpu_regs.data(), ref.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
+        )
+    );
+    EXPECT_EQ(gpu_regs, oracle.registers);
+}
+
 TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
     auto const a = make_inputs(40000, 0x1111'1111'1111'1111ULL);
     auto const b = make_inputs(30000, 0x2222'2222'2222'2222ULL);

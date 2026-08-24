@@ -114,4 +114,42 @@ __device__ inline void update(uint32_t* address, uint16_t incoming, uint32_t& sa
     }
 }
 
+/**
+ * @brief Merges one CTA-local partial register into a global register.
+ *
+ * A higher partial winner replaces the global winner with its count; an equal winner adds the
+ * counts, saturating at @ref max_winner_count. A saturated sum records the sketch-level
+ * saturation flag through @p saturation, matching the sequential @ref update semantics.
+ */
+__device__ inline void
+merge_register(uint32_t* address, uint32_t partial, uint32_t& saturation) noexcept {
+    if (partial == 0U) {
+        return;
+    }
+    auto const partial_winner = winner(partial);
+    auto observed = *address;
+    while (true) {
+        auto const observed_winner = winner(observed);
+        uint32_t replacement;
+        if (partial_winner > observed_winner) {
+            replacement = partial;
+        } else if (partial_winner < observed_winner) {
+            return;
+        } else {
+            auto const sum = static_cast<uint32_t>(count(observed)) + count(partial);
+            if (sum > max_winner_count) {
+                atomicExch(&saturation, 1U);
+                replacement = pack(partial_winner, max_winner_count);
+            } else {
+                replacement = pack(partial_winner, static_cast<uint16_t>(sum));
+            }
+        }
+        auto const previous = atomicCAS(address, observed, replacement);
+        if (previous == observed) {
+            return;
+        }
+        observed = previous;
+    }
+}
+
 }  // namespace cuddl::detail
