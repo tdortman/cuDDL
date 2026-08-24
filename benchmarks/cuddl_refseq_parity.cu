@@ -54,7 +54,7 @@ struct asset_prerequisite {
 /// @brief One query selected by the parity manifest.
 struct parity_query {
     uint32_t ordinal{};
-    bool held_out{};
+    bool external{};
     std::vector<uint16_t> row;
     std::string name;
 };
@@ -82,6 +82,8 @@ struct query_report {
     uint64_t bbtools_row_nonzero{};
     std::vector<double> bbtools_query_runs;
     double bbtools_query_seconds{};
+    std::vector<double> bbtools_query_csr_runs;
+    double bbtools_query_csr_seconds{};
 
     bool counts_match_bbtools{};
     bool candidates_match_bbtools{};
@@ -243,9 +245,13 @@ void report_prerequisite(asset_prerequisite const& prereq, bool asset_present) {
     );
 }
 
-/// @brief Parses the shared query-selection manifest (`holdout:` / `query:` ordinal lines).
+/// @brief Parses a query-selection manifest.
+///
+/// Every line selects one query ordinal. `external:` ordinals are removed from the database
+/// before the index is built, so they arrive as out-of-database queries; `resident:` ordinals
+/// stay in the database. The legacy `holdout:` / `query:` spelling is accepted as an alias.
 struct manifest_selection {
-    std::set<uint32_t> holdout;
+    std::set<uint32_t> external;
     std::vector<uint32_t> queries;
 };
 
@@ -282,9 +288,12 @@ manifest_selection parse_manifest(std::string const& path, size_t record_count) 
                 "manifest ordinal out of range at line " + std::to_string(line_no)
             );
         }
-        if (key == "holdout") {
-            selection.holdout.insert(ordinal);
-        } else if (key == "query") {
+        if (key == "external") {
+            selection.external.insert(ordinal);
+            selection.queries.push_back(ordinal);
+        } else if (key == "holdout") {
+            selection.external.insert(ordinal);
+        } else if (key == "resident" || key == "query") {
             selection.queries.push_back(ordinal);
         } else {
             throw std::runtime_error(
@@ -295,34 +304,31 @@ manifest_selection parse_manifest(std::string const& path, size_t record_count) 
     return selection;
 }
 
-/// @brief The pinned default parity selection, embedded so no manifest file is required.
+/// @brief The pinned default parity selection, generated so no manifest file is required.
 ///
 /// Ordinals are zero-based positions in the pinned v40.00 unmerged RefSeq asset's 148,108
-/// records. The eight held-out rows are also queried; the remaining twelve queries are spread
-/// across the source partitions and include closely related and organelle/plasmid records.
-manifest_selection pinned_manifest_selection(size_t record_count) {
-    manifest_selection selection;
-    selection.holdout = {
-        10007U, 24001U, 41777U, 63211U, 85009U, 103003U, 121999U, 137777U,
-    };
-    selection.queries = {
-        7U,       10007U, 12500U, 24001U, 25000U, 37500U, 41777U,
-        50000U,   62500U, 63211U, 75000U, 85009U, 87500U, 100000U,
-        103003U,  112500U, 121999U, 125000U, 137777U, 147000U,
-    };
-    for (auto const ordinal : selection.holdout) {
-        if (ordinal >= record_count) {
-            throw std::runtime_error(
-                "built-in manifest ordinal out of range: " + std::to_string(ordinal)
-            );
-        }
+/// records. The selection alternates equal numbers of external and resident queries evenly
+/// across the file, so both query classes stress every source partition.
+manifest_selection pinned_manifest_selection(size_t record_count, uint32_t queries_per_class) {
+    if (queries_per_class == 0U) {
+        throw std::runtime_error("--queries-per-class must be positive");
     }
-    for (auto const ordinal : selection.queries) {
-        if (ordinal >= record_count) {
-            throw std::runtime_error(
-                "built-in manifest ordinal out of range: " + std::to_string(ordinal)
-            );
+    auto const total_queries = static_cast<uint64_t>(queries_per_class) * 2U;
+    if (total_queries > record_count) {
+        throw std::runtime_error("--queries-per-class exceeds the decoded record count");
+    }
+
+    manifest_selection selection;
+    for (uint64_t i = 0; i < total_queries; ++i) {
+        auto const ordinal = static_cast<uint32_t>(
+            total_queries == 1U
+                ? 0U
+                : (i * (static_cast<uint64_t>(record_count) - 1U)) / (total_queries - 1U)
+        );
+        if (i % 2U == 0U) {
+            selection.external.insert(ordinal);
         }
+        selection.queries.push_back(ordinal);
     }
     return selection;
 }
@@ -390,6 +396,7 @@ int main(int argc, char** argv) {
         std::string asset_path;
         asset_prerequisite prereq;
         std::string manifest_path;
+        uint32_t queries_per_class = 64;
         uint32_t min_hits = 5;
         uint64_t seed = 42;
         std::string evidence_path;
@@ -428,9 +435,15 @@ int main(int argc, char** argv) {
         app.add_option(
             "--manifest",
             manifest_path,
-            "Optional query-selection manifest override (`holdout: N` / `query: N` ordinal "
+            "Optional query-selection manifest override (`external: N` / `resident: N` ordinal "
             "lines). Defaults to the built-in pinned selection."
         );
+        app.add_option(
+            "--queries-per-class",
+            queries_per_class,
+            "External and resident queries selected by the built-in default (ignored with "
+            "--manifest)"
+        )->check(CLI::PositiveNumber);
         app.add_option("--min-hits", min_hits, "Minimum matching buckets to retain a candidate")
             ->check(CLI::NonNegativeNumber);
         app.add_option("--seed", seed, "Hash seed fallback when the asset has no #seed header");
@@ -580,33 +593,33 @@ int main(int argc, char** argv) {
             prereq.k, prereq.buckets, prereq.exponent, compatibility_seed
         );
 
-        // Require both held-out and database-resident queries. The two classes exercise
-        // reduced-database id mapping as well as ordinary in-database lookup. The pinned default
-        // selection is embedded; `--manifest` exists only for experiments with other selections.
+        // Require both external and resident queries. External queries exercise the
+        // reduced-database id mapping; resident queries exercise ordinary in-database lookup.
+        // The pinned default selection is generated in the binary; `--manifest` is an override.
         auto const selection = manifest_path.empty()
-                                   ? pinned_manifest_selection(db.records.size())
+                                   ? pinned_manifest_selection(db.records.size(), queries_per_class)
                                    : parse_manifest(manifest_path, db.records.size());
-        auto const has_held_out_query = std::any_of(
+        auto const has_external_query = std::any_of(
             selection.queries.begin(), selection.queries.end(), [&](uint32_t ordinal) {
-                return selection.holdout.contains(ordinal);
+                return selection.external.contains(ordinal);
             }
         );
         auto const has_database_query = std::any_of(
             selection.queries.begin(), selection.queries.end(), [&](uint32_t ordinal) {
-                return !selection.holdout.contains(ordinal);
+                return !selection.external.contains(ordinal);
             }
         );
-        if (selection.holdout.empty() || !has_held_out_query || !has_database_query) {
+        if (selection.external.empty() || !has_external_query || !has_database_query) {
             throw std::runtime_error(
-                "manifest must select held-out and database-resident queries"
+                "manifest must select external and resident queries"
             );
         }
 
-        // Build the database subset (every record except the held-out rows)
+        // Build the database subset (every record except the external query rows)
         std::vector<uint32_t> db_ordinals;
         std::vector<uint32_t> ordinal_to_db_id(db.records.size(), UINT32_MAX);
         for (uint32_t ordinal = 0; ordinal < db.records.size(); ++ordinal) {
-            if (selection.holdout.count(ordinal) == 0U) {
+            if (selection.external.count(ordinal) == 0U) {
                 ordinal_to_db_id[ordinal] = static_cast<uint32_t>(db_ordinals.size());
                 db_ordinals.push_back(ordinal);
             }
@@ -621,7 +634,7 @@ int main(int argc, char** argv) {
         for (auto const ordinal : selection.queries) {
             query_report report;
             report.query.ordinal = ordinal;
-            report.query.held_out = selection.holdout.count(ordinal) != 0U;
+            report.query.external = selection.external.count(ordinal) != 0U;
             report.query.row = db.records[ordinal].scores;
             report.query.name = db.records[ordinal].metadata.name;
             reports.push_back(std::move(report));
@@ -657,8 +670,10 @@ int main(int argc, char** argv) {
         double host_to_device_ms = 0;
         std::vector<double> index_build_runs;
         double index_build_ms = 0;
-        std::vector<double> resident_batch_runs;
-        double resident_batch_ms = 0;
+        std::vector<double> in_database_query_runs;
+        std::vector<double> external_query_runs;
+        double in_database_query_ms = 0;
+        double external_query_ms = 0;
         std::vector<double> exhaustive_batch_runs;
         double exhaustive_batch_ms = 0;
         size_t device_free_before = 0, device_free_low = 0, device_total = 0;
@@ -677,16 +692,32 @@ int main(int argc, char** argv) {
 
             auto const stream = cuda::stream_ref{cudaStream_t{nullptr}};
 
-            // Batched buffers: all selected queries in one row-major tile, answered by one
-            // indexed call and one exhaustive call per measured iteration.
+            // Batched buffers. The exhaustive pass still runs over all selected queries in
+            // one row-major tile; the timed indexed search runs two equal-sized tiles so the
+            // evidence can report external and resident query classes separately.
             std::vector<uint16_t> flat_queries;
             flat_queries.reserve(reports.size() * prereq.buckets);
-            for (auto const& report : reports) {
+            std::vector<uint16_t> flat_in_database_queries;
+            std::vector<uint16_t> flat_external_queries;
+            std::vector<uint32_t> in_database_query_to_report;
+            std::vector<uint32_t> external_query_to_report;
+            flat_in_database_queries.reserve(reports.size() * prereq.buckets);
+            flat_external_queries.reserve(reports.size() * prereq.buckets);
+            for (uint32_t qi = 0; qi < reports.size(); ++qi) {
+                auto const& report = reports[qi];
                 flat_queries.insert(
                     flat_queries.end(), report.query.row.begin(), report.query.row.end()
                 );
+                auto& flat_class = report.query.external ? flat_external_queries
+                                                         : flat_in_database_queries;
+                auto& class_to_report =
+                    report.query.external ? external_query_to_report : in_database_query_to_report;
+                flat_class.insert(flat_class.end(), report.query.row.begin(), report.query.row.end());
+                class_to_report.push_back(qi);
             }
             thrust::device_vector<uint16_t> device_queries(flat_queries);
+            thrust::device_vector<uint16_t> device_in_database_queries(flat_in_database_queries);
+            thrust::device_vector<uint16_t> device_external_queries(flat_external_queries);
             thrust::device_vector<uint32_t> batch_count(1U);
             thrust::device_vector<uint32_t> batch_exhaustive_count(1U);
 
@@ -744,13 +775,16 @@ int main(int argc, char** argv) {
                     device_rows_bytes = database.persistent_row_bytes();
                     device_index_bytes = database.persistent_index_bytes();
 
-                    auto const batch_requirements = database.indexed_batch_search_requirements(
+                    auto const max_class_queries = static_cast<uint32_t>(std::max(
+                        in_database_query_to_report.size(), external_query_to_report.size()
+                    ));
+                    auto const batch_requirements =
+                        database.indexed_batch_search_requirements(max_class_queries);
+                    auto const exhaustive_requirements = database.indexed_batch_search_requirements(
                         static_cast<uint32_t>(reports.size())
                     );
-                    if (!batch_requirements) {
-                        throw std::runtime_error(
-                            "batch workspace sizing failed: " + batch_requirements.error().message()
-                        );
+                    if (!batch_requirements || !exhaustive_requirements) {
+                        throw std::runtime_error("batch workspace sizing failed");
                     }
                     batch_workspace =
                         thrust::device_vector<uint8_t>(batch_requirements->workspace_bytes);
@@ -758,29 +792,7 @@ int main(int argc, char** argv) {
                         batch_requirements->maximum_pair_count
                     );
                     batch_exhaustive_results = thrust::device_vector<batch_result_t>(
-                        batch_requirements->maximum_pair_count
-                    );
-                }
-
-                // Batched indexed search: all twenty queries in one stream-ordered call.
-                thrust::device_vector<uint32_t> batch_match_counts;
-                auto const t_batch_start = now_ms();
-                auto const batch_res = database.search_batch_indexed_async(
-                    device_queries,
-                    compatibility,
-                    0U,
-                    batch_workspace,
-                    batch_results,
-                    batch_count,
-                    batch_match_counts,
-                    {.minimum_matches = min_hits},
-                    stream
-                );
-                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream.get()));
-                auto const t_batch_end = now_ms();
-                if (!batch_res) {
-                    throw std::runtime_error(
-                        "batched indexed search failed: " + batch_res.error().message()
+                        exhaustive_requirements->maximum_pair_count
                     );
                 }
 
@@ -807,13 +819,6 @@ int main(int argc, char** argv) {
                     );
                 }
 
-                uint32_t batch_pair_count = 0;
-                CUDDL_CUDA_CALL(cudaMemcpy(
-                    &batch_pair_count,
-                    thrust::raw_pointer_cast(batch_count.data()),
-                    sizeof(batch_pair_count),
-                    cudaMemcpyDeviceToHost
-                ));
                 uint32_t exhaustive_pair_count = 0;
                 CUDDL_CUDA_CALL(cudaMemcpy(
                     &exhaustive_pair_count,
@@ -821,15 +826,6 @@ int main(int argc, char** argv) {
                     sizeof(exhaustive_pair_count),
                     cudaMemcpyDeviceToHost
                 ));
-                batch_host.resize(batch_pair_count);
-                if (batch_pair_count != 0U) {
-                    CUDDL_CUDA_CALL(cudaMemcpy(
-                        batch_host.data(),
-                        thrust::raw_pointer_cast(batch_results.data()),
-                        batch_pair_count * sizeof(batch_result_t),
-                        cudaMemcpyDeviceToHost
-                    ));
-                }
                 batch_exhaustive_host.resize(exhaustive_pair_count);
                 if (exhaustive_pair_count != 0U) {
                     CUDDL_CUDA_CALL(cudaMemcpy(
@@ -840,14 +836,62 @@ int main(int argc, char** argv) {
                     ));
                 }
 
-                // Batched verification: the (query, reference) pairs are emitted in ascending
-                // query-major order, so every pair indexes the dense exhaustive pair list at
-                // `query_id * reference_count + reference_id`.
                 if (measured) {
-                    resident_batch_runs.push_back(t_batch_end - t_batch_start);
                     exhaustive_batch_runs.push_back(t_exhaustive_end - t_exhaustive_start);
+                }
+
+                // Timed indexed search for one query class. The class tile is answered by one
+                // stream-ordered call; local query IDs are mapped back to full report order.
+                auto run_indexed_batch = [&](
+                                             thrust::device_vector<uint16_t> const& class_queries,
+                                             std::vector<uint32_t> const& class_to_report,
+                                             std::vector<double>& runs
+                                         ) {
+                    thrust::device_vector<uint32_t> batch_match_counts;
+                    auto const t_batch_start = now_ms();
+                    auto const batch_res = database.search_batch_indexed_async(
+                        class_queries,
+                        compatibility,
+                        0U,
+                        batch_workspace,
+                        batch_results,
+                        batch_count,
+                        batch_match_counts,
+                        {.minimum_matches = min_hits},
+                        stream
+                    );
+                    CUDDL_CUDA_CALL(cudaStreamSynchronize(stream.get()));
+                    auto const t_batch_end = now_ms();
+                    if (!batch_res) {
+                        throw std::runtime_error(
+                            "batched indexed search failed: " + batch_res.error().message()
+                        );
+                    }
+
+                    uint32_t batch_pair_count = 0;
+                    CUDDL_CUDA_CALL(cudaMemcpy(
+                        &batch_pair_count,
+                        thrust::raw_pointer_cast(batch_count.data()),
+                        sizeof(batch_pair_count),
+                        cudaMemcpyDeviceToHost
+                    ));
+                    batch_host.resize(batch_pair_count);
+                    if (batch_pair_count != 0U) {
+                        CUDDL_CUDA_CALL(cudaMemcpy(
+                            batch_host.data(),
+                            thrust::raw_pointer_cast(batch_results.data()),
+                            batch_pair_count * sizeof(batch_result_t),
+                            cudaMemcpyDeviceToHost
+                        ));
+                    }
+
+                    if (!measured) {
+                        return;
+                    }
+                    runs.push_back(t_batch_end - t_batch_start);
                     for (auto const& pair : batch_host) {
-                        auto& report = reports[pair.query_id];
+                        auto const report_index = class_to_report[pair.query_id];
+                        auto& report = reports[report_index];
                         auto const reference_id = pair.reference_id;
                         auto const& oracle_summary = report.oracle_summaries[reference_id];
                         auto const counts_match =
@@ -859,7 +903,7 @@ int main(int argc, char** argv) {
                             report.summaries_match_oracle = false;
                         }
                         auto const dense_index =
-                            static_cast<size_t>(pair.query_id) * db_ordinals.size() + reference_id;
+                            static_cast<size_t>(report_index) * db_ordinals.size() + reference_id;
                         if (dense_index >= batch_exhaustive_host.size() ||
                             pair.summary != batch_exhaustive_host[dense_index].summary) {
                             report.summaries_match_exhaustive = false;
@@ -869,11 +913,12 @@ int main(int argc, char** argv) {
                     // pairs arrive in ascending query-major order, so each query owns one
                     // contiguous run of the emitted list.
                     size_t batch_index = 0;
-                    for (size_t qi = 0; qi < reports.size(); ++qi) {
-                        auto& report = reports[qi];
+                    for (size_t local_query = 0; local_query < class_to_report.size(); ++local_query) {
+                        auto const report_index = class_to_report[local_query];
+                        auto& report = reports[report_index];
                         std::vector<uint32_t> batch_candidates;
                         while (batch_index < batch_host.size() &&
-                               batch_host[batch_index].query_id == qi) {
+                               batch_host[batch_index].query_id == local_query) {
                             batch_candidates.push_back(batch_host[batch_index].reference_id);
                             ++batch_index;
                         }
@@ -884,8 +929,14 @@ int main(int argc, char** argv) {
                             report.candidates_match_oracle = false;
                         }
                     }
-                }
+                };
 
+                run_indexed_batch(
+                    device_in_database_queries, in_database_query_to_report, in_database_query_runs
+                );
+                run_indexed_batch(
+                    device_external_queries, external_query_to_report, external_query_runs
+                );
                 // Post-sync free memory at this sample point (context only); the build
                 // high-water mark for `peak_allocated_bytes` is sampled during the
                 // construction by a background thread.
@@ -895,7 +946,8 @@ int main(int argc, char** argv) {
             }
 
             index_build_ms = median(index_build_runs);
-            resident_batch_ms = median(resident_batch_runs);
+            in_database_query_ms = median(in_database_query_runs);
+            external_query_ms = median(external_query_runs);
             exhaustive_batch_ms = median(exhaustive_batch_runs);
         } else {
             std::fputs(
@@ -911,11 +963,9 @@ int main(int argc, char** argv) {
             auto const selections_path = workdir + "/selections.txt";
             {
                 std::ofstream selections_file(selections_path);
-                for (auto const ordinal : selection.holdout) {
-                    selections_file << "holdout: " << ordinal << "\n";
-                }
                 for (auto const ordinal : selection.queries) {
-                    selections_file << "query: " << ordinal << "\n";
+                    selections_file << (selection.external.contains(ordinal) ? "external: " : "resident: ")
+                                     << ordinal << "\n";
                 }
             }
             bbtools = run_bbtools_harness(
@@ -950,7 +1000,9 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("BBTools harness query count disagrees with the manifest");
             }
             auto const& query_runs_json = bbtools.at("timings_seconds").at("query_runs");
-            if (query_runs_json.size() != reports.size()) {
+            auto const& query_csr_runs_json = bbtools.at("timings_seconds").at("query_csr_runs");
+            if (query_runs_json.size() != reports.size() ||
+                query_csr_runs_json.size() != reports.size()) {
                 throw std::runtime_error(
                     "BBTools harness query-run count disagrees with the manifest"
                 );
@@ -965,6 +1017,10 @@ int main(int argc, char** argv) {
                     report.bbtools_query_runs.push_back(seconds.get<double>());
                 }
                 report.bbtools_query_seconds = median(report.bbtools_query_runs);
+                for (auto const& seconds : query_csr_runs_json.at(i)) {
+                    report.bbtools_query_csr_runs.push_back(seconds.get<double>());
+                }
+                report.bbtools_query_csr_seconds = median(report.bbtools_query_csr_runs);
                 for (auto const& entry : bq.at("counts")) {
                     auto const id = entry.at("id").get<uint32_t>();
                     auto const count = entry.at("count").get<uint32_t>();
@@ -1036,7 +1092,7 @@ int main(int argc, char** argv) {
             queries_json.push_back({
                 {"ordinal", report.query.ordinal},
                 {"name", report.query.name},
-                {"held_out", report.query.held_out},
+                {"external", report.query.external},
                 {"row_checksum", report.row_checksum},
                 {"row_nonzero", report.row_nonzero},
                 {"oracle_candidate_count", report.oracle_candidates.size()},
@@ -1054,6 +1110,8 @@ int main(int argc, char** argv) {
                 {"exact_refinement_ms", report.exact_refinement_ms},
                 {"bbtools_query_seconds", report.bbtools_query_seconds},
                 {"bbtools_query_runs", report.bbtools_query_runs},
+                {"bbtools_query_csr_seconds", report.bbtools_query_csr_seconds},
+                {"bbtools_query_csr_runs", report.bbtools_query_csr_runs},
             });
         }
 
@@ -1063,11 +1121,11 @@ int main(int argc, char** argv) {
         evidence["measurement"] = {
             {"warmup", warmup},
             {"runs", runs},
-            {"query_mode", "batch"},
+            {"query_mode", "batch_by_class"},
         };
         evidence["manifest"] = manifest_path.empty() ? "built-in" : manifest_path;
         evidence["selection"] = {
-            {"holdout", std::vector<uint32_t>(selection.holdout.begin(), selection.holdout.end())},
+            {"external", std::vector<uint32_t>(selection.external.begin(), selection.external.end())},
             {"queries", selection.queries},
         };
         evidence["asset"] = {
@@ -1089,7 +1147,7 @@ int main(int argc, char** argv) {
         };
         evidence["records"] = db.records.size();
         evidence["db_records"] = db_ordinals.size();
-        evidence["held_out_records"] = selection.holdout.size();
+        evidence["external_records"] = selection.external.size();
         evidence["phases_ms"] = {
             {"asset_read", t_load_end - t_load_start},
             {"a48_parse", t_parse_end - t_parse_start},
@@ -1097,8 +1155,10 @@ int main(int argc, char** argv) {
             {"host_to_device", host_to_device_ms},
             {"index_build", index_build_ms},
             {"index_build_runs", index_build_runs},
-            {"resident_query_total", resident_batch_ms},
-            {"resident_query_runs", resident_batch_runs},
+            {"in_database_query_total", in_database_query_ms},
+            {"in_database_query_runs", in_database_query_runs},
+            {"external_query_total", external_query_ms},
+            {"external_query_runs", external_query_runs},
             {"exhaustive_gpu_total", exhaustive_batch_ms},
             {"exhaustive_gpu_runs", exhaustive_batch_runs},
         };

@@ -14,7 +14,7 @@ four-panel figure:
 
 - asset load (one-shot, both systems),
 - index build (cuDDL, BBTools CSR, BBTools CSR2),
-- answering the twenty queries (cuDDL batched, both BBTools backends),
+- answering the selected queries (cuDDL batched by class, both BBTools backends),
 - memory footprint (query-time resident and peak during the run for both
   systems),
 
@@ -42,7 +42,7 @@ BBTOOLS_COLOR = FILTER_STYLES["cuco_hll"]["color"]
 CSR2_COLOR = "#C58BB0"
 
 GIB = 1 << 30
-PHASES = (("load", "load asset"), ("index", "build index"), ("query", "20 queries"))
+PHASES = (("load", "load asset"), ("index", "build index"), ("query", "queries"))
 
 
 def _bytes(value: float) -> str:
@@ -90,10 +90,16 @@ def main(
     gpu = data["gpu"]
     queries = data["queries"]
 
+    in_database_query_ms = phases.get("in_database_query_total", 0.0)
+    external_query_ms = phases.get("external_query_total", 0.0)
+    if in_database_query_ms == 0.0 and external_query_ms == 0.0:
+        legacy_total = phases.get("resident_query_total", 0.0)
+        in_database_query_ms = legacy_total / 2.0
+        external_query_ms = legacy_total / 2.0
     cuddl_phases = {
         "load": phases["asset_read"] + phases["a48_parse"],
         "index": phases["index_build"],
-        "query": phases["resident_query_total"],
+        "query": in_database_query_ms + external_query_ms,
     }
     bbtools_seconds = bbtools["timings_seconds"]
     bbtools_load = bbtools_seconds["load"] * 1000.0
@@ -107,6 +113,31 @@ def main(
         "index": statistics.median(bbtools_seconds["index_build_csr_runs"]) * 1000.0,
         "query": statistics.median(bbtools_seconds["query_batch_csr_runs"]) * 1000.0,
     }
+
+    resident_queries = [
+        q for q in queries if not q.get("external", q.get("held_out", False))
+    ]
+    external_queries = [q for q in queries if q.get("external", q.get("held_out", False))]
+
+    def class_average(entries, key, fallback):
+        if entries and key in entries[0]:
+            return statistics.median(q.get(key, fallback) for q in entries) * 1000.0
+        return fallback / max(len(queries), 1)
+
+    cuddl_in_database_per_query = in_database_query_ms / max(len(resident_queries), 1)
+    cuddl_external_per_query = external_query_ms / max(len(external_queries), 1)
+    bbtools_csr_resident = class_average(
+        resident_queries, "bbtools_query_csr_seconds", bbtools_csr_phases["query"]
+    )
+    bbtools_csr_external = class_average(
+        external_queries, "bbtools_query_csr_seconds", bbtools_csr_phases["query"]
+    )
+    bbtools_csr2_resident = class_average(
+        resident_queries, "bbtools_query_seconds", bbtools_phases["query"]
+    )
+    bbtools_csr2_external = class_average(
+        external_queries, "bbtools_query_seconds", bbtools_phases["query"]
+    )
 
     queries_ok = sum(
         all(
@@ -190,7 +221,7 @@ def main(
         ax.grid(axis="y", linestyle=":", alpha=0.4)
         ax.set_axisbelow(True)
 
-    # ---- Panel 1: asset load (one-shot, backend-independent for BBTools). ----
+    # Panel 1: asset load (one-shot, backend-independent for BBTools)
     bar_panel(
         axes[0],
         "Asset load (one-shot)",
@@ -202,7 +233,7 @@ def main(
         "wall-clock (log)",
     )
 
-    # ---- Panel 2: index build, both BBTools storage backends. ----
+    # Panel 2: index build, both BBTools storage backends
     bar_panel(
         axes[1],
         "Index build",
@@ -215,43 +246,72 @@ def main(
         "wall-clock (log)",
     )
 
-    # ---- Panel 3: answering the twenty queries. ----
-    bar_panel(
-        axes[2],
-        "20-query batch",
-        [
-            ("cuDDL batched", cuddl_phases["query"], CUDDL_COLOR),
-            ("BBTools CSR", bbtools_csr_phases["query"], BBTOOLS_COLOR),
-            ("BBTools CSR2", bbtools_phases["query"], CSR2_COLOR),
-        ],
-        lambda v: _latency(v),
-        "wall-clock (log)",
+    # Panel 3: query time split by whether the query row is resident in the database or
+    # arrives from outside it. cuDDL bars are class-batch medians divided by class size;
+    # BBTools bars are per-query medians over the measured runs.
+    query_groups = ["resident queries", "external queries"]
+    query_systems = [
+        (
+            "cuDDL",
+            [cuddl_in_database_per_query, cuddl_external_per_query],
+            CUDDL_COLOR,
+        ),
+        (
+            "BBTools CSR",
+            [bbtools_csr_resident, bbtools_csr_external],
+            BBTOOLS_COLOR,
+        ),
+        (
+            "BBTools CSR2",
+            [bbtools_csr2_resident, bbtools_csr2_external],
+            CSR2_COLOR,
+        ),
+    ]
+    query_ax = axes[2]
+    width = 0.24
+    for system_index, (system, values, color) in enumerate(query_systems):
+        offset = (system_index - 1) * width
+        bars = query_ax.bar(
+            [group + offset for group in range(len(query_groups))],
+            [max(value, 1e-6) for value in values],
+            width,
+            color=color,
+        )
+        query_ax.bar_label(bars, fmt=lambda v: _latency(v), fontsize=8, padding=2)
+    query_ax.set_yscale("log")
+    query_ax.set_ylim(
+        top=max(value for _, values, _ in query_systems for value in values) * 2.0
     )
+    query_ax.set_xticks(range(len(query_groups)))
+    query_ax.set_xticklabels([paper_text(label) for label in query_groups], fontsize=11)
+    query_ax.set_ylabel(paper_text("per-query (log)"), fontsize=12)
+    query_ax.set_title(paper_text(f"{len(queries)}-query batch by class"), fontsize=13)
+    query_ax.grid(axis="y", linestyle=":", alpha=0.4)
+    query_ax.set_axisbelow(True)
 
-    # ---- Panel 4: memory footprint. ----
-    # The bars compare the same quantity per system: "query-time resident" is everything each
-    # system holds once the index is built (cuDDL rows + dense offsets + postings on the
-    # device; for BBTools the JVM heap right after its index build, which includes the decoded
-    # rows plus that backend's index). "Peak" is the high-water mark over the whole run; the
-    # JVM peak keeps both backends' indexes alive because the harness rebuilds them in
-    # alternating order each iteration, so it is a protocol artifact, not a query-time cost.
+    # Panel 4: memory footprint
+    # "Query-time resident" is rows + one index. cuDDL uses exact device allocation sizes.
+    # BBTools heap snapshots move with garbage collection (the after-CSR2 snapshot can still
+    # contain the unreclaimed reference CSR), so its index bars use the harness's exact CSR /
+    # CSR2 array-layout sizes plus the pre-index heap as the decoded-rows base.
     ax = axes[3]
     cuddl_rows_bytes = gpu.get("persistent_rows_bytes", 0)
     cuddl_index_bytes = gpu.get("persistent_index_bytes", 0)
     bbtools_memory = bbtools["memory_bytes"]
+    bbtools_rows_bytes = bbtools_memory.get("heap_used_before_index", 0)
     memory_groups = [
         (
             "query-time resident",
             (
                 ("cuDDL rows + dense index", cuddl_rows_bytes + cuddl_index_bytes, CUDDL_COLOR),
                 (
-                    "BBTools CSR heap",
-                    bbtools_memory.get("heap_used_after_csr", 0),
+                    "BBTools rows + CSR index",
+                    bbtools_rows_bytes + bbtools_memory.get("index_csr_bytes", 0),
                     BBTOOLS_COLOR,
                 ),
                 (
-                    "BBTools CSR2 heap",
-                    bbtools_memory.get("heap_used_after_csr2", 0),
+                    "BBTools rows + CSR2 index",
+                    bbtools_rows_bytes + bbtools_memory.get("index_csr2_bytes", 0),
                     CSR2_COLOR,
                 ),
             ),
@@ -286,19 +346,6 @@ def main(
     ax.set_xticklabels([paper_text(label) for label, _ in memory_groups], fontsize=11)
     ax.set_ylabel(paper_text("GiB"), fontsize=12)
     ax.set_title(paper_text("Memory footprint"), fontsize=13)
-    ax.text(
-        0.5,
-        -0.30,
-        paper_text(
-            "cuDDL: GPU device memory (rows + dense index). BBTools: JVM heap (decoded rows "
-            "+ index); the JVM peak keeps both backends alive per alternating iteration."
-        ),
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=7.5,
-        wrap=True,
-    )
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.set_axisbelow(True)
 

@@ -2581,7 +2581,7 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
     constexpr uint64_t seed = 42ULL;
     constexpr uint32_t minimum_matches = 3U;
     constexpr uint32_t reference_count = 4U;
-    constexpr uint32_t held_out_id = 3U;
+    constexpr uint32_t external_id = 3U;
 
     // Deterministic sparse rows over b_default buckets. Nonzero absolute scores live in a
     // realistic DDL range; the pattern yields distinct match counts per reference.
@@ -2605,9 +2605,9 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
         EXPECT_EQ(decoded->records[r].scores, rows[r]);
     }
 
-    // Hold row 3 out of the database, mirroring the parity manifest's held-out policy: the
-    // index is built from the remaining records in original order, and row 3 becomes a
-    // held-out query whose candidate IDs address the reduced database.
+    // Mark row 3 external, mirroring the parity benchmark policy: the index is built from the
+    // remaining records in original order, and row 3 becomes an out-of-database query whose
+    // candidate IDs address the reduced database.
     std::vector<uint32_t> const db_ids{0U, 1U, 2U};
     std::vector<uint16_t> scores(db_ids.size() * b_default);
     for (size_t i = 0; i < db_ids.size(); ++i) {
@@ -2633,8 +2633,8 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
     ASSERT_TRUE(indexed_workspace_bytes.has_value()) << indexed_workspace_bytes.error().message();
     thrust::device_vector<uint8_t> indexed_workspace(*indexed_workspace_bytes);
 
-    // In-database queries and the held-out row must agree with the same host oracle.
-    std::vector<uint32_t> const query_ids{0U, 1U, 2U, held_out_id};
+    // Resident queries and the external row must agree with the same host oracle.
+    std::vector<uint32_t> const query_ids{0U, 1U, 2U, external_id};
     for (auto const query_id : query_ids) {
         SCOPED_TRACE(query_id);
         auto const& query_row = rows[query_id];

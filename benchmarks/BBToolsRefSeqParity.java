@@ -1,8 +1,13 @@
+import cardinality.DynamicDemiLog;
 import ddl.DDLIndexBase;
 import ddl.DDLIndexCSR;
 import ddl.DDLRecord;
 import ddl.DDLLoader;
 import ddl.CSRIndex2;
+import fileIO.ByteFile;
+import fileIO.FileFormat;
+import parse.LineParser1;
+import shared.Tools;
 import simd.Vector;
 
 import java.io.BufferedReader;
@@ -25,16 +30,17 @@ import java.util.concurrent.Future;
 /**
  * BBTools DDLIndex/CSR2 oracle for the cuDDL decoded-row RefSeq parity validation.
  *
- * Loads the official precomputed RefSeq DDL A48 TSV with the first-party
- * single-threaded loader, excludes the rows the parity manifest marks as held
- * out, builds the 32-bit CSR index once as the verification reference, and
- * rebuilds the default 21-bit packed CSR2 index for `WARMUP + RUNS` timed
- * iterations while answering the manifest's selected queries with each
- * backend. The two backends must agree bit-identically in every iteration;
- * their per-query match counts, candidate IDs at the same minimum-match
- * threshold, and exact lower/equal/higher/both-empty summaries for every
- * retained candidate are written to a JSON file that the cuDDL parity command
- * compares against its own decoded-row oracle and GPU index.
+ * Loads the official precomputed RefSeq DDL A48 TSV with an order-preserving
+ * multithreaded wrapper around the first-party record parser, excludes the
+ * rows the parity manifest marks as held out, builds the 32-bit CSR index
+ * once as the verification reference, and rebuilds the default 21-bit packed
+ * CSR2 index for `WARMUP + RUNS` timed iterations while answering the
+ * manifest's selected queries with each backend. The two backends must agree
+ * bit-identically in every iteration; their per-query match counts, candidate
+ * IDs at the same minimum-match threshold, and exact lower/equal/higher/
+ * both-empty summaries for every retained candidate are written to a JSON
+ * file that the cuDDL parity command compares against its own decoded-row
+ * oracle and GPU index.
  *
  * This harness is benchmark support: it exercises the current BBTools
  * implementation, not a cuDDL reimplementation of it.
@@ -77,7 +83,167 @@ public final class BBToolsRefSeqParity {
         return runtime.totalMemory() - runtime.freeMemory();
     }
 
-    public static void main(String[] args) throws IOException {
+    private static final int RECORDS_PER_BUNDLE = 32;
+    private static final byte[] PREFIX_TID = "#tid".getBytes();
+    private static final byte[] PREFIX_ID = "#id".getBytes();
+    private static final byte[] PREFIX_EXPONENT = "#exponent".getBytes();
+
+    /**
+     * Order-preserving multithreaded A48 loader.
+     *
+     * `DDLLoaderMT` parallelises record parsing but merges per-worker batches in worker order,
+     * so the manifest's file ordinals would no longer address the same rows. This wrapper keeps
+     * the same producer/consumer shape, submits batches to a fixed pool in file order, and
+     * collects the futures in submission order, so parsed records remain in file order.
+     */
+    private static ArrayList<DDLRecord> loadFileOrderedMultithreaded(String path, int k, int threads)
+            throws InterruptedException, ExecutionException {
+        if (threads < 2) {
+            return DDLLoader.loadFile(path, k);
+        }
+
+        FileFormat ff = FileFormat.testInput(path, FileFormat.TEXT, null, false, true);
+        ByteFile bf = ByteFile.makeByteFile(ff);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        ArrayList<Future<ArrayList<DDLRecord>>> futures = new ArrayList<>();
+        ArrayList<byte[]> currentRecord = new ArrayList<>(12);
+        ArrayList<ArrayList<byte[]>> bundle = new ArrayList<>(RECORDS_PER_BUNDLE);
+
+        try {
+            for (byte[] line = bf.nextLine(); line != null; line = bf.nextLine()) {
+                if (line.length < 1) {
+                    continue;
+                }
+                if (Tools.startsWith(line, PREFIX_EXPONENT, 0)) {
+                    LineParser1 headerParser = new LineParser1('\t');
+                    headerParser.set(line);
+                    if (headerParser.terms() >= 2) {
+                        DynamicDemiLog.setExponent((int) headerParser.parseLong(1), true, path);
+                    }
+                    continue;
+                }
+                if ((Tools.startsWith(line, PREFIX_TID, 0) || Tools.startsWith(line, PREFIX_ID, 0))
+                        && !currentRecord.isEmpty()) {
+                    bundle.add(currentRecord);
+                    currentRecord = new ArrayList<>(12);
+                    currentRecord.add(line);
+                    if (bundle.size() >= RECORDS_PER_BUNDLE) {
+                        final ArrayList<ArrayList<byte[]>> task = bundle;
+                        futures.add(pool.submit(() -> parseRecordBatch(task, k)));
+                        bundle = new ArrayList<>(RECORDS_PER_BUNDLE);
+                    }
+                } else {
+                    currentRecord.add(line);
+                }
+            }
+
+            if (!currentRecord.isEmpty()) {
+                bundle.add(currentRecord);
+            }
+            if (!bundle.isEmpty()) {
+                final ArrayList<ArrayList<byte[]>> task = bundle;
+                futures.add(pool.submit(() -> parseRecordBatch(task, k)));
+            }
+        } finally {
+            bf.close();
+            pool.shutdown();
+        }
+
+        ArrayList<DDLRecord> merged = new ArrayList<>();
+        for (Future<ArrayList<DDLRecord>> future : futures) {
+            merged.addAll(future.get());
+        }
+        return merged;
+    }
+
+    private static ArrayList<DDLRecord> parseRecordBatch(
+            ArrayList<ArrayList<byte[]>> batch, int k) {
+        ArrayList<DDLRecord> records = new ArrayList<>(batch.size());
+        LineParser1 parser = new LineParser1('\t');
+        for (ArrayList<byte[]> lines : batch) {
+            DDLRecord record = parseRecord(lines, parser, k);
+            if (record != null) {
+                records.add(record);
+            }
+        }
+        return records;
+    }
+
+    private static DDLRecord parseRecord(ArrayList<byte[]> lines, LineParser1 parser, int k) {
+        long recordId = -1;
+        int taxId = -1;
+        String name = null;
+        String file = null;
+        String origin = null;
+        String lineage = null;
+        long bases = 0;
+        int contigs = 0;
+        float gc = -1;
+        int offset = -1;
+        boolean hasKmers = false;
+        byte[] dataLine = null;
+        byte[] kmerLine = null;
+
+        for (byte[] line : lines) {
+            if (line.length < 1) {
+                continue;
+            }
+            if (line[0] == '#') {
+                parser.set(line);
+                if (parser.terms() < 2) {
+                    continue;
+                }
+                if (parser.termEquals("#id", 0)) {
+                    recordId = parser.parseLong(1);
+                } else if (parser.termEquals("#tid", 0)) {
+                    taxId = (int) parser.parseLong(1);
+                } else if (parser.termEquals("#name", 0)) {
+                    name = parser.parseString(1);
+                } else if (parser.termEquals("#file", 0)) {
+                    file = parser.parseString(1);
+                } else if (parser.termEquals("#bases", 0)) {
+                    bases = parser.parseLong(1);
+                } else if (parser.termEquals("#contigs", 0)) {
+                    contigs = (int) parser.parseLong(1);
+                } else if (parser.termEquals("#gc", 0)) {
+                    gc = parser.parseFloat(1);
+                } else if (parser.termEquals("#origin", 0)) {
+                    origin = parser.parseString(1);
+                } else if (parser.termEquals("#lineage", 0)) {
+                    lineage = parser.parseString(1);
+                } else if (parser.termEquals("#offset", 0)) {
+                    offset = (int) parser.parseLong(1);
+                } else if (parser.termEquals("#haskmers", 0)) {
+                    hasKmers = parser.parseLong(1) > 0;
+                }
+            } else if (dataLine == null) {
+                dataLine = line;
+            } else {
+                kmerLine = line;
+            }
+        }
+
+        if (dataLine == null) {
+            return null;
+        }
+
+        long[] kmers = null;
+        if (hasKmers && kmerLine != null && kmerLine.length > 0) {
+            kmers = DDLLoader.parseKmers(kmerLine, parser);
+        }
+        DynamicDemiLog ddl = DDLLoader.parseDDL(dataLine, parser, k, offset, kmers);
+        DDLRecord record = new DDLRecord(ddl, recordId, taxId, name);
+        record.filename = file;
+        record.bases = bases;
+        record.contigs = contigs;
+        record.gc = gc;
+        record.origin = origin;
+        record.lineage = lineage;
+        record.cardinality = ddl.cardinality();
+        return record;
+    }
+
+    public static void main(String[] args) throws IOException, InterruptedException, ExecutionException {
         if (args.length != 7) {
             System.err.println(
                 "usage: java BBToolsRefSeqParity REF_TSV SELECTIONS MIN_HITS THREADS WARMUP RUNS OUT_JSON");
@@ -95,8 +261,10 @@ public final class BBToolsRefSeqParity {
         }
         int totalIterations = warmup + runs;
 
-        // Parse the shared query-selection manifest
-        TreeSet<Integer> holdout = new TreeSet<>();
+        // Parse the shared query-selection manifest. Every line selects one query:
+        // external rows are removed from the database before the index is built, resident rows
+        // stay in the database. Legacy holdout/query keys are accepted as aliases.
+        TreeSet<Integer> external = new TreeSet<>();
         List<Integer> queries = new ArrayList<>();
         try (BufferedReader reader = new BufferedReader(new FileReader(selectionsPath))) {
             String line;
@@ -105,22 +273,28 @@ public final class BBToolsRefSeqParity {
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                     continue;
                 }
-                if (trimmed.startsWith("holdout:")) {
-                    holdout.add(Integer.parseInt(trimmed.substring("holdout:".length()).trim()));
-                } else if (trimmed.startsWith("query:")) {
-                    queries.add(Integer.parseInt(trimmed.substring("query:".length()).trim()));
+                if (trimmed.startsWith("external:")) {
+                    int ordinal = Integer.parseInt(
+                        trimmed.substring(trimmed.indexOf(':') + 1).trim());
+                    external.add(ordinal);
+                    queries.add(ordinal);
+                } else if (trimmed.startsWith("holdout:")) {
+                    external.add(Integer.parseInt(
+                        trimmed.substring(trimmed.indexOf(':') + 1).trim()));
+                } else if (trimmed.startsWith("resident:") || trimmed.startsWith("query:")) {
+                    queries.add(Integer.parseInt(
+                        trimmed.substring(trimmed.indexOf(':') + 1).trim()));
                 } else {
                     throw new IllegalArgumentException("unrecognized selections line: " + trimmed);
                 }
             }
         }
 
-        // Load all records with the first-party loader
-        // The single-threaded DDLLoader is deliberate: DDLLoaderMT does not preserve file order
-        // (per-thread batches are merged in worker order), while the parity manifest addresses
-        // records by file ordinal in both implementations.
+        // Load all records with an order-preserving multithreaded wrapper around the
+        // first-party parser. File order must be preserved because the shared manifest
+        // addresses records by ordinal in both implementations.
         long tLoadStart = System.nanoTime();
-        ArrayList<DDLRecord> records = DDLLoader.loadFile(refPath, K);
+        ArrayList<DDLRecord> records = loadFileOrderedMultithreaded(refPath, K, threads);
         double loadSeconds = (System.nanoTime() - tLoadStart) * 1e-9;
         System.err.printf(Locale.ROOT, "Loaded %d records in %.3f s%n", records.size(), loadSeconds);
         if (records.isEmpty()) {
@@ -132,13 +306,17 @@ public final class BBToolsRefSeqParity {
         }
 
         // Build the database subset: every record except the held-out rows
-        ArrayList<DDLRecord> dbRecords = new ArrayList<>(records.size() - holdout.size());
+        ArrayList<DDLRecord> dbRecords = new ArrayList<>(records.size() - external.size());
         for (int ordinal = 0; ordinal < records.size(); ordinal++) {
-            if (!holdout.contains(ordinal)) {
+            if (!external.contains(ordinal)) {
                 dbRecords.add(records.get(ordinal));
             }
         }
 
+        // The ordered MT parser leaves transient batch buffers on the heap. Reclaim them so
+        // the pre-index rows baseline and the post-CSR2 snapshot measure retained data rather
+        // than parser garbage.
+        System.gc();
         long heapBeforeIndex = heapUsed();
         double tCsrStart = nowSeconds();
         DDLIndexCSR csr = new DDLIndexCSR(buckets, VALUES);
@@ -157,6 +335,7 @@ public final class BBToolsRefSeqParity {
             csrCounts[qi] = csr.query(records.get(queries.get(qi)).ddl);
         }
         csr = null;
+        System.gc();
 
         // Measured iterations: warmup runs discarded, measured runs retained
         // Both backends are rebuilt and queried in every iteration, so the 21-bit CSR2 packing
@@ -168,6 +347,7 @@ public final class BBToolsRefSeqParity {
         double[] batchSeconds = new double[totalIterations];
         double[] batchCsrSeconds = new double[totalIterations];
         double[][] querySeconds = new double[queries.size()][totalIterations];
+        double[][] queryCsrSeconds = new double[queries.size()][totalIterations];
         long heapAfterCsr2 = heapUsed();
         long heapPeak = heapUsed();
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -218,6 +398,8 @@ public final class BBToolsRefSeqParity {
                             double[] result = future.get();
                             if (csr2Pass) {
                                 querySeconds[(int) result[1]][i] = result[0];
+                            } else {
+                                queryCsrSeconds[(int) result[1]][i] = result[0];
                             }
                         } catch (ExecutionException e) {
                             throw new IllegalStateException(
@@ -272,7 +454,7 @@ public final class BBToolsRefSeqParity {
 
             Map<String, Object> report = new LinkedHashMap<>();
             report.put("ordinal", ordinal);
-            report.put("held_out", holdout.contains(ordinal));
+            report.put("external", external.contains(ordinal));
             long[] checksum = rowChecksum(query.ddl.maxArray());
             report.put("row_checksum", checksum[0]);
             report.put("row_nonzero", checksum[1]);
@@ -323,9 +505,9 @@ public final class BBToolsRefSeqParity {
         json.append("  \"runs\": ").append(runs).append(",\n");
         json.append("  \"buckets\": ").append(buckets).append(",\n");
         json.append("  \"values\": ").append(VALUES).append(",\n");
-        json.append("  \"holdout\": [");
+        json.append("  \"external\": [");
         boolean first = true;
-        for (int ordinal : holdout) {
+        for (int ordinal : external) {
             json.append(first ? "" : ", ").append(ordinal);
             first = false;
         }
@@ -364,6 +546,18 @@ public final class BBToolsRefSeqParity {
             }
             json.append("]");
         }
+        json.append("],\n");
+        json.append("    \"query_csr_runs\": [");
+        for (int qi = 0; qi < queries.size(); qi++) {
+            if (qi != 0) {
+                json.append(", ");
+            }
+            json.append("[");
+            for (int i = warmup; i < totalIterations; i++) {
+                json.append(i == warmup ? "" : ", ").append(queryCsrSeconds[qi][i]);
+            }
+            json.append("]");
+        }
         json.append("]\n");
         json.append("  },\n");
         json.append("  \"memory_bytes\": {\n");
@@ -380,7 +574,7 @@ public final class BBToolsRefSeqParity {
             Map<String, Object> report = queryReports.get(qi);
             json.append("    {\n");
             json.append("      \"ordinal\": ").append(report.get("ordinal")).append(",\n");
-            json.append("      \"held_out\": ").append(report.get("held_out")).append(",\n");
+            json.append("      \"external\": ").append(report.get("external")).append(",\n");
             json.append("      \"row_checksum\": ").append(report.get("row_checksum")).append(",\n");
             json.append("      \"row_nonzero\": ").append(report.get("row_nonzero")).append(",\n");
             json.append("      \"candidates\": [");
