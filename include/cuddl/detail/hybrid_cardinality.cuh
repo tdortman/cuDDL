@@ -100,14 +100,17 @@ __device__ inline double dlc(uint32_t const* bins, double bucket_count, double l
     for (int32_t tier = 0; tier + 1 < nlz_bins; ++tier) {
         if (cumulative >= minimum && cumulative <= maximum) {
             auto const occupied = bucket_count - cumulative;
-            auto const tier_estimate =
-                cuda::std::ldexp(bucket_count * cuda::std::log(bucket_count / cumulative), tier);
-            
-            auto const error = cuda::std::sqrt(2.0 / 3.14159265358979323846) *
-                               cuda::std::sqrt(occupied / (bucket_count * cumulative)) /
-                               cuda::std::log(bucket_count / cumulative);
+            auto const log_ratio = cuda::std::log(bucket_count / cumulative);
+            auto const tier_estimate = cuda::std::ldexp(bucket_count * log_ratio, tier);
 
-            auto const weight = cuda::std::pow(1.0 / error, dlc_info_power);
+            auto const error = cuda::std::sqrt(2.0 / 3.14159265358979323846) *
+                               cuda::std::sqrt(occupied / (bucket_count * cumulative)) / log_ratio;
+
+            // `1 / error` is positive here. `pow(x, 4.5)` is the same value as
+            // `x^4 * sqrt(x)` and avoids the generic double-precision pow path.
+            auto const inv_error = 1.0 / error;
+            auto const inv_squared = inv_error * inv_error;
+            auto const weight = inv_squared * inv_squared * cuda::std::sqrt(inv_error);
             weight_sum += weight;
             weighted_log_sum += weight * cuda::std::log(tier_estimate);
         }

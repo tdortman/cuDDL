@@ -716,7 +716,7 @@ __global__ void hybrid_cardinality_kernel(
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(registers[bucket]);
+        auto const stored = winner(__ldcs(&registers[bucket]));
         if (stored == 0U) {
             atomicAdd(bins, 1U);
         } else {
@@ -751,7 +751,7 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(registers[bucket]);
+        auto const stored = winner(__ldcs(&registers[bucket]));
         if (stored == 0U) {
             atomicAdd(bins, 1U);
         } else {
