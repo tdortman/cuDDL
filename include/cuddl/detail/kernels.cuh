@@ -601,54 +601,105 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
 
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    for (auto query = static_cast<uint64_t>(blockIdx.y); query < query_count;
-         query += static_cast<uint64_t>(gridDim.y)) {
-        auto const query_index = static_cast<uint32_t>(query);
-        auto const query_id = query_id_offset + query_index;
-        auto const first_reference = AllToAll ? static_cast<uint64_t>(query_id) + 1U : uint64_t{0};
-        auto const earlier_queries = query_index == 0U ? 0U : query_index - 1U;
-        auto const preceding_pairs =
-            AllToAll ? static_cast<size_t>(query_index) * (reference_count - query_id_offset - 1U) -
-                           static_cast<size_t>(query_index) * earlier_queries / 2U
-                     : static_cast<size_t>(query_index) * reference_count;
-        auto const query_offset =
-            (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
-
-        auto reference =
-            first_reference + static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
+    if constexpr (!AllToAll) {
+        // Reference-major traversal: each warp owns one reference and compares it against
+        // every query in the tile, so each reference row is loaded once (and reused from L1
+        // for the remaining queries) instead of once per (query, reference) pair. The query
+        // rows themselves fit in L2 and are shared by every warp; staging them in shared
+        // memory was profiled and rejected because the larger shared footprint caps the
+        // occupancy at one block per SM. Results keep their dense query-major positions, so
+        // the output layout is unchanged.
+        auto reference = static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
         auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
         for (; reference < reference_count; reference += reference_stride) {
             auto const reference_id = static_cast<uint32_t>(reference);
-            pairwise_counts local{};
-            uint32_t local_matches = 0;
             auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-            for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
-                 bucket += warp_width) {
-                auto const query_score = reference_score(queries[query_offset + bucket]);
-                auto const stored_score = reference_score(rows[reference_offset + bucket]);
-                classify(local, query_score, stored_score);
-                local_matches += query_score != 0U && query_score == stored_score;
-            }
-            auto const total = count_reduce(count_storage[warp]).Sum(local);
-            auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
-            if (lane == 0U) {
-                auto const result_index = preceding_pairs + reference_id - first_reference;
-                results[result_index].query_id = query_id;
-                results[result_index].reference_id = reference_id;
-                results[result_index].summary.counts = total;
-                results[result_index].summary.cardinality = 0.0;
-                if (result_match_counts != nullptr) {
-                    result_match_counts[result_index] = matches;
+            for (uint32_t query_index = 0U; query_index < query_count; ++query_index) {
+                auto const query_id = query_id_offset + query_index;
+                auto const query_offset =
+                    (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+                pairwise_counts local{};
+                uint32_t local_matches = 0U;
+                for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
+                     bucket += warp_width) {
+                    auto const query_score = reference_score(queries[query_offset + bucket]);
+                    auto const stored_score = reference_score(rows[reference_offset + bucket]);
+                    classify(local, query_score, stored_score);
+                    local_matches += query_score != 0U && query_score == stored_score;
                 }
+                auto const total = count_reduce(count_storage[warp]).Sum(local);
+                auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
+                if (lane == 0U) {
+                    auto const result_index =
+                        static_cast<size_t>(query_index) * reference_count + reference_id;
+                    results[result_index].query_id = query_id;
+                    results[result_index].reference_id = reference_id;
+                    results[result_index].summary.counts = total;
+                    results[result_index].summary.cardinality = 0.0;
+                    if (result_match_counts != nullptr) {
+                        result_match_counts[result_index] = matches;
+                    }
+                }
+                __syncwarp();
             }
-            __syncwarp();
+        }
+    } else {
+        for (auto query = static_cast<uint64_t>(blockIdx.y); query < query_count;
+             query += static_cast<uint64_t>(gridDim.y)) {
+            auto const query_index = static_cast<uint32_t>(query);
+            auto const query_id = query_id_offset + query_index;
+            auto const first_reference =
+                AllToAll ? static_cast<uint64_t>(query_id) + 1U : uint64_t{0};
+            auto const earlier_queries = query_index == 0U ? 0U : query_index - 1U;
+            auto const preceding_pairs =
+                AllToAll
+                    ? static_cast<size_t>(query_index) * (reference_count - query_id_offset - 1U) -
+                          static_cast<size_t>(query_index) * earlier_queries / 2U
+                    : static_cast<size_t>(query_index) * reference_count;
+            auto const query_offset =
+                (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+
+            auto reference =
+                first_reference + static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
+            auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
+            for (; reference < reference_count; reference += reference_stride) {
+                auto const reference_id = static_cast<uint32_t>(reference);
+                pairwise_counts local{};
+                uint32_t local_matches = 0;
+                auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
+                for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
+                     bucket += warp_width) {
+                    auto const query_score = reference_score(queries[query_offset + bucket]);
+                    auto const stored_score = reference_score(rows[reference_offset + bucket]);
+                    classify(local, query_score, stored_score);
+                    local_matches += query_score != 0U && query_score == stored_score;
+                }
+                auto const total = count_reduce(count_storage[warp]).Sum(local);
+                auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
+                if (lane == 0U) {
+                    auto const result_index = preceding_pairs + reference_id - first_reference;
+                    results[result_index].query_id = query_id;
+                    results[result_index].reference_id = reference_id;
+                    results[result_index].summary.counts = total;
+                    results[result_index].summary.cardinality = 0.0;
+                    if (result_match_counts != nullptr) {
+                        result_match_counts[result_index] = matches;
+                    }
+                }
+                __syncwarp();
+            }
         }
     }
 }
 
 /// @brief Counts dense index matches for every query/reference pair in one tile.
+///
+/// One warp owns each (query, bucket) cell. The cell's posting list is walked with a lane
+/// stride, so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
+/// postings at a time instead of serially by a single thread, and the two per-cell offset
+/// loads collapse into warp-uniform broadcasts.
 template <size_t BucketCount, typename QueryRow>
-__global__ void count_batch_index_matches_kernel(
+__global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     QueryRow const* queries,
     size_t query_row_offset,
     uint32_t query_count,

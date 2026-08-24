@@ -1051,7 +1051,9 @@ class reference_database_ref {
             (static_cast<uint64_t>(metadata_.reference_count) + references_per_block - 1U) /
             references_per_block
         );
-        auto const query_blocks = query_count < 65535U ? query_count : 65535U;
+        // The exhaustive (non-all-to-all) path is reference-major and ignores the query grid
+        // dimension; the all-to-all path strides queries across gridDim.y.
+        auto const query_blocks = AllToAll ? (query_count < 65535U ? query_count : 65535U) : 1U;
         dim3 const blocks{reference_blocks, query_blocks, 1U};
         detail::batch_exhaustive_search_kernel<BucketCount, AllToAll>
             <<<blocks, detail::block_size, 0, stream.get()>>>(
