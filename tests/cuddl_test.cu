@@ -1,5 +1,7 @@
+#include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
+#include <cuddl/refseq_parity.hpp>
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -2377,6 +2379,340 @@ TEST(FastaTest, EmptyFileParsesToEmptyResult) {
     EXPECT_EQ(res->bases, 0u);
     EXPECT_EQ(res->valid_kmers, 0u);
     std::remove(path.c_str());
+}
+
+/// @brief Encodes one absolute 16-bit bucket value relative to a global NLZ offset.
+///
+/// Mirrors BBTools' `DynamicDemiLog.toBytesRelative`. Callers must guarantee every nonzero @p abs
+/// has `abs >> (16 - exponent_bits) >= global_nlz`, the invariant a well-formed A48 file preserves.
+std::string encode_a48_relative(uint16_t abs, int32_t global_nlz, uint32_t exponent_bits) {
+    if (abs == 0U) {
+        return "0";
+    }
+    auto const mantissa_bits = 16U - exponent_bits;
+    auto const mask = (1U << mantissa_bits) - 1U;
+    auto const abs_nlz = static_cast<uint32_t>(abs >> mantissa_bits);
+    auto const rel_nlz = abs_nlz - static_cast<uint32_t>(global_nlz);
+    auto const rel = static_cast<uint16_t>((rel_nlz << mantissa_bits) | (abs & mask));
+    return cuddl::a48::encode_a48_token(rel);
+}
+
+/// @brief Builds a small A48 TSV using relative (`#offset`) encoding.
+std::string build_a48_relative_tsv(
+    std::vector<std::vector<uint16_t>> const& rows,
+    uint32_t exponent_bits,
+    int32_t global_nlz,
+    uint32_t k,
+    uint64_t seed
+) {
+    std::string out;
+    out += "#k\t" + std::to_string(k) + "\n";
+    out += "#seed\t" + std::to_string(seed) + "\n";
+    out += "#exponent\t" + std::to_string(exponent_bits) + "\n";
+    for (size_t r = 0; r < rows.size(); ++r) {
+        out += "#id\t" + std::to_string(1000 + static_cast<int>(r)) + "\n";
+        out += "#tid\t" + std::to_string(200 + static_cast<int>(r)) + "\n";
+        out += "#name\tref" + std::to_string(r) + "\n";
+        out += "#len\t" + std::to_string(rows[r].size()) + "\n";
+        out += "#offset\t" + std::to_string(global_nlz) + "\n";
+        for (size_t b = 0; b < rows[r].size(); ++b) {
+            if (b != 0U) {
+                out += '\t';
+            }
+            out += encode_a48_relative(rows[r][b], global_nlz, exponent_bits);
+        }
+        out += '\n';
+    }
+    return out;
+}
+
+/// @brief Builds a small A48 TSV using absolute (legacy, no `#offset`) encoding.
+std::string build_a48_absolute_tsv(
+    std::vector<std::vector<uint16_t>> const& rows,
+    uint32_t exponent_bits,
+    uint32_t k,
+    uint64_t seed
+) {
+    std::string out;
+    out += "#k\t" + std::to_string(k) + "\n";
+    out += "#seed\t" + std::to_string(seed) + "\n";
+    out += "#exponent\t" + std::to_string(exponent_bits) + "\n";
+    for (size_t r = 0; r < rows.size(); ++r) {
+        out += "#id\t" + std::to_string(3000 + static_cast<int>(r)) + "\n";
+        out += "#name\tref" + std::to_string(r) + "\n";
+        out += "#len\t" + std::to_string(rows[r].size()) + "\n";
+        for (size_t b = 0; b < rows[r].size(); ++b) {
+            if (b != 0U) {
+                out += '\t';
+            }
+            out += cuddl::a48::encode_a48_token(rows[r][b]);
+        }
+        out += '\n';
+    }
+    return out;
+}
+
+TEST(A48Decoder, DecodesRelativeHeaderRowsAndMetadata) {
+    constexpr uint32_t k = 3U;
+    constexpr uint32_t exponent = 2U;
+    constexpr int32_t global_nlz = 1;
+    constexpr uint64_t seed = 12345ULL;
+    // All nonzero absolute scores have `abs >> (16-2) >= 1`, satisfying the relative invariant.
+    std::vector<std::vector<uint16_t>> const rows{
+        {0, 3000, 4000, 0, 5000, 6000, 0, 7000},
+        {0, 3000, 0, 0, 5000, 0, 8000, 0},
+        {0, 0, 4000, 0, 0, 6000, 0, 0},
+    };
+
+    auto const tsv = build_a48_relative_tsv(rows, exponent, global_nlz, k, seed);
+    auto const decoded = cuddl::a48::decode_a48_tsv(tsv);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+    auto const& db = *decoded;
+
+    EXPECT_EQ(db.metadata.kmer_length, k);
+    EXPECT_TRUE(db.metadata.has_kmer_length);
+    EXPECT_EQ(db.metadata.seed, seed);
+    EXPECT_TRUE(db.metadata.has_seed);
+    EXPECT_EQ(db.metadata.exponent_bits, exponent);
+    EXPECT_TRUE(db.metadata.has_exponent);
+    EXPECT_EQ(db.records.size(), rows.size());
+
+    for (size_t r = 0; r < rows.size(); ++r) {
+        EXPECT_EQ(db.records[r].ordinal, r);
+        EXPECT_EQ(db.records[r].metadata.id, static_cast<int64_t>(1000 + r));
+        EXPECT_EQ(db.records[r].metadata.tax_id, static_cast<int64_t>(200 + r));
+        EXPECT_EQ(db.records[r].metadata.name, "ref" + std::to_string(r));
+        EXPECT_EQ(db.records[r].metadata.offset, global_nlz);
+        ASSERT_EQ(db.records[r].scores.size(), rows[r].size());
+        EXPECT_EQ(db.records[r].scores, rows[r]);
+    }
+}
+
+TEST(A48Decoder, DecodesAbsoluteLegacyRows) {
+    constexpr uint32_t k = 3U;
+    constexpr uint32_t exponent = 2U;
+    constexpr uint64_t seed = 7ULL;
+    std::vector<std::vector<uint16_t>> const rows{
+        {0, 100, 200, 0, 300, 400, 0, 500},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+    };
+    auto const tsv = build_a48_absolute_tsv(rows, exponent, k, seed);
+    auto const decoded = cuddl::a48::decode_a48_tsv(tsv);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+    auto const& db = *decoded;
+    EXPECT_EQ(db.records.size(), rows.size());
+    EXPECT_EQ(db.records[0].scores, rows[0]);
+    EXPECT_EQ(db.records[1].scores, rows[1]);
+}
+
+TEST(A48Decoder, HostDdlIndexOracleCountsMatchCounts) {
+    std::vector<std::vector<uint16_t>> const rows{
+        {0, 100, 200, 0, 300, 400, 0, 500},
+        {0, 100, 0, 0, 300, 0, 600, 0},
+        {0, 0, 200, 0, 0, 400, 0, 0},
+    };
+    std::vector<uint16_t> const query = rows[0];
+    auto const oracle = cuddl::a48::exhaustive_oracle(rows, query, 1U);
+    auto const& counts = oracle.match_counts;
+    EXPECT_EQ(counts.size(), rows.size());
+    // query = row0: nonzero buckets {1,2,4,5,7}. row0 matches all five; row1 matches {1,4};
+    // row2 matches {2,5}.
+    EXPECT_EQ(counts[0], 5U);
+    EXPECT_EQ(counts[1], 2U);
+    EXPECT_EQ(counts[2], 2U);
+    // The fused oracle also classifies the query against every retained reference exactly:
+    // query == row0 itself, so all five nonzero buckets are equal, two buckets are both empty,
+    // and no bucket is lower or higher.
+    auto const& self = oracle.summaries[0];
+    EXPECT_EQ(self.equal, 5U);
+    EXPECT_EQ(self.lower, 0U);
+    EXPECT_EQ(self.higher, 0U);
+    EXPECT_EQ(self.both_empty, 3U);
+}
+
+TEST(A48Decoder, RejectsMalformedInput) {
+    // Character outside the A48 alphabet (ASCII '!' == 33 < 48).
+    {
+        std::string const tsv = "#name\tbad\n0\t0\t!\n";
+        EXPECT_FALSE(cuddl::a48::decode_a48_tsv(tsv).has_value());
+    }
+    // `#len` disagrees with the data-row width.
+    {
+        std::string const tsv = "#name\tbad\n#len\t4\n0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_NE(res.error().message().find("#len"), std::string::npos);
+    }
+    // Bucket count changes between records.
+    {
+        std::string const tsv = "#name\ta\n0\t0\t0\n#name\tb\n0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_NE(res.error().message().find("width"), std::string::npos);
+    }
+    // Relative-encoded record without an `#exponent` header.
+    {
+        std::string const tsv = "#name\tbad\n#offset\t1\n0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_NE(res.error().message().find("exponent"), std::string::npos);
+    }
+    // Data row before any record header.
+    {
+        std::string const tsv = "\n0\t0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_EQ(res.error().message().find("record header") != std::string::npos, true);
+    }
+    // An exponent outside the valid 1..15 range.
+    {
+        std::string const tsv = "#exponent\t0\n#name\tbad\n0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_NE(res.error().message().find("exponent"), std::string::npos);
+    }
+    // A non-numeric header field is malformed, not a thrown exception.
+    {
+        std::string const tsv = "#name\tbad\n#len\tabc\n0\t0\n";
+        auto const res = cuddl::a48::decode_a48_tsv(tsv);
+        ASSERT_FALSE(res.has_value());
+        EXPECT_NE(res.error().message().find("len"), std::string::npos);
+    }
+    // Empty input decodes to no records.
+    { EXPECT_FALSE(cuddl::a48::decode_a48_tsv("").has_value()); }
+}
+
+TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    constexpr uint32_t exponent = 5U;
+    constexpr uint64_t seed = 42ULL;
+    constexpr uint32_t minimum_matches = 3U;
+    constexpr uint32_t reference_count = 4U;
+    constexpr uint32_t held_out_id = 3U;
+
+    // Deterministic sparse rows over b_default buckets. Nonzero absolute scores live in a
+    // realistic DDL range; the pattern yields distinct match counts per reference.
+    std::vector<std::vector<uint16_t>> rows(reference_count, std::vector<uint16_t>(b_default, 0U));
+    for (size_t bucket = 0; bucket < b_default; ++bucket) {
+        auto const base = static_cast<uint16_t>(
+            (bucket % 4U == 0U) ? 0U : static_cast<uint16_t>(3000U * (bucket % 4U))
+        );
+        rows[0][bucket] = base;
+        rows[1][bucket] =
+            static_cast<uint16_t>(base == 0U ? 0U : (bucket % 8U == 5U ? base + 1000U : base));
+        rows[2][bucket] = static_cast<uint16_t>(base == 0U ? 0U : base + 1U);
+        rows[3][bucket] = static_cast<uint16_t>(bucket % 11U == 0U ? base : 0U);
+    }
+
+    auto const tsv = build_a48_absolute_tsv(rows, exponent, k_default, seed);
+    auto const decoded = cuddl::a48::decode_a48_tsv(tsv);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+    ASSERT_EQ(decoded->records.size(), reference_count);
+    for (uint32_t r = 0; r < reference_count; ++r) {
+        EXPECT_EQ(decoded->records[r].scores, rows[r]);
+    }
+
+    // Hold row 3 out of the database, mirroring the parity manifest's held-out policy: the
+    // index is built from the remaining records in original order, and row 3 becomes a
+    // held-out query whose candidate IDs address the reduced database.
+    std::vector<uint32_t> const db_ids{0U, 1U, 2U};
+    std::vector<uint16_t> scores(db_ids.size() * b_default);
+    for (size_t i = 0; i < db_ids.size(); ++i) {
+        std::copy(
+            decoded->records[db_ids[i]].scores.begin(),
+            decoded->records[db_ids[i]].scores.end(),
+            scores.begin() + i * b_default
+        );
+    }
+    auto const compatibility = cuddl::decoded_compatibility(k_default, b_default, exponent, seed);
+    auto const stream = cuda::stream_ref{stream_};
+    thrust::device_vector<uint16_t> device_scores(scores);
+    auto built = database_type::build_indexed_async(device_scores, compatibility, stream);
+    ASSERT_TRUE(built.has_value()) << built.error().message();
+    auto database = std::move(*built);
+
+    // Exhaustive reference database over the same subset, for the GPU exact-summary contract.
+    auto exhaustive_built = database_type::build_async(device_scores, compatibility, stream);
+    ASSERT_TRUE(exhaustive_built.has_value());
+    auto exhaustive_database = std::move(*exhaustive_built);
+
+    auto indexed_workspace_bytes = database.indexed_single_query_workspace_bytes();
+    ASSERT_TRUE(indexed_workspace_bytes.has_value()) << indexed_workspace_bytes.error().message();
+    thrust::device_vector<uint8_t> indexed_workspace(*indexed_workspace_bytes);
+
+    // In-database queries and the held-out row must agree with the same host oracle.
+    std::vector<uint32_t> const query_ids{0U, 1U, 2U, held_out_id};
+    for (auto const query_id : query_ids) {
+        SCOPED_TRACE(query_id);
+        auto const& query_row = rows[query_id];
+        thrust::device_vector<uint16_t> device_query(query_row);
+        thrust::device_vector<cuddl::reference_search_result> indexed(db_ids.size());
+        thrust::device_vector<cuddl::reference_search_result> exhaustive(db_ids.size());
+        thrust::device_vector<uint32_t> indexed_count(1U);
+        thrust::device_vector<uint8_t> exhaustive_workspace;
+
+        ASSERT_TRUE(database
+                        .search_indexed_async(
+                            device_query,
+                            compatibility,
+                            indexed_workspace,
+                            indexed,
+                            indexed_count,
+                            {.minimum_matches = minimum_matches},
+                            stream
+                        )
+                        .has_value());
+        ASSERT_TRUE(
+            exhaustive_database
+                .search_async(device_query, compatibility, exhaustive_workspace, exhaustive, stream)
+                .has_value()
+        );
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+
+        std::vector<cuddl::reference_search_result> indexed_host(db_ids.size());
+        std::vector<cuddl::reference_search_result> exhaustive_host(db_ids.size());
+        ASSERT_TRUE(copy_device_vector(indexed, indexed_host));
+        ASSERT_TRUE(copy_device_vector(exhaustive, exhaustive_host));
+        uint32_t count = 0;
+        ASSERT_EQ(
+            cudaSuccess,
+            cudaMemcpy(
+                &count,
+                thrust::raw_pointer_cast(indexed_count.data()),
+                sizeof(count),
+                cudaMemcpyDeviceToHost
+            )
+        );
+
+        // Independent host oracle: BBTools DDLIndex/CSR2 match counts over the same subset,
+        // plus exhaustive lower/equal/higher/both-empty summaries for every retained candidate.
+        auto const oracle =
+            cuddl::a48::exhaustive_oracle(scores, query_row, b_default, minimum_matches);
+        std::vector<uint32_t> expected_candidates;
+        for (uint32_t r = 0; r < db_ids.size(); ++r) {
+            if (oracle.match_counts[r] >= minimum_matches) {
+                expected_candidates.push_back(r);
+            }
+        }
+
+        EXPECT_EQ(count, expected_candidates.size());
+        ASSERT_LE(count, expected_candidates.size());
+        for (uint32_t i = 0; i < count; ++i) {
+            auto const reference_id = indexed_host[i].reference_id;
+            EXPECT_EQ(reference_id, expected_candidates[i]);
+            // Index match count equals the DDLIndex oracle count and the exact `equal` class.
+            EXPECT_EQ(indexed_host[i].summary.counts.equal, oracle.match_counts[reference_id]);
+            // Exact refinement == the independent exhaustive comparison over decoded rows.
+            auto const& expected_summary = oracle.summaries[reference_id];
+            EXPECT_EQ(indexed_host[i].summary.counts.lower, expected_summary.lower);
+            EXPECT_EQ(indexed_host[i].summary.counts.equal, expected_summary.equal);
+            EXPECT_EQ(indexed_host[i].summary.counts.higher, expected_summary.higher);
+            EXPECT_EQ(indexed_host[i].summary.counts.both_empty, expected_summary.both_empty);
+            // Exact refinement == the exhaustive GPU comparison over the same subset.
+            EXPECT_EQ(indexed_host[i].summary, exhaustive_host[reference_id].summary);
+            EXPECT_EQ(reference_id, exhaustive_host[reference_id].reference_id);
+        }
+    }
 }
 
 }  // namespace
