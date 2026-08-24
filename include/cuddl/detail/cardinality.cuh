@@ -60,5 +60,4 @@ cardinality(double bucket_count, double empty_count, double sum_restored) noexce
     return minimum_mle(bucket_count, empty_count, sum_restored);
 }
 
-
 }  // namespace cuddl::detail

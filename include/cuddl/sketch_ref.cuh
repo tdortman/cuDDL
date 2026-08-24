@@ -8,12 +8,12 @@
 #include <cmath>
 #include <optional>
 
-#include <cuddl/device_span.cuh>
 #include <cuddl/detail/construction.cuh>
 #include <cuddl/detail/kernels.cuh>
+#include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
-#include <cuddl/pairwise_counts.cuh>
 #include <cuddl/hybrid_cardinality.cuh>
+#include <cuddl/pairwise_counts.cuh>
 
 namespace cuddl {
 
@@ -35,7 +35,8 @@ class sketch_ref {
 
     /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
     __host__ __device__ constexpr sketch_ref(
-        device_span<register_type> registers, uint32_t& saturation
+        device_span<register_type> registers,
+        uint32_t& saturation
     ) noexcept
         : registers_(registers), saturation_(saturation) {}
 
@@ -131,7 +132,6 @@ class sketch_ref {
             <<<1, detail::block_size, 0, stream.get()>>>(registers_.data(), output);
         return cuda_try(cudaGetLastError());
     }
-
 
     /// @brief Extracts per-register winner counts and the saturation flag to device outputs.
     ///

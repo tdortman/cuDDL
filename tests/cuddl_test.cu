@@ -10,8 +10,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <limits>
@@ -313,8 +313,7 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
 
 TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     constexpr size_t reference_count = 4;
-    auto const compatibility =
-        cuddl::score_compatibility::current<k_default, b_default>();
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
 
     std::vector<uint16_t> query(b_default);
     std::vector<uint16_t> rows(reference_count * b_default);
@@ -337,11 +336,9 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     );
     ASSERT_TRUE(built.has_value()) << built.error().message();
     auto database = std::move(*built);
-    ASSERT_TRUE(
-        database
-            .search_async(device_query, compatibility, workspace, device_results, stream)
-            .has_value()
-    );
+    ASSERT_TRUE(database
+                    .search_async(device_query, compatibility, workspace, device_results, stream)
+                    .has_value());
 
     std::vector<cuddl::reference_search_result> results(reference_count);
     ASSERT_EQ(
@@ -1427,12 +1424,10 @@ TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
     static_assert(std::is_trivially_copyable_v<typename database_type::ref_type>);
     static_assert(!std::is_trivially_copyable_v<database_type>);
 
-    auto const compatibility =
-        cuddl::score_compatibility::current<k_default, b_default>();
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
     auto const stream = cuda::stream_ref{stream_};
-    auto built = database_type::build_async(
-        cuddl::device_span<uint16_t const>{}, compatibility, stream
-    );
+    auto built =
+        database_type::build_async(cuddl::device_span<uint16_t const>{}, compatibility, stream);
     ASSERT_TRUE(built.has_value()) << built.error().message();
     auto database = std::move(*built);
 
@@ -1455,8 +1450,7 @@ TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
 
 TEST_F(ReferenceDatabaseTest, RejectsMalformedAndIncompatibleInputsWithoutOutput) {
     using database_type = cuddl::reference_database<k_default, b_default>;
-    auto const compatibility =
-        cuddl::score_compatibility::current<k_default, b_default>();
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
     auto const stream = cuda::stream_ref{stream_};
 
     thrust::device_vector<uint16_t> malformed_rows(b_default + 1, 1U);
@@ -1470,9 +1464,8 @@ TEST_F(ReferenceDatabaseTest, RejectsMalformedAndIncompatibleInputsWithoutOutput
 
     auto unsupported = compatibility;
     unsupported.key_mask = 0x7fffU;
-    auto unsupported_build = database_type::build_async(
-        cuddl::device_span<uint16_t const>{}, unsupported, stream
-    );
+    auto unsupported_build =
+        database_type::build_async(cuddl::device_span<uint16_t const>{}, unsupported, stream);
     ASSERT_FALSE(unsupported_build.has_value());
     EXPECT_EQ(unsupported_build.error().category(), cuddl::ErrorCategory::invalid_argument);
 

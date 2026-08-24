@@ -5,14 +5,13 @@
 #include <cuda/std/cstdint>
 
 #include <cuddl/detail/kernels.cuh>
-#include <cuddl/error.hpp>
 #include <cuddl/device_span.cuh>
+#include <cuddl/error.hpp>
 
 namespace cuddl::detail {
 
 /// @brief Grid width for direct global construction, capped at two inputs per thread.
-__host__ inline uint32_t
-construction_blocks(size_t count, cudaStream_t stream = nullptr) noexcept {
+__host__ inline uint32_t construction_blocks(size_t count, cudaStream_t stream = nullptr) noexcept {
     int device = 0;
     (void)stream;
     cudaGetDevice(&device);

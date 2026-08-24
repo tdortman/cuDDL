@@ -844,9 +844,9 @@ class reference_database_ref {
     }
 
     [[nodiscard]] Result<void> validate_index_storage() const {
-        CUDDL_TRY((
-            detail::validate_indexed_score_compatibility<K, BucketCount>(metadata_.compatibility)
-        ));
+        CUDDL_TRY(
+            (detail::validate_indexed_score_compatibility<K, BucketCount>(metadata_.compatibility))
+        );
         auto const cell_count = detail::indexed_cell_count(metadata_.compatibility);
         auto const expected_postings = static_cast<size_t>(
             detail::indexed_posting_count(metadata_.reference_count, metadata_.compatibility)
