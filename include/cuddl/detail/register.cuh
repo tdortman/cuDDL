@@ -86,6 +86,25 @@ __host__ __device__ constexpr uint64_t restore(uint16_t stored) noexcept {
 }
 
 /**
+ * @brief Reconstructs the interval midpoint for @ref restore.
+ *
+ * @ref restore returns the lower bound of the hash interval represented by @p stored. The actual
+ * hash is uniformly distributed across that interval, so the midpoint is the minimum-variance
+ * scalar summary and reduces the small positive bias that lower-bound restoration introduces
+ * into hash-magnitude cardinality sums.
+ */
+__host__ __device__ constexpr uint64_t restore_midpoint(uint16_t stored) noexcept {
+    auto const nlz = static_cast<uint32_t>(stored >> mantissa_bits);
+    auto const lowbits = static_cast<uint32_t>((~stored) & mantissa_mask);
+    auto const mantissa = (1U << mantissa_bits) | lowbits;
+    auto const shift = restore_shift_base - nlz;
+    auto const lower = static_cast<uint64_t>(mantissa) << shift;
+    // `(1 << shift) >> 1` is 2^(shift-1) for ordinary tiers and exactly zero for the
+    // clamped top tier (`shift == 0`), so the midpoint needs no branch.
+    return lower + ((1ULL << shift) >> 1U);
+}
+
+/**
  * @brief Atomically applies the DDL winner-update rule to @p address.
  *
  * A better score replaces the winner and resets its count to one; an equal score increments the

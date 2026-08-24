@@ -22,6 +22,7 @@ namespace {
 using cuddl::detail::hash_kmer;
 using cuddl::detail::pack;
 using cuddl::detail::restore;
+using cuddl::detail::restore_midpoint;
 using cuddl::detail::score;
 using cuddl::detail::winner;
 
@@ -87,7 +88,7 @@ struct scalar_sketch {
             if (w == 0) {
                 ++empty;
             } else {
-                sum += restore(w);
+                sum += restore_midpoint(w);
             }
         }
         return cuddl::detail::cardinality(
@@ -185,6 +186,10 @@ TEST(SketchTest, ScoreEncodingClampsExtremeNlz) {
     EXPECT_GE(high, 1U << cuddl::detail::mantissa_bits);
     uint64_t const restored = restore(high);
     EXPECT_GT(restored, 0ULL);
+    // The midpoint refinement shifts ordinary tiers upward; the clamped top tier is already
+    // exact and must stay unchanged.
+    EXPECT_GT(restore_midpoint(low), restore(low));
+    EXPECT_EQ(restore_midpoint(high), restore(high));
     (void)low;
 }
 

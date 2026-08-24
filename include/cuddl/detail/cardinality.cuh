@@ -18,14 +18,14 @@ constexpr double hash_range = 0x1p64;
  *
  * The denominator combines all observations after scaling hash values to `[0, 1]`:
  * - each empty bucket contributes `1`, meaning that its minimum lies beyond the hash range;
- * - each filled bucket contributes its restored minimum divided by @ref hash_range.
+ * - each filled bucket contributes its restored interval midpoint divided by @ref hash_range.
  *
  * Dividing `bucket_count * filled_bucket_count` by that total gives the maximum-likelihood
  * cardinality estimate. If no bucket is empty, this reduces to the usual MeanM estimate.
  *
  * @param bucket_count Total number of sketch buckets.
  * @param empty_count Number of buckets that received no hashes.
- * @param sum_restored Sum of the restored minimum hash from every filled bucket.
+ * @param sum_restored Sum of the restored interval midpoint from every filled bucket.
  *
  * @return Estimated distinct hash count, or zero when every bucket is empty.
  */

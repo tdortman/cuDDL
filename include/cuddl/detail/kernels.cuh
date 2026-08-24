@@ -237,7 +237,7 @@ summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& ou
             if (winner(left_reg) == 0U) {
                 ++local.empty;
             } else {
-                local.restored_sum += restore(winner(left_reg));
+                local.restored_sum += restore_midpoint(winner(left_reg));
             }
         }
     }
@@ -691,7 +691,7 @@ __global__ void cardinality_kernel(
         if (stored == 0U) {
             ++local.empty;
         } else {
-            local.restored_sum += restore(stored);
+            local.restored_sum += restore_midpoint(stored);
         }
     }
     auto const warp = threadIdx.x >> 5U;
