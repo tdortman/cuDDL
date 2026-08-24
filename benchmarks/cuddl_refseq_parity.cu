@@ -295,6 +295,38 @@ manifest_selection parse_manifest(std::string const& path, size_t record_count) 
     return selection;
 }
 
+/// @brief The pinned default parity selection, embedded so no manifest file is required.
+///
+/// Ordinals are zero-based positions in the pinned v40.00 unmerged RefSeq asset's 148,108
+/// records. The eight held-out rows are also queried; the remaining twelve queries are spread
+/// across the source partitions and include closely related and organelle/plasmid records.
+manifest_selection pinned_manifest_selection(size_t record_count) {
+    manifest_selection selection;
+    selection.holdout = {
+        10007U, 24001U, 41777U, 63211U, 85009U, 103003U, 121999U, 137777U,
+    };
+    selection.queries = {
+        7U,       10007U, 12500U, 24001U, 25000U, 37500U, 41777U,
+        50000U,   62500U, 63211U, 75000U, 85009U, 87500U, 100000U,
+        103003U,  112500U, 121999U, 125000U, 137777U, 147000U,
+    };
+    for (auto const ordinal : selection.holdout) {
+        if (ordinal >= record_count) {
+            throw std::runtime_error(
+                "built-in manifest ordinal out of range: " + std::to_string(ordinal)
+            );
+        }
+    }
+    for (auto const ordinal : selection.queries) {
+        if (ordinal >= record_count) {
+            throw std::runtime_error(
+                "built-in manifest ordinal out of range: " + std::to_string(ordinal)
+            );
+        }
+    }
+    return selection;
+}
+
 /// @brief Compiles and runs the BBTools DDLIndex/CSR2 Java harness, returning its JSON output.
 json run_bbtools_harness(
     std::string const& asset_path,
@@ -357,7 +389,7 @@ int main(int argc, char** argv) {
 
         std::string asset_path;
         asset_prerequisite prereq;
-        std::string manifest_path = "data/refseq_parity_manifest.txt";
+        std::string manifest_path;
         uint32_t min_hits = 5;
         uint64_t seed = 42;
         std::string evidence_path;
@@ -396,7 +428,8 @@ int main(int argc, char** argv) {
         app.add_option(
             "--manifest",
             manifest_path,
-            "Query-selection manifest (`holdout: N` / `query: N` ordinal lines)"
+            "Optional query-selection manifest override (`holdout: N` / `query: N` ordinal "
+            "lines). Defaults to the built-in pinned selection."
         );
         app.add_option("--min-hits", min_hits, "Minimum matching buckets to retain a candidate")
             ->check(CLI::NonNegativeNumber);
@@ -547,9 +580,12 @@ int main(int argc, char** argv) {
             prereq.k, prereq.buckets, prereq.exponent, compatibility_seed
         );
 
-        // Require a manifest containing both held-out and database-resident queries. The two
-        // classes exercise reduced-database id mapping as well as ordinary in-database lookup.
-        auto const selection = parse_manifest(manifest_path, db.records.size());
+        // Require both held-out and database-resident queries. The two classes exercise
+        // reduced-database id mapping as well as ordinary in-database lookup. The pinned default
+        // selection is embedded; `--manifest` exists only for experiments with other selections.
+        auto const selection = manifest_path.empty()
+                                   ? pinned_manifest_selection(db.records.size())
+                                   : parse_manifest(manifest_path, db.records.size());
         auto const has_held_out_query = std::any_of(
             selection.queries.begin(), selection.queries.end(), [&](uint32_t ordinal) {
                 return selection.holdout.contains(ordinal);
@@ -1029,7 +1065,7 @@ int main(int argc, char** argv) {
             {"runs", runs},
             {"query_mode", "batch"},
         };
-        evidence["manifest"] = manifest_path;
+        evidence["manifest"] = manifest_path.empty() ? "built-in" : manifest_path;
         evidence["selection"] = {
             {"holdout", std::vector<uint32_t>(selection.holdout.begin(), selection.holdout.end())},
             {"queries", selection.queries},
