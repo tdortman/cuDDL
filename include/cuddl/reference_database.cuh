@@ -1967,49 +1967,108 @@ class reference_database {
             !query) {
             return Err(query.error());
         }
-        auto const cursor_offset = static_cast<size_t>(
-            detail::align_up(static_cast<uintptr_t>(scan_bytes), alignof(uint32_t))
-        );
-        auto const cursor_bytes = static_cast<size_t>(cell_count) * sizeof(uint32_t);
-        if (cursor_offset > std::numeric_limits<size_t>::max() - cursor_bytes) {
-            return Err(Error::resource("index construction workspace size overflows"));
-        }
-        auto const scratch_bytes = cursor_offset + cursor_bytes;
+        auto const scratch_bytes =
+            detail::align_up(static_cast<uintptr_t>(scan_bytes), alignof(uint8_t));
         uint8_t* scratch = nullptr;
         if (auto const allocation =
                 cuda_try(cudaMallocAsync(&scratch, scratch_bytes, stream.get()));
             !allocation) {
             return Err(allocation.error());
         }
-        auto* cursors = reinterpret_cast<uint32_t*>(scratch + cursor_offset);
+        Row* transposed = nullptr;
         auto fail = [&](Error const& error) -> Result<reference_database> {
+            if (transposed != nullptr) {
+                auto const release = cuda_try(cudaFreeAsync(transposed, stream.get()));
+                if (!release) {
+                    return Err(release.error());
+                }
+            }
             auto const release = cuda_try(cudaFreeAsync(scratch, stream.get()));
             if (!release) {
                 return Err(release.error());
             }
             return Err(error);
         };
-        // Direct counting keeps index-construction scratch to scan storage and one cursor per cell.
+        // Construction scratch is scan storage plus one bucket-major transpose of the indexed
+        // rows; the scatter's per-key ranks live in shared memory, so no per-cell cursor array
+        // is allocated at all.
 
-        if (auto const clear_counts =
-                cuda_try(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
-            !clear_counts) {
-            return fail(clear_counts.error());
-        }
         auto const indexed_row_count = static_cast<size_t>(posting_capacity);
-        auto const blocks = static_cast<uint32_t>(
-            (posting_capacity + detail::block_size - 1U) / detail::block_size
+        auto const reference_count = static_cast<uint32_t>(rows.size() / BucketCount);
+
+        // Bucket-major transpose of the indexed buckets: the per-bucket count and scatter
+        // passes read contiguous references from it instead of striding across rows, keeping
+        // each bucket's dense key range L2-resident for its atomics.
+        auto const transpose_bytes = indexed_row_count * sizeof(Row);
+        if (auto const allocation =
+                cuda_try(cudaMallocAsync(&transposed, transpose_bytes, stream.get()));
+            !allocation) {
+            return fail(allocation.error());
+        }
+        constexpr uint32_t transpose_tile = 32U;
+        dim3 const transpose_grid(
+            (compatibility.indexed_bucket_count + transpose_tile - 1U) / transpose_tile,
+            (reference_count + transpose_tile - 1U) / transpose_tile
         );
-        auto const stored_rows =
-            device_span<Row const>{static_cast<Row const*>(database.rows_), rows.size()};
-        detail::count_index_cells_kernel<BucketCount>
-            <<<blocks, detail::block_size, 0, stream.get()>>>(
-                stored_rows.data(),
-                indexed_row_count,
-                compatibility.indexed_bucket_count,
-                compatibility.key_mask,
-                database.index_offsets_
-            );
+        detail::transpose_indexed_scores_kernel<<<
+            transpose_grid,
+            dim3(transpose_tile, transpose_tile),
+            0,
+            stream.get()>>>(
+            static_cast<Row const*>(database.rows_),
+            reference_count,
+            compatibility.indexed_bucket_count,
+            static_cast<uint32_t>(BucketCount),
+            transposed
+        );
+        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
+            return fail(launch.error());
+        }
+
+        // A small wave-blocked grid sweeps the buckets in rounds so the in-flight buckets'
+        // dense key slices and cursor ranges stay L2-resident; one bucket per resident wave
+        // would leave the SMs idle, and one block per bucket thrashes the cache (the profiled
+        // failure mode of the first bucket-major version).
+        constexpr uint32_t build_wave_blocks = 64;
+        constexpr uint32_t build_bucket_block_size = 1024;
+        auto const bucket_blocks =
+            std::min<uint32_t>(compatibility.indexed_bucket_count, build_wave_blocks);
+        // Both bucket kernels keep a quarter-key table in dynamic shared memory (64 KiB for
+        // 16-bit keys, 32 KiB for 15-bit keys, over the default 48 KiB cap). The required size
+        // depends on this build's key width, so the limit is (re)configured before every launch.
+        auto const key_count = static_cast<uint32_t>(compatibility.key_mask) + 1U;
+        auto const bucket_smem_bytes = static_cast<size_t>(key_count / 4U) * sizeof(uint32_t);
+        if (auto const attribute = cuda_try(cudaFuncSetAttribute(
+                reinterpret_cast<void const*>(detail::count_index_cells_bucket_kernel<Row>),
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(bucket_smem_bytes)
+            ));
+            !attribute) {
+            return fail(attribute.error());
+        }
+        if (auto const attribute = cuda_try(cudaFuncSetAttribute(
+                reinterpret_cast<void const*>(detail::scatter_index_postings_bucket_kernel<Row>),
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(bucket_smem_bytes)
+            ));
+            !attribute) {
+            return fail(attribute.error());
+        }
+
+        // The count flush writes every cell of every bucket slice exactly once (plain stores
+        // from the owning block), so the offsets array needs no separate zeroing before the
+        // exclusive scan.
+        detail::count_index_cells_bucket_kernel<<<
+            bucket_blocks,
+            build_bucket_block_size,
+            bucket_smem_bytes,
+            stream.get()>>>(
+            transposed,
+            compatibility.indexed_bucket_count,
+            reference_count,
+            compatibility.key_mask,
+            database.index_offsets_
+        );
         if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
             return fail(launch.error());
         }
@@ -2025,29 +2084,26 @@ class reference_database {
             !scan) {
             return fail(scan.error());
         }
-        if (auto const copy = cuda_try(cudaMemcpyAsync(
-                cursors,
-                database.index_offsets_,
-                cursor_bytes,
-                cudaMemcpyDeviceToDevice,
-                stream.get()
-            ));
-            !copy) {
-            return fail(copy.error());
-        }
 
-        detail::scatter_index_postings_kernel<BucketCount>
-            <<<blocks, detail::block_size, 0, stream.get()>>>(
-                stored_rows.data(),
-                indexed_row_count,
-                compatibility.indexed_bucket_count,
-                compatibility.key_mask,
-                cursors,
-                database.index_postings_
-            );
+        detail::scatter_index_postings_bucket_kernel<<<
+            bucket_blocks,
+            build_bucket_block_size,
+            bucket_smem_bytes,
+            stream.get()>>>(
+            transposed,
+            compatibility.indexed_bucket_count,
+            reference_count,
+            compatibility.key_mask,
+            database.index_offsets_,
+            database.index_postings_
+        );
         if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
             return fail(launch.error());
         }
+        if (auto const release = cuda_try(cudaFreeAsync(transposed, stream.get())); !release) {
+            return Err(release.error());
+        }
+        transposed = nullptr;
         if (auto const release = cuda_try(cudaFreeAsync(scratch, stream.get())); !release) {
             return Err(release.error());
         }

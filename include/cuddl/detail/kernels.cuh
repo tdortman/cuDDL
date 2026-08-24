@@ -352,57 +352,141 @@ __global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
     }
 }
 
-/// @brief Counts every non-empty indexed row entry in its dense index cell.
+/// @brief Transposes the indexed-bucket slice of a row-major score matrix into bucket-major
+/// order.
 ///
-/// Raw score zero is discarded before masking so masked key zero remains valid.
-template <size_t BucketCount, typename ReferenceRow>
-__global__ void count_index_cells_kernel(
-    ReferenceRow const* rows,
-    size_t indexed_row_count,
+/// The per-bucket build passes read contiguous references from the transposed layout instead of
+/// striding across rows, and each bucket's dense key range stays L2-resident while its atomics
+/// accumulate. Tiled through shared memory so both the reads and the writes are coalesced.
+template <typename Row>
+__global__ void transpose_indexed_scores_kernel(
+    Row const* rows,
+    uint32_t reference_count,
     uint32_t indexed_bucket_count,
-    uint16_t key_mask,
-    uint32_t* cell_counts
+    uint32_t full_bucket_count,
+    Row* transposed
 ) {
-    auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-    for (; offset < indexed_row_count; offset += stride) {
-        auto const reference_id = offset / indexed_bucket_count;
-        auto const bucket = offset % indexed_bucket_count;
-        auto const score = reference_score(rows[reference_id * BucketCount + bucket]);
-        if (score == 0U) {
-            continue;
-        }
-        auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
-        atomicAdd(&cell_counts[cell], 1U);
+    constexpr uint32_t tile = 32U;
+    __shared__ Row staging[tile][tile + 1U];
+    auto const bucket = static_cast<uint32_t>(blockIdx.x) * tile + threadIdx.x;
+    auto const reference = static_cast<uint32_t>(blockIdx.y) * tile + threadIdx.y;
+    if (bucket < indexed_bucket_count && reference < reference_count) {
+        staging[threadIdx.y][threadIdx.x] =
+            rows[static_cast<size_t>(reference) * full_bucket_count + bucket];
+    }
+    __syncthreads();
+    // Output (bucket, reference) = input (reference, bucket). Threads with consecutive
+    // threadIdx.x must write consecutive references of one bucket, so the output bucket index
+    // comes from threadIdx.y and the output reference from threadIdx.x; the shared-memory read
+    // is the transposed (column) access instead.
+    auto const out_bucket = static_cast<uint32_t>(blockIdx.x) * tile + threadIdx.y;
+    auto const out_reference = static_cast<uint32_t>(blockIdx.y) * tile + threadIdx.x;
+    if (out_bucket < indexed_bucket_count && out_reference < reference_count) {
+        transposed[static_cast<size_t>(out_bucket) * reference_count + out_reference] =
+            staging[threadIdx.x][threadIdx.y];
     }
 }
 
-/// @brief Scatters every non-empty indexed row entry into its dense CSR posting range.
-template <size_t BucketCount, typename ReferenceRow>
-__global__ void scatter_index_postings_kernel(
-    ReferenceRow const* rows,
-    size_t indexed_row_count,
+/// @brief Counts every non-empty indexed row entry in its dense index cell, over the
+/// transposed scores.
+///
+/// Each wave-blocked block owns one bucket and counts into a quarter-key shared-memory table
+/// (shared-memory atomics only), then flushes the table with plain coalesced stores. Every
+/// bucket slice is written by exactly one block, so the cell array needs no zeroing pass and
+/// the count contributes no global atomics at all.
+template <typename Row>
+__global__ void count_index_cells_bucket_kernel(
+    Row const* transposed,
     uint32_t indexed_bucket_count,
+    uint32_t reference_count,
     uint16_t key_mask,
-    uint32_t* cursors,
+    uint32_t* cell_counts
+) {
+    extern __shared__ uint32_t key_counts[];
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    auto const quarter_keys = key_count / 4U;
+    for (auto i = threadIdx.x; i < quarter_keys; i += blockDim.x) {
+        key_counts[i] = 0U;
+    }
+    __syncthreads();
+
+    for (auto bucket = blockIdx.x; bucket < indexed_bucket_count; bucket += gridDim.x) {
+        auto const* bucket_scores = transposed + static_cast<size_t>(bucket) * reference_count;
+        auto* bucket_counts = cell_counts + static_cast<size_t>(bucket) * key_count;
+        for (uint32_t quarter = 0U; quarter < 4U; ++quarter) {
+            auto const key_base = quarter * quarter_keys;
+            for (uint32_t reference = threadIdx.x; reference < reference_count;
+                 reference += blockDim.x) {
+                auto const score = reference_score(__ldcs(&bucket_scores[reference]));
+                if (score == 0U) {
+                    continue;
+                }
+                auto const key = static_cast<uint32_t>(score & key_mask);
+                if (key < key_base || key >= key_base + quarter_keys) {
+                    continue;
+                }
+                atomicAdd(&key_counts[key - key_base], 1U);
+            }
+            __syncthreads();
+            for (auto i = threadIdx.x; i < quarter_keys; i += blockDim.x) {
+                bucket_counts[key_base + i] = key_counts[i];
+                key_counts[i] = 0U;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+/// @brief Scatters every non-empty indexed row entry into its dense CSR posting range without
+/// any global atomics.
+///
+/// Each wave-blocked block owns one bucket and keeps the per-key running rank for a quarter of
+/// the key space in dynamic shared memory (64 KiB for 16-bit keys, under this device's 99 KiB
+/// opt-in shared-memory cap). The posting position is computed directly as `offsets[cell] +
+/// local_rank`: the block's shared-memory rank is the only per-cell cursor state, so no global
+/// cursor atomics and no per-cell cursor scratch are needed. Posting order within a cell is
+/// unspecified (the interface never depended on it).
+template <typename Row>
+__global__ void scatter_index_postings_bucket_kernel(
+    Row const* transposed,
+    uint32_t indexed_bucket_count,
+    uint32_t reference_count,
+    uint16_t key_mask,
+    uint32_t const* offsets,
     uint32_t* postings
 ) {
-    auto offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    extern __shared__ uint32_t key_ranks[];
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-    for (; offset < indexed_row_count; offset += stride) {
-        auto const reference_id = offset / indexed_bucket_count;
-        auto const bucket = offset % indexed_bucket_count;
-        auto const score = reference_score(rows[reference_id * BucketCount + bucket]);
-        if (score == 0U) {
-            continue;
+    auto const quarter_keys = key_count / 4U;
+    for (auto i = threadIdx.x; i < quarter_keys; i += blockDim.x) {
+        key_ranks[i] = 0U;
+    }
+    __syncthreads();
+
+    for (auto bucket = blockIdx.x; bucket < indexed_bucket_count; bucket += gridDim.x) {
+        auto const* bucket_scores = transposed + static_cast<size_t>(bucket) * reference_count;
+        auto const* bucket_offsets = offsets + static_cast<size_t>(bucket) * key_count;
+        for (uint32_t quarter = 0U; quarter < 4U; ++quarter) {
+            auto const key_base = quarter * quarter_keys;
+            for (uint32_t reference = threadIdx.x; reference < reference_count;
+                 reference += blockDim.x) {
+                auto const score = reference_score(__ldcs(&bucket_scores[reference]));
+                if (score == 0U) {
+                    continue;
+                }
+                auto const key = static_cast<uint32_t>(score & key_mask);
+                if (key < key_base || key >= key_base + quarter_keys) {
+                    continue;
+                }
+                auto const rank = atomicAdd(&key_ranks[key - key_base], 1U);
+                __stcs(&postings[bucket_offsets[key] + rank], reference);
+            }
+            __syncthreads();
+            for (auto i = threadIdx.x; i < quarter_keys; i += blockDim.x) {
+                key_ranks[i] = 0U;
+            }
+            __syncthreads();
         }
-        auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
-        auto const posting = atomicAdd(&cursors[cell], 1U);
-        postings[posting] = static_cast<uint32_t>(reference_id);
     }
 }
 
