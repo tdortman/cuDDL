@@ -119,22 +119,28 @@ run_result run_gpu(
     }
     double h2d = 0.0, construction = 0.0;
     // Transfer + construct each genome in chunks so a whole-genome stream fits any device.
+    // One reusable chunk buffer avoids a device-wide sync per chunk; async adds keep the GPU
+    // draining the previous chunk while the copy engine streams the next one.
     auto build = [&](cuddl::sketch<25, BucketCount>& target, std::vector<uint64_t> const& kmers) {
+        uint64_t* d = nullptr;
+        CUDDL_CUDA_CALL(cudaMalloc(&d, sketch_chunk_elements * sizeof(uint64_t)));
         for (size_t offset = 0; offset < kmers.size(); offset += sketch_chunk_elements) {
             auto const n = std::min(sketch_chunk_elements, kmers.size() - offset);
-            uint64_t* d = nullptr;
             auto t = steady_clock_t::now();
-            CUDDL_CUDA_CALL(cudaMalloc(&d, n * sizeof(uint64_t)));
             CUDDL_CUDA_CALL(
                 cudaMemcpy(d, kmers.data() + offset, n * sizeof(uint64_t), cudaMemcpyHostToDevice)
             );
             h2d += std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
             t = steady_clock_t::now();
-            CUDDL_UNWRAP(target.add({d, n}));
+            CUDDL_UNWRAP(target.add_async({d, n}));
             construction +=
                 std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
-            CUDDL_CUDA_CALL(cudaFree(d));
         }
+        auto t = steady_clock_t::now();
+        CUDDL_CUDA_CALL(cudaStreamSynchronize(cudaStream_t{nullptr}));
+        construction +=
+            std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
+        CUDDL_CUDA_CALL(cudaFree(d));
     };
     build(query_sketch, query_kmers);
     build(ref_sketch, ref_kmers);
