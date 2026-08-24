@@ -266,6 +266,7 @@ int main(int argc, char** argv) {
         size_t buckets = 2048;
         uint32_t runs = 5;
         uint32_t warmup = 1;
+        uint32_t threads = 0;
         app.add_option("--reference", reference, "Reference FASTA file")->required();
         app.add_option("--query", query, "Query FASTA file")->required();
         app.add_option("--k", k, "K-mer length")->check(CLI::Range(1U, 31U));
@@ -273,6 +274,9 @@ int main(int argc, char** argv) {
         app.add_option("--backend", backend, "Backend: gpu or cpu");
         app.add_option("--runs", runs, "Number of measured runs");
         app.add_option("--warmup", warmup, "Number of untimed warm-up runs");
+        app.add_option(
+            "--threads", threads, "FASTA parse worker count (0 = all cores)"
+        );
         app.add_option("--csv", csv_path, "Output CSV path")->required();
         CLI11_PARSE(app, argc, argv);
 
@@ -290,8 +294,8 @@ int main(int argc, char** argv) {
 
         // Parsing + checksum happens once; per-run timing starts after (preprocess fixed cost).
         auto t0 = steady_clock_t::now();
-        auto const query_parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(query, k));
-        auto const ref_parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(reference, k));
+        auto const query_parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(query, k, threads));
+        auto const ref_parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(reference, k, threads));
         auto const preprocess_ms =
             std::chrono::duration<double, std::milli>(steady_clock_t::now() - t0).count();
         auto const seq_bases = query_parsed.bases + ref_parsed.bases;
