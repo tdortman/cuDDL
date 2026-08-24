@@ -49,3 +49,16 @@ executable(
     cuda_args: cuda_args,
     install: false,
 )
+
+# BBTools RefSeq DDL parity validation. A CLI11 contract target, not an nvbench one: it verifies
+# the official asset's provenance, decodes the A48 rows, runs the independent host exhaustive
+# oracle, builds and searches the cuDDL GPU index, drives the first-party BBTools DDLIndex/CSR2
+# Java harness, and emits machine-readable JSON evidence comparing every surface (or reports the
+# exact external prerequisite when the official RefSeq asset is not available).
+executable(
+    'cuddl-refseq-parity',
+    'cuddl_refseq_parity.cu',
+    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
+    cuda_args: cuda_args,
+    install: false,
+)

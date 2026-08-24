@@ -56,6 +56,10 @@ bbtools_dir = ''
 nvbench_dep = disabler()
 if build_benchmarks
     bbtools_dir = subproject('bbtools').get_variable('bbtools_dir')
+
+    # Header-only JSON used by the RefSeq parity command's machine-readable evidence output.
+    nlohmann_json_dep = subproject('nlohmann_json').get_variable('nlohmann_json_dep')
+
     cmake = import('cmake')
 
     nvbench_opts = cmake.subproject_options()
