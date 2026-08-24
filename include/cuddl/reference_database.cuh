@@ -1108,8 +1108,10 @@ class reference_database_ref {
         CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, requirements.counter_bytes, stream.get()));
         auto const query_buckets =
             static_cast<size_t>(query_count) * metadata_.compatibility.indexed_bucket_count;
+        constexpr uint32_t warp_width = 32;
+        constexpr uint32_t warps_per_block = detail::block_size / warp_width;
         auto const required_bucket_blocks =
-            (query_buckets + detail::block_size - 1U) / detail::block_size;
+            (query_buckets + warps_per_block - 1U) / warps_per_block;
         auto const bucket_blocks = static_cast<uint32_t>(
             required_bucket_blocks < 65535U ? required_bucket_blocks : 65535U
         );

@@ -710,24 +710,29 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     uint16_t key_mask,
     uint32_t* match_counts
 ) {
-    auto query_bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    auto const query_buckets = static_cast<size_t>(query_count) * indexed_bucket_count;
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const cell_index = static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
+    auto const cell_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
+    auto const total_cells = static_cast<uint64_t>(query_count) * indexed_bucket_count;
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-    for (; query_bucket < query_buckets; query_bucket += stride) {
-        auto const query_index = query_bucket / indexed_bucket_count;
-        auto const bucket = query_bucket % indexed_bucket_count;
+    for (auto cell = cell_index; cell < total_cells; cell += cell_stride) {
+        auto const query_index = static_cast<uint32_t>(cell / indexed_bucket_count);
+        auto const bucket = static_cast<uint32_t>(cell % indexed_bucket_count);
         auto const score =
             reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket]);
         if (score == 0U) {
             continue;
         }
         auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
-        auto const begin = offsets[cell];
-        auto const end = offsets[cell + 1U];
-        for (auto posting = begin; posting < end; ++posting) {
-            atomicAdd(&match_counts[query_index * reference_count + postings[posting]], 1U);
+        auto const index_cell = static_cast<uint64_t>(bucket) * key_count + key;
+        auto const begin = offsets[index_cell];
+        auto const end = offsets[index_cell + 1U];
+        auto* const counts = match_counts + static_cast<size_t>(query_index) * reference_count;
+        for (auto posting = begin + lane; posting < end; posting += warp_width) {
+            atomicAdd(&counts[postings[posting]], 1U);
         }
     }
 }
