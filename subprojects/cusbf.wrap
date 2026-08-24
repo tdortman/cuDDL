@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/tdortman/cuSBF.git
-revision = 1df06d25c6257453e07c9a8d37592e5530bc986f
+revision = 44bb6fb1769fdaaf0772b9a20f9dc54a8a8ec174
 depth = 1
 
 [provide]
