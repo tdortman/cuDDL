@@ -679,28 +679,20 @@ __global__ void cardinality_kernel(
     uint64_t* const empty_out,
     double* const estimate_out
 ) {
-    constexpr uint32_t cardinality_block_size = 64;
-    using warp_reduce = cub::WarpReduce<cardinality_payload>;
-    __shared__ typename warp_reduce::TempStorage warp_storage[2];
-    __shared__ cardinality_payload warp_totals[2];
+    using block_reduce = cub::BlockReduce<cardinality_payload, block_size>;
+    __shared__ typename block_reduce::TempStorage storage;
 
     cardinality_payload local{};
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
-         bucket += cardinality_block_size) {
-        auto const stored = winner(registers[bucket]);
+         bucket += block_size) {
+        auto const stored = winner(__ldcs(&registers[bucket]));
         if (stored == 0U) {
             ++local.empty;
         } else {
             local.restored_sum += restore_midpoint(stored);
         }
     }
-    auto const warp = threadIdx.x >> 5U;
-    local = warp_reduce(warp_storage[warp]).Reduce(local, combine_cardinality);
-    if ((threadIdx.x & 31U) == 0U) {
-        warp_totals[threadIdx.x >> 5U] = local;
-    }
-    __syncthreads();
-    auto const total = warp_totals[0] + warp_totals[1];
+    auto const total = block_reduce(storage).Reduce(local, combine_cardinality);
     if (threadIdx.x == 0) {
         *empty_out = total.empty;
         *estimate_out = cardinality(

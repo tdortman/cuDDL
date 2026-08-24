@@ -116,8 +116,9 @@ class sketch_ref {
         double* estimate_out,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::cardinality_kernel<BucketCount>
-            <<<1, 64, 0, stream.get()>>>(registers_.data(), empty_out, estimate_out);
+        detail::cardinality_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
+            registers_.data(), empty_out, estimate_out
+        );
         return cuda_try(cudaGetLastError());
     }
 
