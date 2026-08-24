@@ -60,15 +60,15 @@ class sketch_ref {
     }
 
     /// @brief Resets every register and the saturation flag to zero as one logical operation.
+    ///
+    /// The backing allocation is contractually `BucketCount` registers followed by the aligned
+    /// saturation flag, so one memset covers both.
     [[nodiscard]] Result<void> clear_async(
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        if (auto const result =
-                cuda_try(cudaMemsetAsync(registers_.data(), 0, registers_.size_bytes(), stream.get()));
-            !result) {
-            return result;
-        }
-        return cuda_try(cudaMemsetAsync(&saturation_, 0, sizeof(saturation_), stream.get()));
+        return cuda_try(cudaMemsetAsync(
+            registers_.data(), 0, registers_.size_bytes() + sizeof(saturation_), stream.get()
+        ));
     }
 
     /// @brief Constructs the sketch from packed k-mers in @p input.
