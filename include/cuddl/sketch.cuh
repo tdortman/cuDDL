@@ -56,14 +56,33 @@ struct device_buffer {
     }
 };
 
+/// @brief Device scratch for the owning cardinality wrapper.
+struct cardinality_scratch {
+    uint64_t empty;
+    double estimate;
+};
+
+/// @brief Persistent device scratch used by owning synchronous result wrappers.
+///
+/// Keeping this in the same allocation as the registers avoids a `cudaMalloc`/`cudaFree` pair on
+/// every synchronous `summary()`, `cardinality()`, or `hybrid_cardinality()` call. Those calls
+/// synchronise before returning, so reuse across calls is stream-safe.
+struct sketch_scratch {
+    cardinality_scratch cardinality;
+    hybrid_cardinality_estimates hybrid;
+    pairwise_summary summary;
+};
+
 }  // namespace detail
 
 /**
  * @brief Move-only owning DDL sketch backed by one contiguous device allocation.
  *
- * The allocation holds `BucketCount` packed `uint32_t` registers followed by one aligned
- * `uint32_t` saturation flag. The owning wrapper delegates all stream-ordered work to its
- * @ref sketch_ref and owns temporary output storage, host copies, and synchronisation.
+ * The allocation holds `BucketCount` packed `uint32_t` registers, one aligned `uint32_t`
+ * saturation flag, one alignment pad register, and a small persistent result scratch area.
+ * The owning wrapper delegates all stream-ordered work to its @ref sketch_ref and uses the
+ * scratch area for synchronous result copies instead of allocating temporary device buffers per
+ * call.
  */
 template <uint32_t K, size_t BucketCount>
 class sketch {
@@ -73,7 +92,7 @@ class sketch {
 
     /// @brief Allocates the register array plus saturation flag and clears it (aborts on failure).
     explicit sketch(cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}) {
-        CUDDL_CUDA_ABORT(cudaMalloc(&storage_, (BucketCount + 1) * sizeof(register_type)));
+        CUDDL_CUDA_ABORT(cudaMalloc(&storage_, allocation_words_ * sizeof(register_type)));
         CUDDL_UNWRAP(ref().clear_async(stream));
         CUDDL_CUDA_ABORT(cudaStreamSynchronize(stream.get()));
     }
@@ -162,15 +181,15 @@ class sketch {
         return ref().template summary_async<IncludeCardinality>(other, output, stream);
     }
 
-    /// @brief Host-side fused pairwise summary (allocates temporary device output, synchronises).
+    /// @brief Host-side fused pairwise summary (uses persistent scratch, synchronises).
     template <bool IncludeCardinality = false>
     [[nodiscard]] Result<pairwise_summary> summary(
         ref_type other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        detail::device_buffer<pairwise_summary> output(1);
+        auto* const output = &scratch()->summary;
         if (auto const result =
-                ref().template summary_async<IncludeCardinality>(other, *output.pointer, stream);
+                ref().template summary_async<IncludeCardinality>(other, *output, stream);
             !result) {
             return Err(result.error());
         }
@@ -179,7 +198,7 @@ class sketch {
         }
         pairwise_summary host{};
         if (auto const result =
-                cuda_try(cudaMemcpy(&host, output.pointer, sizeof(host), cudaMemcpyDeviceToHost));
+                cuda_try(cudaMemcpy(&host, output, sizeof(host), cudaMemcpyDeviceToHost));
             !result) {
             return Err(result.error());
         }
@@ -207,9 +226,10 @@ class sketch {
     [[nodiscard]] Result<double> cardinality(
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        detail::device_buffer<uint64_t> empty(1);
-        detail::device_buffer<double> estimate(1);
-        if (auto const result = ref().cardinality_async(empty.pointer, estimate.pointer, stream);
+        auto* const output = scratch();
+        if (auto const result = ref().cardinality_async(
+                &output->cardinality.empty, &output->cardinality.estimate, stream
+            );
             !result) {
             return Err(result.error());
         }
@@ -217,8 +237,9 @@ class sketch {
             return Err(result.error());
         }
         double host = 0.0;
-        if (auto const result =
-                cuda_try(cudaMemcpy(&host, estimate.pointer, sizeof(host), cudaMemcpyDeviceToHost));
+        if (auto const result = cuda_try(cudaMemcpy(
+                &host, &output->cardinality.estimate, sizeof(host), cudaMemcpyDeviceToHost
+            ));
             !result) {
             return Err(result.error());
         }
@@ -229,8 +250,8 @@ class sketch {
     [[nodiscard]] Result<hybrid_cardinality_estimates> hybrid_cardinality(
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        detail::device_buffer<hybrid_cardinality_estimates> output(1);
-        if (auto const result = ref().hybrid_cardinality_async(output.pointer, stream); !result) {
+        auto* const output = scratch();
+        if (auto const result = ref().hybrid_cardinality_async(&output->hybrid, stream); !result) {
             return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
@@ -238,7 +259,7 @@ class sketch {
         }
         hybrid_cardinality_estimates host{};
         if (auto const result =
-                cuda_try(cudaMemcpy(&host, output.pointer, sizeof(host), cudaMemcpyDeviceToHost));
+                cuda_try(cudaMemcpy(&host, &output->hybrid, sizeof(host), cudaMemcpyDeviceToHost));
             !result) {
             return Err(result.error());
         }
@@ -289,6 +310,20 @@ class sketch {
     }
 
    private:
+    /// @brief One pad register after the saturation flag keeps the scratch area 8-byte aligned.
+    static constexpr size_t padded_prefix_words_ = BucketCount + 2U;
+    static constexpr size_t scratch_words_ =
+        (sizeof(detail::sketch_scratch) + sizeof(register_type) - 1U) / sizeof(register_type);
+    static constexpr size_t allocation_words_ = padded_prefix_words_ + scratch_words_;
+
+    static_assert(
+        (padded_prefix_words_ * sizeof(register_type)) % alignof(detail::sketch_scratch) == 0U
+    );
+
+    [[nodiscard]] detail::sketch_scratch* scratch() const noexcept {
+        return reinterpret_cast<detail::sketch_scratch*>(storage_ + padded_prefix_words_);
+    }
+
     register_type* storage_ = nullptr;
 };
 
