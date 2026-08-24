@@ -93,6 +93,9 @@ struct batch_search_requirements {
     uint32_t maximum_pair_count{};
     size_t counter_bytes{};
     size_t candidate_bytes{};
+    size_t reference_histogram_bytes{};
+    size_t reference_cursor_bytes{};
+    size_t reference_candidate_bytes{};
     size_t temporary_bytes{};
     size_t workspace_bytes{};
     size_t result_bytes{};
@@ -922,15 +925,41 @@ class reference_database_ref {
             return Err(selection.error());
         }
 
+        // Reference-major refinement groups the selected pairs per reference so each row is
+        // loaded once instead of once per (query, reference) pair. It needs one histogram and
+        // one cursor per reference plus a dense run buffer for the grouped candidate indices.
+        size_t scan_bytes = 0;
+        auto const scan = cuda_try(
+            cub::DeviceScan::ExclusiveSum(
+                nullptr,
+                scan_bytes,
+                static_cast<uint32_t const*>(nullptr),
+                static_cast<uint32_t*>(nullptr),
+                static_cast<int64_t>(metadata_.reference_count)
+            )
+        );
+        if (!scan) {
+            return Err(scan.error());
+        }
+
         requirements.counter_bytes = static_cast<size_t>(dense_pair_count) * sizeof(uint32_t);
         requirements.candidate_bytes = static_cast<size_t>(dense_pair_count) * sizeof(uint32_t);
-        requirements.temporary_bytes = selection_bytes;
+        requirements.reference_histogram_bytes =
+            static_cast<size_t>(metadata_.reference_count) * sizeof(uint32_t);
+        requirements.reference_cursor_bytes = requirements.reference_histogram_bytes;
+        requirements.reference_candidate_bytes = requirements.candidate_bytes;
+        requirements.temporary_bytes = selection_bytes > scan_bytes ? selection_bytes : scan_bytes;
         constexpr size_t alignment_slack = alignof(uint32_t) - 1U + 255U;
-        auto const arrays_bytes = requirements.counter_bytes + requirements.candidate_bytes;
-        if (selection_bytes > std::numeric_limits<size_t>::max() - arrays_bytes - alignment_slack) {
+        auto const arrays_bytes = requirements.counter_bytes + requirements.candidate_bytes +
+                                  requirements.reference_histogram_bytes +
+                                  requirements.reference_cursor_bytes +
+                                  requirements.reference_candidate_bytes;
+        if (requirements.temporary_bytes >
+            std::numeric_limits<size_t>::max() - arrays_bytes - alignment_slack) {
             return Err(Error::resource("indexed batch workspace size overflows"));
         }
-        requirements.workspace_bytes = arrays_bytes + alignment_slack + selection_bytes;
+        requirements.workspace_bytes =
+            arrays_bytes + alignment_slack + requirements.temporary_bytes;
         return requirements;
     }
 
@@ -1096,12 +1125,21 @@ class reference_database_ref {
         address = detail::align_up(address, alignof(uint32_t));
         auto* candidate_ids = reinterpret_cast<uint32_t*>(address);
         address += requirements.candidate_bytes;
+        address = detail::align_up(address, alignof(uint32_t));
+        auto* reference_histogram = reinterpret_cast<uint32_t*>(address);
+        address += requirements.reference_histogram_bytes;
+        address = detail::align_up(address, alignof(uint32_t));
+        auto* reference_cursor = reinterpret_cast<uint32_t*>(address);
+        address += requirements.reference_cursor_bytes;
+        address = detail::align_up(address, alignof(uint32_t));
+        auto* reference_candidates = reinterpret_cast<uint32_t*>(address);
+        address += requirements.reference_candidate_bytes;
         address = detail::align_up(address, 256U);
         if (address > workspace_end) {
             return Err(Error::resource("indexed batch workspace layout exceeds its capacity"));
         }
-        auto* selection_workspace = reinterpret_cast<void*>(address);
-        auto selection_bytes = static_cast<size_t>(workspace_end - address);
+        auto* temporary_workspace = reinterpret_cast<void*>(address);
+        auto temporary_bytes = static_cast<size_t>(workspace_end - address);
         auto const dense_pair_count =
             static_cast<uint32_t>(requirements.counter_bytes / sizeof(uint32_t));
 
@@ -1132,8 +1170,8 @@ class reference_database_ref {
         auto const ids = thrust::make_counting_iterator(uint32_t{0});
         CUDDL_CUDA_TRY(
             cub::DeviceSelect::If(
-                selection_workspace,
-                selection_bytes,
+                temporary_workspace,
+                temporary_bytes,
                 ids,
                 candidate_ids,
                 result_count.data(),
@@ -1155,11 +1193,51 @@ class reference_database_ref {
         if (written_capacity == 0U) {
             return Ok();
         }
-        constexpr uint32_t warp_width = 32;
-        constexpr uint32_t candidates_per_block = detail::block_size / warp_width;
         auto const capacity = static_cast<uint32_t>(written_capacity);
-        auto const refinement_blocks =
-            (capacity + candidates_per_block - 1U) / candidates_per_block;
+
+        // Group the selected pairs per reference: histogram, exclusive scan into a cursor,
+        // scatter the candidate indices into reference-major runs, then refine each reference
+        // row exactly once while iterating the queries that matched it.
+        CUDDL_CUDA_TRY(cudaMemsetAsync(
+            reference_histogram, 0, requirements.reference_histogram_bytes, stream.get()
+        ));
+        constexpr uint32_t grouping_blocks = 512;
+        detail::histogram_batch_candidates_kernel<<<
+            grouping_blocks,
+            detail::block_size,
+            0,
+            stream.get()>>>(
+            candidate_ids, result_count.data(), metadata_.reference_count, reference_histogram
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        CUDDL_CUDA_TRY(
+            cub::DeviceScan::ExclusiveSum(
+                temporary_workspace,
+                temporary_bytes,
+                reference_histogram,
+                reference_cursor,
+                static_cast<int64_t>(metadata_.reference_count),
+                stream.get()
+            )
+        );
+        detail::scatter_batch_candidates_kernel<<<
+            grouping_blocks,
+            detail::block_size,
+            0,
+            stream.get()>>>(
+            candidate_ids,
+            result_count.data(),
+            metadata_.reference_count,
+            reference_cursor,
+            reference_candidates
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+
+        constexpr uint32_t references_per_block = detail::block_size / warp_width;
+        auto const refinement_blocks = static_cast<uint32_t>(
+            (static_cast<uint64_t>(metadata_.reference_count) + references_per_block - 1U) /
+            references_per_block
+        );
         detail::refine_batch_index_candidates_kernel<BucketCount>
             <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
                 queries.data(),
@@ -1169,6 +1247,9 @@ class reference_database_ref {
                 metadata_.reference_count,
                 match_counts,
                 candidate_ids,
+                reference_candidates,
+                reference_histogram,
+                reference_cursor,
                 result_count.data(),
                 capacity,
                 results.data(),
