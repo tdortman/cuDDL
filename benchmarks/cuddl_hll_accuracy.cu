@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "CLI/CLI.hpp"
 
 namespace {
 
@@ -56,9 +57,9 @@ int main(int argc, char** argv) {
         app.add_option("--trials", trials, "Independent trials per cardinality")
             ->check(CLI::PositiveNumber);
         app.add_option("--min-power", min_power, "Smallest base-2 cardinality exponent")
-            ->check(CLI::Range(1U, 28U));
+            ->check(CLI::PositiveNumber);
         app.add_option("--max-power", max_power, "Largest base-2 cardinality exponent")
-            ->check(CLI::Range(1U, 28U));
+            ->check(CLI::PositiveNumber);
         app.add_option("--seed", root_seed, "Root seed");
 
         CLI11_PARSE(app, argc, argv);
