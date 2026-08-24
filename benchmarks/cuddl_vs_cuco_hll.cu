@@ -65,7 +65,6 @@ void cuddl_construction(nvbench::state& state) {
 
     cudaFree(d_input);
 }
-NVBENCH_BENCH(cuddl_construction).add_int64_power_of_two_axis("Iters", construction_powers);
 
 void cuddl_cardinality(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
@@ -85,7 +84,6 @@ void cuddl_cardinality(nvbench::state& state) {
     add_value(state, "Estimate", CUDDL_UNWRAP(sketch.cardinality()));
     cudaFree(d_input);
 }
-NVBENCH_BENCH(cuddl_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
 
 template <cuddl::detail::hybrid_variant Variant>
 void cuddl_hybrid_cardinality(nvbench::state& state) {
@@ -112,12 +110,10 @@ void cuddl_hybrid_cardinality(nvbench::state& state) {
 void cuddl_bbtools_cardinality(nvbench::state& state) {
     cuddl_hybrid_cardinality<cuddl::detail::hybrid_variant::bbtools>(state);
 }
-NVBENCH_BENCH(cuddl_bbtools_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
 
 void cuddl_paper_cardinality(nvbench::state& state) {
     cuddl_hybrid_cardinality<cuddl::detail::hybrid_variant::paper>(state);
 }
-NVBENCH_BENCH(cuddl_paper_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
 
 // cuCollections HyperLogLog construction
 
@@ -145,8 +141,6 @@ void cuco_hll_construction(nvbench::state& state) {
     cudaFree(d_input);
 }
 
-NVBENCH_BENCH(cuco_hll_construction).add_int64_power_of_two_axis("Iters", construction_powers);
-
 void cuco_hll_cardinality(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
     auto const host = make_inputs(count);
@@ -165,8 +159,6 @@ void cuco_hll_cardinality(nvbench::state& state) {
     add_value(state, "Estimate", hll.estimate());
     cudaFree(d_input);
 }
-
-NVBENCH_BENCH(cuco_hll_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
 
 void cuddl_similarity(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
@@ -202,8 +194,6 @@ void cuddl_similarity(nvbench::state& state) {
     cudaFree(d_right);
     cudaFree(d_left);
 }
-
-NVBENCH_BENCH(cuddl_similarity).add_int64_power_of_two_axis("Iters", construction_powers);
 
 void cuco_hll_similarity(nvbench::state& state) {
     auto const count = static_cast<size_t>(state.get_int64("Iters"));
@@ -250,4 +240,13 @@ void cuco_hll_similarity(nvbench::state& state) {
     cudaFree(d_left);
 }
 
+NVBENCH_BENCH(cuddl_construction).add_int64_power_of_two_axis("Iters", construction_powers);
+NVBENCH_BENCH(cuco_hll_construction).add_int64_power_of_two_axis("Iters", construction_powers);
+
+NVBENCH_BENCH(cuddl_similarity).add_int64_power_of_two_axis("Iters", construction_powers);
 NVBENCH_BENCH(cuco_hll_similarity).add_int64_power_of_two_axis("Iters", construction_powers);
+
+NVBENCH_BENCH(cuddl_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
+NVBENCH_BENCH(cuddl_bbtools_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
+NVBENCH_BENCH(cuddl_paper_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
+NVBENCH_BENCH(cuco_hll_cardinality).add_int64_power_of_two_axis("Iters", cardinality_powers);
