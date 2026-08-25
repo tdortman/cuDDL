@@ -184,7 +184,13 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     settle();
     __syncthreads();
 
-    for (auto i = threadIdx.x; i < BucketCount; i += blockDim.x) {
+    // Each CTA starts its merge at a rotated bucket offset (odd multiplier, coprime with
+    // the power-of-two bucket count), so the CTAs' atomic merges interleave across different
+    // addresses instead of all colliding on the same bucket at once. The per-address CAS
+    // serialization then sees a smooth stream of arrivals rather than a synchronized burst.
+    auto const bucket_offset = (static_cast<size_t>(blockIdx.x) * 139U) & (BucketCount - 1U);
+    for (auto j = threadIdx.x; j < BucketCount; j += blockDim.x) {
+        auto const i = (static_cast<size_t>(j) + bucket_offset) & (BucketCount - 1U);
         auto const stored = state[i];
         if ((stored >> 16U) != 0U) {
             merge_register(
