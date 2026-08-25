@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <cuddl/error.hpp>
@@ -415,6 +418,218 @@ decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t e
     }
     if (result.records.empty()) {
         return Err(Error::invalid_argument("A48 file contains no records"));
+    }
+
+    result.metadata.record_count = result.records.size();
+    return Result<database>::ok(std::move(result));
+}
+
+
+/// @brief Multithreaded variant of @ref decode_a48_tsv.
+///
+/// One pass discovers file-level metadata, record header blocks, and data-row spans. The first
+/// record is decoded synchronously to establish the bucket width; the remaining independent
+/// records are decoded by a fixed pool and written directly to their ordinal slots, so order and
+/// strict validation are identical to the single-threaded decoder.
+[[nodiscard]] inline Result<database>
+decode_a48_tsv_parallel(std::string_view input, uint32_t requested_threads = 0) {
+    struct record_job {
+        std::string header;
+        std::string_view data;
+        uint32_t ordinal{};
+    };
+
+    database result;
+    std::vector<record_job> jobs;
+    uint32_t exponent_bits = 6U;
+    bool has_exponent = false;
+    size_t expected_bucket_count = 0;
+    bool bucket_count_set = false;
+
+    std::string header_block;
+    size_t ordinal = 0;
+    size_t begin = 0;
+    while (begin <= input.size()) {
+        auto const end = input.find('\n', begin);
+        auto line =
+            input.substr(begin, end == std::string_view::npos ? input.size() - begin : end - begin);
+        if (!line.empty() && line.back() == '\r') {
+            line.remove_suffix(1);
+        }
+        if (line.empty()) {
+            if (end == std::string_view::npos) {
+                break;
+            }
+            begin = end + 1U;
+            continue;
+        }
+
+        if (line.front() == '#') {
+            auto const fields = split_fields(line, '\t');
+            if (fields.empty()) {
+                break;
+            }
+            auto key = fields.front();
+            key.remove_prefix(1);
+            auto const value = fields.size() > 1U ? fields[1] : std::string_view{};
+            if (key == "k") {
+                auto const parsed = detail::parse_field<uint32_t>(
+                    [](std::string const& s) { return std::stoul(s); }, value, "k"
+                );
+                if (!parsed) {
+                    return Err(parsed.error());
+                }
+                result.metadata.kmer_length = *parsed;
+                result.metadata.has_kmer_length = true;
+            } else if (key == "seed") {
+                auto const parsed = detail::parse_field<uint64_t>(
+                    [](std::string const& s) { return std::stoull(s); }, value, "seed"
+                );
+                if (!parsed) {
+                    return Err(parsed.error());
+                }
+                result.metadata.seed = *parsed;
+                result.metadata.has_seed = true;
+            } else if (key == "exponent") {
+                auto const parsed = detail::parse_field<uint32_t>(
+                    [](std::string const& s) { return std::stoul(s); }, value, "exponent"
+                );
+                if (!parsed) {
+                    return Err(parsed.error());
+                }
+                if (*parsed < 1U || *parsed > 15U) {
+                    return Err(Error::invalid_argument("A48 exponent must be in [1, 15]"));
+                }
+                exponent_bits = *parsed;
+                result.metadata.exponent_bits = *parsed;
+                result.metadata.has_exponent = true;
+                has_exponent = true;
+            } else if (key == "blacklist") {
+                result.metadata.blacklist = std::string(value);
+            }
+
+            if (is_record_header(key)) {
+                if (!header_block.empty()) {
+                    header_block.push_back('\n');
+                }
+                header_block.append(line);
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            begin = end + 1U;
+            continue;
+        }
+
+        if (header_block.empty()) {
+            return Err(Error::invalid_argument("A48 data row appears before any record header"));
+        }
+        auto const record_ordinal = static_cast<uint32_t>(ordinal);
+        if (record_ordinal == 0U) {
+            auto meta = CUDDL_TRY(parse_record_headers(header_block));
+            header_block.clear();
+            if (meta.offset >= 0 && !has_exponent) {
+                return Err(
+                    Error::invalid_argument("relative-encoded A48 record requires a #exponent header")
+                );
+            }
+            auto scores = CUDDL_TRY(decode_a48_row(line, meta, exponent_bits));
+            if (scores.empty()) {
+                return Err(Error::invalid_argument("A48 record has no bucket values"));
+            }
+            expected_bucket_count = scores.size();
+            bucket_count_set = true;
+            if (meta.len != 0U && meta.len != scores.size()) {
+                return Err(Error::invalid_argument("#len disagrees with the A48 data row width"));
+            }
+            record decoded;
+            decoded.ordinal = record_ordinal;
+            decoded.metadata = std::move(meta);
+            decoded.scores = std::move(scores);
+            result.records.push_back(std::move(decoded));
+        } else {
+            jobs.push_back(
+                record_job{std::move(header_block), line, static_cast<uint32_t>(ordinal)}
+            );
+            header_block.clear();
+        }
+        ++ordinal;
+
+        if (end == std::string_view::npos) {
+            break;
+        }
+        begin = end + 1U;
+    }
+
+    if (!header_block.empty()) {
+        return Err(Error::invalid_argument("A48 file ends inside a record header block"));
+    }
+    if (result.records.empty()) {
+        return Err(Error::invalid_argument("A48 file contains no records"));
+    }
+
+    result.records.resize(result.records.size() + jobs.size());
+    auto const requested = requested_threads == 0U ? std::thread::hardware_concurrency()
+                                                   : requested_threads;
+    auto const worker_count = static_cast<size_t>(std::max(1U, requested));
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors(worker_count);
+    workers.reserve(worker_count);
+
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        auto const chunk_begin = jobs.size() * worker / worker_count;
+        auto const chunk_end = jobs.size() * (worker + 1U) / worker_count;
+        if (chunk_begin == chunk_end) {
+            continue;
+        }
+        workers.emplace_back([&, chunk_begin, chunk_end, worker]() {
+            try {
+                for (size_t i = chunk_begin; i < chunk_end; ++i) {
+                    auto const& job = jobs[i];
+                    auto meta = parse_record_headers(job.header);
+                    if (!meta) {
+                        throw std::runtime_error(meta.error().message());
+                    }
+                    if (meta->offset >= 0 && !has_exponent) {
+                        throw std::runtime_error(
+                            "relative-encoded A48 record requires a #exponent header"
+                        );
+                    }
+                    auto scores = decode_a48_row(job.data, *meta, exponent_bits);
+                    if (!scores) {
+                        throw std::runtime_error(scores.error().message());
+                    }
+                    if (scores->empty()) {
+                        throw std::runtime_error("A48 record has no bucket values");
+                    }
+                    if (!bucket_count_set || scores->size() != expected_bucket_count) {
+                        throw std::runtime_error("A48 data row width changed between records");
+                    }
+                    if (meta->len != 0U && meta->len != scores->size()) {
+                        throw std::runtime_error("#len disagrees with the A48 data row width");
+                    }
+                    record decoded;
+                    decoded.ordinal = job.ordinal;
+                    decoded.metadata = std::move(*meta);
+                    decoded.scores = std::move(*scores);
+                    result.records[job.ordinal] = std::move(decoded);
+                }
+            } catch (...) {
+                errors[worker] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    for (auto const& error : errors) {
+        if (error) {
+            try {
+                std::rethrow_exception(error);
+            } catch (std::exception const& exception) {
+                return Err(Error::invalid_argument(exception.what()));
+            }
+        }
     }
 
     result.metadata.record_count = result.records.size();

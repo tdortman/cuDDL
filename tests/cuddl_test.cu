@@ -2462,6 +2462,20 @@ TEST(A48Decoder, DecodesRelativeHeaderRowsAndMetadata) {
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
     auto const& db = *decoded;
 
+    auto const parallel = cuddl::a48::decode_a48_tsv_parallel(tsv, 4U);
+    ASSERT_TRUE(parallel.has_value()) << parallel.error().message();
+    EXPECT_EQ(parallel->metadata.kmer_length, db.metadata.kmer_length);
+    EXPECT_EQ(parallel->metadata.seed, db.metadata.seed);
+    EXPECT_EQ(parallel->metadata.exponent_bits, db.metadata.exponent_bits);
+    ASSERT_EQ(parallel->records.size(), db.records.size());
+    for (size_t r = 0; r < db.records.size(); ++r) {
+        EXPECT_EQ(parallel->records[r].ordinal, db.records[r].ordinal);
+        EXPECT_EQ(parallel->records[r].metadata.name, db.records[r].metadata.name);
+        EXPECT_EQ(parallel->records[r].metadata.offset, db.records[r].metadata.offset);
+        EXPECT_EQ(parallel->records[r].scores, db.records[r].scores);
+    }
+
+
     EXPECT_EQ(db.metadata.kmer_length, k);
     EXPECT_TRUE(db.metadata.has_kmer_length);
     EXPECT_EQ(db.metadata.seed, seed);
