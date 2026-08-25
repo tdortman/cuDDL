@@ -127,11 +127,11 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     uint32_t prev_old = 0U;
 
     auto const settle = [&] {
-        // This item installed the winner (old < score: count goes 0 -> 1) or tied it
-        // (old == score: count + 1). Re-validate the winner under CAS so an increment
-        // for a replaced winner is dropped, and saturate the per-block count exactly
-        // like the sequential update rule.
-        if ((prev_old >> 16U) <= prev_score) {
+        // A strict install already carries count 1 in the atomic max's replacement value,
+        // so only ties (old == score: count + 1) need the deferred increment. Re-validate
+        // the winner under CAS so an increment for a replaced winner is dropped, and
+        // saturate the per-block count exactly like the sequential update rule.
+        if ((prev_old >> 16U) == prev_score) {
             auto expected = state[prev_bucket];
             while ((expected >> 16U) == prev_score) {
                 if ((expected & 0xffffU) == max_winner_count) {
@@ -150,7 +150,7 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
         auto const hash = hash_kmer(value);
         auto const incoming = static_cast<uint32_t>(score(hash));
         auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
-        auto const old = atomicMax(&state[bucket], incoming << 16U);
+        auto const old = atomicMax(&state[bucket], (incoming << 16U) | 1U);
         settle();
         prev_bucket = bucket;
         prev_score = incoming;
