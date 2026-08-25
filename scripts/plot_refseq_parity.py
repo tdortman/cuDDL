@@ -10,18 +10,15 @@
 
 Reads the machine-readable evidence produced by `cuddl-refseq-parity`
 (`results/refseq-parity/evidence.json`) and renders one slide-oriented
-four-panel figure:
+two-panel figure:
 
-- asset load (one-shot, both systems),
-- index build (cuDDL, BBTools CSR, BBTools CSR2),
-- answering the selected queries (cuDDL batched by class, both BBTools backends),
+- speed (index build and query batch for cuDDL, BBTools CSR, BBTools CSR2),
 - memory footprint (query-time resident and peak during the run for both
-  systems),
+  systems).
 
-The figure is written as PDF and PNG. The index-build and query phases are
-medians over the measured runs reported by `cuddl-refseq-parity` (after its
-warm-up runs); the title and subtitle state the correctness outcome. Asset
-load is reported as a one-shot phase.
+The figure is written as PDF and PNG. The speed bars are medians over the
+measured runs reported by `cuddl-refseq-parity`; the title and subtitle state
+the correctness outcome.
 """
 
 import json
@@ -33,16 +30,12 @@ import matplotlib.pyplot as plt
 import typer
 from plot_utils import FILTER_STYLES, paper_text
 
-# Reuse the repository's existing cuDDL / BBTools palette (see plot_utils.py and
-# plot_bbtools_dynamic_demilog.py): cuDDL is the primary `cuddl` blue, BBTools is the
-# `cuco_hll` magenta used opposite cuDDL in the BBTools comparison figures. CSR2's packed
-# backend gets a lighter shade of the same magenta.
 CUDDL_COLOR = FILTER_STYLES["cuddl"]["color"]
 BBTOOLS_COLOR = FILTER_STYLES["cuco_hll"]["color"]
 CSR2_COLOR = "#C58BB0"
 
 GIB = 1 << 30
-PHASES = (("load", "load asset"), ("index", "build index"), ("query", "queries"))
+PHASES = (("index", "build index"), ("query", "query batch"))
 
 
 def _bytes(value: float) -> str:
@@ -90,54 +83,19 @@ def main(
     gpu = data["gpu"]
     queries = data["queries"]
 
-    in_database_query_ms = phases.get("in_database_query_total", 0.0)
-    external_query_ms = phases.get("external_query_total", 0.0)
-    if in_database_query_ms == 0.0 and external_query_ms == 0.0:
-        legacy_total = phases.get("resident_query_total", 0.0)
-        in_database_query_ms = legacy_total / 2.0
-        external_query_ms = legacy_total / 2.0
     cuddl_phases = {
-        "load": phases["asset_read"] + phases["a48_parse"],
         "index": phases["index_build"],
-        "query": in_database_query_ms + external_query_ms,
+        "query": phases["query_total"],
     }
     bbtools_seconds = bbtools["timings_seconds"]
-    bbtools_load = bbtools_seconds["load"] * 1000.0
     bbtools_phases = {
-        "load": bbtools_load,
         "index": statistics.median(bbtools_seconds["index_build_csr2_runs"]) * 1000.0,
         "query": statistics.median(bbtools_seconds["query_batch_runs"]) * 1000.0,
     }
     bbtools_csr_phases = {
-        "load": bbtools_load,
         "index": statistics.median(bbtools_seconds["index_build_csr_runs"]) * 1000.0,
         "query": statistics.median(bbtools_seconds["query_batch_csr_runs"]) * 1000.0,
     }
-
-    resident_queries = [
-        q for q in queries if not q.get("external", q.get("held_out", False))
-    ]
-    external_queries = [q for q in queries if q.get("external", q.get("held_out", False))]
-
-    def class_average(entries, key, fallback):
-        if entries and key in entries[0]:
-            return statistics.median(q.get(key, fallback) for q in entries) * 1000.0
-        return fallback / max(len(queries), 1)
-
-    cuddl_in_database_per_query = in_database_query_ms / max(len(resident_queries), 1)
-    cuddl_external_per_query = external_query_ms / max(len(external_queries), 1)
-    bbtools_csr_resident = class_average(
-        resident_queries, "bbtools_query_csr_seconds", bbtools_csr_phases["query"]
-    )
-    bbtools_csr_external = class_average(
-        external_queries, "bbtools_query_csr_seconds", bbtools_csr_phases["query"]
-    )
-    bbtools_csr2_resident = class_average(
-        resident_queries, "bbtools_query_seconds", bbtools_phases["query"]
-    )
-    bbtools_csr2_external = class_average(
-        external_queries, "bbtools_query_seconds", bbtools_phases["query"]
-    )
 
     queries_ok = sum(
         all(
@@ -155,10 +113,9 @@ def main(
         for q in queries
     )
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4.8))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     fig.subplots_adjust(top=0.70, wspace=0.45)
 
-    # ---- Shared figure legend (kept out of the panels so it never overlaps the bars). ----
     legend_handles = [
         plt.Line2D(
             [0], [0], marker="s", linestyle="", color=CUDDL_COLOR,
@@ -182,7 +139,6 @@ def main(
         fontsize=11,
     )
 
-    # ---- Title and subtitle (replaces the unreadable bottom footer). ----
     fig.suptitle(
         paper_text("Decoded-row RefSeq parity: cuDDL vs BBTools DDLIndex/CSR2"),
         fontsize=15,
@@ -201,100 +157,43 @@ def main(
         fontsize=11,
     )
 
-    def bar_panel(ax, title, entries, fmt, ylabel):
-        """One panel of labelled bars with its own log range, so each panel's bars stay wide."""
-        bars = ax.bar(
-            range(len(entries)),
-            [max(value, 1e-6) for _, value, _ in entries],
-            0.5,
-            color=[color for _, _, color in entries],
-        )
-        ax.bar_label(bars, fmt=fmt, fontsize=8, padding=2)
-        ax.set_yscale("log")
-        ax.set_ylim(top=max(value for _, value, _ in entries) * 2.0)
-        ax.set_xticks(range(len(entries)))
-        ax.set_xticklabels(
-            [paper_text(label) for label, _, _ in entries], fontsize=9, rotation=12, ha="right"
-        )
-        ax.set_ylabel(paper_text(ylabel), fontsize=12)
-        ax.set_title(paper_text(title), fontsize=13)
-        ax.grid(axis="y", linestyle=":", alpha=0.4)
-        ax.set_axisbelow(True)
-
-    # Panel 1: asset load (one-shot, backend-independent for BBTools)
-    bar_panel(
-        axes[0],
-        "Asset load (one-shot)",
-        [
-            ("cuDDL", cuddl_phases["load"], CUDDL_COLOR),
-            ("BBTools", bbtools_phases["load"], BBTOOLS_COLOR),
-        ],
-        lambda v: _latency(v),
-        "wall-clock (log)",
-    )
-
-    # Panel 2: index build, both BBTools storage backends
-    bar_panel(
-        axes[1],
-        "Index build",
-        [
-            ("cuDDL", cuddl_phases["index"], CUDDL_COLOR),
-            ("BBTools CSR", bbtools_csr_phases["index"], BBTOOLS_COLOR),
-            ("BBTools CSR2", bbtools_phases["index"], CSR2_COLOR),
-        ],
-        lambda v: _latency(v),
-        "wall-clock (log)",
-    )
-
-    # Panel 3: query time split by whether the query row is resident in the database or
-    # arrives from outside it. cuDDL bars are class-batch medians divided by class size;
-    # BBTools bars are per-query medians over the measured runs.
-    query_groups = ["resident queries", "external queries"]
-    query_systems = [
-        (
-            "cuDDL",
-            [cuddl_in_database_per_query, cuddl_external_per_query],
-            CUDDL_COLOR,
-        ),
+    # Panel 1: speed. Index build and query batch share the same log-latency axis.
+    speed_ax = axes[0]
+    speed_groups = ["build index", "query batch"]
+    speed_systems = [
+        ("cuDDL", [cuddl_phases["index"], cuddl_phases["query"]], CUDDL_COLOR),
         (
             "BBTools CSR",
-            [bbtools_csr_resident, bbtools_csr_external],
+            [bbtools_csr_phases["index"], bbtools_csr_phases["query"]],
             BBTOOLS_COLOR,
         ),
         (
             "BBTools CSR2",
-            [bbtools_csr2_resident, bbtools_csr2_external],
+            [bbtools_phases["index"], bbtools_phases["query"]],
             CSR2_COLOR,
         ),
     ]
-    query_ax = axes[2]
     width = 0.24
-    for system_index, (system, values, color) in enumerate(query_systems):
+    for system_index, (_, values, color) in enumerate(speed_systems):
         offset = (system_index - 1) * width
-        bars = query_ax.bar(
-            [group + offset for group in range(len(query_groups))],
+        bars = speed_ax.bar(
+            [group + offset for group in range(len(speed_groups))],
             [max(value, 1e-6) for value in values],
             width,
             color=color,
         )
-        query_ax.bar_label(bars, fmt=lambda v: _latency(v), fontsize=8, padding=2)
-    query_ax.set_yscale("log")
-    query_ax.set_ylim(
-        top=max(value for _, values, _ in query_systems for value in values) * 2.0
-    )
-    query_ax.set_xticks(range(len(query_groups)))
-    query_ax.set_xticklabels([paper_text(label) for label in query_groups], fontsize=11)
-    query_ax.set_ylabel(paper_text("per-query (log)"), fontsize=12)
-    query_ax.set_title(paper_text(f"{len(queries)}-query batch by class"), fontsize=13)
-    query_ax.grid(axis="y", linestyle=":", alpha=0.4)
-    query_ax.set_axisbelow(True)
+        speed_ax.bar_label(bars, fmt=lambda v: _latency(v), fontsize=7, padding=2)
+    speed_ax.set_yscale("log")
+    speed_ax.set_ylim(top=max(value for _, values, _ in speed_systems for value in values) * 2.0)
+    speed_ax.set_xticks(range(len(speed_groups)))
+    speed_ax.set_xticklabels([paper_text(label) for label in speed_groups], fontsize=11)
+    speed_ax.set_ylabel(paper_text("wall-clock (log)"), fontsize=12)
+    speed_ax.set_title(paper_text("Speed"), fontsize=13)
+    speed_ax.grid(axis="y", linestyle=":", alpha=0.4)
+    speed_ax.set_axisbelow(True)
 
-    # Panel 4: memory footprint
-    # "Query-time resident" is rows + one index. cuDDL uses exact device allocation sizes.
-    # BBTools heap snapshots move with garbage collection (the after-CSR2 snapshot can still
-    # contain the unreclaimed reference CSR), so its index bars use the harness's exact CSR /
-    # CSR2 array-layout sizes plus the pre-index heap as the decoded-rows base.
-    ax = axes[3]
+    # Panel 2: memory footprint.
+    memory_ax = axes[1]
     cuddl_rows_bytes = gpu.get("persistent_rows_bytes", 0)
     cuddl_index_bytes = gpu.get("persistent_index_bytes", 0)
     bbtools_memory = bbtools["memory_bytes"]
@@ -328,26 +227,25 @@ def main(
             ),
         ),
     ]
-    x = range(len(memory_groups))
-    width = 0.32
+    memory_width = 0.28
     for group, (_, entries) in enumerate(memory_groups):
         count = len(entries)
-        for i, (label, value, color) in enumerate(entries):
-            bars = ax.bar(
-                [group + (i - (count - 1) / 2) * width],
+        for i, (_, value, color) in enumerate(entries):
+            bars = memory_ax.bar(
+                [group + (i - (count - 1) / 2) * memory_width],
                 [max(value, 1)],
-                width,
+                memory_width,
                 color=color,
             )
-            ax.bar_label(bars, fmt=lambda v: _bytes(v), fontsize=7, padding=2)
+            memory_ax.bar_label(bars, fmt=lambda v: _bytes(v), fontsize=7, padding=2)
     top_value = max(value for _, entries in memory_groups for _, value, _ in entries)
-    ax.set_ylim(0, top_value * 1.18)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([paper_text(label) for label, _ in memory_groups], fontsize=11)
-    ax.set_ylabel(paper_text("GiB"), fontsize=12)
-    ax.set_title(paper_text("Memory footprint"), fontsize=13)
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
-    ax.set_axisbelow(True)
+    memory_ax.set_ylim(0, top_value * 1.18)
+    memory_ax.set_xticks([0, 1])
+    memory_ax.set_xticklabels([paper_text(label) for label, _ in memory_groups], fontsize=11)
+    memory_ax.set_ylabel(paper_text("GiB"), fontsize=12)
+    memory_ax.set_title(paper_text("Memory footprint"), fontsize=13)
+    memory_ax.grid(axis="y", linestyle=":", alpha=0.4)
+    memory_ax.set_axisbelow(True)
 
     output = output.with_suffix("")
     fig.savefig(f"{output}.pdf", bbox_inches="tight", pad_inches=0.15)
@@ -361,12 +259,6 @@ def main(
             f"BBTools CSR {bbtools_csr_phases[key]:12.3f} | "
             f"BBTools CSR2 {bbtools_phases[key]:12.3f}"
         )
-    print(
-        "queries (batch): "
-        f"cuDDL {cuddl_phases['query']:.2f} ms, "
-        f"BBTools CSR {bbtools_csr_phases['query']:.2f} ms, "
-        f"BBTools CSR2 {bbtools_phases['query']:.2f} ms"
-    )
 
 
 if __name__ == "__main__":

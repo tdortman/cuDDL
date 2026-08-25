@@ -21,7 +21,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -261,10 +260,8 @@ public final class BBToolsRefSeqParity {
         }
         int totalIterations = warmup + runs;
 
-        // Parse the shared query-selection manifest. Every line selects one query:
-        // external rows are removed from the database before the index is built, resident rows
-        // stay in the database. Legacy holdout/query keys are accepted as aliases.
-        TreeSet<Integer> external = new TreeSet<>();
+        // Parse the shared query-selection manifest. Every non-comment line is one query
+        // ordinal, addressed in file order by both implementations.
         List<Integer> queries = new ArrayList<>();
         try (BufferedReader reader = new BufferedReader(new FileReader(selectionsPath))) {
             String line;
@@ -273,20 +270,10 @@ public final class BBToolsRefSeqParity {
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                     continue;
                 }
-                if (trimmed.startsWith("external:")) {
-                    int ordinal = Integer.parseInt(
-                        trimmed.substring(trimmed.indexOf(':') + 1).trim());
-                    external.add(ordinal);
-                    queries.add(ordinal);
-                } else if (trimmed.startsWith("holdout:")) {
-                    external.add(Integer.parseInt(
-                        trimmed.substring(trimmed.indexOf(':') + 1).trim()));
-                } else if (trimmed.startsWith("resident:") || trimmed.startsWith("query:")) {
-                    queries.add(Integer.parseInt(
-                        trimmed.substring(trimmed.indexOf(':') + 1).trim()));
-                } else {
+                if (!trimmed.startsWith("query:")) {
                     throw new IllegalArgumentException("unrecognized selections line: " + trimmed);
                 }
+                queries.add(Integer.parseInt(trimmed.substring("query:".length()).trim()));
             }
         }
 
@@ -305,13 +292,8 @@ public final class BBToolsRefSeqParity {
             throw new IllegalStateException("non-power-of-two bucket count: " + buckets);
         }
 
-        // Build the database subset: every record except the held-out rows
-        ArrayList<DDLRecord> dbRecords = new ArrayList<>(records.size() - external.size());
-        for (int ordinal = 0; ordinal < records.size(); ordinal++) {
-            if (!external.contains(ordinal)) {
-                dbRecords.add(records.get(ordinal));
-            }
-        }
+        // Every decoded record is database-resident, so candidate IDs are file ordinals.
+        ArrayList<DDLRecord> dbRecords = records;
 
         // The ordered MT parser leaves transient batch buffers on the heap. Reclaim them so
         // the pre-index rows baseline and the post-CSR2 snapshot measure retained data rather
@@ -454,7 +436,6 @@ public final class BBToolsRefSeqParity {
 
             Map<String, Object> report = new LinkedHashMap<>();
             report.put("ordinal", ordinal);
-            report.put("external", external.contains(ordinal));
             long[] checksum = rowChecksum(query.ddl.maxArray());
             report.put("row_checksum", checksum[0]);
             report.put("row_nonzero", checksum[1]);
@@ -505,13 +486,6 @@ public final class BBToolsRefSeqParity {
         json.append("  \"runs\": ").append(runs).append(",\n");
         json.append("  \"buckets\": ").append(buckets).append(",\n");
         json.append("  \"values\": ").append(VALUES).append(",\n");
-        json.append("  \"external\": [");
-        boolean first = true;
-        for (int ordinal : external) {
-            json.append(first ? "" : ", ").append(ordinal);
-            first = false;
-        }
-        json.append("],\n");
         json.append("  \"timings_seconds\": {\n");
         json.append("    \"load\": ").append(loadSeconds).append(",\n");
         json.append("    \"index_build_csr\": ").append(csrBuildSeconds).append(",\n");
@@ -574,7 +548,6 @@ public final class BBToolsRefSeqParity {
             Map<String, Object> report = queryReports.get(qi);
             json.append("    {\n");
             json.append("      \"ordinal\": ").append(report.get("ordinal")).append(",\n");
-            json.append("      \"external\": ").append(report.get("external")).append(",\n");
             json.append("      \"row_checksum\": ").append(report.get("row_checksum")).append(",\n");
             json.append("      \"row_nonzero\": ").append(report.get("row_nonzero")).append(",\n");
             json.append("      \"candidates\": [");
