@@ -30,16 +30,16 @@ import java.util.concurrent.Future;
  * BBTools DDLIndex/CSR2 oracle for the cuDDL decoded-row RefSeq parity validation.
  *
  * Loads the official precomputed RefSeq DDL A48 TSV with an order-preserving
- * multithreaded wrapper around the first-party record parser, excludes the
- * rows the parity manifest marks as held out, builds the 32-bit CSR index
- * once as the verification reference, and rebuilds the default 21-bit packed
- * CSR2 index for `WARMUP + RUNS` timed iterations while answering the
- * manifest's selected queries with each backend. The two backends must agree
- * bit-identically in every iteration; their per-query match counts, candidate
- * IDs at the same minimum-match threshold, and exact lower/equal/higher/
- * both-empty summaries for every retained candidate are written to a JSON
- * file that the cuDDL parity command compares against its own decoded-row
- * oracle and GPU index.
+ * multithreaded wrapper around the first-party record parser, builds the
+ * 32-bit CSR index once as the verification reference, and rebuilds the
+ * default 21-bit packed CSR2 index for `WARMUP + RUNS` timed iterations
+ * while answering the manifest's selected queries with each backend. The
+ * timed query path computes match counts and the exact
+ * lower/equal/higher/both-empty summaries for every retained candidate, so
+ * it matches the work cuDDL's indexed batch returns. The two backends must
+ * agree bit-identically in every iteration; their per-query results are
+ * written to a JSON file that the cuDDL parity command compares against its
+ * own decoded-row oracle and GPU index.
  *
  * This harness is benchmark support: it exercises the current BBTools
  * implementation, not a cuDDL reimplementation of it.
@@ -319,6 +319,13 @@ public final class BBToolsRefSeqParity {
         csr = null;
         System.gc();
 
+        // Flat reference rows for the timed exact-summary pass. This is the same work cuDDL's
+        // indexed batch performs before returning results.
+        char[][] dbRows = new char[dbRecords.size()][];
+        for (int id = 0; id < dbRecords.size(); id++) {
+            dbRows[id] = dbRecords.get(id).ddl.maxArray();
+        }
+
         // Measured iterations: warmup runs discarded, measured runs retained
         // Both backends are rebuilt and queried in every iteration, so the 21-bit CSR2 packing
         // can be compared with the native 32-bit CSR at the same work. Queries are answered as
@@ -363,8 +370,14 @@ public final class BBToolsRefSeqParity {
                         final int queryIndex = qi;
                         futures.add(pool.submit(() -> {
                             DDLRecord query = records.get(queries.get(queryIndex));
+                            char[] queryRow = query.ddl.maxArray();
                             long tQueryStart = System.nanoTime();
                             int[] counts = backend.query(query.ddl);
+                            for (int id = 0; id < counts.length; id++) {
+                                if (counts[id] >= minHits) {
+                                    Vector.compareDDL(queryRow, dbRows[id]);
+                                }
+                            }
                             double seconds = (System.nanoTime() - tQueryStart) * 1e-9;
                             if (!java.util.Arrays.equals(counts, csrCounts[queryIndex])) {
                                 throw new IllegalStateException(
