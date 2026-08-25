@@ -61,7 +61,7 @@ void cuddl_construction(nvbench::state& state) {
         CUDDL_UNWRAP(sketch.add_async({d_input, count}, stream));
         timer.stop();
     });
-    add_median_throughput(state, count);
+    add_time_stats(state);
 
     cudaFree(d_input);
 }
@@ -80,7 +80,7 @@ void cuddl_cardinality(nvbench::state& state) {
         auto estimate = CUDDL_UNWRAP(sketch.cardinality(cuda::stream_ref{launch.get_stream()}));
         do_not_optimise(estimate);
     });
-    add_median_time(state);
+    add_time_stats(state);
     add_value(state, "Exact", static_cast<double>(count));
     add_value(state, "Estimate", CUDDL_UNWRAP(sketch.cardinality()));
     cudaFree(d_input);
@@ -108,7 +108,7 @@ void cuddl_hybrid_cardinality(nvbench::state& state) {
         }
         do_not_optimise(estimate);
     });
-    add_median_time(state);
+    add_time_stats(state);
     cudaFree(d_input);
 }
 
@@ -141,7 +141,7 @@ void cuco_hll_construction(nvbench::state& state) {
         hll.add_async(d_input, d_input + count, stream);
         timer.stop();
     });
-    add_median_throughput(state, count);
+    add_time_stats(state);
 
     cudaFree(d_input);
 }
@@ -160,7 +160,7 @@ void cuco_hll_cardinality(nvbench::state& state) {
         auto estimate = hll.estimate(cuda::stream_ref{launch.get_stream()});
         do_not_optimise(estimate);
     });
-    add_median_time(state);
+    add_time_stats(state);
     add_value(state, "Exact", static_cast<double>(count));
     add_value(state, "Estimate", static_cast<double>(hll.estimate()));
     cudaFree(d_input);
@@ -194,7 +194,7 @@ void cuddl_similarity(nvbench::state& state) {
         auto equal = timed_summary.counts.equal;
         do_not_optimise(equal);
     });
-    add_median_time(state);
+    add_time_stats(state);
     add_value(state, "Exact Similarity", 0.5);
     add_value(state, "Similarity", similarity);
     cudaFree(d_right);
@@ -232,7 +232,7 @@ void cuco_hll_similarity(nvbench::state& state) {
         auto similarity = (left_estimate + right_estimate - union_estimate) / left_estimate;
         do_not_optimise(similarity);
     });
-    add_median_time(state);
+    add_time_stats(state);
     auto const left_estimate = static_cast<double>(left_hll.estimate());
     auto const right_estimate = static_cast<double>(right_hll.estimate());
     union_hll.clear();
