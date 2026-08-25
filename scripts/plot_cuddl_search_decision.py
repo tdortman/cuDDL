@@ -25,10 +25,8 @@ REQUIRED_COLUMNS = {
     "query_profile",
     "index_mode",
     "threshold_zero_recall",
-    "exhaustive_p50_ms",
-    "exhaustive_p95_ms",
-    "indexed_p50_ms",
-    "indexed_p95_ms",
+    "exhaustive_median_ms",
+    "indexed_median_ms",
     "kill_gate_outcome",
 }
 VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
@@ -102,10 +100,8 @@ def main(
         "fill_ratio",
         "query_count",
         "threshold_zero_recall",
-        "exhaustive_p50_ms",
-        "exhaustive_p95_ms",
-        "indexed_p50_ms",
-        "indexed_p95_ms",
+        "exhaustive_median_ms",
+        "indexed_median_ms",
     )
     try:
         data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
@@ -122,10 +118,8 @@ def main(
         raise typer.BadParameter("CSV contains non-positive search timings")
 
     data["hot_fraction"] = data["skew"].map(skew_fraction)
-    data["p50_speedup"] = data["exhaustive_p50_ms"] / data["indexed_p50_ms"]
-    data["p95_speedup"] = data["exhaustive_p95_ms"] / data["indexed_p95_ms"]
-    data["p50_log2_speedup"] = data["p50_speedup"].map(math.log2)
-    data["p95_log2_speedup"] = data["p95_speedup"].map(math.log2)
+    data["speedup"] = data["exhaustive_median_ms"] / data["indexed_median_ms"]
+    data["log2_speedup"] = data["speedup"].map(math.log2)
     unknown_outcomes = sorted(set(data["kill_gate_outcome"]) - VALID_OUTCOMES)
     if unknown_outcomes:
         raise typer.BadParameter(
@@ -152,14 +146,8 @@ def main(
         for fill_ratio in fill_ratios
         for query_count in query_counts
     ]
-    percentile_columns = (
-        ("p50_log2_speedup", "p50"),
-        ("p95_log2_speedup", "p95"),
-    )
     hot_fractions = sorted(data["hot_fraction"].unique())
-    log2_values = pd.concat(
-        [data[column] for column, _ in percentile_columns], ignore_index=True
-    )
+    log2_values = data["log2_speedup"]
     maximum_log2 = max(1.0, float(log2_values.abs().max()))
     colour_map = LinearSegmentedColormap.from_list(
         "search_decision",
@@ -182,11 +170,13 @@ def main(
     ]
     y_edges = [index - 0.5 for index in range(len(references) + 1)]
 
-    row_count = len(modes) * len(percentile_columns)
+    # One row per index mode and one column per (fill ratio, query count)
+    # panel: a wide, slide-friendly layout showing the median-time speedup.
+    row_count = len(modes)
     fig, axes = plt.subplots(
         row_count,
         len(panel_columns),
-        figsize=(3.2 * len(panel_columns), 2.9 * row_count),
+        figsize=(4.2 * len(panel_columns), 2.9 * row_count),
         sharex=True,
         sharey=True,
         squeeze=False,
@@ -194,103 +184,103 @@ def main(
     mesh = None
     skew_ticks = [value / 100.0 for value in range(0, 51, 10)]
     for mode_row, mode_name in enumerate(modes):
-        for percentile_row, (column, percentile) in enumerate(percentile_columns):
-            row = mode_row * len(percentile_columns) + percentile_row
-            for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
-                ax = axes[row][panel_column]
-                panel = data[
-                    (data["index_mode"] == mode_name)
-                    & (data["fill_ratio"] == fill_ratio)
-                    & (data["query_count"] == query_count)
-                ]
-                matrix = (
-                    panel.pivot(
-                        index="reference_count",
-                        columns="hot_fraction",
-                        values=column,
+        for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
+            ax = axes[mode_row][panel_column]
+            panel = data[
+                (data["index_mode"] == mode_name)
+                & (data["fill_ratio"] == fill_ratio)
+                & (data["query_count"] == query_count)
+            ]
+            matrix = (
+                panel.pivot(
+                    index="reference_count",
+                    columns="hot_fraction",
+                    values="log2_speedup",
+                )
+                .reindex(index=references, columns=hot_fractions)
+                .to_numpy(dtype=float)
+            )
+            recall_matrix = (
+                panel.pivot(
+                    index="reference_count",
+                    columns="hot_fraction",
+                    values="threshold_zero_recall",
+                )
+                .reindex(index=references, columns=hot_fractions)
+                .to_numpy(dtype=float)
+            )
+            mesh = ax.pcolormesh(
+                x_edges,
+                y_edges,
+                matrix,
+                cmap=colour_map,
+                norm=colour_norm,
+                shading="flat",
+                edgecolors="white",
+                linewidth=0.8,
+            )
+            for reference_index, hot_index in zip(
+                *((recall_matrix < 1.0).nonzero())
+            ):
+                ax.plot(
+                    hot_fractions[hot_index],
+                    reference_index,
+                    marker="x",
+                    color="#b2182b",
+                    markersize=5,
+                    markeredgewidth=1.4,
+                )
+            ax.set_xlim(x_edges[0], x_edges[-1])
+            ax.set_ylim(len(references) - 0.5, -0.5)
+            ax.set_xticks(skew_ticks)
+            ax.set_xticklabels(
+                [f"{value:.0%}" for value in skew_ticks],
+                fontsize=pu.TICK_LABEL_FONT_SIZE,
+            )
+            ax.set_yticks(range(len(references)))
+            ax.set_yticklabels(
+                [f"{int(reference):,}" for reference in references],
+                fontsize=pu.TICK_LABEL_FONT_SIZE,
+            )
+            ax.set_title(
+                "\n".join(
+                    (
+                        pu.paper_text(mode_name, bold=True),
+                        pu.paper_text(
+                            f"{fill_ratio:.0%} fill, {int(query_count):,} q",
+                            bold=True,
+                        ),
                     )
-                    .reindex(index=references, columns=hot_fractions)
-                    .to_numpy(dtype=float)
+                ),
+                fontsize=pu.TITLE_FONT_SIZE,
+            )
+            if panel_column == 0:
+                ax.set_ylabel(
+                    pu.paper_text("References"),
+                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
                 )
-                recall_matrix = (
-                    panel.pivot(
-                        index="reference_count",
-                        columns="hot_fraction",
-                        values="threshold_zero_recall",
-                    )
-                    .reindex(index=references, columns=hot_fractions)
-                    .to_numpy(dtype=float)
+            if mode_row == row_count - 1:
+                ax.set_xlabel(
+                    pu.paper_text("Hot-bucket fraction"),
+                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
                 )
-                mesh = ax.pcolormesh(
-                    x_edges,
-                    y_edges,
-                    matrix,
-                    cmap=colour_map,
-                    norm=colour_norm,
-                    shading="flat",
-                    edgecolors="white",
-                    linewidth=0.8,
-                )
-                for reference_index, hot_index in zip(
-                    *((recall_matrix < 1.0).nonzero())
-                ):
-                    ax.plot(
-                        hot_fractions[hot_index],
-                        reference_index,
-                        marker="x",
-                        color="#b2182b",
-                        markersize=5,
-                        markeredgewidth=1.4,
-                    )
-                ax.set_xlim(x_edges[0], x_edges[-1])
-                ax.set_ylim(len(references) - 0.5, -0.5)
-                ax.set_xticks(skew_ticks)
-                ax.set_xticklabels(
-                    [f"{value:.0%}" for value in skew_ticks],
-                    fontsize=pu.TICK_LABEL_FONT_SIZE,
-                )
-                ax.set_yticks(range(len(references)))
-                ax.set_yticklabels(
-                    [f"{int(reference):,}" for reference in references],
-                    fontsize=pu.TICK_LABEL_FONT_SIZE,
-                )
-                ax.set_title(
-                    "\n".join(
-                        (
-                            pu.paper_text(mode_name, bold=True),
-                            pu.paper_text(
-                                f"{fill_ratio:.0%} fill, {int(query_count):,} q",
-                                bold=True,
-                            ),
-                        )
-                    ),
-                    fontsize=pu.TITLE_FONT_SIZE,
-                )
-                if panel_column == 0:
-                    ax.set_ylabel(
-                        pu.paper_text(f"{percentile}\nReferences"),
-                        fontsize=pu.AXIS_LABEL_FONT_SIZE,
-                    )
-                if percentile_row == len(percentile_columns) - 1:
-                    ax.set_xlabel(
-                        pu.paper_text("Hot-bucket fraction"),
-                        fontsize=pu.AXIS_LABEL_FONT_SIZE,
-                    )
-                else:
-                    ax.tick_params(axis="x", labelbottom=False)
-                ax.tick_params(axis="both", length=0)
-                ax.spines[:].set_visible(False)
+            else:
+                ax.tick_params(axis="x", labelbottom=False)
+            ax.tick_params(axis="both", length=0)
+            ax.spines[:].set_visible(False)
 
     if mesh is None:
         raise typer.BadParameter("CSV has no heatmap workloads")
     colorbar = fig.colorbar(
         mesh,
         ax=axes.ravel().tolist(),
-        fraction=0.025,
-        pad=0.025,
+        orientation="horizontal",
+        location="bottom",
+        fraction=0.045,
+        pad=0.055,
     )
     colorbar.set_label(
-        pu.paper_text("log2(exhaustive / indexed time)"),
+        pu.paper_text("log2(exhaustive / indexed median time)"),
         fontsize=pu.AXIS_LABEL_FONT_SIZE,
     )
     colorbar.ax.tick_params(labelsize=pu.TICK_LABEL_FONT_SIZE)
@@ -312,7 +302,7 @@ def main(
         0.957,
         pu.paper_text(
             "Blue = indexed faster; orange = exhaustive faster.\n"
-            "Colour is log2(exhaustive / indexed); p50 and p95 are separate rows. "
+            "Colour is log2(exhaustive / indexed median time). "
             "Red x = threshold-zero recall loss."
         ),
         fontsize=pu.DEFAULT_FONT_SIZE,
@@ -320,12 +310,12 @@ def main(
         va="top",
     )
     fig.subplots_adjust(
-        left=0.12,
-        right=0.84,
-        bottom=0.08,
-        top=0.90,
-        hspace=0.45,
-        wspace=0.18,
+        left=0.10,
+        right=0.96,
+        bottom=0.16,
+        top=0.88,
+        hspace=0.35,
+        wspace=0.20,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     pu.save_figure(fig, output, pad_inches=0.10)
