@@ -48,7 +48,10 @@ def plot(
     bench = pu.load_csv(nvbench_csv)
     bench = bench.rename(columns={"Iters": "Items", "Benchmark": "Estimator"})
     construction = bench[bench["Estimator"].str.endswith("_construction")].copy()
-    construction["Gigaelem/s"] = construction["Median Throughput"] / pu.THROUGHPUT_SCALE
+    # Minimum time is immune to the box's periodic clock stretching, unlike the median.
+    construction["Gigaelem/s"] = (
+        construction["Items"] / construction["Min GPU Time"] / pu.THROUGHPUT_SCALE
+    )
     cardinality = bench[bench["Estimator"].str.endswith("_cardinality")]
 
     construction_estimators = [
