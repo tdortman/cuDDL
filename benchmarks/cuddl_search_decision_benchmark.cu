@@ -44,11 +44,11 @@ constexpr uint32_t k_minimum_matches = 5;
 constexpr uint32_t k_score_period = std::numeric_limits<uint16_t>::max();
 
 std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
-std::vector<nvbench::int64_t> const fill_permilles{250, 1000};
+
 std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
 std::vector<nvbench::int64_t> const query_counts{1, 32};
-std::vector<std::string> const query_profiles{"copied", "boundary"};
-std::vector<nvbench::int64_t> const indexed_bucket_counts{1024, 2048};
+std::vector<std::string> const query_profiles{"copied"};
+
 std::vector<nvbench::int64_t> const key_bits{15, 16};
 
 struct workload {
@@ -56,7 +56,6 @@ struct workload {
     double fill_ratio{};
     double hot_fraction{};
     uint32_t query_count{};
-    bool boundary_probe{};
 };
 
 struct index_mode {
@@ -109,15 +108,10 @@ void stash_state(std::string const& benchmark, std::string const& key, nvbench::
 
 [[nodiscard]] workload read_workload(nvbench::state& state, bool includes_queries) {
     auto const references = state.get_int64("References");
-    auto const fill_permille = state.get_int64("FillPermille");
     auto const hot_percentage = state.get_int64("HotPercent");
     auto const queries = includes_queries ? state.get_int64("Queries") : 1;
-    auto const query_profile = includes_queries ? state.get_string("QueryProfile") : "copied";
     if (references <= 0 || references > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("reference count exceeds the supported 32-bit range");
-    }
-    if (fill_permille <= 0 || fill_permille > 1000) {
-        throw std::runtime_error("fill permille must be in [1, 1000]");
     }
     if (hot_percentage < 0 || hot_percentage > k_max_hot_percentage) {
         throw std::runtime_error("hot skew must be in [0%, 50%]");
@@ -125,33 +119,24 @@ void stash_state(std::string const& benchmark, std::string const& key, nvbench::
     if (queries <= 0 || queries > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("query count exceeds the supported 32-bit range");
     }
-    if (query_profile != "copied" && query_profile != "boundary") {
-        throw std::runtime_error("query profile must be copied or boundary");
-    }
     if (static_cast<uint64_t>(references) * static_cast<uint64_t>(queries) >
         std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("query/reference pairs exceed the supported 32-bit range");
     }
     return {
         .reference_count = static_cast<uint32_t>(references),
-        .fill_ratio = static_cast<double>(fill_permille) / 1000.0,
+        .fill_ratio = 1.0,
         .hot_fraction = static_cast<double>(hot_percentage) / 100.0,
         .query_count = static_cast<uint32_t>(queries),
-        .boundary_probe = query_profile == "boundary",
     };
 }
 [[nodiscard]] index_mode read_index_mode(nvbench::state& state) {
-    auto const buckets = state.get_int64("IndexedBuckets");
     auto const bits = state.get_int64("KeyBits");
-    if (buckets != static_cast<nvbench::int64_t>(k_bucket_count / 2U) &&
-        buckets != static_cast<nvbench::int64_t>(k_bucket_count)) {
-        throw std::runtime_error("indexed bucket count must be half or all buckets");
-    }
     if (bits != 15 && bits != 16) {
         throw std::runtime_error("indexed key width must be 15 or 16 bits");
     }
     return {
-        .indexed_bucket_count = static_cast<uint32_t>(buckets),
+        .indexed_bucket_count = k_bucket_count,
         .key_mask = static_cast<uint16_t>((uint32_t{1} << bits) - 1U),
         .key_bits = static_cast<uint32_t>(bits),
     };
@@ -294,27 +279,6 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         );
     }
 
-    std::array<uint8_t, k_bucket_count> probe_matches{};
-    if (settings.boundary_probe) {
-        size_t first_half_matches = 0;
-        size_t second_half_matches = 0;
-        for (size_t index = hot_count; index < fill_count; ++index) {
-            auto const bucket = buckets[index];
-            if (bucket < k_bucket_count / 2U && first_half_matches < 2U) {
-                probe_matches[bucket] = 1U;
-                ++first_half_matches;
-            } else if (bucket >= k_bucket_count / 2U && second_half_matches < 3U) {
-                probe_matches[bucket] = 1U;
-                ++second_half_matches;
-            }
-        }
-        if (first_half_matches != 2U || second_half_matches != 3U) {
-            throw std::runtime_error(
-                "fixture cannot place threshold matches across both bucket halves"
-            );
-        }
-    }
-
     fixture value{
         .rows =
             std::vector<uint16_t>(static_cast<size_t>(settings.reference_count) * k_bucket_count),
@@ -358,23 +322,6 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
             value.rows.data() + static_cast<size_t>(reference_id) * k_bucket_count,
             k_bucket_count * sizeof(uint16_t)
         );
-        if (!settings.boundary_probe || query_id != 0U) {
-            continue;
-        }
-        for (size_t index = 0; index < fill_count; ++index) {
-            auto const bucket = buckets[index];
-            if (probe_matches[bucket] != 0U) {
-                continue;
-            }
-            auto replacement = static_cast<uint16_t>(
-                1U + cuddl::detail::splitmix64(k_fixture_seed + 0xd1b54a32d192ed03ULL + bucket) %
-                         k_score_period
-            );
-            if (replacement == query[bucket]) {
-                replacement = replacement == k_score_period ? 1U : replacement + 1U;
-            }
-            query[bucket] = replacement;
-        }
     }
     return value;
 }
@@ -1090,8 +1037,7 @@ std::string axes_key(workload const& settings, index_mode const* mode, bool with
                std::to_string(static_cast<int>(std::llround(settings.fill_ratio * 1000.0))) + "," +
                std::to_string(static_cast<int>(std::llround(settings.hot_fraction * 100.0)));
     if (with_queries) {
-        key += "," + std::to_string(settings.query_count) + "," +
-               std::string(settings.boundary_probe ? "boundary" : "copied");
+        key += "," + std::to_string(settings.query_count) + ",copied";
     }
     if (mode != nullptr) {
         key += "," + std::to_string(mode->indexed_bucket_count) + "," +
@@ -1127,8 +1073,7 @@ void stash_state(std::string const& benchmark, std::string const& key, nvbench::
 
 NVBENCH_BENCH(compact_build)
     .add_int64_axis("References", reference_counts)
-    .add_int64_axis("FillPermille", fill_permilles)
-    .add_int64_axis("HotPercent", hot_percentages)
+        .add_int64_axis("HotPercent", hot_percentages)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1137,10 +1082,8 @@ NVBENCH_BENCH(compact_build)
 
 NVBENCH_BENCH(indexed_build)
     .add_int64_axis("References", reference_counts)
-    .add_int64_axis("FillPermille", fill_permilles)
-    .add_int64_axis("HotPercent", hot_percentages)
-    .add_int64_axis("IndexedBuckets", indexed_bucket_counts)
-    .add_int64_axis("KeyBits", key_bits)
+        .add_int64_axis("HotPercent", hot_percentages)
+        .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1149,8 +1092,7 @@ NVBENCH_BENCH(indexed_build)
 
 NVBENCH_BENCH(exhaustive_search)
     .add_int64_axis("References", reference_counts)
-    .add_int64_axis("FillPermille", fill_permilles)
-    .add_int64_axis("HotPercent", hot_percentages)
+        .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .add_string_axis("QueryProfile", query_profiles)
     .set_stopping_criterion("sample-count")
@@ -1161,12 +1103,10 @@ NVBENCH_BENCH(exhaustive_search)
 
 NVBENCH_BENCH(indexed_search)
     .add_int64_axis("References", reference_counts)
-    .add_int64_axis("FillPermille", fill_permilles)
-    .add_int64_axis("HotPercent", hot_percentages)
+        .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .add_string_axis("QueryProfile", query_profiles)
-    .add_int64_axis("IndexedBuckets", indexed_bucket_counts)
-    .add_int64_axis("KeyBits", key_bits)
+        .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1242,7 +1182,8 @@ void write_summary_csv() {
         "status", "reference_count", "fill_ratio", "skew", "query_count", "query_profile",
         "index_mode", "threshold_zero_recall", "exhaustive_min_ms", "exhaustive_mean_ms",
         "exhaustive_median_ms", "exhaustive_max_ms", "indexed_min_ms", "indexed_mean_ms",
-        "indexed_median_ms", "indexed_max_ms", "kill_gate_outcome", "error",
+        "indexed_median_ms", "indexed_max_ms", "atomic_updates", "selected_candidates",
+        "candidate_inflation", "indexed_resident_bytes", "kill_gate_outcome", "error",
     };
 
     std::ofstream csv(g_summary_csv_path);
@@ -1347,6 +1288,10 @@ void write_summary_csv() {
                 row["indexed_mean_ms"] = timing_ms(indexed, "mean");
                 row["indexed_median_ms"] = timing_ms(indexed, "median");
                 row["indexed_max_ms"] = timing_ms(indexed, "max");
+                row["atomic_updates"] = value_of(indexed, "atomic_updates");
+                row["selected_candidates"] = value_of(indexed, "selected_candidates");
+                row["candidate_inflation"] = value_of(indexed, "candidate_inflation");
+                row["indexed_resident_bytes"] = value_of(indexed, "resident_bytes");
 
                 auto const recall_text = row["threshold_zero_recall"];
                 auto const recall = recall_text.empty() ? 0.0 : std::stod(recall_text);
