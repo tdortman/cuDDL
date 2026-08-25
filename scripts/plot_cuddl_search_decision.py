@@ -19,21 +19,14 @@ from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 REQUIRED_COLUMNS = {
     "status",
     "reference_count",
-    "fill_ratio",
     "skew",
     "query_count",
-    "query_profile",
     "index_mode",
-    "threshold_zero_recall",
     "exhaustive_median_ms",
     "indexed_median_ms",
     "kill_gate_outcome",
 }
 VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
-QUERY_PROFILE_LABELS = {
-    "copied": "copied reference rows",
-    "boundary": "query 0 is a five-match threshold-boundary probe",
-}
 
 
 def skew_fraction(value: object) -> float:
@@ -52,17 +45,6 @@ def main(
     output: Annotated[
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-decision.pdf"),
-    mode: Annotated[
-        str | None,
-        typer.Option("--mode", help="Plot one index mode; default facets all modes"),
-    ] = None,
-    query_profile: Annotated[
-        str,
-        typer.Option(
-            "--query-profile",
-            help="Query profile to plot",
-        ),
-    ] = "copied",
 ) -> None:
     """Render speedup curves across the hot-bucket fraction."""
     data = pu.load_csv(csv_path)
@@ -70,36 +52,16 @@ def main(
     if missing:
         raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
 
-    if data["query_profile"].isna().any():
-        raise typer.BadParameter("CSV contains missing query profiles")
-    unknown_profiles = sorted(set(data["query_profile"]) - set(QUERY_PROFILE_LABELS))
-    if unknown_profiles:
-        raise typer.BadParameter(
-            f"CSV contains unknown query profiles: {', '.join(unknown_profiles)}"
-        )
-    if query_profile not in QUERY_PROFILE_LABELS:
-        choices = ", ".join(QUERY_PROFILE_LABELS)
-        raise typer.BadParameter(
-            f"Unknown query profile {query_profile!r}; choose one of: {choices}"
-        )
-
     data = data.loc[data["status"] == "ok"].copy()
-    if query_profile not in set(data["query_profile"]):
-        raise typer.BadParameter(
-            f"CSV has no successful workloads for query profile {query_profile!r}"
-        )
-    data = data.loc[data["query_profile"] == query_profile].copy()
-    if mode is not None:
-        data = data.loc[data["index_mode"] == mode].copy()
+    # The 16-bit key is the canonical index key; the 15-bit tradeoff has its
+    # own figure (plot_cuddl_search_key_bits.py).
+    data["key_bits"] = data["index_mode"].str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
+    data = data.loc[data["key_bits"] == 16].copy()
     if data.empty:
-        raise typer.BadParameter(
-            "CSV has no successful workloads for the selected mode and query profile"
-        )
+        raise typer.BadParameter("CSV has no successful workloads")
     numeric = (
         "reference_count",
-        "fill_ratio",
         "query_count",
-        "threshold_zero_recall",
         "exhaustive_median_ms",
         "indexed_median_ms",
     )
@@ -107,11 +69,6 @@ def main(
         data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
     except (TypeError, ValueError) as error:
         raise typer.BadParameter(f"CSV contains non-numeric benchmark values: {error}")
-    recall = data["threshold_zero_recall"]
-    if not recall.map(math.isfinite).all() or not recall.between(0.0, 1.0).all():
-        raise typer.BadParameter(
-            "CSV contains non-finite or out-of-range threshold-zero recall"
-        )
 
     timing_columns = [name for name in numeric if name.endswith("_ms")]
     if (data[timing_columns] <= 0).any().any():
@@ -127,25 +84,16 @@ def main(
         )
 
     references = sorted(data["reference_count"].unique())
-    fill_ratios = sorted(data["fill_ratio"].unique())
     query_counts = sorted(data["query_count"].unique())
-    modes = sorted(data["index_mode"].unique())
     workload_columns = [
-        "fill_ratio",
         "query_count",
-        "query_profile",
         "hot_fraction",
         "reference_count",
-        "index_mode",
     ]
     if data.duplicated(workload_columns).any():
-        raise typer.BadParameter("CSV contains duplicate workloads per index mode")
+        raise typer.BadParameter("CSV contains duplicate workloads")
 
-    panel_columns = [
-        (fill_ratio, query_count)
-        for fill_ratio in fill_ratios
-        for query_count in query_counts
-    ]
+    panel_columns = [(query_count,) for query_count in query_counts]
     hot_fractions = sorted(data["hot_fraction"].unique())
     log2_values = data["log2_speedup"]
     maximum_log2 = max(1.0, float(log2_values.abs().max()))
@@ -170,104 +118,66 @@ def main(
     ]
     y_edges = [index - 0.5 for index in range(len(references) + 1)]
 
-    # One row per index mode and one column per (fill ratio, query count)
-    # panel: a wide, slide-friendly layout showing the median-time speedup.
-    row_count = len(modes)
+    # One wide row: a panel per query count, slide-friendly.
     fig, axes = plt.subplots(
-        row_count,
+        1,
         len(panel_columns),
-        figsize=(4.2 * len(panel_columns), 2.9 * row_count),
+        figsize=(4.6 * len(panel_columns), 3.4),
         sharex=True,
         sharey=True,
         squeeze=False,
     )
     mesh = None
     skew_ticks = [value / 100.0 for value in range(0, 51, 10)]
-    for mode_row, mode_name in enumerate(modes):
-        for panel_column, (fill_ratio, query_count) in enumerate(panel_columns):
-            ax = axes[mode_row][panel_column]
-            panel = data[
-                (data["index_mode"] == mode_name)
-                & (data["fill_ratio"] == fill_ratio)
-                & (data["query_count"] == query_count)
-            ]
-            matrix = (
-                panel.pivot(
-                    index="reference_count",
-                    columns="hot_fraction",
-                    values="log2_speedup",
-                )
-                .reindex(index=references, columns=hot_fractions)
-                .to_numpy(dtype=float)
+    for panel_column, (query_count,) in enumerate(panel_columns):
+        ax = axes[0][panel_column]
+        panel = data[data["query_count"] == query_count]
+        matrix = (
+            panel.pivot(
+                index="reference_count",
+                columns="hot_fraction",
+                values="log2_speedup",
             )
-            recall_matrix = (
-                panel.pivot(
-                    index="reference_count",
-                    columns="hot_fraction",
-                    values="threshold_zero_recall",
-                )
-                .reindex(index=references, columns=hot_fractions)
-                .to_numpy(dtype=float)
+            .reindex(index=references, columns=hot_fractions)
+            .to_numpy(dtype=float)
+        )
+        mesh = ax.pcolormesh(
+            x_edges,
+            y_edges,
+            matrix,
+            cmap=colour_map,
+            norm=colour_norm,
+            shading="flat",
+            edgecolors="white",
+            linewidth=0.8,
+        )
+        ax.set_xlim(x_edges[0], x_edges[-1])
+        ax.set_ylim(len(references) - 0.5, -0.5)
+        ax.set_xticks(skew_ticks)
+        ax.set_xticklabels(
+            [f"{value:.0%}" for value in skew_ticks],
+            fontsize=pu.TICK_LABEL_FONT_SIZE,
+        )
+        ax.set_yticks(range(len(references)))
+        ax.set_yticklabels(
+            [f"{int(reference):,}" for reference in references],
+            fontsize=pu.TICK_LABEL_FONT_SIZE,
+        )
+        ax.set_title(
+            pu.paper_text(f"{int(query_count):,} q", bold=True),
+            fontsize=pu.TITLE_FONT_SIZE,
+        )
+        if panel_column == 0:
+            ax.set_ylabel(
+                pu.paper_text("References"),
+                fontsize=pu.AXIS_LABEL_FONT_SIZE,
             )
-            mesh = ax.pcolormesh(
-                x_edges,
-                y_edges,
-                matrix,
-                cmap=colour_map,
-                norm=colour_norm,
-                shading="flat",
-                edgecolors="white",
-                linewidth=0.8,
-            )
-            for reference_index, hot_index in zip(
-                *((recall_matrix < 1.0).nonzero())
-            ):
-                ax.plot(
-                    hot_fractions[hot_index],
-                    reference_index,
-                    marker="x",
-                    color="#b2182b",
-                    markersize=5,
-                    markeredgewidth=1.4,
-                )
-            ax.set_xlim(x_edges[0], x_edges[-1])
-            ax.set_ylim(len(references) - 0.5, -0.5)
-            ax.set_xticks(skew_ticks)
-            ax.set_xticklabels(
-                [f"{value:.0%}" for value in skew_ticks],
-                fontsize=pu.TICK_LABEL_FONT_SIZE,
-            )
-            ax.set_yticks(range(len(references)))
-            ax.set_yticklabels(
-                [f"{int(reference):,}" for reference in references],
-                fontsize=pu.TICK_LABEL_FONT_SIZE,
-            )
-            ax.set_title(
-                "\n".join(
-                    (
-                        pu.paper_text(mode_name, bold=True),
-                        pu.paper_text(
-                            f"{fill_ratio:.0%} fill, {int(query_count):,} q",
-                            bold=True,
-                        ),
-                    )
-                ),
-                fontsize=pu.TITLE_FONT_SIZE,
-            )
-            if panel_column == 0:
-                ax.set_ylabel(
-                    pu.paper_text("References"),
-                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
-                )
-            if mode_row == row_count - 1:
-                ax.set_xlabel(
-                    pu.paper_text("Hot-bucket fraction"),
-                    fontsize=pu.AXIS_LABEL_FONT_SIZE,
-                )
-            else:
-                ax.tick_params(axis="x", labelbottom=False)
-            ax.tick_params(axis="both", length=0)
-            ax.spines[:].set_visible(False)
+        ax.set_xlabel(
+            pu.paper_text("Hot-bucket fraction"),
+            fontsize=pu.AXIS_LABEL_FONT_SIZE,
+        )
+        ax.tick_params(axis="both", length=0)
+        ax.spines[:].set_visible(False)
 
     if mesh is None:
         raise typer.BadParameter("CSV has no heatmap workloads")
@@ -276,8 +186,8 @@ def main(
         ax=axes.ravel().tolist(),
         orientation="horizontal",
         location="bottom",
-        fraction=0.045,
-        pad=0.11,
+        fraction=0.06,
+        pad=0.13,
     )
     colorbar.set_label(
         pu.paper_text("log2(exhaustive / indexed median time)"),
@@ -289,33 +199,12 @@ def main(
         fontsize=pu.TITLE_FONT_SIZE,
         y=0.995,
     )
-    fig.text(
-        0.5,
-        0.976,
-        pu.paper_text(f"Query profile: {QUERY_PROFILE_LABELS[query_profile]}."),
-        fontsize=pu.DEFAULT_FONT_SIZE,
-        ha="center",
-        va="top",
-    )
-    fig.text(
-        0.5,
-        0.957,
-        pu.paper_text(
-            "Blue = indexed faster; orange = exhaustive faster.\n"
-            "Colour is log2(exhaustive / indexed median time). "
-            "Red x = threshold-zero recall loss."
-        ),
-        fontsize=pu.DEFAULT_FONT_SIZE,
-        ha="center",
-        va="top",
-    )
     fig.subplots_adjust(
-        left=0.10,
+        left=0.12,
         right=0.96,
-        bottom=0.22,
-        top=0.88,
-        hspace=0.35,
-        wspace=0.20,
+        bottom=0.26,
+        top=0.90,
+        wspace=0.22,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     pu.save_figure(fig, output, pad_inches=0.10)
