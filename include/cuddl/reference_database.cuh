@@ -572,8 +572,10 @@ class reference_database_ref {
             stream.get()
         ));
         auto const indexed_bucket_count = metadata_.compatibility.indexed_bucket_count;
+        constexpr uint32_t warp_width = 32;
+        constexpr uint32_t warps_per_block = detail::block_size / warp_width;
         auto const bucket_blocks = static_cast<uint32_t>(
-            (indexed_bucket_count + detail::block_size - 1U) / detail::block_size
+            (indexed_bucket_count + warps_per_block - 1U) / warps_per_block
         );
         detail::count_index_matches_kernel<BucketCount>
             <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
@@ -600,7 +602,6 @@ class reference_database_ref {
             )
         );
 
-        constexpr uint32_t warp_width = 32;
         constexpr uint32_t references_per_block = detail::block_size / warp_width;
         auto const refinement_blocks =
             (metadata_.reference_count + references_per_block - 1U) / references_per_block;

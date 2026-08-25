@@ -475,6 +475,10 @@ __global__ void scatter_index_postings_bucket_kernel(
 }
 
 /// @brief Counts the query's non-empty posting matches for every reference.
+///
+/// One warp owns each bucket cell and walks its posting list with a lane stride,
+/// so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
+/// postings at a time instead of serially by a single thread.
 template <size_t BucketCount>
 __global__ void count_index_matches_kernel(
     uint16_t const* query,
@@ -484,7 +488,11 @@ __global__ void count_index_matches_kernel(
     uint16_t key_mask,
     uint32_t* match_counts
 ) {
-    auto const bucket = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const bucket = static_cast<size_t>(blockIdx.x) * warps_per_block + warp;
     if (bucket >= indexed_bucket_count) {
         return;
     }
@@ -497,7 +505,7 @@ __global__ void count_index_matches_kernel(
     auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
     auto const begin = offsets[cell];
     auto const end = offsets[cell + 1U];
-    for (auto posting = begin; posting < end; ++posting) {
+    for (auto posting = begin + lane; posting < end; posting += warp_width) {
         atomicAdd(&match_counts[postings[posting]], 1U);
     }
 }
