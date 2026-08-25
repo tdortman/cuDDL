@@ -4,18 +4,28 @@
 #include <thrust/device_vector.h>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
+#include <nvbench/main.cuh>
 #include <nvbench/nvbench.cuh>
+#include <nvbench/version.cuh>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -93,6 +103,9 @@ struct minimum_matches_predicate {
         return result.summary.counts.equal >= minimum_matches;
     }
 };
+
+std::string axes_key(workload const& settings, index_mode const* mode, bool with_queries);
+void stash_state(std::string const& benchmark, std::string const& key, nvbench::state& state);
 
 [[nodiscard]] workload read_workload(nvbench::state& state, bool includes_queries) {
     auto const references = state.get_int64("References");
@@ -815,6 +828,7 @@ void compact_build(nvbench::state& state) {
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto const row_bytes = database_type::persistent_row_bytes(settings.reference_count);
     if (!preflight(state, settings, 2U * row_bytes, compatibility)) {
+        stash_state("compact_build", axes_key(settings, nullptr, false), state);
         return;
     }
 
@@ -840,6 +854,7 @@ void compact_build(nvbench::state& state) {
         );
         do_not_optimise(database);
     });
+    stash_state("compact_build", axes_key(settings, nullptr, false), state);
 }
 
 void indexed_build(nvbench::state& state) {
@@ -850,6 +865,7 @@ void indexed_build(nvbench::state& state) {
     auto const resident_bytes = indexed_resident_bytes(settings.reference_count, compatibility);
     auto const temporary_bytes = indexed_build_temporary_bytes(compatibility);
     if (!preflight(state, settings, row_bytes + resident_bytes + temporary_bytes, compatibility)) {
+        stash_state("indexed_build", axes_key(settings, &mode, false), state);
         return;
     }
 
@@ -875,6 +891,7 @@ void indexed_build(nvbench::state& state) {
         );
         do_not_optimise(database);
     });
+    stash_state("indexed_build", axes_key(settings, &mode, false), state);
 }
 
 void exhaustive_search(nvbench::state& state) {
@@ -889,6 +906,7 @@ void exhaustive_search(nvbench::state& state) {
     if (!preflight(
             state, settings, 2U * row_bytes + query_bytes + search_temporary_bytes, compatibility
         )) {
+        stash_state("exhaustive_search", axes_key(settings, nullptr, true), state);
         return;
     }
 
@@ -928,6 +946,7 @@ void exhaustive_search(nvbench::state& state) {
     );
     add_value(state, "threshold_zero_recall", 1.0);
     state.add_element_count(settings.query_count, "Queries");
+    stash_state("exhaustive_search", axes_key(settings, nullptr, true), state);
 }
 
 void indexed_search(nvbench::state& state) {
@@ -950,6 +969,7 @@ void indexed_search(nvbench::state& state) {
     auto const indexed_phase = row_bytes + query_bytes + resident_bytes +
                                std::max(build_temporary_bytes, indexed_search_temporary_bytes);
     if (!preflight(state, settings, std::max(exhaustive_phase, indexed_phase), indexed_metadata)) {
+        stash_state("indexed_search", axes_key(settings, &mode, true), state);
         return;
     }
 
@@ -1037,6 +1057,70 @@ void indexed_search(nvbench::state& state) {
     add_value(state, "oracle_threshold_pairs", static_cast<double>(recall.oracle_pairs));
     add_value(state, "recalled_pairs", static_cast<double>(recall.recalled_pairs));
     state.add_element_count(settings.query_count, "Queries");
+    stash_state("indexed_search", axes_key(settings, &mode, true), state);
+}
+
+// --- In-process summary collection -------------------------------------------
+// The benchmark writes one summary CSV at the end of the run (see main), so the
+// four benchmark functions stash their per-state results here instead of relying on
+// the JSON + sidecar pipeline.
+
+std::vector<std::string> g_summary_argv;
+std::string g_summary_csv_path = "results/cuddl-search-decision.csv";
+
+struct collected_state {
+    std::map<std::string, std::string> values;  // summary tag -> stringified value
+    bool skipped{};
+    std::string skip_reason;
+};
+
+// Key: benchmark name + newline + comma-joined axes, mirroring the summariser.
+std::map<std::string, collected_state> g_collected;
+
+std::string format_number(double value) {
+    std::array<char, 64> buffer{};
+    auto const result = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general
+    );
+    return std::string(buffer.data(), result.ptr);
+}
+
+std::string axes_key(workload const& settings, index_mode const* mode, bool with_queries) {
+    auto key = std::to_string(settings.reference_count) + "," +
+               std::to_string(static_cast<int>(std::llround(settings.fill_ratio * 1000.0))) + "," +
+               std::to_string(static_cast<int>(std::llround(settings.hot_fraction * 100.0)));
+    if (with_queries) {
+        key += "," + std::to_string(settings.query_count) + "," +
+               std::string(settings.boundary_probe ? "boundary" : "copied");
+    }
+    if (mode != nullptr) {
+        key += "," + std::to_string(mode->indexed_bucket_count) + "," +
+               std::to_string(mode->key_bits);
+    }
+    return key;
+}
+
+void stash_state(std::string const& benchmark, std::string const& key, nvbench::state& state) {
+    collected_state record;
+    record.skipped = state.is_skipped();
+    record.skip_reason = state.get_skip_reason();
+    for (auto const& summary : state.get_summaries()) {
+        if (!summary.has_value("value")) {
+            continue;
+        }
+        switch (summary.get_type("value")) {
+            case nvbench::named_values::type::float64:
+                record.values[summary.get_tag()] = format_number(summary.get_float64("value"));
+                break;
+            case nvbench::named_values::type::int64:
+                record.values[summary.get_tag()] = std::to_string(summary.get_int64("value"));
+                break;
+            case nvbench::named_values::type::string:
+                record.values[summary.get_tag()] = summary.get_string("value");
+                break;
+        }
+    }
+    g_collected[benchmark + "\n" + key] = std::move(record);
 }
 
 }  // namespace
@@ -1088,3 +1172,247 @@ NVBENCH_BENCH(indexed_search)
     .set_criterion_param_int64("target-samples", 20)
     .set_cold_warmup_runs(3)
     .set_skip_batched(true);
+
+namespace {
+
+std::vector<std::string> split(std::string const& text, char separator) {
+    std::vector<std::string> parts;
+    std::stringstream stream(text);
+    std::string part;
+    while (std::getline(stream, part, separator)) {
+        parts.push_back(part);
+    }
+    return parts;
+}
+
+std::string csv_field(std::string value) {
+    if (value.find_first_of(",\"\n") != std::string::npos) {
+        auto quoted = std::string("\"");
+        for (char c : value) {
+            if (c == '"') {
+                quoted += '"';
+            }
+            quoted += c;
+        }
+        quoted += '"';
+        return quoted;
+    }
+    return value;
+}
+
+// The decision CSV joins the four benchmark states per workload and index mode.
+// Timing values come from nvbench's own cold-measurement summaries; the full
+// per-state evidence remains available through nvbench's --csv output.
+void write_summary_csv() {
+    if (g_collected.empty()) {
+        return;
+    }
+
+    auto record_of = [](std::string const& benchmark) {
+        auto prefix = benchmark + "\n";
+        std::map<std::vector<std::string>, collected_state const*> states;
+        for (auto const& [key, value] : g_collected) {
+            if (key.starts_with(prefix)) {
+                states[split(key.substr(prefix.size()), ',')] = &value;
+            }
+        }
+        return states;
+    };
+    auto compact_states = record_of("compact_build");
+    auto indexed_build_states = record_of("indexed_build");
+    auto exhaustive_states = record_of("exhaustive_search");
+    auto indexed_search_states = record_of("indexed_search");
+
+    std::set<std::vector<std::string>> mode_keys;
+    for (auto const& [key, state] : indexed_build_states) {
+        mode_keys.insert({key.end() - 2, key.end()});
+    }
+    for (auto const& [key, state] : indexed_search_states) {
+        mode_keys.insert({key.end() - 2, key.end()});
+    }
+    std::set<std::vector<std::string>> workload_keys;
+    for (auto const& [key, state] : exhaustive_states) {
+        workload_keys.insert(key);
+    }
+    for (auto const& [key, state] : indexed_search_states) {
+        workload_keys.insert({key.begin(), key.end() - 2});
+    }
+
+    std::vector<std::string> fields{
+        "status", "reference_count", "fill_ratio", "skew", "query_count", "query_profile",
+        "index_mode", "threshold_zero_recall", "exhaustive_min_ms", "exhaustive_mean_ms",
+        "exhaustive_median_ms", "exhaustive_max_ms", "indexed_min_ms", "indexed_mean_ms",
+        "indexed_median_ms", "indexed_max_ms", "kill_gate_outcome", "error",
+    };
+
+    std::ofstream csv(g_summary_csv_path);
+    if (!csv) {
+        std::cerr << "could not open summary CSV " << g_summary_csv_path << "\n";
+        return;
+    }
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i != 0U) {
+            csv << ',';
+        }
+        csv << fields[i];
+    }
+    csv << '\n';
+
+    auto value_of = [](collected_state const& state, std::string const& tag) {
+        auto found = state.values.find(tag);
+        return found == state.values.end() ? std::string{} : found->second;
+    };
+    auto timing_ms = [&](collected_state const& state, std::string const& statistic) {
+        auto const text = value_of(state, "nv/cold/time/gpu/" + statistic);
+        return text.empty() ? std::string{} : format_number(std::stod(text) * 1000.0);
+    };
+
+    for (auto const& workload : workload_keys) {
+        for (auto const& mode : mode_keys) {
+            std::vector<std::string> build_key(workload.begin(), workload.begin() + 3);
+            auto indexed_build_key = build_key;
+            indexed_build_key.insert(indexed_build_key.end(), mode.begin(), mode.end());
+            auto indexed_search_key = workload;
+            indexed_search_key.insert(indexed_search_key.end(), mode.begin(), mode.end());
+
+            std::map<std::string, collected_state const*> selected{
+                {"compact_build", nullptr},
+                {"indexed_build", nullptr},
+                {"exhaustive_search", nullptr},
+                {"indexed_search", nullptr},
+            };
+            if (auto found = compact_states.find(build_key); found != compact_states.end()) {
+                selected["compact_build"] = found->second;
+            }
+            if (auto found = indexed_build_states.find(indexed_build_key);
+                found != indexed_build_states.end()) {
+                selected["indexed_build"] = found->second;
+            }
+            if (auto found = exhaustive_states.find(workload); found != exhaustive_states.end()) {
+                selected["exhaustive_search"] = found->second;
+            }
+            if (auto found = indexed_search_states.find(indexed_search_key);
+                found != indexed_search_states.end()) {
+                selected["indexed_search"] = found->second;
+            }
+
+            std::vector<std::string> missing;
+            std::vector<std::string> skipped;
+            for (auto const& [name, state] : selected) {
+                if (state == nullptr) {
+                    missing.push_back(name);
+                } else if (state->skipped) {
+                    skipped.push_back(name + ": " + state->skip_reason);
+                }
+            }
+            auto const status = missing.empty() && skipped.empty() ? std::string_view("ok") : std::string_view("skipped");
+            std::string error;
+            for (auto const& name : missing) {
+                error += (error.empty() ? "" : "; ") + ("missing " + name);
+            }
+            for (auto const& note : skipped) {
+                error += (error.empty() ? "" : "; ") + note;
+            }
+
+            auto const& references = workload[0];
+            auto const& fill_permille = workload[1];
+            auto const& hot_percent = workload[2];
+            auto const fill_ratio = std::stod(fill_permille) / 1000.0;
+            auto const query_count = workload.size() >= 5U ? workload[3] : "1";
+            auto const query_profile = workload.size() >= 5U ? workload[4] : "copied";
+            auto const& buckets = mode[0];
+            auto const& bits = mode[1];
+
+            std::map<std::string, std::string> row{
+                {"status", std::string(status)},
+                {"reference_count", references},
+                {"fill_ratio", format_number(fill_ratio)},
+                {"skew", hot_percent + "%"},
+                {"query_count", query_count},
+                {"query_profile", query_profile},
+                {"index_mode", "b" + buckets + "_k" + bits},
+                {"kill_gate_outcome", "inconclusive"},
+                {"error", error},
+            };
+
+            if (status == "ok") {
+                auto const& exhaustive = *selected["exhaustive_search"];
+                auto const& indexed = *selected["indexed_search"];
+                row["threshold_zero_recall"] = value_of(indexed, "threshold_zero_recall");
+                row["exhaustive_min_ms"] = timing_ms(exhaustive, "min");
+                row["exhaustive_mean_ms"] = timing_ms(exhaustive, "mean");
+                row["exhaustive_median_ms"] = timing_ms(exhaustive, "median");
+                row["exhaustive_max_ms"] = timing_ms(exhaustive, "max");
+                row["indexed_min_ms"] = timing_ms(indexed, "min");
+                row["indexed_mean_ms"] = timing_ms(indexed, "mean");
+                row["indexed_median_ms"] = timing_ms(indexed, "median");
+                row["indexed_max_ms"] = timing_ms(indexed, "max");
+
+                auto const recall_text = row["threshold_zero_recall"];
+                auto const recall = recall_text.empty() ? 0.0 : std::stod(recall_text);
+                auto const exhaustive_median = std::stod(row["exhaustive_median_ms"]);
+                auto const indexed_median = std::stod(row["indexed_median_ms"]);
+                auto const recall_loss = !std::isfinite(recall) || recall < 1.0;
+                auto const indexed_win = indexed_median < exhaustive_median;
+                auto const exhaustive_win = exhaustive_median < indexed_median;
+                if (recall_loss) {
+                    row["kill_gate_outcome"] = "recall_loss";
+                } else if (indexed_win) {
+                    row["kill_gate_outcome"] = "indexed_win";
+                } else if (exhaustive_win) {
+                    row["kill_gate_outcome"] = "exhaustive_win";
+                }
+            }
+
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (i != 0U) {
+                    csv << ',';
+                }
+                csv << csv_field(row[fields[i]]);
+            }
+            csv << '\n';
+        }
+    }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) try {
+    g_summary_argv.assign(argv, argv + argc);
+    nvbench::detail::main_initialize(argc, argv);
+    {
+        std::vector<char*> remaining{argv[0]};
+        for (int i = 1; i < argc; ++i) {
+            std::string_view const argument = argv[i];
+            if (argument == "--summary-csv") {
+                if (i + 1 < argc) {
+                    g_summary_csv_path = argv[++i];
+                }
+                continue;
+            }
+            if (argument.starts_with("--summary-csv=")) {
+                g_summary_csv_path = std::string(argument.substr(14));
+                continue;
+            }
+            remaining.push_back(argv[i]);
+        }
+        auto const args = nvbench::detail::main_convert_args(
+            static_cast<int>(remaining.size()), remaining.data()
+        );
+        nvbench::option_parser parser;
+        parser.parse(args);
+        nvbench::detail::main_print_preamble(parser);
+        nvbench::detail::main_run_benchmarks(parser);
+        nvbench::detail::main_print_epilogue(parser);
+        nvbench::detail::main_print_results(parser);
+    }
+    nvbench::detail::main_finalize();
+    write_summary_csv();
+    return 0;
+} catch (std::exception& error) {
+    std::cerr << "\nNVBench encountered an error:\n\n" << error.what() << "\n";
+    return 1;
+} catch (...) {
+    std::cerr << "\nNVBench encountered an unknown error.\n";
+    return 1;
+}

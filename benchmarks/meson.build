@@ -42,6 +42,9 @@ executable(
     install: false,
 )
 
+# Provides its own main (strips --summary-csv, runs nvbench, then writes the summary CSV).
+# nvbench_main stays linked: its static archive member is skipped when main is already
+# defined, while its cuda driver/nvml/cupti link dependencies are still required.
 executable(
     'cuddl-search-decision-benchmark',
     'cuddl_search_decision_benchmark.cu',
