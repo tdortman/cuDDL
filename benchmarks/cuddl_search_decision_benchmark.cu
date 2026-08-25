@@ -41,12 +41,19 @@ constexpr size_t k_bucket_count = 2048;
 constexpr uint64_t k_fixture_seed = 4242;
 constexpr nvbench::int64_t k_max_hot_percentage = 50;
 constexpr uint32_t k_minimum_matches = 5;
-constexpr uint32_t k_score_period = std::numeric_limits<uint16_t>::max();
+// Fixture scores occupy the 15-bit space: the RefSeq DB's top register bit is
+// empirically dead (paper Section 8.2: set in 461 of 383M registers), so the
+// 15-bit key masking the paper recommends (Section 8.6) folds ~nothing.
+constexpr uint32_t k_score_period = 0x7FFFU;
+// Fraction of references that share the hot value inside a hot bucket. A hot
+// register value is shared by thousands of unrelated sketches in real RefSeq
+// data (paper, Section 9): ~1% of the 200,687 sketches, not all of them.
+constexpr double k_hot_value_fraction = 0.01;
 
 std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
 
 std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
-std::vector<nvbench::int64_t> const query_counts{1, 32};
+std::vector<nvbench::int64_t> const query_counts{1, 128};
 std::vector<std::string> const query_profiles{"copied"};
 
 std::vector<nvbench::int64_t> const key_bits{15, 16};
@@ -73,6 +80,7 @@ struct fixture {
     std::vector<uint32_t> bucket_shifts;
     uint64_t populated_posting_lists{};
     uint64_t posting_entries{};
+    uint32_t hot_reference_count{};
 };
 
 struct indexed_fixture_metrics {
@@ -244,12 +252,14 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
            storage.posting_bytes;
 }
 
-[[nodiscard]] uint64_t congruent_reference_count(uint32_t reference_count, uint32_t reference_id) {
-    auto const residue = reference_id % k_score_period;
+[[nodiscard]] uint64_t congruent_reference_count(
+    uint32_t reference_count, uint32_t reference_id, uint32_t period = k_score_period
+) {
+    auto const residue = reference_id % period;
     if (residue >= reference_count) {
         return 0U;
     }
-    return 1U + (static_cast<uint64_t>(reference_count) - 1U - residue) / k_score_period;
+    return 1U + (static_cast<uint64_t>(reference_count) - 1U - residue) / period;
 }
 
 [[nodiscard]] uint32_t query_reference_id(workload const& settings, uint32_t query_id) {
@@ -265,6 +275,16 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     auto const hot_count = std::clamp<size_t>(
         static_cast<size_t>(std::llround(settings.hot_fraction * fill_count)), 0U, fill_count
     );
+    auto const hot_reference_count =
+        hot_count == 0U
+            ? 0U
+            : std::clamp<size_t>(
+                  static_cast<size_t>(
+                      std::llround(k_hot_value_fraction * settings.reference_count)
+                  ),
+                  1U,
+                  settings.reference_count
+              );
 
     std::vector<size_t> buckets(fill_count);
     std::vector<uint32_t> shifts(fill_count);
@@ -289,9 +309,13 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         .bucket_hot = std::vector<uint8_t>(k_bucket_count),
         .bucket_shifts = std::vector<uint32_t>(k_bucket_count),
         .populated_posting_lists =
-            hot_count +
+            hot_count *
+                (1U + std::min<uint64_t>(
+                          settings.reference_count - hot_reference_count, k_score_period - 1U
+                      )) +
             (fill_count - hot_count) * std::min<uint64_t>(settings.reference_count, k_score_period),
         .posting_entries = static_cast<uint64_t>(settings.reference_count) * fill_count,
+        .hot_reference_count = static_cast<uint32_t>(hot_reference_count),
     };
     for (size_t index = 0; index < fill_count; ++index) {
         auto const bucket = buckets[index];
@@ -304,18 +328,29 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         for (size_t index = 0; index < fill_count; ++index) {
             auto const bucket = buckets[index];
             auto const score =
-                index < hot_count ? uint16_t{1U}
-                                  : static_cast<uint16_t>(
-                                        1U + (static_cast<uint64_t>(reference_id) + shifts[index]) %
-                                                 k_score_period
-                                    );
+                index < hot_count
+                    ? (reference_id < hot_reference_count
+                           ? uint16_t{1U}
+                           : static_cast<uint16_t>(
+                                 2U + (static_cast<uint64_t>(reference_id) + shifts[index]) %
+                                         (k_score_period - 1U)
+                             ))
+                    : static_cast<uint16_t>(
+                          1U + (static_cast<uint64_t>(reference_id) + shifts[index]) %
+                                  k_score_period
+                      );
             value.rows[static_cast<size_t>(reference_id) * k_bucket_count + bucket] = score;
             value.bucket_top_bit_counts[bucket] += (score & 0x8000U) != 0U;
         }
     }
 
     for (uint32_t query_id = 0; query_id < settings.query_count; ++query_id) {
-        auto const reference_id = query_reference_id(settings, query_id);
+        // With skew, queries copy rows from the hot group so every query
+        // exercises the hot posting lists (the hard case the kill gate decides).
+        auto const query_pool = hot_count == 0U ? settings.reference_count : hot_reference_count;
+        auto const reference_id = static_cast<uint32_t>(
+            query_reference_id(settings, query_id) % query_pool
+        );
         auto* query = value.queries.data() + static_cast<size_t>(query_id) * k_bucket_count;
         std::memcpy(
             query,
@@ -326,19 +361,20 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     return value;
 }
 
-[[nodiscard]] uint64_t
-distinct_index_keys(uint32_t reference_count, uint32_t shift, uint16_t key_mask) {
+[[nodiscard]] uint64_t distinct_index_keys(
+    uint32_t reference_count, uint32_t shift, uint16_t key_mask, uint32_t period, uint32_t base = 1U
+) {
     if (key_mask == std::numeric_limits<uint16_t>::max()) {
-        return std::min<uint64_t>(reference_count, k_score_period);
+        return std::min<uint64_t>(reference_count, period);
     }
     auto const key_count = static_cast<size_t>(key_mask) + 1U;
-    if (reference_count >= k_score_period) {
-        return key_count;
+    if (reference_count >= period) {
+        return std::min<uint64_t>(period, key_count);
     }
     std::vector<uint8_t> seen(key_count);
     for (uint32_t reference_id = 0; reference_id < reference_count; ++reference_id) {
         auto const score = static_cast<uint16_t>(
-            1U + (static_cast<uint64_t>(reference_id) + shift) % k_score_period
+            base + (static_cast<uint64_t>(reference_id) + shift) % period
         );
         seen[score & key_mask] = 1U;
     }
@@ -353,7 +389,9 @@ distinct_index_keys(uint32_t reference_count, uint32_t shift, uint16_t key_mask)
     indexed_fixture_metrics metrics{};
     auto posting_count = [&](uint16_t query_score, uint32_t shift) {
         auto count_score = [&](uint16_t score) {
-            if (score == 0U) {
+            if (score == 0U || score > k_score_period) {
+                // Scores above the fixture period cannot occur, so a 15-bit
+                // fold pair outside the score space contributes nothing.
                 return uint64_t{0};
             }
             auto const residue = static_cast<uint32_t>(
@@ -376,10 +414,21 @@ distinct_index_keys(uint32_t reference_count, uint32_t shift, uint16_t key_mask)
         metrics.nonzero_scores += settings.reference_count;
         metrics.top_bit_count += data.bucket_top_bit_counts[bucket];
         if (data.bucket_hot[bucket] != 0U) {
-            ++metrics.populated_posting_lists;
+            metrics.populated_posting_lists += 1U + distinct_index_keys(
+                static_cast<uint32_t>(settings.reference_count - data.hot_reference_count),
+                static_cast<uint32_t>(
+                    static_cast<uint64_t>(data.hot_reference_count) + data.bucket_shifts[bucket]
+                ),
+                mode.key_mask,
+                k_score_period - 1U,
+                2U
+            );
         } else {
             metrics.populated_posting_lists += distinct_index_keys(
-                settings.reference_count, data.bucket_shifts[bucket], mode.key_mask
+                settings.reference_count,
+                data.bucket_shifts[bucket],
+                mode.key_mask,
+                k_score_period
             );
         }
     }
@@ -394,7 +443,23 @@ distinct_index_keys(uint32_t reference_count, uint32_t shift, uint16_t key_mask)
             }
             if (data.bucket_hot[bucket] != 0U) {
                 if ((query_score & mode.key_mask) == (uint16_t{1U} & mode.key_mask)) {
-                    metrics.posting_visits += settings.reference_count;
+                    auto visits = static_cast<uint64_t>(data.hot_reference_count);
+                    if (mode.key_mask != std::numeric_limits<uint16_t>::max() &&
+                        0x8001U <= k_score_period) {
+                        // 15-bit keys fold score 0x8001 (32769) into the hot key; count
+                        // the non-hot references whose spread score lands there. The
+                        // folded score only exists when the fixture spans 16 bits.
+                        constexpr uint32_t period = k_score_period - 1U;
+                        auto const shift = data.bucket_shifts[bucket];
+                        auto const folded = static_cast<uint32_t>(
+                            (32767ULL + period - (shift % period)) % period
+                        );
+                        visits += congruent_reference_count(
+                                      settings.reference_count, folded, period
+                                  ) -
+                                  congruent_reference_count(data.hot_reference_count, folded, period);
+                    }
+                    metrics.posting_visits += visits;
                 }
                 continue;
             }
