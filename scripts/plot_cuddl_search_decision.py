@@ -277,7 +277,7 @@ def main(
         orientation="horizontal",
         location="bottom",
         fraction=0.045,
-        pad=0.055,
+        pad=0.11,
     )
     colorbar.set_label(
         pu.paper_text("log2(exhaustive / indexed median time)"),
@@ -312,7 +312,7 @@ def main(
     fig.subplots_adjust(
         left=0.10,
         right=0.96,
-        bottom=0.16,
+        bottom=0.22,
         top=0.88,
         hspace=0.35,
         wspace=0.20,
