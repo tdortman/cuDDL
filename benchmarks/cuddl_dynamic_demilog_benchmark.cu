@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
         double estimate = 0;
         auto const seconds = run(host, estimate);
         std::printf(
-            "cuddl,%zu,%zu,%d,%.9f,%.3f,%.0f\n",
+            "cuddl,%zu,%zu,,%d,%.9f,%.3f,%.0f\n",
             count,
             bucket_count,
             i,

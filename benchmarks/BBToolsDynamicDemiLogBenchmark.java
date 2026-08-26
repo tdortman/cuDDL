@@ -1,7 +1,13 @@
 import cardinality.DynamicDemiLog;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
-/** Times the original BBTools DynamicDemiLog over deterministic packed values. */
+/** Times parallel BBTools DynamicDemiLog construction over deterministic packed values. */
 public final class BBToolsDynamicDemiLogBenchmark {
 
     private static long splitmix64(long value) {
@@ -21,43 +27,71 @@ public final class BBToolsDynamicDemiLogBenchmark {
         return values;
     }
 
-    private static long run(long[] values, int buckets) {
-        final DynamicDemiLog sketch = DynamicDemiLog.create(buckets, 25, 0, 0, false);
+    private static long run(long[] values, int buckets, int maxThreads) {
+        final int threads = Math.min(values.length, maxThreads);
+        final ExecutorService pool = Executors.newFixedThreadPool(threads);
+        final List<Future<DynamicDemiLog>> partials = new ArrayList<>(threads);
 
-        for (final long value : values) {
-            sketch.add(value);
+        for (int worker = 0; worker < threads; worker++) {
+            final int start = (int) ((long) values.length * worker / threads);
+            final int end = (int) ((long) values.length * (worker + 1) / threads);
+            partials.add(pool.submit(() -> {
+                final DynamicDemiLog partial =
+                    DynamicDemiLog.create(buckets, 25, 0, 0, false);
+                for (int i = start; i < end; i++) {
+                    partial.add(values[i]);
+                }
+                return partial;
+            }));
+        }
+
+        final DynamicDemiLog sketch = DynamicDemiLog.create(buckets, 25, 0, 0, false);
+        try {
+            for (final Future<DynamicDemiLog> partial : partials) {
+                sketch.add(partial.get());
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("construction interrupted", error);
+        } catch (ExecutionException error) {
+            throw new IllegalStateException("construction failed", error.getCause());
+        } finally {
+            pool.shutdown();
         }
 
         return sketch.cardinality();
     }
 
     public static void main(String[] args) {
-        if (args.length != 4) {
-            throw new IllegalArgumentException("usage: COUNT BUCKETS WARMUP RUNS");
+        if (args.length != 5) {
+            throw new IllegalArgumentException("usage: COUNT BUCKETS THREADS WARMUP RUNS");
         }
 
         final int count = Integer.parseInt(args[0]);
         final int buckets = Integer.parseInt(args[1]);
-        final int warmup = Integer.parseInt(args[2]);
-        final int runs = Integer.parseInt(args[3]);
+        final int threads = Integer.parseInt(args[2]);
+        final int warmup = Integer.parseInt(args[3]);
+        final int runs = Integer.parseInt(args[4]);
 
-        if (count < 1 || buckets < 1 || warmup < 0 || runs < 1) {
-            throw new IllegalArgumentException("COUNT, BUCKETS, and RUNS must be positive");
+        if (count < 1 || buckets < 1 || threads < 1 || warmup < 0 || runs < 1) {
+            throw new IllegalArgumentException(
+                "COUNT, BUCKETS, THREADS, and RUNS must be positive");
         }
 
         for (int i = 0; i < warmup; i++) {
-            run(inputs(count, -1L - i), buckets);
+            run(inputs(count, -1L - i), buckets, threads);
         }
         for (int i = 0; i < runs; i++) {
             final long[] values = inputs(count, i);
             final long start = System.nanoTime();
-            final long estimate = run(values, buckets);
+            final long estimate = run(values, buckets, threads);
             final double seconds = (System.nanoTime() - start) * 1e-9;
             System.out.printf(
                 Locale.ROOT,
-                "bbtools,%d,%d,%d,%.9f,%.3f,%d%n",
+                "bbtools,%d,%d,%d,%d,%.9f,%.3f,%d%n",
                 count,
                 buckets,
+                Math.min(count, threads),
                 i,
                 seconds,
                 count / seconds,

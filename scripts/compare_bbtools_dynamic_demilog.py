@@ -3,9 +3,10 @@
 # requires-python = ">=3.12"
 # dependencies = ["typer"]
 # ///
-"""Benchmark cuDDL against the original BBTools DynamicDemiLog."""
+"""Benchmark cuDDL against parallel BBTools DynamicDemiLog construction."""
 
 import csv
+import os
 import statistics
 import subprocess
 import sys
@@ -19,6 +20,7 @@ FIELDS = (
     "implementation",
     "count",
     "buckets",
+    "threads",
     "trial",
     "seconds",
     "adds_per_second",
@@ -38,6 +40,9 @@ def powers(first: int, last: int) -> list[int]:
 def main(
     min_power: Annotated[int, typer.Option(min=1)] = 8,
     max_power: Annotated[int, typer.Option(min=1)] = 28,
+    threads: Annotated[int, typer.Option(min=1, help="BBTools worker count")] = (
+        os.cpu_count() or 1
+    ),
     warmup: Annotated[int, typer.Option(min=0)] = 3,
     trials: Annotated[int, typer.Option(min=1)] = 10,
     build_dir: Annotated[Path, typer.Option()] = Path("build"),
@@ -71,6 +76,7 @@ def main(
                     "BBToolsDynamicDemiLogBenchmark",
                     str(count),
                     "2048",
+                    str(threads),
                     str(warmup),
                     str(trials),
                 ]
