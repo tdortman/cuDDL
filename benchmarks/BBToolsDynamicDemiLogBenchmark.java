@@ -16,30 +16,46 @@ public final class BBToolsDynamicDemiLogBenchmark {
         return value ^ (value >>> 31);
     }
 
-    private static long[] inputs(int count, long trial) {
-        final long[] values = new long[count];
-        final long mask = (1L << 50) - 1;
+    private static final int MAX_SHARD_LENGTH = 1 << 26;
 
-        for (int i = 0; i < count; i++) {
-            values[i] = splitmix64(42L + i + trial * 0x9e3779b97f4a7c15L) & mask;
+    private static long[][] inputs(long count, int maxThreads, long trial) {
+        final int workers = (int) Math.min(count, maxThreads);
+        final long requiredShards = (count - 1) / MAX_SHARD_LENGTH + 1;
+        final int shardCount = Math.toIntExact(Math.max(workers, requiredShards));
+        final long baseLength = count / shardCount;
+        final long extra = count % shardCount;
+        final long[][] shards = new long[shardCount][];
+        final long mask = (1L << 50) - 1;
+        final long trialOffset = trial * 0x9e3779b97f4a7c15L;
+        long start = 0;
+
+        for (int shard = 0; shard < shardCount; shard++) {
+            final int length = Math.toIntExact(baseLength + (shard < extra ? 1 : 0));
+            final long[] values = new long[length];
+            for (int i = 0; i < length; i++) {
+                values[i] = splitmix64(42L + start + i + trialOffset) & mask;
+            }
+            shards[shard] = values;
+            start += length;
         }
 
-        return values;
+        return shards;
     }
 
-    private static long run(long[] values, int buckets, int maxThreads) {
+    private static long run(long[][] values, int buckets, int maxThreads) {
         final int threads = Math.min(values.length, maxThreads);
         final ExecutorService pool = Executors.newFixedThreadPool(threads);
         final List<Future<DynamicDemiLog>> partials = new ArrayList<>(threads);
 
         for (int worker = 0; worker < threads; worker++) {
-            final int start = (int) ((long) values.length * worker / threads);
-            final int end = (int) ((long) values.length * (worker + 1) / threads);
+            final int firstShard = worker;
             partials.add(pool.submit(() -> {
                 final DynamicDemiLog partial =
                     DynamicDemiLog.create(buckets, 25, 0, 0, false);
-                for (int i = start; i < end; i++) {
-                    partial.add(values[i]);
+                for (int shard = firstShard; shard < values.length; shard += threads) {
+                    for (final long value : values[shard]) {
+                        partial.add(value);
+                    }
                 }
                 return partial;
             }));
@@ -67,7 +83,7 @@ public final class BBToolsDynamicDemiLogBenchmark {
             throw new IllegalArgumentException("usage: COUNT BUCKETS THREADS WARMUP RUNS");
         }
 
-        final int count = Integer.parseInt(args[0]);
+        final long count = Long.parseLong(args[0]);
         final int buckets = Integer.parseInt(args[1]);
         final int threads = Integer.parseInt(args[2]);
         final int warmup = Integer.parseInt(args[3]);
@@ -79,10 +95,10 @@ public final class BBToolsDynamicDemiLogBenchmark {
         }
 
         for (int i = 0; i < warmup; i++) {
-            run(inputs(count, -1L - i), buckets, threads);
+            run(inputs(count, threads, -1L - i), buckets, threads);
         }
         for (int i = 0; i < runs; i++) {
-            final long[] values = inputs(count, i);
+            final long[][] values = inputs(count, threads, i);
             final long start = System.nanoTime();
             final long estimate = run(values, buckets, threads);
             final double seconds = (System.nanoTime() - start) * 1e-9;
