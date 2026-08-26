@@ -15,6 +15,26 @@ IMPLEMENTATIONS = (
     ("cuddl", "cuDDL", pu.FILTER_STYLES["cuddl"]),
     ("bbtools", "BBTools DynamicDemiLog", pu.FILTER_STYLES["cuco_hll"]),
 )
+ESTIMATORS = (
+    (
+        "cuddl",
+        "estimate",
+        "cuDDL unbiased",
+        {**pu.FILTER_STYLES["cuddl"], "linestyle": "--"},
+    ),
+    (
+        "cuddl",
+        "bounded_estimate",
+        "cuDDL corrected",
+        pu.FILTER_STYLES["cuddl_bbtools"],
+    ),
+    (
+        "bbtools",
+        "estimate",
+        "BBTools DynamicDemiLog",
+        pu.FILTER_STYLES["cuco_hll"],
+    ),
+)
 
 
 def main(
@@ -25,9 +45,6 @@ def main(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     data = pu.load_csv(csv_path)
-    data["absolute_error"] = (
-        (data["estimate"] - data["count"]) / data["count"]
-    ).abs() * 100.0
 
     throughput = data.groupby(["implementation", "count"])["adds_per_second"].median()
     fig, ax = pu.setup_figure(figsize=(12, 8))
@@ -56,15 +73,19 @@ def main(
     pu.format_axis(ax, xlabel="Distinct inputs", ylabel="cuDDL speedup over BBTools")
     pu.save_figure(fig, output_dir / "speedup.pdf")
 
-    accuracy = data.groupby(["implementation", "count"])["absolute_error"].mean()
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    for name, label, style in IMPLEMENTATIONS:
-        series = accuracy.loc[name]
+    for implementation, column, label, style in ESTIMATORS:
+        selected = data[data["implementation"] == implementation]
+        series = (
+            ((selected[column] - selected["count"]) / selected["count"]).abs()
+            * 100.0
+        ).groupby(selected["count"]).mean()
         ax.semilogx(
             series.index,
             series,
             color=style["color"],
             marker=style["marker"],
+            linestyle=style.get("linestyle", "-"),
             label=label,
         )
     pu.format_axis(
@@ -75,17 +96,18 @@ def main(
     pu.create_legend(ax)
     pu.save_figure(fig, output_dir / "accuracy.pdf")
 
-    estimates = data.groupby(["implementation", "count"])["estimate"].mean()
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    exact = estimates.loc["cuddl"].index
+    exact = data[data["implementation"] == "cuddl"]["count"].drop_duplicates()
     ax.loglog(exact, exact, color="#333333", linestyle="--", label="Exact")
-    for name, label, style in IMPLEMENTATIONS:
-        series = estimates.loc[name]
+    for implementation, column, label, style in ESTIMATORS:
+        selected = data[data["implementation"] == implementation]
+        series = selected.groupby("count")[column].mean()
         ax.loglog(
             series.index,
             series,
             color=style["color"],
             marker=style["marker"],
+            linestyle=style.get("linestyle", "-"),
             label=label,
         )
     pu.format_axis(ax, xlabel="Exact distinct count", ylabel="Estimated distinct count")

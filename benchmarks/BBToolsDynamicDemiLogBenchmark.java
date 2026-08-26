@@ -42,9 +42,8 @@ public final class BBToolsDynamicDemiLogBenchmark {
         return shards;
     }
 
-    private static long run(long[][] values, int buckets, int maxThreads) {
-        final int threads = Math.min(values.length, maxThreads);
-        final ExecutorService pool = Executors.newFixedThreadPool(threads);
+    private static long run(
+        long[][] values, int buckets, ExecutorService pool, int threads) {
         final List<Future<DynamicDemiLog>> partials = new ArrayList<>(threads);
 
         for (int worker = 0; worker < threads; worker++) {
@@ -71,8 +70,6 @@ public final class BBToolsDynamicDemiLogBenchmark {
             throw new IllegalStateException("construction interrupted", error);
         } catch (ExecutionException error) {
             throw new IllegalStateException("construction failed", error.getCause());
-        } finally {
-            pool.shutdown();
         }
 
         return sketch.cardinality();
@@ -94,25 +91,32 @@ public final class BBToolsDynamicDemiLogBenchmark {
                 "COUNT, BUCKETS, THREADS, and RUNS must be positive");
         }
 
-        for (int i = 0; i < warmup; i++) {
-            run(inputs(count, threads, -1L - i), buckets, threads);
-        }
-        for (int i = 0; i < runs; i++) {
-            final long[][] values = inputs(count, threads, i);
-            final long start = System.nanoTime();
-            final long estimate = run(values, buckets, threads);
-            final double seconds = (System.nanoTime() - start) * 1e-9;
-            System.out.printf(
-                Locale.ROOT,
-                "bbtools,%d,%d,%d,%d,%.9f,%.3f,%d%n",
-                count,
-                buckets,
-                Math.min(count, threads),
-                i,
-                seconds,
-                count / seconds,
-                estimate
-            );
+        final int workerCount = (int) Math.min(count, threads);
+        final ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+        try {
+            for (int i = 0; i < warmup; i++) {
+                run(inputs(count, threads, -1L - i), buckets, pool, workerCount);
+            }
+            for (int i = 0; i < runs; i++) {
+                final long[][] values = inputs(count, threads, i);
+                final long start = System.nanoTime();
+                final long estimate = run(values, buckets, pool, workerCount);
+                final double seconds = (System.nanoTime() - start) * 1e-9;
+                System.out.printf(
+                    Locale.ROOT,
+                    "bbtools,%d,%d,%d,%d,%.9f,%.3f,%d,%d%n",
+                    count,
+                    buckets,
+                    workerCount,
+                    i,
+                    seconds,
+                    count / seconds,
+                    estimate,
+                    estimate
+                );
+            }
+        } finally {
+            pool.shutdown();
         }
     }
 }

@@ -59,14 +59,16 @@ int main(int argc, char** argv) {
         auto const host = make_inputs(count, i);
         double estimate = 0;
         auto const seconds = run(host, estimate);
+        auto const bounded_estimate = std::min(estimate, static_cast<double>(count));
         std::printf(
-            "cuddl,%zu,%zu,,%d,%.9f,%.3f,%.0f\n",
+            "cuddl,%zu,%zu,,%d,%.9f,%.3f,%.0f,%.0f\n",
             count,
             bucket_count,
             i,
             seconds,
             count / seconds,
-            estimate
+            estimate,
+            bounded_estimate
         );
     }
 }

@@ -25,6 +25,7 @@ FIELDS = (
     "seconds",
     "adds_per_second",
     "estimate",
+    "bounded_estimate",
 )
 
 
