@@ -29,8 +29,18 @@ FIELDS = (
 
 
 def run(command: list[str]) -> list[dict[str, str]]:
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        message = error.stderr.strip() or error.stdout.strip() or str(error)
+        raise RuntimeError(message) from error
     return list(csv.DictReader(result.stdout.splitlines(), fieldnames=FIELDS))
+
+
+def java_heap(count: int) -> str:
+    gib = 1 << 30
+    # Each input occupies eight bytes; leave half again for GC and JVM objects.
+    return f"-Xmx{max(1, (count * 12 + gib - 1) // gib)}g"
 
 
 def powers(first: int, last: int) -> list[int]:
@@ -71,6 +81,7 @@ def main(
             rows += run(
                 [
                     "java",
+                    java_heap(count),
                     "-cp",
                     f"{classes}:{jar}",
                     "BBToolsDynamicDemiLogBenchmark",
