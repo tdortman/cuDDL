@@ -310,6 +310,76 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
     );
 }
 
+TEST(SketchTest, BatchComparisonMatchesScalarOracle) {
+    constexpr size_t pair_count = 3;
+    std::vector<uint16_t> left_scores(pair_count * b_default);
+    std::vector<uint16_t> right_scores(pair_count * b_default);
+    std::vector<uint32_t> left_registers(pair_count * b_default);
+    std::vector<uint32_t> right_registers(pair_count * b_default);
+    for (size_t pair = 0; pair < pair_count; ++pair) {
+        for (size_t bucket = 0; bucket < b_default; ++bucket) {
+            auto const index = pair * b_default + bucket;
+            left_scores[index] = (bucket + pair) % 11U == 0U
+                                     ? 0U
+                                     : static_cast<uint16_t>((bucket * 13U + pair) % 251U + 1U);
+            right_scores[index] =
+                (bucket + 2U * pair) % 13U == 0U
+                    ? 0U
+                    : static_cast<uint16_t>((bucket * 17U + pair * 3U) % 251U + 1U);
+            left_registers[index] = pack(left_scores[index], left_scores[index] == 0U ? 0U : 1U);
+            right_registers[index] = pack(right_scores[index], right_scores[index] == 0U ? 0U : 1U);
+        }
+    }
+
+    thrust::device_vector<uint32_t> device_left(left_registers);
+    thrust::device_vector<uint32_t> device_right(right_registers);
+    thrust::device_vector<cuddl::pairwise_summary> device_outputs(pair_count);
+    auto const result = cuddl::compare_batch_async<b_default>(
+        {thrust::raw_pointer_cast(device_left.data()), device_left.size()},
+        {thrust::raw_pointer_cast(device_right.data()), device_right.size()},
+        {thrust::raw_pointer_cast(device_outputs.data()), device_outputs.size()}
+    );
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
+
+    std::vector<cuddl::pairwise_summary> outputs;
+    ASSERT_TRUE(copy_device_vector(device_outputs, outputs));
+    for (size_t pair = 0; pair < pair_count; ++pair) {
+        auto const begin = left_scores.begin() + static_cast<ptrdiff_t>(pair * b_default);
+        std::vector<uint16_t> left_row(begin, begin + b_default);
+        EXPECT_EQ(outputs[pair], score_row_oracle(left_row, right_scores, pair));
+    }
+
+    auto const unequal = cuddl::compare_batch_async<b_default>(
+        {thrust::raw_pointer_cast(device_left.data()), device_left.size()},
+        {thrust::raw_pointer_cast(device_right.data()), device_right.size() - 1U},
+        {thrust::raw_pointer_cast(device_outputs.data()), device_outputs.size()}
+    );
+    EXPECT_FALSE(unequal.has_value());
+    EXPECT_EQ(unequal.error().category(), cuddl::ErrorCategory::invalid_argument);
+
+    auto const undersized = cuddl::compare_batch_async<b_default>(
+        {thrust::raw_pointer_cast(device_left.data()), device_left.size()},
+        {thrust::raw_pointer_cast(device_right.data()), device_right.size()},
+        {thrust::raw_pointer_cast(device_outputs.data()), pair_count - 1U}
+    );
+    EXPECT_FALSE(undersized.has_value());
+    auto const null_input = cuddl::compare_batch_async<b_default>(
+        cuddl::device_span<uint32_t const>{static_cast<uint32_t const*>(nullptr), b_default},
+        {thrust::raw_pointer_cast(device_right.data()), b_default},
+        {thrust::raw_pointer_cast(device_outputs.data()), 1U}
+    );
+    EXPECT_FALSE(null_input.has_value());
+    EXPECT_TRUE(
+        cuddl::compare_batch_async<b_default>(
+            cuddl::device_span<uint32_t const>{},
+            cuddl::device_span<uint32_t const>{},
+            cuddl::device_span<cuddl::pairwise_summary>{}
+        )
+            .has_value()
+    );
+}
+
 TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     constexpr size_t reference_count = 4;
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();

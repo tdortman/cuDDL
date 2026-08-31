@@ -238,6 +238,42 @@ summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& ou
     }
 }
 
+/**
+ * @brief Compares corresponding rows from two contiguous packed-register batches.
+ *
+ * One warp owns one pair. Grid-stride traversal keeps the launch bounded for very large batches.
+ */
+template <size_t BucketCount>
+__global__ __launch_bounds__(block_size) void batch_summary_kernel(
+    uint32_t const* left_rows,
+    uint32_t const* right_rows,
+    size_t pair_count,
+    pairwise_summary* outputs
+) {
+    constexpr uint32_t warp_width = 32U;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    using warp_reduce = cub::WarpReduce<pairwise_counts>;
+    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto pair = static_cast<size_t>(blockIdx.x) * warps_per_block + warp;
+    auto const pair_stride = static_cast<size_t>(gridDim.x) * warps_per_block;
+    for (; pair < pair_count; pair += pair_stride) {
+        auto const row_offset = pair * BucketCount;
+        pairwise_counts local{};
+        for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
+            classify(local, left_rows[row_offset + bucket], right_rows[row_offset + bucket]);
+        }
+        auto const total = warp_reduce(storage[warp]).Sum(local);
+        if (lane == 0U) {
+            outputs[pair].counts = total;
+            outputs[pair].cardinality = 0.0;
+        }
+        __syncwarp();
+    }
+}
+
 /// @brief Reads the search score from either supported exact row backing.
 __host__ __device__ constexpr uint16_t reference_score(uint16_t score) noexcept {
     return score;
