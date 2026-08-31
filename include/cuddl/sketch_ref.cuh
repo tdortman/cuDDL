@@ -183,9 +183,10 @@ class sketch_ref {
         return static_cast<double>(summary.counts.equal) / static_cast<double>(divisor);
     }
 
-    /// @brief Fraction of the other sketch's content present in `this`, clamped to `[0, 1]`.
+    /// @brief Relative cardinality of `this` to the other sketch, clamped to `[0, 1]`.
     ///
-    /// `(equal + higher) / (equal + lower)`; `std::nullopt` when the divisor is zero.
+    /// BBTools completeness: `(equal + higher) / (equal + lower)`; `std::nullopt` when the
+    /// divisor is zero. This is a size-ratio estimate, not reverse containment.
     [[nodiscard]] std::optional<double> completeness(
         pairwise_summary const& summary
     ) const noexcept {
