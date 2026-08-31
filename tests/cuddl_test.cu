@@ -225,8 +225,7 @@ TEST(SketchTest, UnalignedInputSpanningMultipleGridStrideIterationsMatchesScalar
     // leaves the bucket empty.
     int multiprocessors = 0;
     ASSERT_EQ(
-        cudaSuccess,
-        cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0)
+        cudaSuccess, cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0)
     );
     ASSERT_GT(multiprocessors, 0);
     auto const stride = size_t{2} * static_cast<size_t>(multiprocessors) *
@@ -2474,7 +2473,6 @@ TEST(A48Decoder, DecodesRelativeHeaderRowsAndMetadata) {
         EXPECT_EQ(parallel->records[r].metadata.offset, db.records[r].metadata.offset);
         EXPECT_EQ(parallel->records[r].scores, db.records[r].scores);
     }
-
 
     EXPECT_EQ(db.metadata.kmer_length, k);
     EXPECT_TRUE(db.metadata.has_kmer_length);
