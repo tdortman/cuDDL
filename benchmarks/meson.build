@@ -24,6 +24,14 @@ executable(
     install: false,
 )
 
+executable(
+    'cuddl-pairwise-batch-benchmark',
+    'cuddl_pairwise_batch_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 # Raw-FASTA end-to-end gate binary. Per the benchmark contract this is a dedicated CLI11
 # target (it measures the full parse -> sketch -> compare pipeline), not a google-benchmark one.
 executable(
