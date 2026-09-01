@@ -1157,15 +1157,17 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
     EXPECT_EQ(exhaustive_requirements->candidate_bytes, 0U);
     EXPECT_EQ(exhaustive_requirements->temporary_bytes, 0U);
     EXPECT_EQ(exhaustive_requirements->workspace_bytes, 0U);
-    EXPECT_EQ(
-        indexed_requirements->counter_bytes,
-        static_cast<size_t>(reference_count) * reference_count * sizeof(uint32_t)
-    );
-    EXPECT_EQ(
-        indexed_requirements->candidate_bytes,
-        static_cast<size_t>(reference_count) * reference_count * sizeof(uint32_t)
-    );
+    EXPECT_GT(indexed_requirements->counter_bytes, 0U);
+    EXPECT_GT(indexed_requirements->candidate_bytes, 0U);
     EXPECT_EQ(indexed_requirements->maximum_pair_count, 6U);
+    auto large_indexed_requirements = compact.indexed_batch_search_requirements(128U);
+    ASSERT_TRUE(large_indexed_requirements.has_value())
+        << large_indexed_requirements.error().message();
+    auto const dense_counter_bytes = static_cast<size_t>(128U) * reference_count * sizeof(uint32_t);
+    EXPECT_LE(
+        large_indexed_requirements->counter_bytes, dense_counter_bytes + 2U * sizeof(uint32_t)
+    );
+    EXPECT_LE(large_indexed_requirements->candidate_bytes, dense_counter_bytes);
 
     thrust::device_vector<uint8_t> compact_exhaustive_workspace(
         exhaustive_requirements->workspace_bytes

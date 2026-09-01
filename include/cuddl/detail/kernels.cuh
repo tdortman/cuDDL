@@ -781,44 +781,6 @@ struct batch_minimum_match_predicate {
     }
 };
 
-/// @brief Histograms selected batch candidates per reference id.
-__global__ void histogram_batch_candidates_kernel(
-    uint32_t const* candidate_ids,
-    uint32_t const* candidate_count,
-    uint32_t reference_count,
-    uint32_t* reference_histogram
-) {
-    auto const count = *candidate_count;
-    auto index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
-    for (; index < count; index += stride) {
-        auto const reference_id = candidate_ids[index] % reference_count;
-        atomicAdd(&reference_histogram[reference_id], 1U);
-    }
-}
-
-/// @brief Scatters batch candidate indices into reference-major runs.
-///
-/// @p reference_cursor holds the exclusive per-reference scan of the histogram; each atomic
-/// bump assigns the next slot of the owning reference's contiguous run, so the refinement can
-/// walk one run per reference row load.
-__global__ void scatter_batch_candidates_kernel(
-    uint32_t const* candidate_ids,
-    uint32_t const* candidate_count,
-    uint32_t reference_count,
-    uint32_t* reference_cursor,
-    uint32_t* reference_candidates
-) {
-    auto const count = *candidate_count;
-    auto index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
-    for (; index < count; index += stride) {
-        auto const reference_id = candidate_ids[index] % reference_count;
-        auto const slot = atomicAdd(&reference_cursor[reference_id], 1U);
-        reference_candidates[slot] = static_cast<uint32_t>(index);
-    }
-}
-
 /// @brief Classifies one contiguous per-lane chunk of both rows.
 ///
 /// With @p Use256 the chunk covers 16 buckets for 16-bit scores (one 256-bit load per row, via
@@ -925,12 +887,7 @@ __device__ void refine_write_result(
     }
 }
 
-/// @brief Exactly refines a bounded stable candidate list, one reference row load per reference.
-///
-/// The candidates arrive reference-major (one contiguous run per reference), so a warp loads
-/// its reference row once and reuses it from the cache for every query in the run instead of
-/// re-reading the full row per (query, reference) pair. Results keep their stable query-major
-/// positions from the selection.
+/// @brief Exactly refines one stable query-major candidate tile.
 template <size_t BucketCount, typename QueryRow, typename ReferenceRow, typename SearchResult>
 __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kernel(
     QueryRow const* queries,
@@ -940,10 +897,9 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
     uint32_t reference_count,
     uint32_t const* match_counts,
     uint32_t const* candidate_ids,
-    uint32_t const* reference_candidates,
-    uint32_t const* reference_histogram,
-    uint32_t const* reference_cursor,
     uint32_t const* candidate_count,
+    uint32_t const* result_offset,
+    uint32_t const* required_count,
     uint32_t result_capacity,
     SearchResult* results,
     uint32_t* result_match_counts
@@ -953,39 +909,31 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
     using warp_reduce = cub::WarpReduce<pairwise_counts>;
     __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
 
-    if (*candidate_count > result_capacity) {
+    if (required_count != nullptr && *required_count > result_capacity) {
         return;
     }
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto const reference_id = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
-    if (reference_id >= reference_count) {
-        return;
-    }
-
-    auto const run_end = reference_cursor[reference_id];
-    auto const run_begin = run_end - reference_histogram[reference_id];
-    if (run_begin == run_end) {
-        return;
-    }
+    auto candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+    auto const candidate_stride = static_cast<uint32_t>(gridDim.x) * warps_per_block;
 
     // The 256-bit load path needs 32-byte-aligned rows; callers may hand over spans whose base
     // breaks that, in which case the same chunking falls back to 128-bit loads.
     auto const wide256 = (reinterpret_cast<uintptr_t>(queries) & 31U) == 0U &&
                          (reinterpret_cast<uintptr_t>(rows) & 31U) == 0U;
-    auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-    if (wide256) {
-        constexpr uint32_t chunk_buckets =
-            (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 16U : 8U;
-        static_assert(BucketCount % chunk_buckets == 0U);
-        constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-        for (auto slot = run_begin; slot < run_end; ++slot) {
-            auto const index = reference_candidates[slot];
-            auto const pair_id = candidate_ids[index];
-            auto const query_index = pair_id / reference_count;
-            pairwise_counts local{};
-            auto const query_offset =
-                (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+    for (; candidate_index < *candidate_count; candidate_index += candidate_stride) {
+        auto const pair_id = candidate_ids[candidate_index];
+        auto const query_index = pair_id / reference_count;
+        auto const reference_id = pair_id % reference_count;
+        auto const query_offset =
+            (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+        auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
+        pairwise_counts local{};
+        if (wide256) {
+            constexpr uint32_t chunk_buckets =
+                (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 16U : 8U;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
             for (auto chunk = static_cast<uint32_t>(lane); chunk < chunks_per_row;
                  chunk += warp_width) {
                 classify_wide_chunk<true>(
@@ -994,32 +942,11 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
                     rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
                 );
             }
-            refine_write_result(
-                index,
-                query_index,
-                reference_id,
-                query_id_offset,
-                match_counts,
-                pair_id,
-                local,
-                storage[warp],
-                lane,
-                results,
-                result_match_counts
-            );
-        }
-    } else {
-        constexpr uint32_t chunk_buckets =
-            (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 8U : 4U;
-        static_assert(BucketCount % chunk_buckets == 0U);
-        constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-        for (auto slot = run_begin; slot < run_end; ++slot) {
-            auto const index = reference_candidates[slot];
-            auto const pair_id = candidate_ids[index];
-            auto const query_index = pair_id / reference_count;
-            pairwise_counts local{};
-            auto const query_offset =
-                (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
+        } else {
+            constexpr uint32_t chunk_buckets =
+                (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 8U : 4U;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
             for (auto chunk = static_cast<uint32_t>(lane); chunk < chunks_per_row;
                  chunk += warp_width) {
                 classify_wide_chunk<false>(
@@ -1028,20 +955,33 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
                     rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
                 );
             }
-            refine_write_result(
-                index,
-                query_index,
-                reference_id,
-                query_id_offset,
-                match_counts,
-                pair_id,
-                local,
-                storage[warp],
-                lane,
-                results,
-                result_match_counts
-            );
         }
+        refine_write_result(
+            *result_offset + candidate_index,
+            query_index,
+            reference_id,
+            query_id_offset,
+            match_counts,
+            pair_id,
+            local,
+            storage[warp],
+            lane,
+            results,
+            result_match_counts
+        );
+        __syncwarp();
+    }
+}
+
+/// @brief Advances a tiled result offset after the preceding refinement completes.
+__global__ void advance_indexed_result_count_kernel(
+    uint32_t const* tile_count,
+    uint32_t* result_offset,
+    uint32_t const* required_count,
+    uint32_t result_capacity
+) {
+    if (threadIdx.x == 0U && (required_count == nullptr || *required_count <= result_capacity)) {
+        *result_offset += *tile_count;
     }
 }
 
