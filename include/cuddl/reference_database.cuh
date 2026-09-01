@@ -39,7 +39,7 @@ struct score_compatibility {
     uint16_t key_mask{};
 
     /// @brief Metadata for score rows produced by the current cuDDL construction path.
-    template <uint32_t K, size_t BucketCount>
+    template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     [[nodiscard]] static constexpr score_compatibility current() noexcept {
         static_assert(BucketCount <= std::numeric_limits<uint32_t>::max());
         return {
@@ -47,8 +47,8 @@ struct score_compatibility {
             .bucket_count = static_cast<uint32_t>(BucketCount),
             .indexed_bucket_count = static_cast<uint32_t>(BucketCount),
             .score_encoder_identity = 1U,
-            .exponent_bits = static_cast<uint16_t>(16U - detail::mantissa_bits),
-            .mantissa_bits = static_cast<uint16_t>(detail::mantissa_bits),
+            .exponent_bits = static_cast<uint16_t>(Layout::exponent_bits),
+            .mantissa_bits = static_cast<uint16_t>(Layout::mantissa_bits),
             .hash_identity = 1U,
             .hash_seed = detail::seed,
             .canonicalisation_policy = 1U,
@@ -112,7 +112,7 @@ struct indexed_search_options {
 
 namespace detail {
 
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 [[nodiscard]] inline Result<void> validate_score_compatibility(
     score_compatibility const& compatibility
 ) {
@@ -122,10 +122,10 @@ template <uint32_t K, size_t BucketCount>
     if (compatibility.bucket_count != BucketCount) {
         return Err(Error::invalid_argument("bucket count does not match the database type"));
     }
-    if (compatibility.score_encoder_identity == 0U || compatibility.exponent_bits == 0U ||
-        compatibility.mantissa_bits == 0U ||
-        static_cast<uint32_t>(compatibility.exponent_bits) + compatibility.mantissa_bits != 16U) {
-        return Err(Error::invalid_argument("score encoding must identify a 16-bit format"));
+    if (compatibility.score_encoder_identity == 0U ||
+        compatibility.exponent_bits != Layout::exponent_bits ||
+        compatibility.mantissa_bits != Layout::mantissa_bits) {
+        return Err(Error::invalid_argument("score encoding does not match the register layout"));
     }
     if (compatibility.hash_identity == 0U) {
         return Err(Error::invalid_argument("hash identity must be specified"));
@@ -136,11 +136,11 @@ template <uint32_t K, size_t BucketCount>
     return Ok();
 }
 
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 [[nodiscard]] inline Result<void> validate_non_indexed_score_compatibility(
     score_compatibility const& compatibility
 ) {
-    if (auto const validation = validate_score_compatibility<K, BucketCount>(compatibility);
+    if (auto const validation = validate_score_compatibility<K, BucketCount, Layout>(compatibility);
         !validation) {
         return validation;
     }
@@ -153,11 +153,11 @@ template <uint32_t K, size_t BucketCount>
     return Ok();
 }
 
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 [[nodiscard]] inline Result<void> validate_indexed_score_compatibility(
     score_compatibility const& compatibility
 ) {
-    if (auto const validation = validate_score_compatibility<K, BucketCount>(compatibility);
+    if (auto const validation = validate_score_compatibility<K, BucketCount, Layout>(compatibility);
         !validation) {
         return validation;
     }
@@ -196,7 +196,7 @@ indexed_posting_count(uint32_t reference_count, score_compatibility const& compa
  * Inputs, database rows, workspace, and results must remain valid until the supplied stream
  * completes.
  */
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class reference_database_ref {
     static_assert(K >= 1 && K <= 31);
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
@@ -205,6 +205,7 @@ class reference_database_ref {
    public:
     using score_type = uint16_t;
     using register_type = uint32_t;
+    using layout_type = Layout;
     using result_type = reference_search_result;
     using batch_result_type = batch_search_result;
 
@@ -391,7 +392,7 @@ class reference_database_ref {
             return Err(Error::invalid_argument("query must contain one complete score row"));
         }
         if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(query_compatibility);
+                detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility);
             !validation) {
             return validation;
         }
@@ -504,7 +505,7 @@ class reference_database_ref {
             return Err(Error::invalid_argument("query must contain one complete score row"));
         }
         if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(query_compatibility);
+                detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility);
             !validation) {
             return validation;
         }
@@ -845,9 +846,9 @@ class reference_database_ref {
     }
 
     [[nodiscard]] Result<void> validate_index_storage() const {
-        CUDDL_TRY(
-            (detail::validate_indexed_score_compatibility<K, BucketCount>(metadata_.compatibility))
-        );
+        CUDDL_TRY((detail::validate_indexed_score_compatibility<K, BucketCount, Layout>(
+            metadata_.compatibility
+        )));
         auto const cell_count = detail::indexed_cell_count(metadata_.compatibility);
         auto const expected_postings = static_cast<size_t>(
             detail::indexed_posting_count(metadata_.reference_count, metadata_.compatibility)
@@ -985,7 +986,7 @@ class reference_database_ref {
             return Err(Error::resource("query IDs exceed the stable 32-bit range"));
         }
         if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount>(query_compatibility);
+                detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility);
             !validation) {
             return Err(validation.error());
         }
@@ -1289,14 +1290,15 @@ class reference_database_ref {
  * Building enqueues row copies on the supplied stream. Inputs and the returned database must
  * remain alive until that stream completes.
  */
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class reference_database {
     static_assert(K >= 1 && K <= 31);
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
 
    public:
-    using ref_type = reference_database_ref<K, BucketCount>;
+    using ref_type = reference_database_ref<K, BucketCount, Layout>;
+    using layout_type = Layout;
     using score_type = typename ref_type::score_type;
     using register_type = typename ref_type::register_type;
     using result_type = typename ref_type::result_type;
@@ -1890,13 +1892,17 @@ class reference_database {
         static_assert(std::is_same_v<Row, score_type> || std::is_same_v<Row, register_type>);
         if (indexed) {
             if (auto const validation =
-                    detail::validate_indexed_score_compatibility<K, BucketCount>(compatibility);
+                    detail::validate_indexed_score_compatibility<K, BucketCount, Layout>(
+                        compatibility
+                    );
                 !validation) {
                 return Err(validation.error());
             }
         } else {
             if (auto const validation =
-                    detail::validate_non_indexed_score_compatibility<K, BucketCount>(compatibility);
+                    detail::validate_non_indexed_score_compatibility<K, BucketCount, Layout>(
+                        compatibility
+                    );
                 !validation) {
                 return Err(validation.error());
             }

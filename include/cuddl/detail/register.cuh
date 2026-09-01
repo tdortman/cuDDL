@@ -6,24 +6,32 @@
 
 #include <cuddl/detail/hash.cuh>
 
-namespace cuddl::detail {
+namespace cuddl {
 
-/// @brief Number of mantissa bits in the 16-bit DDL score. The exponent field occupies bits 15..10.
-constexpr uint32_t mantissa_bits = 10;
+/// @brief Compile-time split of a 16-bit DDL score into exponent and mantissa fields.
+template <uint32_t ExponentBits, uint32_t MantissaBits>
+struct register_layout {
+    static_assert(ExponentBits > 0U);
+    static_assert(MantissaBits > 0U);
+    static_assert(ExponentBits + MantissaBits == 16U);
+
+    static constexpr uint32_t exponent_bits = ExponentBits;
+    static constexpr uint32_t mantissa_bits = MantissaBits;
+};
+
+using default_register_layout = register_layout<6, 10>;
+
+namespace detail {
+
+/// @brief Default score layout retained for source compatibility.
+constexpr uint32_t mantissa_bits = default_register_layout::mantissa_bits;
 constexpr uint32_t mantissa_mask = (1U << mantissa_bits) - 1U;
 
 /// @brief Maximum winner multiplicity representable in the low 16 bits of a packed register.
 constexpr uint32_t max_winner_count = 0xffffU;
 
-/// @brief 64 hash bits minus one leading one minus the mantissa width.
+/// @brief Default restoration constants retained for source compatibility.
 constexpr uint32_t restore_shift_base = 63U - mantissa_bits;
-
-/// @brief Largest NLZ that leaves a full @ref mantissa_bits mantissa under the leading one.
-///
-/// The mantissa occupies the bits immediately below the leading one, so scores with NLZ above
-/// `restore_shift_base` cannot carry a full mantissa. Such hashes are astronomically rare (they
-/// require the hash to have roughly 54 leading zeros) but must not underflow the mantissa shift,
-/// so they all collapse to the `restore_shift_base` tier.
 constexpr uint32_t max_nlz = restore_shift_base;
 
 /**
@@ -34,17 +42,22 @@ constexpr uint32_t max_nlz = restore_shift_base;
  * always encodes a rarer hash. Zero is reserved for the empty register, so a hash whose raw
  * exponent/mantissa encoding is zero collapses to one.
  */
+template <typename Layout = default_register_layout>
 __host__ __device__ inline uint16_t score(uint64_t hash) noexcept {
+    constexpr auto layout_mantissa_mask = (1U << Layout::mantissa_bits) - 1U;
+    constexpr auto layout_restore_shift_base = 63U - Layout::mantissa_bits;
+    constexpr auto layout_max_nlz =
+        cuda::std::min(layout_restore_shift_base, (1U << Layout::exponent_bits) - 1U);
 #ifdef __CUDA_ARCH__
     auto const nlz = static_cast<uint32_t>(__clzll(hash | 1ULL));
 #else
     auto const nlz = static_cast<uint32_t>(__builtin_clzll(hash | 1ULL));
 #endif
-    auto const capped = nlz > max_nlz ? max_nlz : nlz;
-    auto const shift = restore_shift_base - capped;
-    auto const mantissa = static_cast<uint32_t>((hash >> shift) & mantissa_mask);
-    auto const inverted = static_cast<uint32_t>(mantissa ^ mantissa_mask);
-    auto const raw = static_cast<uint16_t>((capped << mantissa_bits) | inverted);
+    auto const capped = nlz > layout_max_nlz ? layout_max_nlz : nlz;
+    auto const shift = layout_restore_shift_base - capped;
+    auto const mantissa = static_cast<uint32_t>((hash >> shift) & layout_mantissa_mask);
+    auto const inverted = static_cast<uint32_t>(mantissa ^ layout_mantissa_mask);
+    auto const raw = static_cast<uint16_t>((capped << Layout::mantissa_bits) | inverted);
     return raw == 0U ? static_cast<uint16_t>(1U) : raw;
 }
 
@@ -77,11 +90,14 @@ __host__ __device__ constexpr uint16_t saturated_add(uint16_t left, uint16_t rig
  * Inverts the @ref score encoding: recovers NLZ from the exponent field, uninverts the mantissa
  * bits and prepends the implicit leading one, then shifts the result back into 64-bit space.
  */
+template <typename Layout = default_register_layout>
 __host__ __device__ constexpr uint64_t restore(uint16_t stored) noexcept {
-    auto const nlz = static_cast<uint32_t>(stored >> mantissa_bits);
-    auto const lowbits = static_cast<uint32_t>((~stored) & mantissa_mask);
-    auto const mantissa = (1U << mantissa_bits) | lowbits;
-    auto const shift = restore_shift_base - nlz;
+    constexpr auto layout_mantissa_mask = (1U << Layout::mantissa_bits) - 1U;
+    constexpr auto layout_restore_shift_base = 63U - Layout::mantissa_bits;
+    auto const nlz = static_cast<uint32_t>(stored >> Layout::mantissa_bits);
+    auto const lowbits = static_cast<uint32_t>((~stored) & layout_mantissa_mask);
+    auto const mantissa = (1U << Layout::mantissa_bits) | lowbits;
+    auto const shift = layout_restore_shift_base - nlz;
     return static_cast<uint64_t>(mantissa) << shift;
 }
 
@@ -93,11 +109,14 @@ __host__ __device__ constexpr uint64_t restore(uint16_t stored) noexcept {
  * scalar summary and reduces the small positive bias that lower-bound restoration introduces
  * into hash-magnitude cardinality sums.
  */
+template <typename Layout = default_register_layout>
 __host__ __device__ constexpr uint64_t restore_midpoint(uint16_t stored) noexcept {
-    auto const nlz = static_cast<uint32_t>(stored >> mantissa_bits);
-    auto const lowbits = static_cast<uint32_t>((~stored) & mantissa_mask);
-    auto const mantissa = (1U << mantissa_bits) | lowbits;
-    auto const shift = restore_shift_base - nlz;
+    constexpr auto layout_mantissa_mask = (1U << Layout::mantissa_bits) - 1U;
+    constexpr auto layout_restore_shift_base = 63U - Layout::mantissa_bits;
+    auto const nlz = static_cast<uint32_t>(stored >> Layout::mantissa_bits);
+    auto const lowbits = static_cast<uint32_t>((~stored) & layout_mantissa_mask);
+    auto const mantissa = (1U << Layout::mantissa_bits) | lowbits;
+    auto const shift = layout_restore_shift_base - nlz;
     auto const lower = static_cast<uint64_t>(mantissa) << shift;
     // `(1 << shift) >> 1` is 2^(shift-1) for ordinary tiers and exactly zero for the
     // clamped top tier (`shift == 0`), so the midpoint needs no branch.
@@ -171,4 +190,5 @@ merge_register(uint32_t* address, uint32_t partial, uint32_t& saturation) noexce
     }
 }
 
-}  // namespace cuddl::detail
+}  // namespace detail
+}  // namespace cuddl

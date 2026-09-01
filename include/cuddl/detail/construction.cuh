@@ -30,7 +30,7 @@ __host__ inline uint32_t construction_blocks(size_t count, cudaStream_t stream =
 /// Sketches that fit in default static shared memory are built through a CTA-local shared winner
 /// array with an exact count fix-up and merge (`add_shared_kernel`); larger sketches fall back to
 /// the direct global packed-CAS kernel.
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __host__ inline Result<void> launch_construction(
     device_span<uint64_t const> input,
     device_span<uint32_t> registers,
@@ -59,14 +59,16 @@ __host__ inline Result<void> launch_construction(
         blocks = static_cast<uint32_t>(
             cuda::std::min<size_t>(blocks, cuda::std::max<size_t>(1U, needed))
         );
-        add_shared_kernel<BucketCount><<<blocks, shared_construction_block_size, 0, stream>>>(
-            input.data(), input.size(), registers.data(), saturation, vector_input
-        );
+        add_shared_kernel<BucketCount, Layout>
+            <<<blocks, shared_construction_block_size, 0, stream>>>(
+                input.data(), input.size(), registers.data(), saturation, vector_input
+            );
         return cuda_try(cudaGetLastError());
     }
-    add_kernel<BucketCount><<<construction_blocks(input.size(), stream), block_size, 0, stream>>>(
-        input.data(), input.size(), registers.data(), saturation
-    );
+    add_kernel<BucketCount, Layout>
+        <<<construction_blocks(input.size(), stream), block_size, 0, stream>>>(
+            input.data(), input.size(), registers.data(), saturation
+        );
     return cuda_try(cudaGetLastError());
 }
 

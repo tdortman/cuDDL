@@ -24,7 +24,7 @@ namespace cuddl {
  * allocation must contain `BucketCount` packed `uint32_t` registers followed by one aligned
  * `uint32_t` saturation flag. Pass by value into device or host code.
  */
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch_ref {
     static_assert(K >= 1 && K <= 31);
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
@@ -32,6 +32,7 @@ class sketch_ref {
 
    public:
     using register_type = uint32_t;
+    using layout_type = Layout;
 
     /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
     __host__ __device__ constexpr sketch_ref(
@@ -79,7 +80,7 @@ class sketch_ref {
         device_span<uint64_t const> input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return detail::launch_construction<BucketCount>(
+        return detail::launch_construction<BucketCount, Layout>(
             input, registers_, saturation_, stream.get()
         );
     }
@@ -93,7 +94,7 @@ class sketch_ref {
         pairwise_summary& output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::summary_kernel<BucketCount, IncludeCardinality>
+        detail::summary_kernel<BucketCount, IncludeCardinality, Layout>
             <<<1, detail::block_size, 0, stream.get()>>>(
                 registers_.data(), other.registers_.data(), output
             );
@@ -117,7 +118,7 @@ class sketch_ref {
         double* estimate_out,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::cardinality_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
+        detail::cardinality_kernel<BucketCount, Layout><<<1, detail::block_size, 0, stream.get()>>>(
             registers_.data(), empty_out, estimate_out
         );
         return cuda_try(cudaGetLastError());
@@ -128,7 +129,7 @@ class sketch_ref {
         hybrid_cardinality_estimates* output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        detail::hybrid_cardinality_kernel<BucketCount>
+        detail::hybrid_cardinality_kernel<BucketCount, Layout>
             <<<1, detail::block_size, 0, stream.get()>>>(registers_.data(), output);
         return cuda_try(cudaGetLastError());
     }

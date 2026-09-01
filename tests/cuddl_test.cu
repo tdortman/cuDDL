@@ -33,7 +33,7 @@ constexpr size_t b_default = 2048;
 constexpr uint16_t k_counter_max = 65535;
 
 /// @brief Scalar, sequential CPU oracle for DDL construction and comparison.
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = cuddl::default_register_layout>
 struct scalar_sketch {
     std::vector<uint32_t> registers = std::vector<uint32_t>(BucketCount, 0U);
     std::vector<uint16_t> winners = std::vector<uint16_t>(BucketCount, 0U);
@@ -44,7 +44,7 @@ struct scalar_sketch {
         for (auto const input : inputs) {
             auto const h = hash_kmer(input);
             auto const b = h & (BucketCount - 1);
-            auto const s = score(h);
+            auto const s = score<Layout>(h);
             if (s > winners[b]) {
                 winners[b] = s;
                 counts[b] = 1;
@@ -90,7 +90,7 @@ struct scalar_sketch {
             if (w == 0) {
                 ++empty;
             } else {
-                sum += restore_midpoint(w);
+                sum += restore_midpoint<Layout>(w);
             }
         }
         return cuddl::detail::cardinality(
@@ -193,6 +193,42 @@ TEST(SketchTest, ScoreEncodingClampsExtremeNlz) {
     EXPECT_GT(restore_midpoint(low), restore(low));
     EXPECT_EQ(restore_midpoint(high), restore(high));
     (void)low;
+}
+
+TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
+    using layout = cuddl::register_layout<5, 11>;
+    using ref_type = cuddl::sketch_ref<k_default, b_default, layout>;
+    static_assert(std::is_empty_v<layout>);
+    static_assert(sizeof(ref_type) == sizeof(cuddl::sketch_ref<k_default, b_default>));
+    EXPECT_EQ(score<layout>(0ULL), std::numeric_limits<uint16_t>::max());
+    EXPECT_EQ(restore<layout>(std::numeric_limits<uint16_t>::max()), 1ULL << 32U);
+
+    auto const inputs = make_inputs(50000);
+    cuddl::sketch<k_default, b_default, layout> gpu;
+    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}).has_value());
+
+    scalar_sketch<b_default, layout> oracle;
+    oracle.add(inputs);
+    oracle.pack_registers();
+
+    std::vector<uint32_t> gpu_regs(b_default);
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpy(
+            gpu_regs.data(),
+            gpu.ref().data().data(),
+            b_default * sizeof(uint32_t),
+            cudaMemcpyDeviceToHost
+        )
+    );
+    EXPECT_EQ(gpu_regs, oracle.registers);
+
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default, layout>();
+    EXPECT_EQ(compatibility.exponent_bits, 5U);
+    EXPECT_EQ(compatibility.mantissa_bits, 11U);
+    EXPECT_TRUE(gpu.cardinality().has_value());
+    EXPECT_TRUE(gpu.hybrid_cardinality().has_value());
+    EXPECT_TRUE(gpu.summary<true>(gpu.ref()).has_value());
 }
 
 TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
@@ -2658,8 +2694,9 @@ TEST(A48Decoder, RejectsMalformedInput) {
 }
 
 TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
-    using database_type = cuddl::reference_database<k_default, b_default>;
-    constexpr uint32_t exponent = 5U;
+    using layout = cuddl::register_layout<5, 11>;
+    using database_type = cuddl::reference_database<k_default, b_default, layout>;
+    constexpr uint32_t exponent = layout::exponent_bits;
     constexpr uint64_t seed = 42ULL;
     constexpr uint32_t minimum_matches = 3U;
     constexpr uint32_t reference_count = 4U;

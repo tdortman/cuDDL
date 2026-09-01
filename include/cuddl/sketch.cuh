@@ -82,10 +82,11 @@ struct sketch_scratch {
  * `uint32_t` saturation flag. A separate mapped pinned-host scratch area receives small
  * synchronous results without a device-to-host copy.
  */
-template <uint32_t K, size_t BucketCount>
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch {
    public:
-    using ref_type = sketch_ref<K, BucketCount>;
+    using ref_type = sketch_ref<K, BucketCount, Layout>;
+    using layout_type = Layout;
     using register_type = typename ref_type::register_type;
 
     /// @brief Allocates the register array plus saturation flag and clears it (aborts on failure).

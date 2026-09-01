@@ -61,7 +61,7 @@ __device__ summary_payload combine_payloads(summary_payload a, summary_payload c
  *
  * @p saturation records whether any register's winner count saturated.
  */
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ __launch_bounds__(block_size, 4) void add_kernel(
     uint64_t const* input,
     size_t input_size,
@@ -76,7 +76,7 @@ __global__ __launch_bounds__(block_size, 4) void add_kernel(
             auto const current = offset + stride * item;
             if (current < input_size) {
                 auto const hash = hash_kmer(input[current]);
-                update(&registers[bucket_of<BucketCount>(hash)], score(hash), saturation);
+                update(&registers[bucket_of<BucketCount>(hash)], score<Layout>(hash), saturation);
             }
         }
     }
@@ -107,7 +107,7 @@ constexpr uint32_t shared_construction_block_size = 768;
  * loop over 256-bit chunks, so the grid is a single balanced wave for every input size and the
  * per-CTA merge traffic stays minimal.
  */
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ __launch_bounds__(shared_construction_block_size) void add_shared_kernel(
     uint64_t const* input,
     size_t input_size,
@@ -148,7 +148,7 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     };
     auto const process = [&](uint64_t value) {
         auto const hash = hash_kmer(value);
-        auto const incoming = static_cast<uint32_t>(score(hash));
+        auto const incoming = static_cast<uint32_t>(score<Layout>(hash));
         auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
         auto const old = atomicMax(&state[bucket], (incoming << 16U) | 1U);
         settle();
@@ -205,7 +205,7 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
 /**
  * @brief Computes pairwise counts and optionally cardinality for two constructed sketches.
  */
-template <size_t BucketCount, bool IncludeCardinality>
+template <size_t BucketCount, bool IncludeCardinality, typename Layout = default_register_layout>
 __global__ void
 summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& output) {
     using block_reduce = cub::BlockReduce<summary_payload, block_size>;
@@ -221,7 +221,7 @@ summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& ou
             if (winner(left_reg) == 0U) {
                 ++local.empty;
             } else {
-                local.restored_sum += restore_midpoint(winner(left_reg));
+                local.restored_sum += restore_midpoint<Layout>(winner(left_reg));
             }
         }
     }
@@ -1050,7 +1050,7 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
  *
  * @p empty_out receives the empty-register count; @p estimate_out receives the estimate.
  */
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ void cardinality_kernel(
     uint32_t const* const registers,
     uint64_t* const empty_out,
@@ -1067,7 +1067,7 @@ __global__ void cardinality_kernel(
         if (stored == 0U) {
             ++local_empty;
         } else {
-            local_restored += static_cast<float>(restore_midpoint(stored));
+            local_restored += static_cast<float>(restore_midpoint<Layout>(stored));
         }
     }
     empty[threadIdx.x] = local_empty;
@@ -1089,7 +1089,7 @@ __global__ void cardinality_kernel(
     }
 }
 
-template <size_t BucketCount>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ void hybrid_cardinality_kernel(
     uint32_t const* const registers,
     hybrid_cardinality_estimates* const estimates
@@ -1108,8 +1108,8 @@ __global__ void hybrid_cardinality_kernel(
         if (stored == 0U) {
             atomicAdd(bins, 1U);
         } else {
-            atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            local_restored += static_cast<float>(restore(stored));
+            atomicAdd(bins + static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U, 1U);
+            local_restored += static_cast<float>(restore<Layout>(stored));
         }
     }
     restored[threadIdx.x] = local_restored;
@@ -1126,7 +1126,7 @@ __global__ void hybrid_cardinality_kernel(
     }
 }
 
-template <size_t BucketCount, hybrid_variant Variant>
+template <size_t BucketCount, hybrid_variant Variant, typename Layout = default_register_layout>
 __global__ void
 hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const estimate) {
     __shared__ uint32_t bins[nlz_bins];
@@ -1143,8 +1143,8 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
         if (stored == 0U) {
             atomicAdd(bins, 1U);
         } else {
-            atomicAdd(bins + static_cast<uint32_t>(stored >> mantissa_bits) + 1U, 1U);
-            local_restored += static_cast<float>(restore(stored));
+            atomicAdd(bins + static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U, 1U);
+            local_restored += static_cast<float>(restore<Layout>(stored));
         }
     }
     restored[threadIdx.x] = local_restored;

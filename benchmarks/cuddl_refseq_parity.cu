@@ -29,7 +29,8 @@
 namespace {
 
 using namespace std::chrono;
-using ddl_t = cuddl::reference_database<25, 4096>;
+using refseq_register_layout = cuddl::register_layout<5, 11>;
+using ddl_t = cuddl::reference_database<25, 4096, refseq_register_layout>;
 using json = nlohmann::json;
 
 /// @brief The official BBTools RefSeq DDL sketch asset pinned for parity validation.
@@ -48,7 +49,7 @@ struct asset_prerequisite {
     std::string sha256 = "4f7181c94c32e2e778ea1f4ec4edb8ba485a62549cc9460d842a5a7acaa8acc5";
     uint32_t k = 25;
     uint32_t buckets = 4096;
-    uint32_t exponent = 5;
+    uint32_t exponent = refseq_register_layout::exponent_bits;
     uint32_t records = 148108;
     bool merged = false;
 };
@@ -570,8 +571,9 @@ int main(int argc, char** argv) {
         );
         // The parity command is pinned to one 25/4096/e5 asset family (unmerged and merged
         // variants of refseqSketchDDL_k25e5b4096), so the construction parameters are
-        // provenance constants, not options: the GPU search type is `reference_database<25,
-        // 4096>`, and accepting other k/bucket/exponent values would only fail later.
+        // provenance constants, not options: the GPU search type is
+        // `reference_database<25, 4096, register_layout<5, 11>>`, and accepting other
+        // k/bucket/exponent values would only fail later.
         app.add_option(
             "--expect-records",
             prereq.records,
