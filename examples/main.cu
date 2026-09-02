@@ -42,50 +42,39 @@ int main(int argc, char** argv) {
     ));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
 
-    auto const left_ref = left.ref();
-    auto const right_ref = right.ref();
-    CUDDL_UNWRAP(left_ref.clear_async());
-    CUDDL_UNWRAP(left_ref.add_async(
-        {thrust::raw_pointer_cast(input.data()), input.size()}
-    ));
+    CUDDL_UNWRAP(left.clear_async());
+    CUDDL_UNWRAP(left.add_async({thrust::raw_pointer_cast(input.data()), input.size()}));
 
     thrust::device_vector<cuddl::pairwise_summary> summaries(3);
     auto* summary_output = thrust::raw_pointer_cast(summaries.data());
-    CUDDL_UNWRAP(left.summary_async(right_ref, summary_output[0]));
-    CUDDL_UNWRAP(left_ref.summary_async<true>(right_ref, summary_output[1]));
-    CUDDL_UNWRAP(left_ref.compare_async(right_ref, summary_output[2]));
+    CUDDL_UNWRAP(left.summary_async(right, summary_output[0]));
+    CUDDL_UNWRAP(left.summary_async<true>(right, summary_output[1]));
+    CUDDL_UNWRAP(left.compare_async(right, summary_output[2]));
 
     thrust::device_vector<uint64_t> empty(1);
     thrust::device_vector<double> estimate(1);
     CUDDL_UNWRAP(left.cardinality_async(
         thrust::raw_pointer_cast(empty.data()), thrust::raw_pointer_cast(estimate.data())
     ));
-    CUDDL_UNWRAP(left_ref.cardinality_async(
-        thrust::raw_pointer_cast(empty.data()), thrust::raw_pointer_cast(estimate.data())
-    ));
-
-    thrust::device_vector<uint16_t> counts(left_ref.bucket_count());
+    thrust::device_vector<uint16_t> counts(left.bucket_count());
     thrust::device_vector<uint32_t> saturated(1);
     CUDDL_UNWRAP(left.winner_counts_async(
         thrust::raw_pointer_cast(counts.data()), thrust::raw_pointer_cast(saturated.data())
     ));
-    CUDDL_UNWRAP(left_ref.winner_counts_async(
-        thrust::raw_pointer_cast(counts.data()), thrust::raw_pointer_cast(saturated.data())
-    ));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
 
-    auto const summary = CUDDL_UNWRAP(left.summary(right_ref));
-    auto const reverse = CUDDL_UNWRAP(right.compare(left_ref));
+    auto const summary = CUDDL_UNWRAP(left.summary(right));
+    auto const reverse = CUDDL_UNWRAP(right.compare(left));
     auto const cardinality = CUDDL_UNWRAP(left.cardinality());
     auto const winner_counts = CUDDL_UNWRAP(left.winner_counts());
 
-    auto const wkid = left_ref.wkid(summary);
-    auto const ani = left_ref.ani(summary);
-    auto const containment = right_ref.containment(reverse);
-    auto const completeness = right_ref.completeness(reverse);
+    auto const wkid = left.wkid(summary);
+    auto const ani = left.ani(summary);
+    auto const containment = right.containment(reverse);
+    auto const completeness = right.completeness(reverse);
 
-    std::cout << "k: " << left_ref.kmer_length() << '\n'
-              << "Buckets: " << left_ref.bucket_count() << '\n'
+    std::cout << "k: " << left.kmer_length() << '\n'
+              << "Buckets: " << left.bucket_count() << '\n'
               << "Left cardinality: " << cardinality << '\n'
               << "Left/right WKID: " << wkid.value_or(0.0) << '\n'
               << "Left/right ANI: " << ani.value_or(0.0) << '\n'

@@ -185,12 +185,11 @@ void cuddl_similarity(nvbench::state& state) {
     CUDDL_UNWRAP(left_sketch.add({d_left, left.size()}));
     CUDDL_UNWRAP(right_sketch.add({d_right, right.size()}));
 
-    auto const summary = CUDDL_UNWRAP(left_sketch.compare(right_sketch.ref()));
-    auto similarity = *left_sketch.ref().containment(summary);
+    auto const summary = CUDDL_UNWRAP(left_sketch.compare(right_sketch));
+    auto similarity = *decltype(left_sketch)::containment(summary);
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        auto timed_summary = CUDDL_UNWRAP(
-            left_sketch.compare(right_sketch.ref(), cuda::stream_ref{launch.get_stream()})
-        );
+        auto timed_summary =
+            CUDDL_UNWRAP(left_sketch.compare(right_sketch, cuda::stream_ref{launch.get_stream()}));
         auto equal = timed_summary.counts.equal;
         do_not_optimise(equal);
     });

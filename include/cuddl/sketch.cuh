@@ -6,14 +6,17 @@
 
 #include <thrust/device_vector.h>
 #include <thrust/memory.h>
+#include <algorithm>
+#include <cmath>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
+#include <cuddl/detail/sketch_view.cuh>
 #include <cuddl/error.hpp>
 #include <cuddl/hybrid_cardinality.cuh>
 #include <cuddl/pairwise_counts.cuh>
-#include <cuddl/sketch_ref.cuh>
 
 namespace cuddl {
 namespace detail {
@@ -85,9 +88,8 @@ struct sketch_scratch {
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch {
    public:
-    using ref_type = sketch_ref<K, BucketCount, Layout>;
     using layout_type = Layout;
-    using register_type = typename ref_type::register_type;
+    using register_type = uint32_t;
 
     /// @brief Allocates the register array plus saturation flag and clears it (aborts on failure).
     explicit sketch(cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}) {
@@ -98,7 +100,7 @@ class sketch {
         CUDDL_CUDA_ABORT(cudaHostGetDevicePointer(
             reinterpret_cast<void**>(&mapped_scratch_device_), mapped_scratch_, 0U
         ));
-        CUDDL_UNWRAP(ref().clear_async(stream));
+        CUDDL_UNWRAP(view().clear_async(stream));
         CUDDL_CUDA_ABORT(cudaStreamSynchronize(stream.get()));
     }
 
@@ -140,15 +142,30 @@ class sketch {
         }
     }
 
-    /// @brief Non-owning reference over this sketch's registers and saturation flag.
-    [[nodiscard]] ref_type ref() const noexcept {
-        return ref_type({storage_, BucketCount}, storage_[BucketCount]);
+    /// @brief Packed device registers.
+    [[nodiscard]] device_span<register_type> data() noexcept {
+        return {storage_, BucketCount};
+    }
+
+    /// @brief Packed device registers.
+    [[nodiscard]] device_span<register_type const> data() const noexcept {
+        return {storage_, BucketCount};
+    }
+
+    /// @brief Number of registers in the sketch.
+    [[nodiscard]] static constexpr size_t bucket_count() noexcept {
+        return BucketCount;
+    }
+
+    /// @brief Compile-time k-mer length.
+    [[nodiscard]] static constexpr uint32_t kmer_length() noexcept {
+        return K;
     }
 
     [[nodiscard]] Result<void> clear_async(
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().clear_async(stream);
+        return view().clear_async(stream);
     }
 
     [[nodiscard]] Result<void> clear(
@@ -164,7 +181,7 @@ class sketch {
         device_span<uint64_t const> input,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().add_async(input, stream);
+        return view().add_async(input, stream);
     }
 
     [[nodiscard]] Result<void> add(
@@ -194,22 +211,31 @@ class sketch {
     /// @brief Computes a fused pairwise summary into caller-owned device storage.
     template <bool IncludeCardinality = false>
     [[nodiscard]] Result<void> summary_async(
-        ref_type other,
+        sketch const& other,
         pairwise_summary& output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().template summary_async<IncludeCardinality>(other, output, stream);
+        return view().template summary_async<IncludeCardinality>(other.view(), output, stream);
+    }
+
+    /// @brief Computes raw pairwise counts into caller-owned device storage.
+    [[nodiscard]] Result<void> compare_async(
+        sketch const& other,
+        pairwise_summary& output,
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const noexcept {
+        return summary_async(other, output, stream);
     }
 
     /// @brief Host-side fused pairwise summary (uses mapped scratch, synchronises).
     template <bool IncludeCardinality = false>
     [[nodiscard]] Result<pairwise_summary> summary(
-        ref_type other,
+        sketch const& other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         auto* const output = &mapped_scratch_device_->summary;
         if (auto const result =
-                ref().template summary_async<IncludeCardinality>(other, *output, stream);
+                view().template summary_async<IncludeCardinality>(other.view(), *output, stream);
             !result) {
             return Err(result.error());
         }
@@ -221,10 +247,61 @@ class sketch {
 
     /// @brief Raw pairwise counts against @p other (host result).
     [[nodiscard]] Result<pairwise_summary> compare(
-        ref_type other,
+        sketch const& other,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return summary(other, stream);
+    }
+
+    /// @brief Weighted k-mer identity from a raw pair summary.
+    ///
+    /// Pads non-zero divisors below six to suppress similarity from sparse random collisions.
+    /// Returns `std::nullopt` when the divisor is zero.
+    [[nodiscard]] static std::optional<double> wkid(pairwise_summary const& summary) noexcept {
+        auto const equal = summary.counts.equal;
+        auto const divisor = equal + std::min(summary.counts.lower, summary.counts.higher);
+        if (divisor == 0U) {
+            return std::nullopt;
+        }
+        return static_cast<double>(equal) / static_cast<double>(std::max(divisor, 6U));
+    }
+
+    /// @brief Average nucleotide identity estimate from a raw pair summary.
+    [[nodiscard]] static std::optional<double> ani(pairwise_summary const& summary) noexcept {
+        auto const identity = wkid(summary);
+        if (!identity) {
+            return std::nullopt;
+        }
+        return std::pow(*identity, 1.0 / static_cast<double>(K));
+    }
+
+    /// @brief Fraction of the left sketch's content shared with the right sketch.
+    ///
+    /// `equal / (equal + higher)`; `std::nullopt` when the divisor is zero.
+    [[nodiscard]] static std::optional<double> containment(
+        pairwise_summary const& summary
+    ) noexcept {
+        auto const divisor = summary.counts.equal + summary.counts.higher;
+        if (divisor == 0U) {
+            return std::nullopt;
+        }
+        return static_cast<double>(summary.counts.equal) / static_cast<double>(divisor);
+    }
+
+    /// @brief Relative cardinality of the left sketch to the right sketch, clamped to `[0, 1]`.
+    ///
+    /// BBTools completeness: `(equal + higher) / (equal + lower)`; `std::nullopt` when the
+    /// divisor is zero. This is a size-ratio estimate, not reverse containment.
+    [[nodiscard]] static std::optional<double> completeness(
+        pairwise_summary const& summary
+    ) noexcept {
+        auto const divisor = summary.counts.equal + summary.counts.lower;
+        if (divisor == 0U) {
+            return std::nullopt;
+        }
+        auto const value = static_cast<double>(summary.counts.equal + summary.counts.higher) /
+                           static_cast<double>(divisor);
+        return std::clamp(value, 0.0, 1.0);
     }
 
     /// @brief Computes this sketch's hybridDDL cardinality reduction on the GPU.
@@ -233,7 +310,7 @@ class sketch {
         double* estimate_out,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().cardinality_async(empty_out, estimate_out, stream);
+        return view().cardinality_async(empty_out, estimate_out, stream);
     }
 
     /// @brief Host-side cardinality estimate for this sketch.
@@ -241,9 +318,7 @@ class sketch {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         auto* const output = &mapped_scratch_device_->cardinality;
-        if (auto const result = ref().cardinality_async(
-                &output->empty, &output->estimate, stream
-            );
+        if (auto const result = view().cardinality_async(&output->empty, &output->estimate, stream);
             !result) {
             return Err(result.error());
         }
@@ -258,7 +333,7 @@ class sketch {
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         auto* const output = &mapped_scratch_device_->hybrid;
-        if (auto const result = ref().hybrid_cardinality_async(output, stream); !result) {
+        if (auto const result = view().hybrid_cardinality_async(output, stream); !result) {
             return Err(result.error());
         }
         if (auto const result = cuda_try(cudaStreamSynchronize(stream.get())); !result) {
@@ -273,7 +348,7 @@ class sketch {
         uint32_t* saturation_out,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
-        return ref().winner_counts_async(counts_out, saturation_out, stream);
+        return view().winner_counts_async(counts_out, saturation_out, stream);
     }
 
     /// @brief Extracts per-register winner counts and saturation flag (host result).
@@ -283,7 +358,7 @@ class sketch {
         detail::device_buffer<uint16_t> counts(BucketCount);
         detail::device_buffer<uint32_t> saturation(1);
         if (auto const result =
-                ref().winner_counts_async(counts.pointer, saturation.pointer, stream);
+                view().winner_counts_async(counts.pointer, saturation.pointer, stream);
             !result) {
             return Err(result.error());
         }
@@ -311,6 +386,12 @@ class sketch {
     }
 
    private:
+    using view_type = detail::sketch_view<K, BucketCount, Layout>;
+
+    [[nodiscard]] view_type view() const noexcept {
+        return view_type({storage_, BucketCount}, storage_[BucketCount]);
+    }
+
     /// @brief One pad register after the saturation flag keeps the next allocation aligned.
     static constexpr size_t padded_prefix_words_ = BucketCount + 2U;
     static constexpr size_t allocation_words_ = padded_prefix_words_;

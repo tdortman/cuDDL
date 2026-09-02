@@ -284,9 +284,8 @@ std::string read_file_any(std::string const& path) {
     auto const blocks = find_bgzf_blocks(path, compressed_size);
     if (!blocks.empty()) {
         auto const requested = std::thread::hardware_concurrency();
-        auto const worker_count = std::min<size_t>(
-            requested == 0U ? 1U : requested, std::max<size_t>(1U, blocks.size())
-        );
+        auto const worker_count =
+            std::min<size_t>(requested == 0U ? 1U : requested, std::max<size_t>(1U, blocks.size()));
         std::vector<std::string> outputs(worker_count);
         std::vector<std::exception_ptr> errors(worker_count);
         std::vector<std::thread> workers;
@@ -533,11 +532,13 @@ manifest_selection pinned_manifest_selection(size_t record_count, uint32_t query
 
     manifest_selection selection;
     for (uint64_t i = 0; i < query_count; ++i) {
-        selection.queries.push_back(static_cast<uint32_t>(
-            query_count == 1U
-                ? 0U
-                : (i * (static_cast<uint64_t>(record_count) - 1U)) / (query_count - 1U)
-        ));
+        selection.queries.push_back(
+            static_cast<uint32_t>(
+                query_count == 1U
+                    ? 0U
+                    : (i * (static_cast<uint64_t>(record_count) - 1U)) / (query_count - 1U)
+            )
+        );
     }
     return selection;
 }
@@ -649,10 +650,11 @@ int main(int argc, char** argv) {
             "to the built-in pinned selection."
         );
         app.add_option(
-            "--query-count",
-            query_count,
-            "Queries selected by the built-in default (ignored with --manifest)"
-        )->check(CLI::PositiveNumber);
+               "--query-count",
+               query_count,
+               "Queries selected by the built-in default (ignored with --manifest)"
+        )
+            ->check(CLI::PositiveNumber);
         app.add_option("--min-hits", min_hits, "Minimum matching buckets to retain a candidate")
             ->check(CLI::NonNegativeNumber);
         app.add_option("--seed", seed, "Hash seed fallback when the asset has no #seed header");
@@ -703,10 +705,7 @@ int main(int argc, char** argv) {
             open_evidence();
             report_prerequisite(prereq, false);
             json evidence = make_benchmark_result(
-                "cuDDL RefSeq parity",
-                "refseq_parity",
-                "end_to_end",
-                json::array()
+                "cuDDL RefSeq parity", "refseq_parity", "end_to_end", json::array()
             );
             evidence["datasets"]["refseq"] = {
                 {"path", prereq.resource},
@@ -715,18 +714,19 @@ int main(int argc, char** argv) {
             evidence["measurements"].push_back({
                 {"implementation", {{"name", "cuDDL"}, {"variant", "GPU"}}},
                 {"case", {{"phase", "prerequisite"}}},
-                {"metrics", {
-                    {"ok", false},
-                    {"reason", "ASSET_NOT_AVAILABLE"},
-                    {"resource", prereq.resource},
-                    {"release", prereq.release},
-                    {"url", prereq.url},
-                    {"size_bytes_expected", prereq.size_bytes},
-                    {"k", prereq.k},
-                    {"buckets", prereq.buckets},
-                    {"exponent", prereq.exponent},
-                    {"merged", prereq.merged},
-                }},
+                {"metrics",
+                 {
+                     {"ok", false},
+                     {"reason", "ASSET_NOT_AVAILABLE"},
+                     {"resource", prereq.resource},
+                     {"release", prereq.release},
+                     {"url", prereq.url},
+                     {"size_bytes_expected", prereq.size_bytes},
+                     {"k", prereq.k},
+                     {"buckets", prereq.buckets},
+                     {"exponent", prereq.exponent},
+                     {"merged", prereq.merged},
+                 }},
             });
             auto const text = evidence.dump(2);
             FILE* out = evidence_file != nullptr ? evidence_file : stdout;
@@ -762,9 +762,8 @@ int main(int argc, char** argv) {
 
         // Decode A48
         auto const t_parse_start = now_ms();
-        auto decoded = cuddl::a48::decode_a48_tsv_parallel(
-            opaque, std::thread::hardware_concurrency()
-        );
+        auto decoded =
+            cuddl::a48::decode_a48_tsv_parallel(opaque, std::thread::hardware_concurrency());
         auto const t_parse_end = now_ms();
         if (!decoded) {
             throw std::runtime_error("A48 decode failed: " + decoded.error().message());
@@ -904,7 +903,7 @@ int main(int argc, char** argv) {
             thrust::device_vector<uint32_t> batch_exhaustive_count(1U);
 
             thrust::device_vector<uint8_t> batch_workspace;
-            using batch_result_t = ddl_t::ref_type::batch_result_type;
+            using batch_result_t = ddl_t::batch_result_type;
             thrust::device_vector<batch_result_t> batch_results;
             thrust::device_vector<batch_result_t> batch_exhaustive_results;
             std::vector<batch_result_t> batch_host;
@@ -947,9 +946,8 @@ int main(int argc, char** argv) {
                     sampler_stop.store(true, std::memory_order_relaxed);
                     sampler.join();
                     if (sample_free_low <= device_free_before) {
-                        device_peak_bytes = std::max(
-                            device_peak_bytes, device_free_before - sample_free_low
-                        );
+                        device_peak_bytes =
+                            std::max(device_peak_bytes, device_free_before - sample_free_low);
                     }
                 }
 
@@ -1233,10 +1231,10 @@ int main(int argc, char** argv) {
             // performed inside the measured GPU loop, so they hold across every measured run.
 
             auto const report_ok =
-                report.gpu_ran && report.candidates_match_oracle &&
-                report.summaries_match_oracle && report.summaries_match_exhaustive &&
-                report.decode_matches_bbtools && report.counts_match_bbtools &&
-                report.candidates_match_bbtools && report.summaries_match_bbtools;
+                report.gpu_ran && report.candidates_match_oracle && report.summaries_match_oracle &&
+                report.summaries_match_exhaustive && report.decode_matches_bbtools &&
+                report.counts_match_bbtools && report.candidates_match_bbtools &&
+                report.summaries_match_bbtools;
             ok = ok && report_ok;
         }
 
@@ -1359,9 +1357,11 @@ int main(int argc, char** argv) {
             auto const bbtools_timings = bbtools.at("timings_seconds");
             auto const bbtools_raw_memory = bbtools.value("memory_bytes", json::object());
             auto const bbtools_memory = json{
-                {"heap_used_before_index", bbtools_raw_memory.value("heap_used_before_index", size_t{0})},
+                {"heap_used_before_index",
+                 bbtools_raw_memory.value("heap_used_before_index", size_t{0})},
                 {"heap_used_after_csr", bbtools_raw_memory.value("heap_used_after_csr", size_t{0})},
-                {"heap_used_after_csr2", bbtools_raw_memory.value("heap_used_after_csr2", size_t{0})},
+                {"heap_used_after_csr2",
+                 bbtools_raw_memory.value("heap_used_after_csr2", size_t{0})},
                 {"heap_used_peak", bbtools_raw_memory.value("heap_used_peak", size_t{0})},
                 {"nonempty_slots", bbtools_raw_memory.value("nonempty_slots", size_t{0})},
                 {"index_csr_bytes", bbtools_raw_memory.value("index_csr_bytes", size_t{0})},
@@ -1380,9 +1380,10 @@ int main(int argc, char** argv) {
                 "Java",
                 make_case("index_build"),
                 bbtools_metrics,
-                {{"wall_clock", timing_summary_seconds(
-                    bbtools_timings.at("index_build_csr_runs"), "BBTools Java"
-                )}},
+                {{"wall_clock",
+                  timing_summary_seconds(
+                      bbtools_timings.at("index_build_csr_runs"), "BBTools Java"
+                  )}},
                 bbtools_memory
             );
             append_measurement(
@@ -1391,9 +1392,10 @@ int main(int argc, char** argv) {
                 "Java",
                 make_case("index_build"),
                 bbtools_metrics,
-                {{"wall_clock", timing_summary_seconds(
-                    bbtools_timings.at("index_build_csr2_runs"), "BBTools Java"
-                )}},
+                {{"wall_clock",
+                  timing_summary_seconds(
+                      bbtools_timings.at("index_build_csr2_runs"), "BBTools Java"
+                  )}},
                 bbtools_memory
             );
             append_measurement(
@@ -1402,9 +1404,10 @@ int main(int argc, char** argv) {
                 "Java",
                 make_case("query_batch"),
                 bbtools_metrics,
-                {{"wall_clock", timing_summary_seconds(
-                    bbtools_timings.at("query_batch_csr_runs"), "BBTools Java"
-                )}},
+                {{"wall_clock",
+                  timing_summary_seconds(
+                      bbtools_timings.at("query_batch_csr_runs"), "BBTools Java"
+                  )}},
                 bbtools_memory
             );
             append_measurement(
@@ -1413,9 +1416,8 @@ int main(int argc, char** argv) {
                 "Java",
                 make_case("query_batch"),
                 bbtools_metrics,
-                {{"wall_clock", timing_summary_seconds(
-                    bbtools_timings.at("query_batch_runs"), "BBTools Java"
-                )}},
+                {{"wall_clock",
+                  timing_summary_seconds(bbtools_timings.at("query_batch_runs"), "BBTools Java")}},
                 bbtools_memory
             );
         }
@@ -1490,10 +1492,7 @@ int main(int argc, char** argv) {
         );
 
         json evidence = make_benchmark_result(
-            "cuDDL RefSeq parity",
-            "refseq_parity",
-            "end_to_end",
-            std::move(measurements)
+            "cuDDL RefSeq parity", "refseq_parity", "end_to_end", std::move(measurements)
         );
         evidence["datasets"]["refseq"] = {
             {"path", asset_path},

@@ -200,6 +200,8 @@ indexed_batch_query_tile_size(uint32_t reference_count, uint32_t query_count) no
 
 }  // namespace detail
 
+namespace detail {
+
 /**
  * @brief Non-owning, trivially copyable view of one selected reference-row backing.
  *
@@ -207,7 +209,7 @@ indexed_batch_query_tile_size(uint32_t reference_count, uint32_t query_count) no
  * completes.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
-class reference_database_ref {
+class reference_database_view {
     static_assert(K >= 1 && K <= 31);
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
@@ -219,7 +221,7 @@ class reference_database_ref {
     using result_type = reference_search_result;
     using batch_result_type = batch_search_result;
 
-    __host__ __device__ constexpr reference_database_ref(
+    __host__ __device__ constexpr reference_database_view(
         device_span<score_type const> rows,
         reference_database_metadata metadata,
         device_span<uint32_t const> index_offsets = {},
@@ -232,7 +234,7 @@ class reference_database_ref {
           index_postings_(index_postings),
           indexed_(indexed) {}
 
-    __host__ __device__ constexpr reference_database_ref(
+    __host__ __device__ constexpr reference_database_view(
         device_span<register_type const> packed_rows,
         device_span<uint32_t const> saturation_states,
         reference_database_metadata metadata,
@@ -1254,6 +1256,8 @@ class reference_database_ref {
     bool indexed_{};
 };
 
+}  // namespace detail
+
 /**
  * @brief Move-only owner of one immutable contiguous reference database.
  *
@@ -1267,12 +1271,11 @@ class reference_database {
     static_assert((BucketCount & (BucketCount - 1)) == 0);
 
    public:
-    using ref_type = reference_database_ref<K, BucketCount, Layout>;
     using layout_type = Layout;
-    using score_type = typename ref_type::score_type;
-    using register_type = typename ref_type::register_type;
-    using result_type = typename ref_type::result_type;
-    using batch_result_type = typename ref_type::batch_result_type;
+    using score_type = uint16_t;
+    using register_type = uint32_t;
+    using result_type = reference_search_result;
+    using batch_result_type = batch_search_result;
 
     reference_database(reference_database const&) = delete;
     reference_database& operator=(reference_database const&) = delete;
@@ -1413,30 +1416,18 @@ class reference_database {
         );
     }
 
-    [[nodiscard]] ref_type ref() const noexcept {
-        auto const offset_count =
-            indexed_ ? static_cast<size_t>(detail::indexed_cell_count(metadata_.compatibility) + 1U)
-                     : 0U;
-        auto const row_count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        auto const offsets = device_span<uint32_t const>{index_offsets_, offset_count};
-        auto const postings = device_span<uint32_t const>{index_postings_, index_posting_capacity_};
-        if (packed_) {
-            return ref_type(
-                {static_cast<register_type const*>(rows_), row_count},
-                {saturation_states_, metadata_.reference_count},
-                metadata_,
-                offsets,
-                postings,
-                indexed_
-            );
-        }
-        return ref_type(
-            {static_cast<score_type const*>(rows_), row_count},
-            metadata_,
-            offsets,
-            postings,
-            indexed_
-        );
+    [[nodiscard]] device_span<score_type const> data() const noexcept {
+        return view().data();
+    }
+
+    /// @brief Packed winner/count rows, or an empty span for compact databases.
+    [[nodiscard]] device_span<register_type const> packed_data() const noexcept {
+        return view().packed_data();
+    }
+
+    /// @brief Per-reference saturation states retained with packed rows.
+    [[nodiscard]] device_span<uint32_t const> saturation_states() const noexcept {
+        return view().saturation_states();
     }
 
     [[nodiscard]] reference_database_metadata metadata() const noexcept {
@@ -1456,67 +1447,67 @@ class reference_database {
     }
 
     [[nodiscard]] static constexpr size_t persistent_row_bytes(uint32_t reference_count) noexcept {
-        return ref_type::persistent_row_bytes(reference_count);
+        return view_type::persistent_row_bytes(reference_count);
     }
 
     [[nodiscard]] static constexpr size_t persistent_packed_row_bytes(
         uint32_t reference_count
     ) noexcept {
-        return ref_type::persistent_packed_row_bytes(reference_count);
+        return view_type::persistent_packed_row_bytes(reference_count);
     }
 
     [[nodiscard]] size_t persistent_row_bytes() const noexcept {
-        return ref().persistent_row_bytes();
+        return view().persistent_row_bytes();
     }
 
     [[nodiscard]] size_t persistent_index_bytes() const noexcept {
-        return ref().persistent_index_bytes();
+        return view().persistent_index_bytes();
     }
 
     [[nodiscard]] static constexpr size_t single_query_workspace_bytes(
         uint32_t reference_count
     ) noexcept {
-        return ref_type::single_query_workspace_bytes(reference_count);
+        return view_type::single_query_workspace_bytes(reference_count);
     }
 
     [[nodiscard]] size_t single_query_workspace_bytes() const noexcept {
-        return ref().single_query_workspace_bytes();
+        return view().single_query_workspace_bytes();
     }
 
     [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes() const {
-        return ref().indexed_single_query_workspace_bytes();
+        return view().indexed_single_query_workspace_bytes();
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements> batch_search_requirements(
         uint32_t query_count
     ) const {
-        return ref().batch_search_requirements(query_count);
+        return view().batch_search_requirements(query_count);
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
         uint32_t query_count
     ) const {
-        return ref().indexed_batch_search_requirements(query_count);
+        return view().indexed_batch_search_requirements(query_count);
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        return ref().all_to_all_search_requirements(first_query_id, query_count);
+        return view().all_to_all_search_requirements(first_query_id, query_count);
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        return ref().indexed_all_to_all_search_requirements(first_query_id, query_count);
+        return view().indexed_all_to_all_search_requirements(first_query_id, query_count);
     }
 
     [[nodiscard]] static constexpr uint32_t single_query_result_count(
         uint32_t reference_count
     ) noexcept {
-        return ref_type::single_query_result_count(reference_count);
+        return view_type::single_query_result_count(reference_count);
     }
 
     [[nodiscard]] uint32_t single_query_result_count() const noexcept {
-        return ref().single_query_result_count();
+        return view().single_query_result_count();
     }
 
     [[nodiscard]] Result<void> search_async(
@@ -1526,7 +1517,7 @@ class reference_database {
         device_span<result_type> results,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_async(query, query_compatibility, workspace, results, stream);
+        return view().search_async(query, query_compatibility, workspace, results, stream);
     }
 
     /// @brief Thrust overload for caller-owned query, workspace, and result storage.
@@ -1555,7 +1546,7 @@ class reference_database {
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_indexed_async(
+        return view().search_indexed_async(
             query, query_compatibility, workspace, results, result_count, options, stream
         );
     }
@@ -1591,7 +1582,7 @@ class reference_database {
         device_span<uint32_t> result_match_counts = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_batch_async(
+        return view().search_batch_async(
             queries,
             query_compatibility,
             query_id_offset,
@@ -1659,7 +1650,7 @@ class reference_database {
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_batch_indexed_async(
+        return view().search_batch_indexed_async(
             queries,
             query_compatibility,
             query_id_offset,
@@ -1730,7 +1721,7 @@ class reference_database {
         device_span<uint32_t> result_match_counts = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_all_to_all_async(
+        return view().search_all_to_all_async(
             first_query_id,
             query_count,
             workspace,
@@ -1792,7 +1783,7 @@ class reference_database {
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
-        return ref().search_all_to_all_indexed_async(
+        return view().search_all_to_all_indexed_async(
             first_query_id,
             query_count,
             workspace,
@@ -1850,6 +1841,34 @@ class reference_database {
     }
 
    private:
+    using view_type = detail::reference_database_view<K, BucketCount, Layout>;
+
+    [[nodiscard]] view_type view() const noexcept {
+        auto const offset_count =
+            indexed_ ? static_cast<size_t>(detail::indexed_cell_count(metadata_.compatibility) + 1U)
+                     : 0U;
+        auto const row_count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
+        auto const offsets = device_span<uint32_t const>{index_offsets_, offset_count};
+        auto const postings = device_span<uint32_t const>{index_postings_, index_posting_capacity_};
+        if (packed_) {
+            return view_type(
+                {static_cast<register_type const*>(rows_), row_count},
+                {saturation_states_, metadata_.reference_count},
+                metadata_,
+                offsets,
+                postings,
+                indexed_
+            );
+        }
+        return view_type(
+            {static_cast<score_type const*>(rows_), row_count},
+            metadata_,
+            offsets,
+            postings,
+            indexed_
+        );
+    }
+
     reference_database() = default;
 
     template <typename Row>

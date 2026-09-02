@@ -286,14 +286,12 @@ exact_pair_metrics(size_t left, size_t right, size_t intersection, double actual
     return *value;
 }
 
-[[nodiscard]] metrics
-sketch_metrics(sketch_type const& left, cuddl::pairwise_summary const& summary) {
-    auto const ref = left.ref();
+[[nodiscard]] metrics sketch_metrics(cuddl::pairwise_summary const& summary) {
     return {
-        .containment = require(ref.containment(summary), "containment"),
-        .completeness = require(ref.completeness(summary), "completeness"),
-        .wkid = require(ref.wkid(summary), "WKID"),
-        .ani = require(ref.ani(summary), "ANI"),
+        .containment = require(sketch_type::containment(summary), "containment"),
+        .completeness = require(sketch_type::completeness(summary), "completeness"),
+        .wkid = require(sketch_type::wkid(summary), "WKID"),
+        .ani = require(sketch_type::ani(summary), "ANI"),
     };
 }
 
@@ -327,9 +325,9 @@ void emit_orientation(
     size_t intersection,
     error_samples& errors
 ) {
-    auto const summary = CUDDL_UNWRAP(left.compare(right.ref()));
+    auto const summary = CUDDL_UNWRAP(left.compare(right));
     auto const exact = exact_pair_metrics(left_size, right_size, intersection, input.actual_ani);
-    auto const estimate = sketch_metrics(left, summary);
+    auto const estimate = sketch_metrics(summary);
     auto const& counts = summary.counts;
     auto const primary_orientation = std::string_view{orientation} == "query_to_reference";
 

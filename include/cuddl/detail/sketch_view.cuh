@@ -4,10 +4,6 @@
 #include <cuda/std/cstdint>
 #include <cuda/stream_ref>
 
-#include <algorithm>
-#include <cmath>
-#include <optional>
-
 #include <cuddl/detail/construction.cuh>
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/device_span.cuh>
@@ -15,17 +11,17 @@
 #include <cuddl/hybrid_cardinality.cuh>
 #include <cuddl/pairwise_counts.cuh>
 
-namespace cuddl {
+namespace cuddl::detail {
 
 /**
- * @brief Non-owning, trivially copyable device reference to a DDL sketch.
+ * @brief Non-owning implementation view of a DDL sketch.
  *
  * Provides allocation-free, stream-ordered operations on an external contiguous allocation. The
  * allocation must contain `BucketCount` packed `uint32_t` registers followed by one aligned
  * `uint32_t` saturation flag. Pass by value into device or host code.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
-class sketch_ref {
+class sketch_view {
     static_assert(K >= 1 && K <= 31);
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
@@ -35,7 +31,7 @@ class sketch_ref {
     using layout_type = Layout;
 
     /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
-    __host__ __device__ constexpr sketch_ref(
+    __host__ __device__ constexpr sketch_view(
         device_span<register_type> registers,
         uint32_t& saturation
     ) noexcept
@@ -90,7 +86,7 @@ class sketch_ref {
     /// @p output must point at device memory valid until @p stream completes.
     template <bool IncludeCardinality = false>
     [[nodiscard]] Result<void> summary_async(
-        sketch_ref other,
+        sketch_view other,
         pairwise_summary& output,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const noexcept {
@@ -99,15 +95,6 @@ class sketch_ref {
                 registers_.data(), other.registers_.data(), output
             );
         return cuda_try(cudaGetLastError());
-    }
-
-    /// @brief Computes raw pairwise counts into caller-owned device storage.
-    [[nodiscard]] Result<void> compare_async(
-        sketch_ref other,
-        pairwise_summary& output,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const noexcept {
-        return summary_async(other, output, stream);
     }
 
     /// @brief Computes this sketch's cardinality reduction on the GPU.
@@ -149,60 +136,9 @@ class sketch_ref {
         return cuda_try(cudaGetLastError());
     }
 
-    /// @brief Weighted k-mer identity from a raw pair summary.
-    ///
-    /// Pads non-zero divisors below six to suppress similarity from sparse random collisions.
-    /// Returns `std::nullopt` when the divisor is zero.
-    [[nodiscard]] std::optional<double> wkid(pairwise_summary const& summary) const noexcept {
-        auto const equal = summary.counts.equal;
-        auto const divisor = equal + std::min(summary.counts.lower, summary.counts.higher);
-        if (divisor == 0U) {
-            return std::nullopt;
-        }
-        return static_cast<double>(equal) / static_cast<double>(std::max(divisor, 6U));
-    }
-
-    /// @brief Average nucleotide identity estimate from a raw pair summary.
-    [[nodiscard]] std::optional<double> ani(pairwise_summary const& summary) const noexcept {
-        auto const identity = wkid(summary);
-        if (!identity) {
-            return std::nullopt;
-        }
-        return std::pow(*identity, 1.0 / static_cast<double>(K));
-    }
-
-    /// @brief Fraction of `this`'s content shared with the other sketch.
-    ///
-    /// `equal / (equal + higher)`; `std::nullopt` when the divisor is zero.
-    [[nodiscard]] std::optional<double> containment(
-        pairwise_summary const& summary
-    ) const noexcept {
-        auto const divisor = summary.counts.equal + summary.counts.higher;
-        if (divisor == 0U) {
-            return std::nullopt;
-        }
-        return static_cast<double>(summary.counts.equal) / static_cast<double>(divisor);
-    }
-
-    /// @brief Relative cardinality of `this` to the other sketch, clamped to `[0, 1]`.
-    ///
-    /// BBTools completeness: `(equal + higher) / (equal + lower)`; `std::nullopt` when the
-    /// divisor is zero. This is a size-ratio estimate, not reverse containment.
-    [[nodiscard]] std::optional<double> completeness(
-        pairwise_summary const& summary
-    ) const noexcept {
-        auto const divisor = summary.counts.equal + summary.counts.lower;
-        if (divisor == 0U) {
-            return std::nullopt;
-        }
-        auto const value = static_cast<double>(summary.counts.equal + summary.counts.higher) /
-                           static_cast<double>(divisor);
-        return std::clamp(value, 0.0, 1.0);
-    }
-
    private:
     device_span<register_type> registers_;
     uint32_t& saturation_;
 };
 
-}  // namespace cuddl
+}  // namespace cuddl::detail

@@ -52,15 +52,14 @@ struct run_result {
 
 /// @brief Fills metric fields of @p r from raw pairwise counts via the library metric methods.
 void fill_metrics(run_result& r, cuddl::pairwise_counts const& counts, uint32_t k) {
-    uint32_t saturation{};
-    cuddl::sketch_ref<25, 2048> metrics{{}, saturation};
+    using sketch_type = cuddl::sketch<25, 2048>;
     cuddl::pairwise_summary summary;
     summary.counts = counts;
-    auto const wkid = metrics.wkid(summary);
+    auto const wkid = sketch_type::wkid(summary);
     if (wkid) {
         r.valid_metric = true;
         r.wkid = *wkid;
-        auto const ani = metrics.ani(summary);
+        auto const ani = sketch_type::ani(summary);
         if (ani) {
             r.ani = *ani;
         }
@@ -150,7 +149,7 @@ run_result run_gpu(
     r.construction_ms = construction;
 
     t0 = steady_clock_t::now();
-    auto const summary = CUDDL_UNWRAP(query_sketch.compare(ref_sketch.ref()));
+    auto const summary = CUDDL_UNWRAP(query_sketch.compare(ref_sketch));
     r.comparison_ms = std::chrono::duration<double, std::milli>(steady_clock_t::now() - t0).count();
 
     r.lower = summary.counts.lower;

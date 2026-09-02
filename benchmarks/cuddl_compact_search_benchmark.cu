@@ -5,16 +5,16 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cub/warp/warp_reduce.cuh>
-#include <nvbench/nvbench.cuh>
 #include <nvbench/main.cuh>
+#include <nvbench/nvbench.cuh>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 
 #include <cctype>
 #include <filesystem>
@@ -279,9 +279,7 @@ void launch_cooperative_exhaustive(
 }
 
 std::vector<nvbench::int64_t> const
-    parameter_reference_counts{
-        1, 64, 1024, 2048, 2560, 3072, 4096, 8192, 16384, 65536, 200687
-    };
+    parameter_reference_counts{1, 64, 1024, 2048, 2560, 3072, 4096, 8192, 16384, 65536, 200687};
 std::vector<std::string> const parameter_row_types{"compact", "packed"};
 std::vector<std::string> const parameter_launches{
     "cub_b32_w1", "cub_b64_w1", "cub_b128_w1", "cub_b256_w1", "cub_b512_w1", "cub_b1024_w1",
@@ -673,9 +671,8 @@ class pipeline_failure : public std::runtime_error {
    public:
     using std::runtime_error::runtime_error;
 };
-__global__ void extract_winner_scores_kernel(
-    uint32_t const* registers, uint16_t* scores, size_t count
-) {
+__global__ void
+extract_winner_scores_kernel(uint32_t const* registers, uint16_t* scores, size_t count) {
     for (auto i = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x); i < count;
          i += static_cast<size_t>(blockDim.x * gridDim.x)) {
         scores[i] = cuddl::detail::winner(registers[i]);
@@ -734,9 +731,7 @@ std::string pipeline_sha256(std::string const& path) {
             break;
         }
         if (std::isxdigit(static_cast<unsigned char>(character))) {
-            hex.push_back(
-                static_cast<char>(std::tolower(static_cast<unsigned char>(character)))
-            );
+            hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
         }
     }
     if (hex.size() != 64U) {
@@ -786,7 +781,9 @@ template <typename Function>
 struct pipeline_callable {
     Function function;
 
-    void operator()(nvbench::state& state, nvbench::type_list<>) { function(state); }
+    void operator()(nvbench::state& state, nvbench::type_list<>) {
+        function(state);
+    }
 };
 
 template <typename Function>
@@ -798,9 +795,7 @@ json pipeline_measure(
 ) {
     using function_type = std::decay_t<Function>;
     using callable_type = pipeline_callable<function_type>;
-    nvbench::benchmark<callable_type> benchmark(
-        callable_type{std::forward<Function>(function)}
-    );
+    nvbench::benchmark<callable_type> benchmark(callable_type{std::forward<Function>(function)});
     benchmark.set_name(name)
         .add_string_axis("Stage", std::move(stages))
         .set_stopping_criterion("sample-count")
@@ -826,10 +821,9 @@ json pipeline_measure(
         }
         auto const prefix = std::string{measurement} + "/time/" + clock;
         measurements[state.get_string("Stage")] = {
-            {"samples", state.get_summary(std::string{measurement} + "/sample_size")
-                            .get_int64("value")},
-            {"median_ms",
-             state.get_summary(prefix + "/median").get_float64("value") * 1000.0},
+            {"samples",
+             state.get_summary(std::string{measurement} + "/sample_size").get_int64("value")},
+            {"median_ms", state.get_summary(prefix + "/median").get_float64("value") * 1000.0},
             {"min_ms", state.get_summary(prefix + "/min").get_float64("value") * 1000.0},
             {"max_ms", state.get_summary(prefix + "/max").get_float64("value") * 1000.0},
             {"relative_stddev_percent",
@@ -840,11 +834,10 @@ json pipeline_measure(
 }
 
 json run_pipeline(pipeline_options const& options) {
-    auto const benchmark_name = options.name.empty()
-                                    ? std::filesystem::path(options.reference).stem().string() +
-                                          " vs " +
-                                          std::filesystem::path(options.query).stem().string()
-                                    : options.name;
+    auto const benchmark_name =
+        options.name.empty() ? std::filesystem::path(options.reference).stem().string() + " vs " +
+                                   std::filesystem::path(options.query).stem().string()
+                             : options.name;
     auto const checksum_reference = pipeline_sha256(options.reference);
     auto const checksum_query = pipeline_sha256(options.query);
 
@@ -875,12 +868,12 @@ json run_pipeline(pipeline_options const& options) {
     constexpr uint32_t extract_grid =
         static_cast<uint32_t>((k_pipeline_buckets + extract_block - 1) / extract_block);
     extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
-        thrust::raw_pointer_cast(reference_sketch.ref().data().data()),
+        thrust::raw_pointer_cast(reference_sketch.data().data()),
         thrust::raw_pointer_cast(device_reference_rows.data()),
         k_pipeline_buckets
     );
     extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
-        thrust::raw_pointer_cast(query_sketch.ref().data().data()),
+        thrust::raw_pointer_cast(query_sketch.data().data()),
         thrust::raw_pointer_cast(device_query_rows.data()),
         k_pipeline_buckets
     );
@@ -890,41 +883,41 @@ json run_pipeline(pipeline_options const& options) {
     auto const compatibility =
         cuddl::score_compatibility::current<k_pipeline_k, k_pipeline_buckets>();
 
-    auto bare_database = pipeline_unwrap(
-        pipeline_database::build_async(device_reference_rows, compatibility)
-    );
+    auto bare_database =
+        pipeline_unwrap(pipeline_database::build_async(device_reference_rows, compatibility));
 
     auto database = pipeline_unwrap(
         pipeline_database::build_indexed_async(device_reference_rows, compatibility)
     );
 
-    auto const workspace_bytes =
-        pipeline_unwrap(database.ref().indexed_single_query_workspace_bytes());
+    auto const workspace_bytes = pipeline_unwrap(database.indexed_single_query_workspace_bytes());
     thrust::device_vector<cuddl::reference_search_result> exhaustive_results(
-        database.ref().reference_count()
+        database.reference_count()
     );
     thrust::device_vector<cuddl::reference_search_result> indexed_results(
-        database.ref().reference_count()
+        database.reference_count()
     );
     thrust::device_vector<uint8_t> workspace(workspace_bytes);
     thrust::device_vector<uint32_t> result_count(1U);
 
     auto const query_span = cuddl::device_span<uint16_t const>{
-        thrust::raw_pointer_cast(device_query_rows.data()), device_query_rows.size()};
+        thrust::raw_pointer_cast(device_query_rows.data()), device_query_rows.size()
+    };
     auto exhaustive_span = cuddl::device_span<cuddl::reference_search_result>{
-        thrust::raw_pointer_cast(exhaustive_results.data()), exhaustive_results.size()};
+        thrust::raw_pointer_cast(exhaustive_results.data()), exhaustive_results.size()
+    };
     auto indexed_span = cuddl::device_span<cuddl::reference_search_result>{
-        thrust::raw_pointer_cast(indexed_results.data()), indexed_results.size()};
-    auto workspace_span = cuddl::device_span<uint8_t>{
-        thrust::raw_pointer_cast(workspace.data()), workspace.size()};
+        thrust::raw_pointer_cast(indexed_results.data()), indexed_results.size()
+    };
+    auto workspace_span =
+        cuddl::device_span<uint8_t>{thrust::raw_pointer_cast(workspace.data()), workspace.size()};
     auto count_span = cuddl::device_span<uint32_t>{
-        thrust::raw_pointer_cast(result_count.data()), result_count.size()};
+        thrust::raw_pointer_cast(result_count.data()), result_count.size()
+    };
 
-    pipeline_check(
-        database.ref().search_async(query_span, compatibility, {}, exhaustive_span)
-    );
+    pipeline_check(database.search_async(query_span, compatibility, {}, exhaustive_span));
 
-    pipeline_check(database.ref().search_indexed_async(
+    pipeline_check(database.search_indexed_async(
         query_span,
         compatibility,
         workspace_span,
@@ -940,13 +933,9 @@ json run_pipeline(pipeline_options const& options) {
     auto const host_peak = pipeline_host_peak_bytes();
 
     auto timing_statistics = pipeline_measure(
-        "pipeline_parse",
-        {"parse_reference", "parse_query"},
-        true,
-        [&](nvbench::state& state) {
-            auto const& path = state.get_string("Stage") == "parse_reference"
-                                   ? options.reference
-                                   : options.query;
+        "pipeline_parse", {"parse_reference", "parse_query"}, true, [&](nvbench::state& state) {
+            auto const& path =
+                state.get_string("Stage") == "parse_reference" ? options.reference : options.query;
             state.exec(nvbench::exec_tag::timer, [&](nvbench::launch&, auto& timer) {
                 timer.start();
                 auto parsed = cuddl::detail::parse_fasta(path, k_pipeline_k);
@@ -977,85 +966,93 @@ json run_pipeline(pipeline_options const& options) {
             state.exec(
                 nvbench::exec_tag::sync | nvbench::exec_tag::timer,
                 [&](nvbench::launch& launch, auto& timer) {
-                auto const stream = cuda::stream_ref{launch.get_stream()};
-                if (stage == "host_to_device_transfer") {
-                    timer.start();
-                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                        thrust::raw_pointer_cast(device_reference_kmers.data()),
-                        reference_kmers.kmers.data(),
-                        reference_kmers.kmers.size() * sizeof(uint64_t),
-                        cudaMemcpyHostToDevice,
-                        launch.get_stream()
-                    ));
-                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                        thrust::raw_pointer_cast(device_query_kmers.data()),
-                        query_kmers.kmers.data(),
-                        query_kmers.kmers.size() * sizeof(uint64_t),
-                        cudaMemcpyHostToDevice,
-                        launch.get_stream()
-                    ));
-                    timer.stop();
-                } else if (stage == "sketch_reference") {
-                    pipeline_check(reference_sketch.clear_async(stream));
-                    timer.start();
-                    pipeline_check(reference_sketch.add_async(device_reference_kmers, stream));
-                    timer.stop();
-                } else if (stage == "sketch_query") {
-                    pipeline_check(query_sketch.clear_async(stream));
-                    timer.start();
-                    pipeline_check(query_sketch.add_async(device_query_kmers, stream));
-                    timer.stop();
-                } else if (stage == "sketch_extract") {
-                    timer.start();
-                    extract_winner_scores_kernel<<<extract_grid, extract_block, 0, launch.get_stream()>>>(
-                        thrust::raw_pointer_cast(reference_sketch.ref().data().data()),
-                        thrust::raw_pointer_cast(device_reference_rows.data()),
-                        k_pipeline_buckets
-                    );
-                    extract_winner_scores_kernel<<<extract_grid, extract_block, 0, launch.get_stream()>>>(
-                        thrust::raw_pointer_cast(query_sketch.ref().data().data()),
-                        thrust::raw_pointer_cast(device_query_rows.data()),
-                        k_pipeline_buckets
-                    );
-                    CUDDL_CUDA_CALL(cudaGetLastError());
-                    timer.stop();
-                } else if (stage == "database_build") {
-                    timer.start();
-                    auto measured = pipeline_database::build_async(
-                        device_reference_rows, compatibility, stream
-                    );
-                    timer.stop();
-                    auto measured_database = pipeline_unwrap(std::move(measured));
-                    do_not_optimise(measured_database);
-                } else if (stage == "index_build") {
-                    timer.start();
-                    auto measured = pipeline_database::build_indexed_async(
-                        device_reference_rows, compatibility, stream
-                    );
-                    timer.stop();
-                    auto measured_database = pipeline_unwrap(std::move(measured));
-                    do_not_optimise(measured_database);
-                } else if (stage == "search_exhaustive") {
-                    timer.start();
-                    pipeline_check(database.ref().search_async(
-                        query_span, compatibility, {}, exhaustive_span, stream
-                    ));
-                    timer.stop();
-                } else if (stage == "search_indexed") {
-                    timer.start();
-                    pipeline_check(database.ref().search_indexed_async(
-                        query_span,
-                        compatibility,
-                        workspace_span,
-                        indexed_span,
-                        count_span,
-                        {.minimum_matches = options.minimum_matches},
-                        stream
-                    ));
-                    timer.stop();
-                } else {
-                    throw pipeline_failure("unknown pipeline timing stage: " + stage);
-                }
+                    auto const stream = cuda::stream_ref{launch.get_stream()};
+                    if (stage == "host_to_device_transfer") {
+                        timer.start();
+                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                            thrust::raw_pointer_cast(device_reference_kmers.data()),
+                            reference_kmers.kmers.data(),
+                            reference_kmers.kmers.size() * sizeof(uint64_t),
+                            cudaMemcpyHostToDevice,
+                            launch.get_stream()
+                        ));
+                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                            thrust::raw_pointer_cast(device_query_kmers.data()),
+                            query_kmers.kmers.data(),
+                            query_kmers.kmers.size() * sizeof(uint64_t),
+                            cudaMemcpyHostToDevice,
+                            launch.get_stream()
+                        ));
+                        timer.stop();
+                    } else if (stage == "sketch_reference") {
+                        pipeline_check(reference_sketch.clear_async(stream));
+                        timer.start();
+                        pipeline_check(reference_sketch.add_async(device_reference_kmers, stream));
+                        timer.stop();
+                    } else if (stage == "sketch_query") {
+                        pipeline_check(query_sketch.clear_async(stream));
+                        timer.start();
+                        pipeline_check(query_sketch.add_async(device_query_kmers, stream));
+                        timer.stop();
+                    } else if (stage == "sketch_extract") {
+                        timer.start();
+                        extract_winner_scores_kernel<<<
+                            extract_grid,
+                            extract_block,
+                            0,
+                            launch.get_stream()>>>(
+                            thrust::raw_pointer_cast(reference_sketch.data().data()),
+                            thrust::raw_pointer_cast(device_reference_rows.data()),
+                            k_pipeline_buckets
+                        );
+                        extract_winner_scores_kernel<<<
+                            extract_grid,
+                            extract_block,
+                            0,
+                            launch.get_stream()>>>(
+                            thrust::raw_pointer_cast(query_sketch.data().data()),
+                            thrust::raw_pointer_cast(device_query_rows.data()),
+                            k_pipeline_buckets
+                        );
+                        CUDDL_CUDA_CALL(cudaGetLastError());
+                        timer.stop();
+                    } else if (stage == "database_build") {
+                        timer.start();
+                        auto measured = pipeline_database::build_async(
+                            device_reference_rows, compatibility, stream
+                        );
+                        timer.stop();
+                        auto measured_database = pipeline_unwrap(std::move(measured));
+                        do_not_optimise(measured_database);
+                    } else if (stage == "index_build") {
+                        timer.start();
+                        auto measured = pipeline_database::build_indexed_async(
+                            device_reference_rows, compatibility, stream
+                        );
+                        timer.stop();
+                        auto measured_database = pipeline_unwrap(std::move(measured));
+                        do_not_optimise(measured_database);
+                    } else if (stage == "search_exhaustive") {
+                        timer.start();
+                        pipeline_check(database.search_async(
+                            query_span, compatibility, {}, exhaustive_span, stream
+                        ));
+                        timer.stop();
+                    } else if (stage == "search_indexed") {
+                        timer.start();
+                        pipeline_check(database.search_indexed_async(
+                            query_span,
+                            compatibility,
+                            workspace_span,
+                            indexed_span,
+                            count_span,
+                            {.minimum_matches = options.minimum_matches},
+                            stream
+                        ));
+                        timer.stop();
+                    } else {
+                        throw pipeline_failure("unknown pipeline timing stage: " + stage);
+                    }
                 }
             );
         }
@@ -1667,8 +1664,8 @@ int main(int argc, char** argv) try {
         std::string_view const value = argv[argument];
         auto const split = value.find('=');
         auto const name = value.substr(0U, split);
-        if (name == "--name" || name == "--reference" || name == "--query" ||
-            name == "--output" || name == "--minimum-matches") {
+        if (name == "--name" || name == "--reference" || name == "--query" || name == "--output" ||
+            name == "--minimum-matches") {
             std::string_view take = value.substr(split + 1U);
             if (split == std::string_view::npos) {
                 if (argument + 1 >= argc) {
@@ -1677,8 +1674,7 @@ int main(int argc, char** argv) try {
                 take = argv[++argument];
             }
             if (name == "--minimum-matches") {
-                options.minimum_matches =
-                    static_cast<uint32_t>(std::stoul(std::string(take)));
+                options.minimum_matches = static_cast<uint32_t>(std::stoul(std::string(take)));
             } else if (name == "--name") {
                 options.name = take;
             } else if (name == "--reference") {

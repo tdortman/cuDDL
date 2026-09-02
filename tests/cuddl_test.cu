@@ -164,12 +164,11 @@ bool copy_device_vector(thrust::device_vector<T> const& source, std::vector<T>& 
            ) == cudaSuccess;
 }
 
-TEST(SketchTest, RefIsTriviallyCopyableAndKBeforeBucket) {
-    static_assert(std::is_trivially_copyable_v<cuddl::sketch_ref<25, 2048>>);
-    static_assert(std::is_trivially_copyable_v<cuddl::sketch<25, 2048>> == false);
-    using ref_t = cuddl::sketch_ref<25, 2048>;
-    EXPECT_EQ(ref_t::bucket_count(), 2048);
-    EXPECT_EQ(ref_t::kmer_length(), 25);
+TEST(SketchTest, PublicMetadataUsesKBeforeBucket) {
+    using sketch_type = cuddl::sketch<25, 2048>;
+    static_assert(!std::is_trivially_copyable_v<sketch_type>);
+    EXPECT_EQ(sketch_type::bucket_count(), 2048);
+    EXPECT_EQ(sketch_type::kmer_length(), 25);
 }
 
 TEST(SketchTest, EmptyRegisterEncoding) {
@@ -197,9 +196,9 @@ TEST(SketchTest, ScoreEncodingClampsExtremeNlz) {
 
 TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
     using layout = cuddl::register_layout<5, 11>;
-    using ref_type = cuddl::sketch_ref<k_default, b_default, layout>;
+    using sketch_type = cuddl::sketch<k_default, b_default, layout>;
     static_assert(std::is_empty_v<layout>);
-    static_assert(sizeof(ref_type) == sizeof(cuddl::sketch_ref<k_default, b_default>));
+    static_assert(std::is_same_v<typename sketch_type::register_type, uint32_t>);
     EXPECT_EQ(score<layout>(0ULL), std::numeric_limits<uint16_t>::max());
     EXPECT_EQ(restore<layout>(std::numeric_limits<uint16_t>::max()), 1ULL << 32U);
 
@@ -215,10 +214,7 @@ TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
     ASSERT_EQ(
         cudaSuccess,
         cudaMemcpy(
-            gpu_regs.data(),
-            gpu.ref().data().data(),
-            b_default * sizeof(uint32_t),
-            cudaMemcpyDeviceToHost
+            gpu_regs.data(), gpu.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
         )
     );
     EXPECT_EQ(gpu_regs, oracle.registers);
@@ -228,7 +224,7 @@ TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
     EXPECT_EQ(compatibility.mantissa_bits, 11U);
     EXPECT_TRUE(gpu.cardinality().has_value());
     EXPECT_TRUE(gpu.hybrid_cardinality().has_value());
-    EXPECT_TRUE(gpu.summary<true>(gpu.ref()).has_value());
+    EXPECT_TRUE(gpu.summary<true>(gpu).has_value());
 }
 
 TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
@@ -241,12 +237,10 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
     oracle.pack_registers();
 
     std::vector<uint32_t> gpu_regs(b_default);
-    // Copy GPU registers out via the owning sketch's pointer.
-    cuddl::sketch_ref<k_default, b_default> ref = gpu.ref();
     ASSERT_EQ(
         cudaSuccess,
         cudaMemcpy(
-            gpu_regs.data(), ref.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
+            gpu_regs.data(), gpu.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
         )
     );
     EXPECT_EQ(gpu_regs, oracle.registers);
@@ -304,11 +298,10 @@ TEST(SketchTest, UnalignedInputSpanningMultipleGridStrideIterationsMatchesScalar
     oracle.pack_registers();
 
     std::vector<uint32_t> gpu_regs(b_default);
-    cuddl::sketch_ref<k_default, b_default> ref = gpu.ref();
     ASSERT_EQ(
         cudaSuccess,
         cudaMemcpy(
-            gpu_regs.data(), ref.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
+            gpu_regs.data(), gpu.data().data(), b_default * sizeof(uint32_t), cudaMemcpyDeviceToHost
         )
     );
     EXPECT_EQ(gpu_regs, oracle.registers);
@@ -327,7 +320,7 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
     ASSERT_TRUE(gpu_a.add({a.data(), a.size()}).has_value());
     ASSERT_TRUE(gpu_b.add({b_joined.data(), b_joined.size()}).has_value());
 
-    auto const gpu_summary = gpu_a.compare(gpu_b.ref());
+    auto const gpu_summary = gpu_a.compare(gpu_b);
     ASSERT_TRUE(gpu_summary.has_value());
 
     scalar_sketch<b_default> oracle_a;
@@ -505,9 +498,9 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
         packed_database.persistent_row_bytes(),
         reference_count * (b_default * sizeof(uint32_t) + sizeof(uint32_t))
     );
-    EXPECT_TRUE(compact.ref().packed_data().empty());
-    EXPECT_EQ(packed_database.ref().packed_data().size(), packed.size());
-    EXPECT_EQ(packed_database.ref().saturation_states().size(), saturation.size());
+    EXPECT_TRUE(compact.packed_data().empty());
+    EXPECT_EQ(packed_database.packed_data().size(), packed.size());
+    EXPECT_EQ(packed_database.saturation_states().size(), saturation.size());
 
     thrust::device_vector<cuddl::reference_search_result> compact_exhaustive(reference_count);
     thrust::device_vector<cuddl::reference_search_result> packed_exhaustive(reference_count);
@@ -625,8 +618,8 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
         cudaSuccess,
         cudaMemcpyAsync(
             recovered_packed.data(),
-            packed_database.ref().packed_data().data(),
-            packed_database.ref().packed_data().size_bytes(),
+            packed_database.packed_data().data(),
+            packed_database.packed_data().size_bytes(),
             cudaMemcpyDeviceToHost,
             stream_
         )
@@ -635,8 +628,8 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
         cudaSuccess,
         cudaMemcpyAsync(
             recovered_saturation.data(),
-            packed_database.ref().saturation_states().data(),
-            packed_database.ref().saturation_states().size_bytes(),
+            packed_database.saturation_states().data(),
+            packed_database.saturation_states().size_bytes(),
             cudaMemcpyDeviceToHost,
             stream_
         )
@@ -1528,7 +1521,6 @@ TEST_F(ReferenceDatabaseTest, PackedRowsShareConstructionFailureContract) {
 
 TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
     using database_type = cuddl::reference_database<k_default, b_default>;
-    static_assert(std::is_trivially_copyable_v<typename database_type::ref_type>);
     static_assert(!std::is_trivially_copyable_v<database_type>);
 
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
@@ -2122,18 +2114,6 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchRejectsInvalidInputsWithoutOutput) {
     auto built = database_type::build_indexed_async(rows, compatibility, stream);
     ASSERT_TRUE(built.has_value()) << built.error().message();
     auto database = std::move(*built);
-    auto forged_metadata = database.metadata();
-    forged_metadata.compatibility.indexed_bucket_count = 2U * b_default;
-    typename database_type::ref_type forged_ref{
-        cuddl::device_span<uint16_t const>{},
-        forged_metadata,
-        cuddl::device_span<uint32_t const>{},
-        cuddl::device_span<uint32_t const>{},
-        true,
-    };
-    auto forged_requirements = forged_ref.indexed_single_query_workspace_bytes();
-    ASSERT_FALSE(forged_requirements.has_value());
-    EXPECT_EQ(forged_requirements.error().category(), cuddl::ErrorCategory::invalid_argument);
     auto workspace_bytes = database.indexed_single_query_workspace_bytes();
     ASSERT_TRUE(workspace_bytes.has_value()) << workspace_bytes.error().message();
     ASSERT_GT(*workspace_bytes, 0U);
@@ -2347,14 +2327,13 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     ASSERT_TRUE(sb.add({a.data(), a.size()}).has_value());
     ASSERT_TRUE(sc.add({c.data(), c.size()}).has_value());
 
-    auto const same_result = sa.compare(sb.ref());
+    auto const same_result = sa.compare(sb);
     ASSERT_TRUE(same_result.has_value());
     auto const same = *same_result;
-    auto const ref_same = sa.ref();
-    auto const wkid_same = ref_same.wkid(same);
-    auto const ani_same = ref_same.ani(same);
-    auto const cont_same = ref_same.containment(same);
-    auto const comp_same = ref_same.completeness(same);
+    auto const wkid_same = decltype(sa)::wkid(same);
+    auto const ani_same = decltype(sa)::ani(same);
+    auto const cont_same = decltype(sa)::containment(same);
+    auto const comp_same = decltype(sa)::completeness(same);
     ASSERT_TRUE(wkid_same.has_value());
     ASSERT_TRUE(ani_same.has_value());
     ASSERT_TRUE(cont_same.has_value());
@@ -2364,22 +2343,21 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     EXPECT_GT(*cont_same, 0.9);
     EXPECT_GT(*comp_same, 0.9);
 
-    auto const disjoint_result = sa.compare(sc.ref());
+    auto const disjoint_result = sa.compare(sc);
     ASSERT_TRUE(disjoint_result.has_value());
     auto const disjoint = *disjoint_result;
-    auto const wkid_disjoint = sa.ref().wkid(disjoint);
+    auto const wkid_disjoint = decltype(sa)::wkid(disjoint);
     ASSERT_TRUE(wkid_disjoint.has_value());
     EXPECT_LT(*wkid_disjoint, 0.05);
 }
 
 TEST(SketchTest, WkidPadsSparseDivisors) {
-    cuddl::sketch<k_default, b_default> sketch;
     cuddl::pairwise_summary sparse{};
     sparse.counts.equal = 1;
     sparse.counts.lower = 2;
     sparse.counts.higher = 4;
 
-    auto const wkid = sketch.ref().wkid(sparse);
+    auto const wkid = cuddl::sketch<k_default, b_default>::wkid(sparse);
     ASSERT_TRUE(wkid.has_value());
     EXPECT_DOUBLE_EQ(*wkid, 1.0 / 6.0);
 }

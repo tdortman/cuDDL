@@ -10,4 +10,3 @@
 #include <cuddl/pairwise_counts.cuh>
 #include <cuddl/reference_database.cuh>
 #include <cuddl/sketch.cuh>
-#include <cuddl/sketch_ref.cuh>
