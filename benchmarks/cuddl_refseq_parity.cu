@@ -985,6 +985,7 @@ int main(int argc, char** argv) {
                     batch_exhaustive_workspace,
                     batch_exhaustive_results,
                     batch_exhaustive_count,
+                    [](uint32_t) {},
                     batch_exhaustive_match_counts,
                     stream
                 );
@@ -1024,6 +1025,7 @@ int main(int argc, char** argv) {
                     batch_workspace,
                     batch_results,
                     batch_count,
+                    [](uint32_t) {},
                     batch_match_counts,
                     {.minimum_matches = min_hits},
                     stream

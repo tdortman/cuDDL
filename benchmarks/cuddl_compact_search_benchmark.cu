@@ -1535,6 +1535,7 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         workspace,
         results,
         result_count,
+        [](uint32_t) {},
         result_match_counts
     ));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
@@ -1563,6 +1564,7 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
             workspace,
             results,
             result_count,
+            [](uint32_t) {},
             result_match_counts,
             stream
         ));

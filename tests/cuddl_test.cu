@@ -747,6 +747,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         compact_exhaustive_workspace,
                         compact_exhaustive,
                         compact_exhaustive_count,
+                        [](uint32_t) {},
                         compact_exhaustive_matches,
                         stream
                     )
@@ -759,6 +760,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         packed_exhaustive_workspace,
                         packed_exhaustive,
                         packed_exhaustive_count,
+                        [](uint32_t) {},
                         packed_exhaustive_matches,
                         stream
                     )
@@ -771,6 +773,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         compact_indexed_workspace,
                         compact_indexed,
                         compact_indexed_count,
+                        [](uint32_t) {},
                         compact_indexed_matches,
                         {.minimum_matches = 1U},
                         stream
@@ -784,6 +787,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         packed_indexed_workspace,
                         packed_indexed,
                         packed_indexed_count,
+                        [](uint32_t) {},
                         packed_indexed_matches,
                         {.minimum_matches = 1U},
                         stream
@@ -800,6 +804,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         compact_exhaustive_workspace,
                         no_diagnostic_results,
                         no_diagnostic_count,
+                        [](uint32_t) {},
                         stream
                     )
                     .has_value());
@@ -1002,6 +1007,7 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         workspace,
         short_results,
         short_count,
+        [](uint32_t) {},
         short_matches,
         {.minimum_matches = 0U},
         stream
@@ -1038,6 +1044,7 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         exhaustive_workspace,
         exhaustive_short_results,
         exhaustive_short_count,
+        [](uint32_t) {},
         exhaustive_short_matches,
         stream
     );
@@ -1074,6 +1081,7 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
                         workspace,
                         successful_results,
                         successful_count,
+                        [](uint32_t) {},
                         successful_matches,
                         {.minimum_matches = 0U},
                         stream
@@ -1112,6 +1120,100 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
     EXPECT_EQ(successful_host, expected_results);
     EXPECT_EQ(successful_matches_host, expected_matches);
 }
+TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    constexpr uint32_t reference_count = 2U;
+    constexpr uint32_t query_count = 130U;
+    constexpr uint32_t query_id_offset = 1000U;
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    std::vector<uint16_t> host_rows(static_cast<size_t>(reference_count) * b_default, 7U);
+    std::vector<uint16_t> host_queries(static_cast<size_t>(query_count) * b_default, 7U);
+    thrust::device_vector<uint16_t> device_rows(host_rows);
+    thrust::device_vector<uint16_t> device_queries(host_queries);
+    auto database = *database_type::build_indexed_async(device_rows, compatibility);
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+
+    auto const exhaustive_requirements = *database.batch_search_requirements(query_count);
+    auto const indexed_requirements = *database.indexed_batch_search_requirements(query_count);
+    EXPECT_EQ(exhaustive_requirements.maximum_pair_count, 128U * reference_count);
+    EXPECT_EQ(indexed_requirements.maximum_pair_count, 128U * reference_count);
+
+    auto collect = [&](bool indexed) {
+        auto const& requirements = indexed ? indexed_requirements : exhaustive_requirements;
+        thrust::device_vector<uint8_t> workspace(requirements.workspace_bytes);
+        thrust::device_vector<cuddl::batch_search_result> results(requirements.maximum_pair_count);
+        thrust::device_vector<uint32_t> result_count(1U);
+        std::vector<cuddl::batch_search_result> collected;
+        std::vector<uint32_t> tile_capacities;
+        auto on_tile = [&](uint32_t capacity) {
+            ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+            uint32_t count = 0U;
+            ASSERT_EQ(
+                cudaSuccess,
+                cudaMemcpy(
+                    &count,
+                    thrust::raw_pointer_cast(result_count.data()),
+                    sizeof(count),
+                    cudaMemcpyDeviceToHost
+                )
+            );
+            ASSERT_LE(count, capacity);
+            std::vector<cuddl::batch_search_result> tile(count);
+            if (count != 0U) {
+                ASSERT_EQ(
+                    cudaSuccess,
+                    cudaMemcpy(
+                        tile.data(),
+                        thrust::raw_pointer_cast(results.data()),
+                        count * sizeof(cuddl::batch_search_result),
+                        cudaMemcpyDeviceToHost
+                    )
+                );
+            }
+            tile_capacities.push_back(capacity);
+            collected.insert(collected.end(), tile.begin(), tile.end());
+        };
+        auto const search = indexed ? database.search_batch_indexed_async(
+                                          device_queries,
+                                          compatibility,
+                                          query_id_offset,
+                                          workspace,
+                                          results,
+                                          result_count,
+                                          on_tile,
+                                          {.minimum_matches = 0U},
+                                          cuda::stream_ref{stream_}
+                                      )
+                                    : database.search_batch_async(
+                                          device_queries,
+                                          compatibility,
+                                          query_id_offset,
+                                          workspace,
+                                          results,
+                                          result_count,
+                                          on_tile,
+                                          cuda::stream_ref{stream_}
+                                      );
+        EXPECT_TRUE(search.has_value()) << search.error().message();
+        EXPECT_EQ(tile_capacities, (std::vector<uint32_t>{256U, 4U}));
+        EXPECT_EQ(collected.size(), static_cast<size_t>(query_count) * reference_count);
+        std::sort(collected.begin(), collected.end(), [](auto const& left, auto const& right) {
+            return std::tie(left.query_id, left.reference_id) <
+                   std::tie(right.query_id, right.reference_id);
+        });
+        for (uint32_t query = 0U; query < query_count; ++query) {
+            for (uint32_t reference = 0U; reference < reference_count; ++reference) {
+                auto const& result =
+                    collected[static_cast<size_t>(query) * reference_count + reference];
+                EXPECT_EQ(result.query_id, query_id_offset + query);
+                EXPECT_EQ(result.reference_id, reference);
+            }
+        }
+    };
+    collect(false);
+    collect(true);
+}
+
 TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     constexpr uint32_t reference_count = 4U;
@@ -1303,6 +1405,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         empty_exhaustive_workspace,
                         empty_results,
                         empty_count,
+                        [](uint32_t) {},
                         empty_matches,
                         stream
                     )
@@ -1320,6 +1423,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         empty_indexed_workspace,
                         empty_results,
                         empty_count,
+                        [](uint32_t) {},
                         empty_matches,
                         {.minimum_matches = 0U},
                         stream
@@ -1348,6 +1452,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         partial_workspace,
                         partial_results,
                         partial_count,
+                        [](uint32_t) {},
                         partial_matches,
                         stream
                     )
