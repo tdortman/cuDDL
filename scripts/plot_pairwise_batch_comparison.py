@@ -86,29 +86,32 @@ def main(
         {
             "implementation",
             "mode",
-            "batch",
+            "sketch_pairs",
             "threads",
             "seconds_per_batch",
-            "comparisons_per_second",
+            "pair_comparisons_per_second",
         },
         "batch JSON",
     )
 
     cuddl = batch[batch["implementation"] == "cuddl"]
     bbtools = batch[batch["implementation"] == "bbtools"]
-    gpu = cuddl.pivot(index="batch", columns="mode", values="seconds_per_batch")
-    pairs_per_second = cuddl.pivot(
-        index="batch", columns="mode", values="comparisons_per_second"
+    gpu = cuddl.pivot(index="sketch_pairs", columns="mode", values="seconds_per_batch")
+    pair_comparisons_per_second = cuddl.pivot(
+        index="sketch_pairs", columns="mode", values="pair_comparisons_per_second"
     )
-    batches = sorted(int(value) for value in gpu.index)
-    gpu = gpu.reindex(batches)
-    pairs_per_second = pairs_per_second.reindex(batches)
+    sketch_pair_counts = sorted(int(value) for value in gpu.index)
+    gpu = gpu.reindex(sketch_pair_counts)
+    pair_comparisons_per_second = pair_comparisons_per_second.reindex(
+        sketch_pair_counts
+    )
     cpu = (
-        bbtools.groupby(["mode", "batch"])["comparisons_per_second"]
+        bbtools.groupby(["mode", "sketch_pairs"])["pair_comparisons_per_second"]
         .median()
         .unstack(0)
-        .reindex(batches)
     )
+    cpu_pair_counts = sorted(int(value) for value in cpu.index)
+    cpu = cpu.reindex(cpu_pair_counts)
     thread_counts: dict[str, int] = {}
     for mode in ("parallel", "sequential"):
         values = sorted(
@@ -180,8 +183,8 @@ def main(
 
     fig, throughput_ax = pu.setup_figure()
     throughput_ax.plot(
-        batches,
-        pairs_per_second["device_resident"] / 1e6,
+        sketch_pair_counts,
+        pair_comparisons_per_second["device_resident"] / 1e6,
         color=CUDDL["color"],
         marker=CUDDL["marker"],
         linewidth=pu.LINE_WIDTH,
@@ -189,8 +192,8 @@ def main(
         label="cuDDL, device resident",
     )
     throughput_ax.plot(
-        batches,
-        pairs_per_second["transfer_each_batch"] / 1e6,
+        sketch_pair_counts,
+        pair_comparisons_per_second["transfer_each_batch"] / 1e6,
         color=CUDDL["color"],
         marker="^",
         linestyle="--",
@@ -199,7 +202,7 @@ def main(
         label="cuDDL, transfer each batch",
     )
     throughput_ax.plot(
-        batches,
+        cpu_pair_counts,
         cpu["parallel"] / 1e6,
         color=BBTOOLS["color"],
         marker=BBTOOLS["marker"],
@@ -208,7 +211,7 @@ def main(
         label=f"BBTools, {thread_count} thread{'s' if thread_count != 1 else ''}",
     )
     throughput_ax.plot(
-        batches,
+        cpu_pair_counts,
         cpu["sequential"] / 1e6,
         color=BBTOOLS["color"],
         linestyle=":",
@@ -220,8 +223,8 @@ def main(
     )
     pu.format_axis(
         throughput_ax,
-        xlabel="Comparisons per batch",
-        ylabel="Comparisons per second (millions)",
+        xlabel="Sketch pairs per batch",
+        ylabel="Pair comparisons per second (millions)",
         title="Batched throughput",
         xscale="log",
         yscale="log",
@@ -232,26 +235,24 @@ def main(
 
     components = pd.DataFrame(
         {
-            "Host to device": gpu["h2d"],
+            "Sketch transfers": gpu["h2d"] + gpu["d2h"],
             "Comparison kernel": gpu["device_resident"],
-            "Device to host": gpu["d2h"],
         },
         index=gpu.index,
     )
     shares = components.div(components.sum(axis=1), axis=0) * 100
     stage_names = [
-        "Host to device",
+        "Sketch transfers",
         "Comparison kernel",
-        "Device to host",
     ]
     matrix = shares[stage_names].T
     fig, stages_ax = pu.setup_figure()
     stages_ax.imshow(matrix, aspect="auto", cmap="Blues", vmin=0, vmax=100)
     stages_ax.set_xticks(
-        range(len(batches)),
-        [rf"$2^{{{int(math.log2(batch))}}}$" for batch in batches],
+        range(len(sketch_pair_counts)),
+        [rf"$2^{{{int(math.log2(count))}}}$" for count in sketch_pair_counts],
     )
-    stages_ax.set_yticks(range(len(stage_names)), ["H2D", "Kernel", "D2H"])
+    stages_ax.set_yticks(range(len(stage_names)), stage_names)
     for row, stage in enumerate(stage_names):
         for column, value in enumerate(matrix.loc[stage]):
             label = (
@@ -272,7 +273,7 @@ def main(
             )
     pu.format_axis(
         stages_ax,
-        xlabel="Comparisons per batch",
+        xlabel="Sketch pairs per batch",
         ylabel="",
         title="Isolated phase timing share (%)",
         xscale=None,
@@ -282,11 +283,18 @@ def main(
     fig.tight_layout()
     pu.save_figure(fig, output_dir / "runtime_share.pdf")
 
-    resident_speedup = pairs_per_second["device_resident"] / cpu["parallel"]
-    transferred_speedup = pairs_per_second["transfer_each_batch"] / cpu["parallel"]
+    shared_pair_counts = sorted(set(sketch_pair_counts) & set(cpu_pair_counts))
+    resident_speedup = (
+        pair_comparisons_per_second.loc[shared_pair_counts, "device_resident"]
+        / cpu.loc[shared_pair_counts, "parallel"]
+    )
+    transferred_speedup = (
+        pair_comparisons_per_second.loc[shared_pair_counts, "transfer_each_batch"]
+        / cpu.loc[shared_pair_counts, "parallel"]
+    )
     fig, speedup_ax = pu.setup_figure()
     speedup_ax.plot(
-        batches,
+        shared_pair_counts,
         resident_speedup,
         color=CUDDL["color"],
         marker="o",
@@ -295,7 +303,7 @@ def main(
         label="Device resident",
     )
     speedup_ax.plot(
-        batches,
+        shared_pair_counts,
         transferred_speedup,
         color="#E76F51",
         marker="^",
@@ -309,7 +317,7 @@ def main(
     )
     pu.format_axis(
         speedup_ax,
-        xlabel="Comparisons per batch",
+        xlabel="Sketch pairs per batch",
         ylabel=f"Speedup over {thread_count}-thread BBTools",
         title="Relative throughput",
         xscale="log",
@@ -320,7 +328,8 @@ def main(
     pu.save_figure(fig, output_dir / "relative_throughput.pdf")
 
     typer.echo(
-        f"At {batches[-1]} pairs, resident cuDDL is {resident_speedup.iloc[-1]:.1f}x "
+        f"At {shared_pair_counts[-1]} sketch pairs, resident cuDDL is "
+        f"{resident_speedup.iloc[-1]:.1f}x "
         f"the {thread_count}-thread BBTools throughput; transfer-each-batch is "
         f"{transferred_speedup.iloc[-1]:.2f}x."
     )

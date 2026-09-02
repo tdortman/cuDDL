@@ -17,7 +17,26 @@
 namespace {
 
 constexpr size_t bucket_count = 2048;
-std::vector<nvbench::int64_t> const batch_sizes{1, 8, 32, 128, 512, 2048, 8192};
+std::vector<nvbench::int64_t> const sketch_pair_counts{
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072
+};
 
 void check(cudaError_t error) {
     if (error != cudaSuccess) {
@@ -170,7 +189,7 @@ class batch_fixture {
 
 void profile_kernel(nvbench::state& state) {
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());
     state.add_global_memory_writes<cuddl::pairwise_summary>(fixture.pairs());
@@ -184,7 +203,7 @@ void profile_kernel(nvbench::state& state) {
 
 void profile_h2d(nvbench::state& state) {
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_writes<uint32_t>(2U * fixture.register_count());
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
@@ -194,7 +213,7 @@ void profile_h2d(nvbench::state& state) {
 
 void profile_d2h(nvbench::state& state) {
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
     fixture.compare(cudaStream_t{nullptr});
     check(cudaDeviceSynchronize());
     state.add_element_count(fixture.pairs(), "Pairs");
@@ -207,7 +226,7 @@ void profile_d2h(nvbench::state& state) {
 
 void profile_end_to_end(nvbench::state& state) {
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());
     state.add_global_memory_writes<uint32_t>(2U * fixture.register_count());
@@ -221,11 +240,17 @@ void profile_end_to_end(nvbench::state& state) {
     fixture.verify();
 }
 
-NVBENCH_BENCH(profile_kernel).set_name("batch_compare_kernel").add_int64_axis("Batch", batch_sizes);
-NVBENCH_BENCH(profile_h2d).set_name("batch_compare_h2d").add_int64_axis("Batch", batch_sizes);
-NVBENCH_BENCH(profile_d2h).set_name("batch_compare_d2h").add_int64_axis("Batch", batch_sizes);
+NVBENCH_BENCH(profile_kernel)
+    .set_name("batch_compare_kernel")
+    .add_int64_axis("Sketch Pairs", sketch_pair_counts);
+NVBENCH_BENCH(profile_h2d)
+    .set_name("batch_compare_h2d")
+    .add_int64_axis("Sketch Pairs", sketch_pair_counts);
+NVBENCH_BENCH(profile_d2h)
+    .set_name("batch_compare_d2h")
+    .add_int64_axis("Sketch Pairs", sketch_pair_counts);
 NVBENCH_BENCH(profile_end_to_end)
     .set_name("batch_compare_end_to_end")
-    .add_int64_axis("Batch", batch_sizes);
+    .add_int64_axis("Sketch Pairs", sketch_pair_counts);
 
 }  // namespace

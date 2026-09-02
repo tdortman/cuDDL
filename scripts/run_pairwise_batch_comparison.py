@@ -87,19 +87,19 @@ def read_nvbench(path: Path) -> tuple[list[dict[str, object]], dict[str, int | s
             if mode is None or source["Skipped"] != "No":
                 continue
             systems.add(tuple(source[field] for field in SYSTEM_FIELDS))
-            batch = int(source["Batch"])
+            sketch_pairs = int(source["Sketch Pairs"])
             seconds = float(source["GPU Time (sec)"])
             rows.append(
                 {
                     "implementation": "cuddl",
                     "mode": mode,
-                    "batch": batch,
+                    "sketch_pairs": sketch_pairs,
                     "threads": 0,
                     "trial": None,
                     "samples": int(source["Samples"]),
                     "iterations": None,
                     "seconds_per_batch": seconds,
-                    "comparisons_per_second": batch / seconds,
+                    "pair_comparisons_per_second": sketch_pairs / seconds,
                     "device": source["Device Name"],
                 }
             )
@@ -123,13 +123,15 @@ def read_bbtools(text: str) -> list[dict[str, object]]:
             {
                 "implementation": "bbtools",
                 "mode": mode,
-                "batch": int(source["batch"]),
+                "sketch_pairs": int(source["sketch_pairs"]),
                 "threads": int(source["threads"]),
                 "trial": int(source["trial"]),
                 "samples": None,
                 "iterations": int(source["iterations"]),
                 "seconds_per_batch": float(source["seconds_per_batch"]),
-                "comparisons_per_second": float(source["comparisons_per_second"]),
+                "pair_comparisons_per_second": float(
+                    source["pair_comparisons_per_second"]
+                ),
                 "device": None,
             }
         )
@@ -150,7 +152,7 @@ def main(
         int, typer.Option(min=1, help="BBTools parallel worker count")
     ] = available_cpus(),
     samples: Annotated[
-        int, typer.Option(min=1, help="NVBench samples per batch size")
+        int, typer.Option(min=1, help="NVBench samples per sketch-pair count")
     ] = 30,
     iterations: Annotated[
         int, typer.Option(min=1, help="BBTools batches timed per trial")
@@ -159,6 +161,12 @@ def main(
     java_heap_gb: Annotated[
         int, typer.Option(min=1, help="Maximum JVM heap in GiB")
     ] = 8,
+    min_exponent: Annotated[
+        int, typer.Option(min=0, max=30, help="Smallest base-2 sketch-pair exponent")
+    ] = 0,
+    max_exponent: Annotated[
+        int, typer.Option(min=0, max=30, help="Largest base-2 sketch-pair exponent")
+    ] = 17,
 ) -> None:
     """Build and run both implementations, then publish one JSON result."""
     build_dir = project_path(build_dir)
@@ -166,6 +174,12 @@ def main(
     output = project_path(output)
     java_source = ROOT / "benchmarks/BBToolsPairwiseBatchBenchmark.java"
     classes = build_dir / "bbtools-pairwise-batch-classes"
+    if min_exponent > max_exponent:
+        raise typer.BadParameter("--min-exponent must not exceed --max-exponent")
+    sketch_pair_counts = [
+        1 << exponent for exponent in range(min_exponent, max_exponent + 1)
+    ]
+    nvbench_axis = "Sketch Pairs=[" + ",".join(map(str, sketch_pair_counts)) + "]"
 
     if not bbtools_jar.is_file():
         raise typer.BadParameter(f"BBTools jar does not exist: {bbtools_jar}")
@@ -193,6 +207,8 @@ def main(
         run(
             [
                 str(cuddl_benchmark),
+                "--axis",
+                nvbench_axis,
                 "--stopping-criterion",
                 "sample-count",
                 "--target-samples",
@@ -215,6 +231,8 @@ def main(
                 str(threads),
                 str(iterations),
                 str(trials),
+                str(min_exponent),
+                str(max_exponent),
             ],
             capture=True,
         )
@@ -228,7 +246,7 @@ def main(
         key=lambda row: (
             row["implementation"],
             row["mode"],
-            cast(int, row["batch"]),
+            cast(int, row["sketch_pairs"]),
             cast(int | None, row["trial"]) or -1,
         )
     )
@@ -239,7 +257,7 @@ def main(
         system=system,
         measurements=measurements_from_rows(
             rows,
-            case_fields=("mode", "batch", "threads", "trial"),
+            case_fields=("mode", "sketch_pairs", "threads", "trial"),
             omit_fields=("device",),
         ),
     )
