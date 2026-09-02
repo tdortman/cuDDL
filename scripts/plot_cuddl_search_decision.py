@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
-"""Plot indexed-versus-exhaustive search decisions from shared result JSON."""
+"""Plot synthetic all-to-all decisions and actual RefSeq database scaling."""
 
 import math
 from itertools import pairwise
@@ -16,45 +16,202 @@ import plot_utils as pu
 import typer
 from benchmark_schema import flatten_measurements, load_result
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
-from matplotlib.patches import Patch
+from matplotlib.ticker import FuncFormatter, PercentFormatter
 
-REQUIRED_COLUMNS = {
+COMMON_COLUMNS = {
     "status",
     "reference_count",
-    "skew",
     "query_count",
     "query_profile",
-    "fill_ratio",
     "indexed_bucket_count",
     "index_mode",
     "exhaustive_p50_ms",
     "indexed_p50_ms",
-    "kill_gate_outcome",
 }
-VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
-REFSEQ_REFERENCE_COUNT = 200687
-PAPER_INDEXED_BUCKET_COUNT = 2048
-PAPER_FILL_RATIO = 1.0
-PAPER_QUERY_PROFILE = "all_to_all"
 
 
 def skew_fraction(value: object) -> float:
-    text = str(value)
-    if text == "uniform":
-        return 0.0
-    if text == "hot":
-        return 0.5
-    return float(text.removesuffix("%")) / 100.0
+    return float(str(value).removesuffix("%")) / 100.0
 
 
 def speedup_label(log2_speedup: float) -> str:
-    """Format a log2 speedup as the actual exhaustive/indexed time ratio."""
     ratio = 2.0**log2_speedup
     if ratio >= 100.0:
         return f"{ratio:.0f}"
     if ratio >= 10.0:
         return f"{ratio:.1f}"
     return f"{ratio:.2g}"
+
+
+def reference_label(value: float) -> str:
+    return f"{value / 1000.0:.0f}k"
+
+
+def cell_edges(values: list[float]) -> list[float]:
+    if len(values) == 1:
+        return [values[0] - 0.025, values[0] + 0.025]
+    return [
+        values[0] - (values[1] - values[0]) / 2.0,
+        *[(left + right) / 2.0 for left, right in pairwise(values)],
+        values[-1] + (values[-1] - values[-2]) / 2.0,
+    ]
+
+
+def plot_synthetic(ax: plt.Axes, data: pd.DataFrame) -> None:
+    required = {"fill_ratio", "skew"}
+    missing = sorted(required - set(data.columns))
+    if missing:
+        raise typer.BadParameter(
+            f"synthetic rows are missing columns: {', '.join(missing)}"
+        )
+    data = data.loc[
+        (pd.to_numeric(data["indexed_bucket_count"]) == 2048)
+        & (pd.to_numeric(data["fill_ratio"]) == 1.0)
+    ].copy()
+    if data.empty:
+        raise typer.BadParameter("result has no canonical synthetic all-to-all rows")
+    data["hot_fraction"] = data["skew"].map(skew_fraction)
+    data["log2_speedup"] = (
+        pd.to_numeric(data["exhaustive_p50_ms"]) / pd.to_numeric(data["indexed_p50_ms"])
+    ).map(math.log2)
+    references = sorted(data["reference_count"].astype(int).unique())
+    hot_fractions = sorted(data["hot_fraction"].unique())
+    matrix = (
+        data.pivot(
+            index="reference_count", columns="hot_fraction", values="log2_speedup"
+        )
+        .reindex(index=references, columns=hot_fractions)
+        .to_numpy(dtype=float)
+    )
+    maximum = max(1.0, float(data["log2_speedup"].abs().max()))
+    mesh = ax.pcolormesh(
+        cell_edges(hot_fractions),
+        [index - 0.5 for index in range(len(references) + 1)],
+        matrix,
+        cmap=LinearSegmentedColormap.from_list(
+            "search_decision", ["#d55e00", "#ffffff", "#0072b2"]
+        ),
+        norm=TwoSlopeNorm(vmin=-maximum, vcenter=0.0, vmax=maximum),
+        edgecolors="white",
+        linewidth=0.8,
+    )
+    for row, values in enumerate(matrix):
+        for column, value in enumerate(values):
+            if math.isfinite(value):
+                ax.text(
+                    hot_fractions[column],
+                    row,
+                    r"$\times$" + speedup_label(value),
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="white" if abs(value) > maximum * 0.55 else "#222222",
+                )
+    ax.set(
+        title=pu.paper_text("Synthetic all-to-all", bold=True),
+        xlabel=pu.paper_text("Hot buckets (score shared by 1% of references)"),
+        ylabel=pu.paper_text("References"),
+        yticks=range(len(references)),
+        yticklabels=[f"{value:,}" for value in references],
+    )
+    ax.set_xticks(hot_fractions, [f"{value:.0%}" for value in hot_fractions])
+    ax.set_ylim(len(references) - 0.5, -0.5)
+    colorbar = ax.figure.colorbar(mesh, ax=ax, pad=0.02)
+    colorbar.set_ticks(
+        [
+            -maximum,
+            *[tick for tick in colorbar.get_ticks() if -maximum < tick < maximum],
+            maximum,
+        ]
+    )
+    colorbar.ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _position: speedup_label(value))
+    )
+    colorbar.set_label(
+        pu.paper_text("exhaustive / indexed median time") + r" ($\times$)"
+    )
+
+
+def plot_refseq(axes: tuple[plt.Axes, plt.Axes, plt.Axes], data: pd.DataFrame) -> None:
+    missing = sorted({"selected_candidates"} - set(data.columns))
+    if missing:
+        raise typer.BadParameter(
+            f"RefSeq scaling rows are missing columns: {', '.join(missing)}"
+        )
+    data = data.loc[pd.to_numeric(data["indexed_bucket_count"]) == 4096].copy()
+    if data.empty:
+        raise typer.BadParameter("result has no RefSeq reference-scaling rows")
+    data["query_count"] = pd.to_numeric(data["query_count"])
+    data["reference_count"] = pd.to_numeric(data["reference_count"])
+    data["selected_candidates"] = pd.to_numeric(data["selected_candidates"])
+    data = data.sort_values("reference_count")
+    latency_ax, speedup_ax, candidates_ax = axes
+    for implementation, column, color, marker in (
+        ("Exhaustive", "exhaustive_p50_ms", "#d55e00", "s"),
+        ("Indexed", "indexed_p50_ms", "#0072b2", "o"),
+    ):
+        latency_ax.plot(
+            data["reference_count"],
+            pd.to_numeric(data[column]),
+            label=implementation,
+            color=color,
+            marker=marker,
+            linewidth=2,
+            markersize=5,
+        )
+    speedup_ax.plot(
+        data["reference_count"],
+        pd.to_numeric(data["exhaustive_p50_ms"])
+        / pd.to_numeric(data["indexed_p50_ms"]),
+        color="#0072b2",
+        marker="o",
+        linewidth=2,
+    )
+    candidates_ax.plot(
+        data["reference_count"],
+        data["selected_candidates"] / (data["query_count"] * data["reference_count"]),
+        color="#009e73",
+        marker="^",
+        linewidth=2,
+    )
+    latency_ax.set(
+        title=pu.paper_text("RefSeq batch latency (4,096 queries)", bold=True),
+        ylabel=pu.paper_text("Median time (ms)"),
+    )
+    speedup_ax.set(
+        title=pu.paper_text("Indexed speedup", bold=True),
+        ylabel=pu.paper_text("Exhaustive / indexed time") + r" ($\times$)",
+    )
+    candidates_ax.set(
+        title=pu.paper_text("Candidate fraction", bold=True),
+        ylabel=pu.paper_text("Candidate pairs / database pairs"),
+    )
+    for ax in axes:
+        ax.set_xscale("log", base=2)
+        labeled_references = [1024, 4096, 16384, 65536, 148108]
+        ax.set_xticks(
+            labeled_references,
+            [reference_label(value) for value in labeled_references],
+        )
+        ax.set_xlabel(pu.paper_text("References"))
+        ax.grid(True, which="major", alpha=0.25)
+        ax.margins(x=0.05, y=0.15)
+    latency_ax.set_yscale("log")
+    speedup_ax.set_ylim(bottom=0.0)
+    speedup_ax.axhline(1.0, color="#666666", linestyle="--", linewidth=1)
+    speedup_ax.text(
+        data["reference_count"].max(),
+        1.0,
+        pu.paper_text("parity"),
+        ha="right",
+        va="bottom",
+    )
+    candidate_fraction = data["selected_candidates"] / (
+        data["query_count"] * data["reference_count"]
+    )
+    candidates_ax.set_ylim(0.0, float(candidate_fraction.max()) * 1.15)
+    candidates_ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    latency_ax.legend(frameon=False)
 
 
 def main(
@@ -66,241 +223,46 @@ def main(
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-decision.pdf"),
 ) -> None:
-    """Render speedup curves across the hot-bucket fraction."""
+    """Render every successful 16-bit search profile."""
     try:
         result = load_result(json_path, "search_decision")
     except ValueError as error:
         raise typer.BadParameter(f"{json_path}: {error}") from error
     data = pd.DataFrame(flatten_measurements(result))
-    missing = sorted(REQUIRED_COLUMNS - set(data.columns))
+    missing = sorted(COMMON_COLUMNS - set(data.columns))
     if missing:
         raise typer.BadParameter(f"result is missing columns: {', '.join(missing)}")
-
     data = data.loc[data["status"] == "ok"].copy()
-    # The 16-bit key is the canonical index key; the 15-bit tradeoff has its
-    # own figure (plot_cuddl_search_key_bits.py).
     data["key_bits"] = (
         data["index_mode"].astype("string").str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
     )
     data = data.loc[data["key_bits"] == 16].copy()
     if data.empty:
-        raise typer.BadParameter("result has no successful workloads")
-    numeric = (
-        "reference_count",
-        "query_count",
-        "fill_ratio",
-        "indexed_bucket_count",
-        "exhaustive_p50_ms",
-        "indexed_p50_ms",
-    )
-    try:
-        data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
-    except (TypeError, ValueError) as error:
-        raise typer.BadParameter(
-            f"result contains non-numeric benchmark values: {error}"
-        )
-
-    timing_columns = [name for name in numeric if name.endswith("_ms")]
-    if (data[timing_columns] <= 0).any().any():
+        raise typer.BadParameter("result has no successful 16-bit workloads")
+    timings = data[["exhaustive_p50_ms", "indexed_p50_ms"]].apply(pd.to_numeric)
+    if (timings <= 0).any().any():
         raise typer.BadParameter("result contains non-positive search timings")
 
-    data = data.loc[
-        (data["indexed_bucket_count"] == PAPER_INDEXED_BUCKET_COUNT)
-        & (data["fill_ratio"] == PAPER_FILL_RATIO)
-        & (data["query_profile"] == PAPER_QUERY_PROFILE)
-    ].copy()
-    if data.empty:
-        raise typer.BadParameter("result has no canonical paper workloads")
-
-    data["hot_fraction"] = data["skew"].map(skew_fraction)
-    data["speedup"] = data["exhaustive_p50_ms"] / data["indexed_p50_ms"]
-    data["log2_speedup"] = data["speedup"].map(math.log2)
-    unknown_outcomes = sorted(set(data["kill_gate_outcome"]) - VALID_OUTCOMES)
-    if unknown_outcomes:
-        raise typer.BadParameter(
-            f"result contains unknown kill-gate outcomes: {', '.join(unknown_outcomes)}"
+    synthetic = data.loc[data["query_profile"] == "all_to_all"].copy()
+    refseq = data.loc[data["query_profile"] == "refseq_reference_scaling"].copy()
+    if synthetic.empty and refseq.empty:
+        raise typer.BadParameter("result has no supported search profiles")
+    if not synthetic.empty and not refseq.empty:
+        fig = plt.figure(figsize=(12.0, 7.2), layout="constrained")
+        grid = fig.add_gridspec(2, 3)
+        plot_synthetic(fig.add_subplot(grid[0, :]), synthetic)
+        plot_refseq(
+            tuple(fig.add_subplot(grid[1, column]) for column in range(3)), refseq
         )
-
-    references = sorted(data["reference_count"].unique())
-    workload_columns = [
-        "query_count",
-        "hot_fraction",
-        "reference_count",
-        "fill_ratio",
-        "indexed_bucket_count",
-        "query_profile",
-    ]
-    if data.duplicated(workload_columns).any():
-        raise typer.BadParameter("result contains duplicate workloads")
-
-    panel_columns = ["all_to_all"]
-    hot_fractions = sorted(data["hot_fraction"].unique())
-    log2_values = data["log2_speedup"]
-    maximum_log2 = max(1.0, float(log2_values.abs().max()))
-    colour_map = LinearSegmentedColormap.from_list(
-        "search_decision",
-        ["#f4a582", "#ffffff", "#92c5de"],
-    )
-    colour_norm = TwoSlopeNorm(
-        vmin=-maximum_log2,
-        vcenter=0.0,
-        vmax=maximum_log2,
-    )
-
-    if len(hot_fractions) == 1:
-        half_step = 0.05
+    elif not synthetic.empty:
+        fig, ax = plt.subplots(figsize=(9.0, 3.6), layout="constrained")
+        plot_synthetic(ax, synthetic)
     else:
-        half_step = min(right - left for left, right in pairwise(hot_fractions)) / 2.0
-    x_edges = [
-        hot_fractions[0] - half_step,
-        *[(left + right) / 2.0 for left, right in pairwise(hot_fractions)],
-        hot_fractions[-1] + half_step,
-    ]
-    y_edges = [index - 0.5 for index in range(len(references) + 1)]
-
-    # Stacked panels with square cells: the grid is 11 hot fractions by 3
-    # reference counts, so a panel is 11/3 as wide as it is tall. Size the
-    # figure in inches so each cell stays readable and annotated.
-    cell_size = 0.42
-    panel_width = len(hot_fractions) * cell_size
-    panel_height = len(references) * cell_size
-    left_margin = 1.55
-    bottom_margin = 0.56
-    top_margin = 0.85
-    panel_gap = 0.35
-    # Gap to panels + tick-label room + bar + rotated label + right margin.
-    colorbar_space = 0.10 + 0.55 + 0.06 + 0.95
-    fig_width = left_margin + panel_width + colorbar_space
-    fig_height = (
-        bottom_margin + len(panel_columns) * panel_height + panel_gap + top_margin
-    )
-    fig, axes = plt.subplots(
-        len(panel_columns),
-        1,
-        figsize=(fig_width, fig_height),
-        sharex=True,
-        sharey=True,
-        squeeze=False,
-    )
-    mesh = None
-    skew_ticks = [value / 100.0 for value in range(0, 51, 5)]
-    for panel_column, _ in enumerate(panel_columns):
-        ax = axes[panel_column][0]
-        panel = data
-        matrix = (
-            panel.pivot(
-                index="reference_count",
-                columns="hot_fraction",
-                values="log2_speedup",
-            )
-            .reindex(index=references, columns=hot_fractions)
-            .to_numpy(dtype=float)
-        )
-        mesh = ax.pcolormesh(
-            x_edges,
-            y_edges,
-            matrix,
-            cmap=colour_map,
-            norm=colour_norm,
-            shading="flat",
-            edgecolors="white",
-            linewidth=0.8,
-        )
-        ax.set_xlim(x_edges[0], x_edges[-1])
-        ax.set_ylim(len(references) - 0.5, -0.5)
-        ax.set_aspect(x_edges[1] - x_edges[0], adjustable="box")
-        for row_index in range(len(references)):
-            for column_index, value in enumerate(matrix[row_index]):
-                if not math.isfinite(value):
-                    continue
-                ax.text(
-                    (x_edges[column_index] + x_edges[column_index + 1]) / 2.0,
-                    row_index,
-                    r"$\times$" + speedup_label(value),
-                    ha="center",
-                    va="center",
-                    fontsize=10,
-                    color="#1a1a1a",
-                )
-        ax.set_xticks(skew_ticks)
-        ax.set_xticklabels(
-            [f"{value:.0%}" for value in skew_ticks],
-            fontsize=pu.TICK_LABEL_FONT_SIZE,
-        )
-        ax.set_yticks(range(len(references)))
-        ax.set_yticklabels(
-            [
-                f"{int(reference):,} (RefSeq)"
-                if reference == REFSEQ_REFERENCE_COUNT
-                else f"{int(reference):,} (synthetic)"
-                for reference in references
-            ],
-            fontsize=pu.TICK_LABEL_FONT_SIZE,
-        )
-        ax.set_title(
-            pu.paper_text("All-to-all", bold=True),
-            fontsize=pu.TITLE_FONT_SIZE,
-        )
-        if panel_column == 0:
-            ax.set_ylabel(
-                pu.paper_text("References"),
-                fontsize=pu.AXIS_LABEL_FONT_SIZE,
-            )
-        if panel_column == len(panel_columns) - 1:
-            ax.set_xlabel(
-                pu.paper_text("Hot buckets (score 1 for 1% of references)"),
-                fontsize=pu.AXIS_LABEL_FONT_SIZE,
-            )
-        ax.tick_params(axis="both", length=0)
-        ax.spines[:].set_visible(False)
-
-    if mesh is None:
-        raise typer.BadParameter("result has no heatmap workloads")
-    fig.subplots_adjust(
-        left=left_margin / fig_width,
-        right=(left_margin + panel_width) / fig_width,
-        bottom=bottom_margin / fig_height,
-        top=(bottom_margin + len(panel_columns) * panel_height + panel_gap)
-        / fig_height,
-        hspace=panel_gap / panel_height,
-    )
-    colorbar_axes = fig.add_axes(
-        (
-            (left_margin + panel_width + 0.10 + 0.55) / fig_width,
-            bottom_margin / fig_height,
-            0.06 / fig_width,
-            (len(panel_columns) * panel_height + panel_gap) / fig_height,
-        )
-    )
-    colorbar = fig.colorbar(mesh, cax=colorbar_axes)
-    # Ticks stay on the log2 scale (diverging colours), but the labels and the
-    # cell annotations show the actual exhaustive / indexed time ratio.
-    colour_ticks = [
-        tick for tick in range(-16, 17, 4) if -maximum_log2 <= tick <= maximum_log2
-    ]
-    colorbar.set_ticks(colour_ticks)
-    colorbar.set_ticklabels(
-        [f"1/{2**-tick}" if tick < 0 else str(2**tick) for tick in colour_ticks]
-    )
-    colorbar.set_label(
-        pu.paper_text("exhaustive / indexed median time") + r" ($\times$)",
-        fontsize=pu.AXIS_LABEL_FONT_SIZE,
-    )
-    colorbar.ax.tick_params(labelsize=pu.TICK_LABEL_FONT_SIZE)
+        fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.7), layout="constrained")
+        plot_refseq(tuple(axes), refseq)
     fig.suptitle(
-        pu.paper_text("Indexed versus exhaustive all-to-all search", bold=True),
+        pu.paper_text("Indexed versus exhaustive search", bold=True),
         fontsize=pu.TITLE_FONT_SIZE,
-        y=1.0 - 0.06 / fig_height,
-    )
-    fig.legend(
-        handles=[
-            Patch(color="#92c5de", label=pu.paper_text("Indexed faster")),
-            Patch(color="#f4a582", label=pu.paper_text("Exhaustive faster")),
-        ],
-        loc="upper left",
-        bbox_to_anchor=(0.005, 1.0 - 0.22 / fig_height),
-        frameon=False,
-        fontsize=12,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     pu.save_figure(fig, output, pad_inches=0.10)

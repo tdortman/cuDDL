@@ -3,14 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
-"""Plot 15-bit versus 16-bit index keys from shared result JSON.
-
-RefSeq register scores occupy the 15-bit space (the top bit is empirically
-dead, paper Section 8.2), so masking to 15 bits halves the index offset table
-without changing the posting lists: same visits, same candidate quality, half
-the resident bytes. One panel per relevant metric on the 200,687-sketch
-RefSeq database.
-"""
+"""Plot 15-bit versus 16-bit indexes across actual RefSeq database sizes."""
 
 from pathlib import Path
 from typing import Annotated
@@ -21,29 +14,22 @@ import plot_utils as pu
 import typer
 from benchmark_schema import flatten_measurements, load_result
 
-PAPER_REFERENCE_COUNT = 200687
-PAPER_INDEXED_BUCKET_COUNT = 2048
-PAPER_FILL_RATIO = 1.0
-PAPER_QUERY_PROFILE = "all_to_all"
-
-METRICS = (
-    ("atomic_updates", "Index entries visited", "log"),
-    ("indexed_p50_ms", "Indexed median time (ms)", "linear"),
-)
-
 KEY_BIT_STYLES = {
-    15: {"color": "#2c7fb8", "label": "15-bit key", "marker": "o"},
-    16: {"color": "#d95f0e", "label": "16-bit key", "marker": "s"},
+    15: {
+        "color": "#0072b2",
+        "label": "15-bit key",
+        "linestyle": "-",
+        "marker": "o",
+        "markerfacecolor": "#0072b2",
+    },
+    16: {
+        "color": "#d55e00",
+        "label": "16-bit key",
+        "linestyle": "--",
+        "marker": "s",
+        "markerfacecolor": "none",
+    },
 }
-
-
-def skew_fraction(value: object) -> float:
-    text = str(value)
-    if text == "uniform":
-        return 0.0
-    if text == "hot":
-        return 0.5
-    return float(text.removesuffix("%")) / 100.0
 
 
 def main(
@@ -55,7 +41,7 @@ def main(
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-key-bits.pdf"),
 ) -> None:
-    """Render posting work and time for both key widths."""
+    """Render indexed latency and search speedup for both key widths."""
     try:
         result = load_result(json_path, "search_decision")
     except ValueError as error:
@@ -66,114 +52,83 @@ def main(
         "reference_count",
         "query_count",
         "query_profile",
-        "fill_ratio",
         "indexed_bucket_count",
-        "skew",
         "index_mode",
-        *(name for name, _, _ in METRICS),
+        "exhaustive_p50_ms",
+        "indexed_p50_ms",
     }
     missing = sorted(required - set(data.columns))
     if missing:
         raise typer.BadParameter(f"result is missing columns: {', '.join(missing)}")
 
-    data = data.loc[data["status"] == "ok"].copy()
-    numeric = (
-        "reference_count",
-        "query_count",
-        "fill_ratio",
-        "indexed_bucket_count",
-        *(name for name, _, _ in METRICS),
-    )
-    try:
-        data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
-    except (TypeError, ValueError) as error:
-        raise typer.BadParameter(
-            f"result contains non-numeric benchmark values: {error}"
-        ) from error
     data = data.loc[
-        (data["reference_count"] == PAPER_REFERENCE_COUNT)
-        & (data["query_profile"] == PAPER_QUERY_PROFILE)
-        & (data["fill_ratio"] == PAPER_FILL_RATIO)
-        & (data["indexed_bucket_count"] == PAPER_INDEXED_BUCKET_COUNT)
+        (data["status"] == "ok")
+        & (data["query_profile"] == "refseq_reference_scaling")
+        & (pd.to_numeric(data["indexed_bucket_count"]) == 4096)
     ].copy()
     if data.empty:
-        raise typer.BadParameter("result has no paper-scale all-to-all workloads")
-
-    data["hot_fraction"] = data["skew"].map(skew_fraction)
+        raise typer.BadParameter("result has no successful RefSeq scaling workloads")
     data["key_bits"] = (
         data["index_mode"].astype("string").str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
     )
-    hot_fractions = sorted(data["hot_fraction"].unique())
-    if not hot_fractions:
-        raise typer.BadParameter("result has no hot-fraction sweep")
+    for column in (
+        "reference_count",
+        "query_count",
+        "exhaustive_p50_ms",
+        "indexed_p50_ms",
+    ):
+        data[column] = pd.to_numeric(data[column])
+    if (data["indexed_p50_ms"] <= 0).any():
+        raise typer.BadParameter("result contains non-positive indexed timings")
+    data["search_speedup"] = data["exhaustive_p50_ms"] / data["indexed_p50_ms"]
 
-    fig, axes = plt.subplots(
-        1,
-        len(METRICS),
-        figsize=(8.4, 3.7),
-        squeeze=False,
-    )
-    for metric_column, (column, label, scale) in enumerate(METRICS):
-        ax = axes[0][metric_column]
-        for bits, style in KEY_BIT_STYLES.items():
-            series = (
-                data[data["key_bits"] == bits].groupby("hot_fraction")[column].median()
-            )
-            # The two widths coincide within noise on several metrics; offset the
-            # points slightly so the second series does not paint over the first.
-            offset = (bits - 15.5) * 0.024
-            ax.plot(
-                series.index + offset,
-                series,
-                marker=style["marker"],
-                color=style["color"],
-                label=style["label"],
-            )
-        if scale == "log":
-            ax.set_yscale("log")
-        ax.set_title(
-            pu.paper_text(label, bold=True),
-            fontsize=pu.TITLE_FONT_SIZE,
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.7), layout="constrained")
+    for bits, style in KEY_BIT_STYLES.items():
+        series = data.loc[data["key_bits"] == bits].sort_values("reference_count")
+        if series.empty:
+            continue
+        axes[0].plot(
+            series["reference_count"],
+            series["indexed_p50_ms"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            markerfacecolor=style["markerfacecolor"],
+            label=style["label"],
         )
-        ax.set_xlabel(
-            pu.paper_text("Hot-bucket fraction"),
-            fontsize=pu.AXIS_LABEL_FONT_SIZE,
+        axes[1].plot(
+            series["reference_count"],
+            series["search_speedup"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            markerfacecolor=style["markerfacecolor"],
+            label=style["label"],
         )
-        ax.tick_params(labelsize=pu.TICK_LABEL_FONT_SIZE)
-
-    # The median-time curves rise toward the top-right of the right panel, so
-    # its bottom-right corner hosts the legend without covering any data.
-    axes[0][1].legend(
-        handles=[
-            plt.Line2D(
-                [],
-                [],
-                color=style["color"],
-                marker=style["marker"],
-                label=style["label"],
-            )
-            for style in KEY_BIT_STYLES.values()
-        ],
-        loc="lower right",
-        fontsize=pu.TICK_LABEL_FONT_SIZE,
-        frameon=False,
-        handlelength=2.5,
-    )
+    for ax in axes:
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel(pu.paper_text("References"))
+        labeled_references = [1024, 4096, 16384, 65536, 148108]
+        ax.set_xticks(
+            labeled_references,
+            [f"{value / 1000.0:.0f}k" for value in labeled_references],
+        )
+        ax.grid(True, which="major", alpha=0.25)
+        ax.margins(x=0.04, y=0.15)
+    axes[0].set_yscale("log")
+    axes[0].set_title(pu.paper_text("Indexed batch latency", bold=True))
+    axes[0].set_ylabel(pu.paper_text("Median time (ms)"))
+    axes[1].set_title(pu.paper_text("Indexed speedup", bold=True))
+    axes[1].set_ylabel(pu.paper_text("Exhaustive / indexed time") + r" ($\times$)")
+    axes[1].set_ylim(bottom=0.0)
+    axes[1].axhline(1.0, color="#666666", linestyle="--", linewidth=1, label="Parity")
+    axes[0].legend(frameon=False)
+    axes[1].legend(frameon=False)
     fig.suptitle(
-        pu.paper_text(
-            f"15-bit versus 16-bit index keys on {PAPER_REFERENCE_COUNT:,} RefSeq sketches, all-to-all",
-            bold=True,
-        ),
-        fontsize=pu.TITLE_FONT_SIZE + 2,
-        y=0.985,
+        pu.paper_text("Index key width across RefSeq database sizes", bold=True),
+        fontsize=pu.TITLE_FONT_SIZE,
     )
-    fig.subplots_adjust(
-        left=0.07,
-        right=0.97,
-        bottom=0.16,
-        top=0.78,
-        wspace=0.30,
-    )
+    fig.supxlabel(pu.paper_text("Overlapping curves indicate equivalent performance"))
     output.parent.mkdir(parents=True, exist_ok=True)
     pu.save_figure(fig, output, pad_inches=0.10)
 

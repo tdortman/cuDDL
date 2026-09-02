@@ -1,4 +1,6 @@
+#include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
+#include <cuddl/refseq_parity.hpp>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
@@ -15,11 +17,15 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -29,12 +35,15 @@
 #include <vector>
 
 #include "common.cuh"
+#include "compressed_file.hpp"
 #include "result_json.hpp"
 
 namespace {
 
 using clock_type = std::chrono::steady_clock;
 using database_type = cuddl::reference_database<25, 2048>;
+using refseq_register_layout = cuddl::register_layout<5, 11>;
+using refseq_database_type = cuddl::reference_database<25, 4096, refseq_register_layout>;
 
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
@@ -50,10 +59,17 @@ constexpr uint32_t k_score_period = 0x7FFFU;
 // data (paper, Section 9): ~1% of the 200,687 sketches, not all of them.
 constexpr double k_hot_value_fraction = 0.01;
 
-std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
+std::vector<nvbench::int64_t> const reference_counts{1024, 16384};
 
 std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
 std::vector<nvbench::int64_t> const key_bits{15, 16};
+std::vector<nvbench::int64_t> const
+    refseq_reference_counts{1024, 2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 148108};
+constexpr uint32_t k_refseq_bucket_count = 4096U;
+constexpr uint32_t k_refseq_reference_count = 148108U;
+constexpr uint32_t k_refseq_query_count = 4096U;
+constexpr uint64_t k_refseq_asset_size = 1270805218ULL;
+std::string g_refseq_asset_path = "data/refseqSketchDDL_k25e5b4096.tsv.gz";
 
 struct workload {
     uint32_t reference_count{};
@@ -150,18 +166,13 @@ void add_string(nvbench::state& state, char const* name, std::string value) {
     summary.set_string("name", name);
     summary.set_string("value", std::move(value));
 }
-void add_common_metadata(
-    nvbench::state& state,
-    workload const& value,
-    size_t free_memory_bytes,
-    cuddl::score_compatibility const& compatibility
-) {
+
+void add_environment_metadata(nvbench::state& state, size_t free_memory_bytes) {
     int runtime_version = 0;
     int driver_version = 0;
     CUDDL_CUDA_CALL(cudaRuntimeGetVersion(&runtime_version));
     CUDDL_CUDA_CALL(cudaDriverGetVersion(&driver_version));
     static json const host = benchmark_host_system();
-
     add_string(state, "system_os", host.at("os").get<std::string>());
     add_string(state, "system_kernel", host.at("kernel").get<std::string>());
     add_string(state, "system_architecture", host.at("architecture").get<std::string>());
@@ -172,9 +183,6 @@ void add_common_metadata(
         std::to_string(host.at("logical_cpu_count").get<uint64_t>())
     );
     add_string(state, "system_ram_bytes", std::to_string(host.at("ram_bytes").get<uint64_t>()));
-    add_value(state, "fixture_seed", static_cast<double>(k_fixture_seed));
-    add_value(state, "hot_fraction", value.hot_fraction);
-    add_value(state, "minimum_matches", k_minimum_matches);
     add_value(state, "free_memory_before_bytes", static_cast<double>(free_memory_bytes));
     add_value(state, "cuda_runtime_version", runtime_version);
     add_value(state, "cuda_driver_version", driver_version);
@@ -185,6 +193,12 @@ void add_common_metadata(
 #else
     add_string(state, "build_configuration", "unoptimised");
 #endif
+}
+
+void add_compatibility_metadata(
+    nvbench::state& state,
+    cuddl::score_compatibility const& compatibility
+) {
     add_value(state, "kmer_length", compatibility.kmer_length);
     add_value(state, "bucket_count", compatibility.bucket_count);
     add_value(state, "indexed_bucket_count", compatibility.indexed_bucket_count);
@@ -197,6 +211,19 @@ void add_common_metadata(
     add_string(state, "blacklist_identity", std::to_string(compatibility.blacklist_identity));
     add_value(state, "blacklist_version", compatibility.blacklist_version);
     add_value(state, "key_mask", compatibility.key_mask);
+}
+
+void add_common_metadata(
+    nvbench::state& state,
+    workload const& value,
+    size_t free_memory_bytes,
+    cuddl::score_compatibility const& compatibility
+) {
+    add_environment_metadata(state, free_memory_bytes);
+    add_compatibility_metadata(state, compatibility);
+    add_value(state, "fixture_seed", static_cast<double>(k_fixture_seed));
+    add_value(state, "hot_fraction", value.hot_fraction);
+    add_value(state, "minimum_matches", k_minimum_matches);
     add_value(
         state,
         "filled_cells_per_row",
@@ -1009,6 +1036,293 @@ void indexed_search(nvbench::state& state) {
     stash_state("indexed_search", axes_key(settings, &mode), state);
 }
 
+struct refseq_fixture {
+    std::vector<uint16_t> rows;
+    cuddl::score_compatibility compatibility;
+};
+
+[[nodiscard]] refseq_fixture load_refseq_fixture() {
+    if (std::filesystem::file_size(g_refseq_asset_path) != k_refseq_asset_size) {
+        throw std::runtime_error(
+            "RefSeq asset has the wrong compressed size: " + g_refseq_asset_path
+        );
+    }
+    auto opaque = cuddl_bench::read_file_any(g_refseq_asset_path);
+    auto decoded = CUDDL_UNWRAP(
+        cuddl::a48::decode_a48_tsv_parallel(opaque, std::thread::hardware_concurrency())
+    );
+    if (!decoded.metadata.has_kmer_length || decoded.metadata.kmer_length != k_kmer_length ||
+        !decoded.metadata.has_seed || !decoded.metadata.has_exponent ||
+        decoded.metadata.exponent_bits != 5U ||
+        decoded.records.size() != k_refseq_reference_count) {
+        throw std::runtime_error("RefSeq asset metadata does not match the pinned v40.00 asset");
+    }
+    std::mt19937_64 generator{k_fixture_seed};
+    std::shuffle(decoded.records.begin(), decoded.records.end(), generator);
+
+    refseq_fixture fixture{
+        .rows = std::vector<uint16_t>(
+            static_cast<size_t>(decoded.records.size()) * k_refseq_bucket_count
+        ),
+        .compatibility = cuddl::decoded_compatibility(
+            k_kmer_length,
+            k_refseq_bucket_count,
+            decoded.metadata.exponent_bits,
+            decoded.metadata.seed
+        ),
+    };
+    for (size_t row = 0; row < decoded.records.size(); ++row) {
+        if (decoded.records[row].scores.size() != k_refseq_bucket_count) {
+            throw std::runtime_error("RefSeq asset contains a row with the wrong bucket count");
+        }
+        std::copy(
+            decoded.records[row].scores.begin(),
+            decoded.records[row].scores.end(),
+            fixture.rows.begin() + static_cast<std::ptrdiff_t>(row * k_refseq_bucket_count)
+        );
+    }
+    return fixture;
+}
+
+struct refseq_context {
+    cuddl::score_compatibility compatibility;
+    thrust::device_vector<uint16_t> rows;
+    std::optional<refseq_database_type> exhaustive_database;
+    std::optional<refseq_database_type> indexed_database;
+    uint32_t exhaustive_reference_count{};
+    uint32_t indexed_reference_count{};
+    uint32_t indexed_key_bits{};
+};
+std::unique_ptr<refseq_context> g_refseq_context;
+
+[[nodiscard]] refseq_context& get_refseq_context() {
+    if (!g_refseq_context) {
+        auto fixture = load_refseq_fixture();
+        g_refseq_context = std::make_unique<refseq_context>(refseq_context{
+            .compatibility = fixture.compatibility,
+            .rows = thrust::device_vector<uint16_t>(fixture.rows),
+            .exhaustive_database = {},
+            .indexed_database = {},
+            .exhaustive_reference_count = 0U,
+            .indexed_reference_count = 0U,
+            .indexed_key_bits = 0U,
+        });
+    }
+    return *g_refseq_context;
+}
+
+[[nodiscard]] uint32_t read_refseq_reference_count(nvbench::state& state) {
+    auto const reference_count = state.get_int64("References");
+    if (reference_count <= 0 || reference_count > k_refseq_reference_count) {
+        throw std::runtime_error("RefSeq reference count is out of range");
+    }
+    return static_cast<uint32_t>(reference_count);
+}
+
+[[nodiscard]] index_mode read_refseq_index_mode(nvbench::state& state) {
+    auto mode = read_index_mode(state);
+    mode.indexed_bucket_count = k_refseq_bucket_count;
+    return mode;
+}
+
+[[nodiscard]] std::string refseq_axes_key(uint32_t reference_count, index_mode const* mode) {
+    auto key = std::to_string(reference_count);
+    if (mode != nullptr) {
+        key +=
+            "," + std::to_string(mode->indexed_bucket_count) + "," + std::to_string(mode->key_bits);
+    }
+    return key;
+}
+
+void add_refseq_metadata(
+    nvbench::state& state,
+    uint32_t reference_count,
+    cuddl::score_compatibility const& compatibility,
+    size_t resident_bytes
+) {
+    size_t free_memory = 0U;
+    size_t total_memory = 0U;
+    CUDDL_CUDA_CALL(cudaMemGetInfo(&free_memory, &total_memory));
+    static_cast<void>(total_memory);
+    add_environment_metadata(state, free_memory);
+    add_compatibility_metadata(state, compatibility);
+    add_string(state, "dataset_path", g_refseq_asset_path);
+    add_string(state, "query_profile", "refseq_reference_scaling");
+    add_value(state, "reference_count", reference_count);
+    add_value(state, "query_count", k_refseq_query_count);
+    add_value(state, "fixture_seed", k_fixture_seed);
+    add_value(state, "minimum_matches", k_minimum_matches);
+    add_value(state, "resident_bytes", static_cast<double>(resident_bytes));
+}
+
+[[nodiscard]] cuddl::device_span<uint16_t const>
+refseq_reference_rows(refseq_context const& context, uint32_t reference_count) {
+    return {
+        thrust::raw_pointer_cast(context.rows.data()),
+        static_cast<size_t>(reference_count) * k_refseq_bucket_count,
+    };
+}
+
+[[nodiscard]] cuddl::device_span<uint16_t const> refseq_queries(refseq_context const& context) {
+    auto const offset = static_cast<size_t>(k_refseq_reference_count - k_refseq_query_count) *
+                        k_refseq_bucket_count;
+    return {
+        thrust::raw_pointer_cast(context.rows.data()) + offset,
+        static_cast<size_t>(k_refseq_query_count) * k_refseq_bucket_count,
+    };
+}
+
+template <typename T>
+[[nodiscard]] cuddl::device_span<T> device_vector_span(thrust::device_vector<T>& values) {
+    return {thrust::raw_pointer_cast(values.data()), values.size()};
+}
+
+void refseq_exhaustive_search(nvbench::state& state) {
+    auto const reference_count = read_refseq_reference_count(state);
+    auto& context = get_refseq_context();
+    if (!context.exhaustive_database || context.exhaustive_reference_count != reference_count) {
+        context.exhaustive_database.reset();
+        context.exhaustive_database.emplace(CUDDL_UNWRAP(
+            refseq_database_type::build_async(
+                refseq_reference_rows(context, reference_count), context.compatibility
+            )
+        ));
+        context.exhaustive_reference_count = reference_count;
+        CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    }
+    auto const& database = *context.exhaustive_database;
+    auto const requirements =
+        CUDDL_UNWRAP(database.batch_search_requirements(k_refseq_query_count));
+    thrust::device_vector<uint8_t> workspace(requirements.workspace_bytes);
+    thrust::device_vector<cuddl::batch_search_result> results(requirements.maximum_pair_count);
+    thrust::device_vector<uint32_t> result_count(1U);
+    add_refseq_metadata(
+        state, reference_count, context.compatibility, database.persistent_row_bytes()
+    );
+    state.add_element_count(
+        static_cast<size_t>(k_refseq_query_count) * reference_count, "Pair Comparisons"
+    );
+
+    CUDDL_UNWRAP(database.search_batch_async(
+        refseq_queries(context),
+        context.compatibility,
+        0U,
+        device_vector_span(workspace),
+        device_vector_span(results),
+        device_vector_span(result_count),
+        [&](uint32_t expected_count) {
+            uint32_t observed_count = 0U;
+            CUDDL_CUDA_CALL(cudaMemcpy(
+                &observed_count,
+                thrust::raw_pointer_cast(result_count.data()),
+                sizeof(observed_count),
+                cudaMemcpyDeviceToHost
+            ));
+            if (observed_count != expected_count) {
+                throw std::runtime_error("RefSeq exhaustive tile returned the wrong pair count");
+            }
+        }
+    ));
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        CUDDL_UNWRAP(database.search_batch_async(
+            refseq_queries(context),
+            context.compatibility,
+            0U,
+            device_vector_span(workspace),
+            device_vector_span(results),
+            device_vector_span(result_count),
+            [](uint32_t) {},
+            {},
+            cuda::stream_ref{launch.get_stream()}
+        ));
+    });
+    stash_state("refseq_exhaustive_search", refseq_axes_key(reference_count, nullptr), state);
+}
+
+void refseq_indexed_search(nvbench::state& state) {
+    auto const reference_count = read_refseq_reference_count(state);
+    auto const mode = read_refseq_index_mode(state);
+    auto compatibility = get_refseq_context().compatibility;
+    compatibility.key_mask = mode.key_mask;
+    auto& context = get_refseq_context();
+    if (!context.indexed_database || context.indexed_reference_count != reference_count ||
+        context.indexed_key_bits != mode.key_bits) {
+        context.indexed_database.reset();
+        auto database = CUDDL_UNWRAP(
+            refseq_database_type::build_indexed_async(
+                refseq_reference_rows(context, reference_count), compatibility
+            )
+        );
+        context.indexed_database.emplace(std::move(database));
+        context.indexed_reference_count = reference_count;
+        context.indexed_key_bits = mode.key_bits;
+        CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    }
+    auto const& database = *context.indexed_database;
+    auto const requirements =
+        CUDDL_UNWRAP(database.indexed_batch_search_requirements(k_refseq_query_count));
+    thrust::device_vector<uint8_t> workspace(requirements.workspace_bytes);
+    thrust::device_vector<cuddl::batch_search_result> results(requirements.maximum_pair_count);
+    thrust::device_vector<uint32_t> result_count(1U);
+    add_refseq_metadata(
+        state,
+        reference_count,
+        compatibility,
+        database.persistent_row_bytes() + database.persistent_index_bytes()
+    );
+    uint64_t selected_candidates = 0U;
+    CUDDL_UNWRAP(database.search_batch_indexed_async(
+        refseq_queries(context),
+        compatibility,
+        0U,
+        device_vector_span(workspace),
+        device_vector_span(results),
+        device_vector_span(result_count),
+        [&](uint32_t maximum_count) {
+            uint32_t observed_count = 0U;
+            CUDDL_CUDA_CALL(cudaMemcpy(
+                &observed_count,
+                thrust::raw_pointer_cast(result_count.data()),
+                sizeof(observed_count),
+                cudaMemcpyDeviceToHost
+            ));
+            if (observed_count > maximum_count) {
+                throw std::runtime_error("RefSeq indexed tile exceeded its result capacity");
+            }
+            selected_candidates += observed_count;
+        },
+        {},
+        {.minimum_matches = k_minimum_matches}
+    ));
+    add_value(state, "selected_candidates", static_cast<double>(selected_candidates));
+    add_value(
+        state,
+        "candidate_fraction",
+        static_cast<double>(selected_candidates) /
+            (static_cast<double>(k_refseq_query_count) * reference_count)
+    );
+    state.add_element_count(
+        static_cast<size_t>(k_refseq_query_count) * reference_count, "Database Pairs"
+    );
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        CUDDL_UNWRAP(database.search_batch_indexed_async(
+            refseq_queries(context),
+            compatibility,
+            0U,
+            device_vector_span(workspace),
+            device_vector_span(results),
+            device_vector_span(result_count),
+            [](uint32_t) {},
+            {},
+            {.minimum_matches = k_minimum_matches},
+            cuda::stream_ref{launch.get_stream()}
+        ));
+    });
+    stash_state("refseq_indexed_search", refseq_axes_key(reference_count, &mode), state);
+}
+
 // --- In-process summary collection -------------------------------------------
 // The benchmark writes one summary CSV at the end of the run (see main), so the
 // four benchmark functions stash their per-state results here instead of relying on
@@ -1107,6 +1421,23 @@ NVBENCH_BENCH(indexed_search)
     .set_cold_warmup_runs(3)
     .set_skip_batched(true);
 
+NVBENCH_BENCH(refseq_exhaustive_search)
+    .add_int64_axis("References", refseq_reference_counts)
+    .set_stopping_criterion("sample-count")
+    .set_min_samples(20)
+    .set_criterion_param_int64("target-samples", 20)
+    .set_cold_warmup_runs(3)
+    .set_skip_batched(true);
+
+NVBENCH_BENCH(refseq_indexed_search)
+    .add_int64_axis("KeyBits", key_bits)
+    .add_int64_axis("References", refseq_reference_counts)
+    .set_stopping_criterion("sample-count")
+    .set_min_samples(20)
+    .set_criterion_param_int64("target-samples", 20)
+    .set_cold_warmup_runs(3)
+    .set_skip_batched(true);
+
 namespace {
 
 std::vector<std::string> split(std::string const& text, char separator) {
@@ -1141,6 +1472,8 @@ void write_summary_json() {
     auto indexed_build_states = record_of("indexed_build");
     auto exhaustive_states = record_of("exhaustive_search");
     auto indexed_search_states = record_of("indexed_search");
+    auto refseq_exhaustive_states = record_of("refseq_exhaustive_search");
+    auto refseq_indexed_states = record_of("refseq_indexed_search");
 
     std::set<std::vector<std::string>> mode_keys;
     for (auto const& [key, state] : indexed_build_states) {
@@ -1246,11 +1579,11 @@ void write_summary_json() {
                 row["threshold_zero_recall"] = value_of(indexed, "threshold_zero_recall");
                 row["exhaustive_min_ms"] = timing_ms(exhaustive, "min");
                 row["exhaustive_mean_ms"] = timing_ms(exhaustive, "mean");
-                row["exhaustive_median_ms"] = timing_ms(exhaustive, "median");
+                row["exhaustive_p50_ms"] = timing_ms(exhaustive, "median");
                 row["exhaustive_max_ms"] = timing_ms(exhaustive, "max");
                 row["indexed_min_ms"] = timing_ms(indexed, "min");
                 row["indexed_mean_ms"] = timing_ms(indexed, "mean");
-                row["indexed_median_ms"] = timing_ms(indexed, "median");
+                row["indexed_p50_ms"] = timing_ms(indexed, "median");
                 row["indexed_max_ms"] = timing_ms(indexed, "max");
                 row["atomic_updates"] = value_of(indexed, "atomic_updates");
                 row["selected_candidates"] = value_of(indexed, "selected_candidates");
@@ -1259,8 +1592,8 @@ void write_summary_json() {
 
                 auto const recall_text = row["threshold_zero_recall"];
                 auto const recall = recall_text.empty() ? 0.0 : std::stod(recall_text);
-                auto const exhaustive_median = std::stod(row["exhaustive_median_ms"]);
-                auto const indexed_median = std::stod(row["indexed_median_ms"]);
+                auto const exhaustive_median = std::stod(row["exhaustive_p50_ms"]);
+                auto const indexed_median = std::stod(row["indexed_p50_ms"]);
                 auto const recall_loss = !std::isfinite(recall) || recall < 1.0;
                 auto const indexed_win = indexed_median < exhaustive_median;
                 auto const exhaustive_win = exhaustive_median < indexed_median;
@@ -1278,11 +1611,11 @@ void write_summary_json() {
                      "threshold_zero_recall",
                      "exhaustive_min_ms",
                      "exhaustive_mean_ms",
-                     "exhaustive_median_ms",
+                     "exhaustive_p50_ms",
                      "exhaustive_max_ms",
                      "indexed_min_ms",
                      "indexed_mean_ms",
-                     "indexed_median_ms",
+                     "indexed_p50_ms",
                      "indexed_max_ms",
                      "candidate_inflation",
                  }) {
@@ -1321,6 +1654,76 @@ void write_summary_json() {
             measurements.push_back(std::move(measurement));
         }
     }
+
+    for (auto const& [key, indexed] : refseq_indexed_states) {
+        if (key.size() != 3U) {
+            continue;
+        }
+        auto exhaustive = refseq_exhaustive_states.find({key[0]});
+        auto const complete = exhaustive != refseq_exhaustive_states.end();
+        auto const skipped = indexed->skipped || (complete && exhaustive->second->skipped);
+        std::string error;
+        if (!complete) {
+            error = "missing refseq_exhaustive_search";
+        } else if (indexed->skipped) {
+            error = indexed->skip_reason;
+        } else if (exhaustive->second->skipped) {
+            error = exhaustive->second->skip_reason;
+        }
+
+        json metrics{{"kill_gate_outcome", "inconclusive"}};
+        if (complete && !skipped) {
+            auto const exhaustive_p50 = timing_ms(*exhaustive->second, "median");
+            auto const indexed_p50 = timing_ms(*indexed, "median");
+            auto const database_pairs =
+                std::stoull(key[0]) * static_cast<uint64_t>(k_refseq_query_count);
+            metrics.update({
+                {"exhaustive_p50_ms", std::stod(exhaustive_p50)},
+                {"indexed_p50_ms", std::stod(indexed_p50)},
+                {"exhaustive_queries_per_second",
+                 1000.0 * k_refseq_query_count / std::stod(exhaustive_p50)},
+                {"indexed_queries_per_second",
+                 1000.0 * k_refseq_query_count / std::stod(indexed_p50)},
+                {"search_speedup", std::stod(exhaustive_p50) / std::stod(indexed_p50)},
+                {"database_pairs", database_pairs},
+                {"exhaustive_effective_pairs_per_second",
+                 1000.0 * static_cast<double>(database_pairs) / std::stod(exhaustive_p50)},
+                {"indexed_effective_pairs_per_second",
+                 1000.0 * static_cast<double>(database_pairs) / std::stod(indexed_p50)},
+            });
+            auto const candidates = value_of(*indexed, "selected_candidates");
+            if (!candidates.empty()) {
+                auto const candidate_count = integer_of(candidates);
+                metrics["selected_candidates"] = candidate_count;
+                metrics["candidate_fraction"] =
+                    static_cast<double>(candidate_count) / static_cast<double>(database_pairs);
+            }
+        }
+
+        json measurement{
+            {"implementation", {{"name", "cuddl"}}},
+            {"case",
+             {
+                 {"status", complete && !skipped ? "ok" : "skipped"},
+                 {"dataset", "BBTools RefSeq DDL v40.00"},
+                 {"dataset_path", g_refseq_asset_path},
+                 {"reference_count", std::stoull(key[0])},
+                 {"query_count", k_refseq_query_count},
+                 {"query_profile", "refseq_reference_scaling"},
+                 {"fixture_seed", k_fixture_seed},
+                 {"index_mode", "b" + key[1] + "_k" + key[2]},
+                 {"indexed_bucket_count", std::stoull(key[1])},
+                 {"key_bits", std::stoull(key[2])},
+                 {"error", error},
+             }},
+            {"metrics", std::move(metrics)},
+        };
+        auto const resident_bytes = value_of(*indexed, "resident_bytes");
+        if (!resident_bytes.empty()) {
+            measurement["memory_bytes"] = {{"indexed_resident", integer_of(resident_bytes)}};
+        }
+        measurements.push_back(std::move(measurement));
+    }
     write_benchmark_result(
         g_summary_json_path,
         make_benchmark_result(
@@ -1347,6 +1750,17 @@ int main(int argc, char** argv) try {
                 g_summary_json_path = std::string(argument.substr(15));
                 continue;
             }
+            if (argument == "--refseq-asset") {
+                if (i + 1 >= argc) {
+                    throw std::runtime_error("--refseq-asset requires a path");
+                }
+                g_refseq_asset_path = argv[++i];
+                continue;
+            }
+            if (argument.starts_with("--refseq-asset=")) {
+                g_refseq_asset_path = std::string(argument.substr(15));
+                continue;
+            }
             remaining.push_back(argv[i]);
         }
         auto const args = nvbench::detail::main_convert_args(
@@ -1359,13 +1773,16 @@ int main(int argc, char** argv) try {
         nvbench::detail::main_print_epilogue(parser);
         nvbench::detail::main_print_results(parser);
     }
+    g_refseq_context.reset();
     nvbench::detail::main_finalize();
     write_summary_json();
     return 0;
 } catch (std::exception& error) {
+    g_refseq_context.reset();
     std::cerr << "\nNVBench encountered an error:\n\n" << error.what() << "\n";
     return 1;
 } catch (...) {
+    g_refseq_context.reset();
     std::cerr << "\nNVBench encountered an unknown error.\n";
     return 1;
 }

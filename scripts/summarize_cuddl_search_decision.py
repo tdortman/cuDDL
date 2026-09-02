@@ -17,7 +17,12 @@ import typer
 from benchmark_schema import make_result, measurements_from_rows, write_result
 
 BUILD_BENCHMARKS = ("compact_build", "indexed_build")
-SEARCH_BENCHMARKS = ("exhaustive_search", "indexed_search")
+SEARCH_BENCHMARKS = (
+    "exhaustive_search",
+    "indexed_search",
+    "refseq_exhaustive_search",
+    "refseq_indexed_search",
+)
 PAPER_REFERENCE_COUNT = 200687
 
 FIELDS = (
@@ -51,6 +56,8 @@ FIELDS = (
     "minimum_matches",
     "query_count",
     "query_profile",
+    "dataset",
+    "dataset_path",
     "warmup",
     "exhaustive_repetitions",
     "indexed_repetitions",
@@ -83,6 +90,7 @@ FIELDS = (
     "posting_visits",
     "atomic_updates",
     "selected_candidates",
+    "candidate_fraction",
     "candidate_inflation",
     "exhaustive_exact_comparisons",
     "indexed_exact_comparisons",
@@ -96,6 +104,10 @@ FIELDS = (
     "indexed_p50_ms",
     "indexed_p95_ms",
     "indexed_queries_per_second",
+    "database_pairs",
+    "exhaustive_effective_pairs_per_second",
+    "indexed_effective_pairs_per_second",
+    "search_speedup",
     "kill_gate_rule",
     "kill_gate_outcome",
     "paper_scale_suitability",
@@ -134,6 +146,8 @@ CASE_FIELDS = (
     "minimum_matches",
     "query_count",
     "query_profile",
+    "dataset",
+    "dataset_path",
     "warmup",
     "kill_gate_rule",
     "kill_gate_outcome",
@@ -191,6 +205,7 @@ INTEGER_FIELDS = {
     "indexed_exact_comparisons",
     "oracle_threshold_pairs",
     "recalled_pairs",
+    "database_pairs",
 }
 
 FLOAT_FIELDS = {
@@ -211,6 +226,7 @@ FLOAT_FIELDS = {
     "indexed_build_p50_ms",
     "indexed_build_p95_ms",
     "top_bit_frequency",
+    "candidate_fraction",
     "candidate_inflation",
     "exact_result_recall",
     "threshold_zero_recall",
@@ -220,6 +236,9 @@ FLOAT_FIELDS = {
     "indexed_p50_ms",
     "indexed_p95_ms",
     "indexed_queries_per_second",
+    "exhaustive_effective_pairs_per_second",
+    "indexed_effective_pairs_per_second",
+    "search_speedup",
 }
 
 
@@ -275,12 +294,18 @@ def mode_key(state: dict[str, Any]) -> tuple[str, str]:
     return str(int(float(buckets))), str(int(bits))
 
 
-def state_key(state: dict[str, Any], include_mode: bool = False) -> tuple[str, ...]:
+def state_key(
+    state: dict[str, Any], name: str, include_mode: bool = False
+) -> tuple[str, ...]:
     axes = axis_values(state)
     key = (
-        axes["References"],
-        axes.get("FillPermille", "1000"),
-        axes["HotPercent"],
+        (axes["References"],)
+        if name.startswith("refseq_")
+        else (
+            axes["References"],
+            axes.get("FillPermille", "1000"),
+            axes["HotPercent"],
+        )
     )
     return (*key, *mode_key(state)) if include_mode else key
 
@@ -294,10 +319,10 @@ def benchmark_states(
         )
     except StopIteration as error:
         raise ValueError(f"benchmark {name!r} is missing from input") from error
-    include_mode = name in ("indexed_build", "indexed_search")
+    include_mode = name in ("indexed_build", "indexed_search", "refseq_indexed_search")
     states = {}
     for state in benchmark["states"]:
-        key = state_key(state, include_mode)
+        key = state_key(state, name, include_mode)
         if key in states:
             raise ValueError(f"benchmark {name!r} contains duplicate state {key}")
         states[key] = state
@@ -595,6 +620,108 @@ def main(
                     outcome = "no_speed_win" if exhaustive_win else "inconclusive"
                 row["paper_scale_suitability"] = outcome
             rows.append(row)
+
+    for indexed_key, indexed in states["refseq_indexed_search"].items():
+        reference_count, buckets, bits = (int(value) for value in indexed_key)
+        exhaustive = states["refseq_exhaustive_search"].get((str(reference_count),))
+        missing = exhaustive is None
+        skipped = [
+            state.get("skip_reason", "skipped")
+            for state in (exhaustive, indexed)
+            if state is not None and state.get("is_skipped")
+        ]
+        status = "ok" if not missing and not skipped else "skipped"
+        error = "missing refseq_exhaustive_search" if missing else "; ".join(skipped)
+        device = devices[indexed["device"]]
+        sm_version = int(device["sm_version"])
+        query_count = int(summary_value(indexed, "query_count"))
+        row: dict[str, Any] = {
+            "schema_version": 3,
+            "timestamp_utc": datetime.fromtimestamp(
+                input_path.stat().st_mtime, timezone.utc
+            ).isoformat(),
+            "benchmark_command": shlex.join(document["meta"]["argv"]),
+            "nvbench_version": document["meta"]["version"]["nvbench"]["string"],
+            "gpu_name": device["name"],
+            "compute_capability": f"{sm_version // 100}.{sm_version % 100 // 10}",
+            "multiprocessor_count": device["number_of_sms"],
+            "global_memory_bytes": device["global_memory_size"],
+            "reference_count": reference_count,
+            "query_count": query_count,
+            "query_profile": "refseq_reference_scaling",
+            "dataset": "BBTools RefSeq DDL v40.00",
+            "dataset_path": summary_value(indexed, "dataset_path"),
+            "indexed_bucket_count": buckets,
+            "key_bits": bits,
+            "key_mask": str((1 << bits) - 1),
+            "index_mode": f"b{buckets}_k{bits}",
+            "warmup": indexed["cold_warmup_runs"],
+            "kill_gate_outcome": "inconclusive",
+            "paper_scale_suitability": "not_paper_scale",
+            "status": status,
+            "error": error,
+            "implementation": "cuddl",
+        }
+        for tag in (
+            "system_os",
+            "system_kernel",
+            "system_architecture",
+            "system_cpu",
+            "system_logical_cpu_count",
+            "system_ram_bytes",
+            "free_memory_before_bytes",
+            "cuda_runtime_version",
+            "cuda_driver_version",
+            "cuda_compile_version",
+            "compiler",
+            "build_configuration",
+            "kmer_length",
+            "bucket_count",
+            "score_encoder_identity",
+            "exponent_bits",
+            "mantissa_bits",
+            "hash_identity",
+            "hash_seed",
+            "canonicalisation_policy",
+            "blacklist_identity",
+            "blacklist_version",
+            "minimum_matches",
+        ):
+            row[tag] = summary_value(indexed, tag)
+        row["indexed_resident_bytes"] = as_number(indexed, "resident_bytes")
+        row["selected_candidates"] = as_number(indexed, "selected_candidates")
+        if status == "ok":
+            assert exhaustive is not None
+            exhaustive_p50, exhaustive_p95, exhaustive_count = timing_ms(
+                input_path, exhaustive
+            )
+            indexed_p50, indexed_p95, indexed_count = timing_ms(input_path, indexed)
+            database_pairs = query_count * reference_count
+            selected_candidates = row["selected_candidates"]
+            row.update(
+                {
+                    "database_pairs": database_pairs,
+                    "exhaustive_p50_ms": exhaustive_p50,
+                    "exhaustive_p95_ms": exhaustive_p95,
+                    "indexed_p50_ms": indexed_p50,
+                    "indexed_p95_ms": indexed_p95,
+                    "exhaustive_effective_pairs_per_second": 1000.0
+                    * database_pairs
+                    / exhaustive_p50,
+                    "indexed_effective_pairs_per_second": 1000.0
+                    * database_pairs
+                    / indexed_p50,
+                    "exhaustive_queries_per_second": 1000.0
+                    * query_count
+                    / exhaustive_p50,
+                    "indexed_queries_per_second": 1000.0 * query_count / indexed_p50,
+                    "search_speedup": exhaustive_p50 / indexed_p50,
+                    "candidate_fraction": selected_candidates / database_pairs,
+                    "exhaustive_repetitions": exhaustive_count,
+                    "indexed_repetitions": indexed_count,
+                }
+            )
+        rows.append(row)
 
     typed_rows = [typed_row(row) for row in rows]
     system_fields = {
