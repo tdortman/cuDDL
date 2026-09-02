@@ -67,7 +67,7 @@ std::vector<nvbench::int64_t> const
     refseq_reference_counts{1024, 2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 148108};
 constexpr uint32_t k_refseq_bucket_count = 4096U;
 constexpr uint32_t k_refseq_reference_count = 148108U;
-constexpr uint32_t k_refseq_query_count = 4096U;
+constexpr uint32_t k_refseq_query_count = 8192U;
 constexpr uint64_t k_refseq_asset_size = 1270805218ULL;
 std::string g_refseq_asset_path = "data/refseqSketchDDL_k25e5b4096.tsv.gz";
 
@@ -1552,11 +1552,11 @@ void write_summary_json() {
                 error += (error.empty() ? "" : "; ") + note;
             }
 
-            auto const references = workload[0];
-            auto const fill_permille = workload[1];
-            auto const hot_percent = workload[2];
+            auto const& references = workload[0];
+            auto const& fill_permille = workload[1];
+            auto const& hot_percent = workload[2];
             auto const fill_ratio = std::stod(fill_permille) / 1000.0;
-            auto const query_count = references;
+            auto const& query_count = references;
             auto const query_profile = "all_to_all";
             auto const& buckets = mode[0];
             auto const& bits = mode[1];

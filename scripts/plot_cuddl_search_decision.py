@@ -175,7 +175,7 @@ def plot_refseq(axes: tuple[plt.Axes, plt.Axes, plt.Axes], data: pd.DataFrame) -
         linewidth=2,
     )
     latency_ax.set(
-        title=pu.paper_text("RefSeq batch latency (4,096 queries)", bold=True),
+        title=pu.paper_text("RefSeq batch latency (8,192 queries)", bold=True),
         ylabel=pu.paper_text("Median time (ms)"),
     )
     speedup_ax.set(
