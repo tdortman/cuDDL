@@ -18,7 +18,6 @@ from benchmark_schema import make_result, measurements_from_rows, write_result
 
 BUILD_BENCHMARKS = ("compact_build", "indexed_build")
 SEARCH_BENCHMARKS = ("exhaustive_search", "indexed_search")
-QUERY_PROFILES = {"copied", "boundary"}
 PAPER_REFERENCE_COUNT = 200687
 
 FIELDS = (
@@ -276,28 +275,13 @@ def mode_key(state: dict[str, Any]) -> tuple[str, str]:
     return str(int(float(buckets))), str(int(bits))
 
 
-def state_key(
-    state: dict[str, Any], include_queries: bool, include_mode: bool = False
-) -> tuple[str, ...]:
+def state_key(state: dict[str, Any], include_mode: bool = False) -> tuple[str, ...]:
     axes = axis_values(state)
     key = (
         axes["References"],
         axes.get("FillPermille", "1000"),
         axes["HotPercent"],
     )
-    if include_queries:
-        try:
-            query_profile = axes["QueryProfile"]
-            key = (*key, axes["Queries"], query_profile)
-        except KeyError as error:
-            missing = ", ".join(
-                axis for axis in ("Queries", "QueryProfile") if axis not in axes
-            )
-            raise ValueError(
-                f"search benchmark state is missing required axis/axes: {missing}"
-            ) from error
-        if query_profile not in QUERY_PROFILES:
-            raise ValueError(f"unknown query profile: {query_profile!r}")
     return (*key, *mode_key(state)) if include_mode else key
 
 
@@ -310,11 +294,10 @@ def benchmark_states(
         )
     except StopIteration as error:
         raise ValueError(f"benchmark {name!r} is missing from input") from error
-    include_queries = name in SEARCH_BENCHMARKS
     include_mode = name in ("indexed_build", "indexed_search")
     states = {}
     for state in benchmark["states"]:
-        key = state_key(state, include_queries, include_mode)
+        key = state_key(state, include_mode)
         if key in states:
             raise ValueError(f"benchmark {name!r} contains duplicate state {key}")
         states[key] = state
@@ -382,7 +365,7 @@ def main(
     workload_keys = sorted(
         set(states["exhaustive_search"])
         | {key[:-2] for key in states["indexed_search"]},
-        key=lambda key: (*tuple(int(value) for value in key[:-1]), key[-1]),
+        key=lambda key: tuple(int(value) for value in key),
     )
     mode_keys = sorted(
         {key[-2:] for key in states["indexed_build"]}
@@ -438,8 +421,8 @@ def main(
                 "reference_count": axes["References"],
                 "fill_ratio": int(axes.get("FillPermille", "1000")) / 1000.0,
                 "skew": f"{int(axes['HotPercent'])}%",
-                "query_count": workload_key[3],
-                "query_profile": workload_key[4],
+                "query_count": reference_count,
+                "query_profile": "all_to_all",
                 "indexed_bucket_count": mode[0],
                 "key_bits": mode[1],
                 "key_mask": str((1 << int(mode[1])) - 1),
@@ -503,7 +486,7 @@ def main(
                     input_path, exhaustive
                 )
                 indexed_p50, indexed_p95, indexed_count = timing_ms(input_path, indexed)
-                query_count = int(axes["Queries"])
+                query_count = reference_count
                 recall = as_number(indexed, "threshold_zero_recall")
                 if math.isnan(recall):
                     raise ValueError(

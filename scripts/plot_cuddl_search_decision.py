@@ -35,7 +35,7 @@ VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"
 REFSEQ_REFERENCE_COUNT = 200687
 PAPER_INDEXED_BUCKET_COUNT = 2048
 PAPER_FILL_RATIO = 1.0
-PAPER_QUERY_PROFILE = "copied"
+PAPER_QUERY_PROFILE = "all_to_all"
 
 
 def skew_fraction(value: object) -> float:
@@ -122,7 +122,6 @@ def main(
         )
 
     references = sorted(data["reference_count"].unique())
-    query_counts = sorted(data["query_count"].unique())
     workload_columns = [
         "query_count",
         "hot_fraction",
@@ -134,13 +133,7 @@ def main(
     if data.duplicated(workload_columns).any():
         raise typer.BadParameter("result contains duplicate workloads")
 
-    # The realistic query regime is a single query and a 128-query batch; older
-    # result JSONs carried more query-count axes that no longer reflect the paper workload.
-    panel_columns = [
-        (query_count,) for query_count in query_counts if query_count in {1, 128}
-    ]
-    if not panel_columns:
-        raise typer.BadParameter("result has no 1-query or 128-query workloads")
+    panel_columns = ["all_to_all"]
     hot_fractions = sorted(data["hot_fraction"].unique())
     log2_values = data["log2_speedup"]
     maximum_log2 = max(1.0, float(log2_values.abs().max()))
@@ -191,9 +184,9 @@ def main(
     )
     mesh = None
     skew_ticks = [value / 100.0 for value in range(0, 51, 5)]
-    for panel_column, (query_count,) in enumerate(panel_columns):
+    for panel_column, _ in enumerate(panel_columns):
         ax = axes[panel_column][0]
-        panel = data[data["query_count"] == query_count]
+        panel = data
         matrix = (
             panel.pivot(
                 index="reference_count",
@@ -245,10 +238,7 @@ def main(
             fontsize=pu.TICK_LABEL_FONT_SIZE,
         )
         ax.set_title(
-            pu.paper_text(
-                f"{int(query_count):,} quer{'y' if query_count == 1 else 'ies'}",
-                bold=True,
-            ),
+            pu.paper_text("All-to-all", bold=True),
             fontsize=pu.TITLE_FONT_SIZE,
         )
         if panel_column == 0:
@@ -298,7 +288,7 @@ def main(
     )
     colorbar.ax.tick_params(labelsize=pu.TICK_LABEL_FONT_SIZE)
     fig.suptitle(
-        pu.paper_text("Indexed versus exhaustive search", bold=True),
+        pu.paper_text("Indexed versus exhaustive all-to-all search", bold=True),
         fontsize=pu.TITLE_FONT_SIZE,
         y=1.0 - 0.06 / fig_height,
     )

@@ -24,7 +24,7 @@ from benchmark_schema import flatten_measurements, load_result
 PAPER_REFERENCE_COUNT = 200687
 PAPER_INDEXED_BUCKET_COUNT = 2048
 PAPER_FILL_RATIO = 1.0
-PAPER_QUERY_PROFILE = "copied"
+PAPER_QUERY_PROFILE = "all_to_all"
 
 METRICS = (
     ("atomic_updates", "Index entries visited", "log"),
@@ -92,13 +92,12 @@ def main(
         ) from error
     data = data.loc[
         (data["reference_count"] == PAPER_REFERENCE_COUNT)
-        & (data["query_count"] == 128)
         & (data["query_profile"] == PAPER_QUERY_PROFILE)
         & (data["fill_ratio"] == PAPER_FILL_RATIO)
         & (data["indexed_bucket_count"] == PAPER_INDEXED_BUCKET_COUNT)
     ].copy()
     if data.empty:
-        raise typer.BadParameter("result has no paper-scale, 128-query workloads")
+        raise typer.BadParameter("result has no paper-scale all-to-all workloads")
 
     data["hot_fraction"] = data["skew"].map(skew_fraction)
     data["key_bits"] = (
@@ -162,7 +161,7 @@ def main(
     )
     fig.suptitle(
         pu.paper_text(
-            f"15-bit versus 16-bit index keys on {PAPER_REFERENCE_COUNT:,} RefSeq sketches",
+            f"15-bit versus 16-bit index keys on {PAPER_REFERENCE_COUNT:,} RefSeq sketches, all-to-all",
             bold=True,
         ),
         fontsize=pu.TITLE_FONT_SIZE + 2,

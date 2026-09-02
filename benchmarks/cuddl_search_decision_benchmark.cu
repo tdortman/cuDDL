@@ -14,9 +14,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <ctime>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -53,9 +53,6 @@ constexpr double k_hot_value_fraction = 0.01;
 std::vector<nvbench::int64_t> const reference_counts{1024, 16384, 200687};
 
 std::vector<nvbench::int64_t> const hot_percentages{0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
-std::vector<nvbench::int64_t> const query_counts{1, 128};
-std::vector<std::string> const query_profiles{"copied"};
-
 std::vector<nvbench::int64_t> const key_bits{15, 16};
 
 struct workload {
@@ -73,7 +70,6 @@ struct index_mode {
 
 struct fixture {
     std::vector<uint16_t> rows;
-    std::vector<uint16_t> queries;
     std::vector<uint64_t> bucket_top_bit_counts;
     std::vector<uint8_t> bucket_filled;
     std::vector<uint8_t> bucket_hot;
@@ -111,31 +107,23 @@ struct minimum_matches_predicate {
     }
 };
 
-std::string axes_key(workload const& settings, index_mode const* mode, bool with_queries);
+std::string axes_key(workload const& settings, index_mode const* mode);
 void stash_state(std::string const& benchmark, std::string const& key, nvbench::state& state);
 
-[[nodiscard]] workload read_workload(nvbench::state& state, bool includes_queries) {
+[[nodiscard]] workload read_workload(nvbench::state& state) {
     auto const references = state.get_int64("References");
     auto const hot_percentage = state.get_int64("HotPercent");
-    auto const queries = includes_queries ? state.get_int64("Queries") : 1;
     if (references <= 0 || references > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("reference count exceeds the supported 32-bit range");
     }
     if (hot_percentage < 0 || hot_percentage > k_max_hot_percentage) {
         throw std::runtime_error("hot skew must be in [0%, 50%]");
     }
-    if (queries <= 0 || queries > std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error("query count exceeds the supported 32-bit range");
-    }
-    if (static_cast<uint64_t>(references) * static_cast<uint64_t>(queries) >
-        std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error("query/reference pairs exceed the supported 32-bit range");
-    }
     return {
         .reference_count = static_cast<uint32_t>(references),
         .fill_ratio = 1.0,
         .hot_fraction = static_cast<double>(hot_percentage) / 100.0,
-        .query_count = static_cast<uint32_t>(queries),
+        .query_count = static_cast<uint32_t>(references),
     };
 }
 [[nodiscard]] index_mode read_index_mode(nvbench::state& state) {
@@ -183,9 +171,7 @@ void add_common_metadata(
         "system_logical_cpu_count",
         std::to_string(host.at("logical_cpu_count").get<uint64_t>())
     );
-    add_string(
-        state, "system_ram_bytes", std::to_string(host.at("ram_bytes").get<uint64_t>())
-    );
+    add_string(state, "system_ram_bytes", std::to_string(host.at("ram_bytes").get<uint64_t>()));
     add_value(state, "fixture_seed", static_cast<double>(k_fixture_seed));
     add_value(state, "hot_fraction", value.hot_fraction);
     add_value(state, "minimum_matches", k_minimum_matches);
@@ -277,12 +263,6 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     return 1U + (static_cast<uint64_t>(reference_count) - 1U - residue) / period;
 }
 
-[[nodiscard]] uint32_t query_reference_id(workload const& settings, uint32_t query_id) {
-    return static_cast<uint32_t>(
-        cuddl::detail::splitmix64(k_fixture_seed + 0x9e3779b97f4a7c15ULL + query_id) %
-        settings.reference_count
-    );
-}
 [[nodiscard]] fixture make_fixture(workload const& settings) {
     auto const fill_count = std::clamp<size_t>(
         static_cast<size_t>(std::llround(settings.fill_ratio * k_bucket_count)), 1U, k_bucket_count
@@ -316,8 +296,6 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     fixture value{
         .rows =
             std::vector<uint16_t>(static_cast<size_t>(settings.reference_count) * k_bucket_count),
-        .queries =
-            std::vector<uint16_t>(static_cast<size_t>(settings.query_count) * k_bucket_count),
         .bucket_top_bit_counts = std::vector<uint64_t>(k_bucket_count),
         .bucket_filled = std::vector<uint8_t>(k_bucket_count),
         .bucket_hot = std::vector<uint8_t>(k_bucket_count),
@@ -358,19 +336,6 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         }
     }
 
-    for (uint32_t query_id = 0; query_id < settings.query_count; ++query_id) {
-        // With skew, queries copy rows from the hot group so every query
-        // exercises the hot posting lists (the hard case the kill gate decides).
-        auto const query_pool = hot_count == 0U ? settings.reference_count : hot_reference_count;
-        auto const reference_id =
-            static_cast<uint32_t>(query_reference_id(settings, query_id) % query_pool);
-        auto* query = value.queries.data() + static_cast<size_t>(query_id) * k_bucket_count;
-        std::memcpy(
-            query,
-            value.rows.data() + static_cast<size_t>(reference_id) * k_bucket_count,
-            k_bucket_count * sizeof(uint16_t)
-        );
-    }
     return value;
 }
 
@@ -452,7 +417,7 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     for (uint32_t query_id = 0; query_id < settings.query_count; ++query_id) {
         auto const query_offset = static_cast<size_t>(query_id) * k_bucket_count;
         for (uint32_t bucket = 0; bucket < mode.indexed_bucket_count; ++bucket) {
-            auto const query_score = data.queries[query_offset + bucket];
+            auto const query_score = data.rows[query_offset + bucket];
             if (query_score == 0U || data.bucket_filled[bucket] == 0U) {
                 continue;
             }
@@ -516,196 +481,184 @@ template <typename DeviceResult, typename Convert>
     return count;
 }
 
-template <typename Execute>
-[[nodiscard]] search_output execute_exhaustive_search(
-    database_type const& database,
-    thrust::device_vector<uint16_t> const& queries,
-    workload const& settings,
-    cuddl::score_compatibility const& compatibility,
-    uint32_t minimum_matches,
-    Execute&& execute
-) {
-    if (settings.query_count == 1U) {
-        auto const result_capacity = database.reference_count();
-        auto const database_workspace_bytes = database.single_query_workspace_bytes();
-        thrust::device_vector<uint8_t> database_workspace(database_workspace_bytes);
-        thrust::device_vector<cuddl::reference_search_result> exhaustive_results(result_capacity);
-        thrust::device_vector<cuddl::reference_search_result> selected_results(result_capacity);
-        thrust::device_vector<uint32_t> selected_count(1U);
-        size_t selection_workspace_bytes = 0;
-        CUDDL_CUDA_CALL(
-            cub::DeviceSelect::If(
-                nullptr,
-                selection_workspace_bytes,
-                thrust::raw_pointer_cast(exhaustive_results.data()),
-                thrust::raw_pointer_cast(selected_results.data()),
-                thrust::raw_pointer_cast(selected_count.data()),
-                static_cast<int64_t>(result_capacity),
-                minimum_matches_predicate{minimum_matches}
-            )
-        );
-        thrust::device_vector<uint8_t> selection_workspace(selection_workspace_bytes);
-        execute([&](cudaStream_t stream) {
-            CUDDL_UNWRAP(database.search_async(
-                queries,
-                compatibility,
-                database_workspace,
-                exhaustive_results,
-                cuda::stream_ref{stream}
-            ));
-            CUDDL_CUDA_CALL(
-                cub::DeviceSelect::If(
-                    thrust::raw_pointer_cast(selection_workspace.data()),
-                    selection_workspace_bytes,
-                    thrust::raw_pointer_cast(exhaustive_results.data()),
-                    thrust::raw_pointer_cast(selected_results.data()),
-                    thrust::raw_pointer_cast(selected_count.data()),
-                    static_cast<int64_t>(result_capacity),
-                    minimum_matches_predicate{minimum_matches},
-                    stream
-                )
-            );
-        });
-        auto const count = read_result_count(selected_count);
-        return {
-            .results = copy_normalised_results(
-                selected_results,
-                count,
-                [](auto const& result) {
-                    return normalised_search_result{0U, result.reference_id, result.summary};
-                }
-            ),
-            .workspace_bytes = database_workspace_bytes + selection_workspace_bytes,
-        };
-    }
+struct exhaustive_search_buffers {
+    thrust::device_vector<uint8_t> database_workspace;
+    thrust::device_vector<cuddl::batch_search_result> exhaustive_results;
+    thrust::device_vector<uint32_t> exhaustive_count;
+    thrust::device_vector<cuddl::batch_search_result> selected_results;
+    thrust::device_vector<uint32_t> selected_count;
+    thrust::device_vector<uint8_t> selection_workspace;
+    size_t selection_workspace_bytes{};
+};
 
-    auto const requirements =
-        CUDDL_UNWRAP(database.batch_search_requirements(settings.query_count));
-    auto const result_capacity = requirements.maximum_pair_count;
-    thrust::device_vector<uint8_t> database_workspace(requirements.workspace_bytes);
-    thrust::device_vector<cuddl::batch_search_result> exhaustive_results(result_capacity);
-    thrust::device_vector<uint32_t> exhaustive_count(1U);
-    thrust::device_vector<cuddl::batch_search_result> selected_results(result_capacity);
-    thrust::device_vector<uint32_t> selected_count(1U);
+[[nodiscard]] exhaustive_search_buffers
+make_exhaustive_search_buffers(database_type const& database, uint32_t minimum_matches) {
+    auto const requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
     size_t selection_workspace_bytes = 0;
+    cuddl::batch_search_result* input = nullptr;
+    cuddl::batch_search_result* output = nullptr;
+    uint32_t* count = nullptr;
     CUDDL_CUDA_CALL(
         cub::DeviceSelect::If(
             nullptr,
             selection_workspace_bytes,
-            thrust::raw_pointer_cast(exhaustive_results.data()),
-            thrust::raw_pointer_cast(selected_results.data()),
-            thrust::raw_pointer_cast(selected_count.data()),
-            static_cast<int64_t>(result_capacity),
+            input,
+            output,
+            count,
+            static_cast<int64_t>(requirements.maximum_pair_count),
             minimum_matches_predicate{minimum_matches}
         )
     );
-    thrust::device_vector<uint8_t> selection_workspace(selection_workspace_bytes);
-    execute([&](cudaStream_t stream) {
-        CUDDL_UNWRAP(database.search_batch_async(
-            queries,
-            compatibility,
-            0U,
-            database_workspace,
-            exhaustive_results,
-            exhaustive_count,
-            cuda::stream_ref{stream}
-        ));
-        CUDDL_CUDA_CALL(
-            cub::DeviceSelect::If(
-                thrust::raw_pointer_cast(selection_workspace.data()),
-                selection_workspace_bytes,
-                thrust::raw_pointer_cast(exhaustive_results.data()),
-                thrust::raw_pointer_cast(selected_results.data()),
-                thrust::raw_pointer_cast(selected_count.data()),
-                static_cast<int64_t>(result_capacity),
-                minimum_matches_predicate{minimum_matches},
-                stream
-            )
-        );
-    });
-    auto const count = read_result_count(selected_count);
     return {
-        .results = copy_normalised_results(
-            selected_results,
-            count,
-            [](auto const& result) {
-                return normalised_search_result{
-                    result.query_id, result.reference_id, result.summary
-                };
-            }
-        ),
-        .workspace_bytes = requirements.workspace_bytes + selection_workspace_bytes,
+        .database_workspace = thrust::device_vector<uint8_t>(requirements.workspace_bytes),
+        .exhaustive_results =
+            thrust::device_vector<cuddl::batch_search_result>(requirements.maximum_pair_count),
+        .exhaustive_count = thrust::device_vector<uint32_t>(1U),
+        .selected_results =
+            thrust::device_vector<cuddl::batch_search_result>(requirements.maximum_pair_count),
+        .selected_count = thrust::device_vector<uint32_t>(1U),
+        .selection_workspace = thrust::device_vector<uint8_t>(selection_workspace_bytes),
+        .selection_workspace_bytes = selection_workspace_bytes,
     };
 }
 
 template <typename Execute>
-[[nodiscard]] search_output execute_indexed_search(
+[[nodiscard]] search_output execute_exhaustive_search(
     database_type const& database,
-    thrust::device_vector<uint16_t> const& queries,
-    workload const& settings,
-    cuddl::score_compatibility const& compatibility,
     uint32_t minimum_matches,
     Execute&& execute
 ) {
-    if (settings.query_count == 1U) {
-        auto const workspace_bytes = CUDDL_UNWRAP(database.indexed_single_query_workspace_bytes());
-        thrust::device_vector<uint8_t> workspace(workspace_bytes);
-        thrust::device_vector<cuddl::reference_search_result> results(database.reference_count());
-        thrust::device_vector<uint32_t> result_count(1U);
-        execute([&](cudaStream_t stream) {
-            CUDDL_UNWRAP(database.search_indexed_async(
-                queries,
-                compatibility,
-                workspace,
-                results,
-                result_count,
-                {.minimum_matches = minimum_matches},
-                cuda::stream_ref{stream}
-            ));
-        });
-        auto const count = read_result_count(result_count);
-        return {
-            .results = copy_normalised_results(
-                results,
-                count,
-                [](auto const& result) {
-                    return normalised_search_result{0U, result.reference_id, result.summary};
-                }
-            ),
-            .workspace_bytes = workspace_bytes,
-        };
-    }
-
-    auto const requirements =
-        CUDDL_UNWRAP(database.indexed_batch_search_requirements(settings.query_count));
-    thrust::device_vector<uint8_t> workspace(requirements.workspace_bytes);
-    thrust::device_vector<cuddl::batch_search_result> results(requirements.maximum_pair_count);
-    thrust::device_vector<uint32_t> result_count(1U);
+    auto buffers = make_exhaustive_search_buffers(database, minimum_matches);
     execute([&](cudaStream_t stream) {
-        CUDDL_UNWRAP(database.search_batch_indexed_async(
-            queries,
-            compatibility,
-            0U,
-            workspace,
-            results,
-            result_count,
+        CUDDL_UNWRAP(database.search_all_to_all_async(
+            buffers.database_workspace,
+            buffers.exhaustive_results,
+            buffers.exhaustive_count,
+            [&](uint32_t pair_count) {
+                CUDDL_CUDA_CALL(
+                    cub::DeviceSelect::If(
+                        thrust::raw_pointer_cast(buffers.selection_workspace.data()),
+                        buffers.selection_workspace_bytes,
+                        thrust::raw_pointer_cast(buffers.exhaustive_results.data()),
+                        thrust::raw_pointer_cast(buffers.selected_results.data()),
+                        thrust::raw_pointer_cast(buffers.selected_count.data()),
+                        static_cast<int64_t>(pair_count),
+                        minimum_matches_predicate{minimum_matches},
+                        stream
+                    )
+                );
+            },
+            cuda::stream_ref{stream}
+        ));
+    });
+    return {
+        .results = {},
+        .workspace_bytes = buffers.database_workspace.size() + buffers.selection_workspace.size(),
+    };
+}
+
+[[nodiscard]] search_output
+collect_exhaustive_results(database_type const& database, uint32_t minimum_matches) {
+    auto buffers = make_exhaustive_search_buffers(database, minimum_matches);
+    search_output output{
+        .results = {},
+        .workspace_bytes = buffers.database_workspace.size() + buffers.selection_workspace.size(),
+    };
+    CUDDL_UNWRAP(database.search_all_to_all_async(
+        buffers.database_workspace,
+        buffers.exhaustive_results,
+        buffers.exhaustive_count,
+        [&](uint32_t pair_count) {
+            CUDDL_CUDA_CALL(
+                cub::DeviceSelect::If(
+                    thrust::raw_pointer_cast(buffers.selection_workspace.data()),
+                    buffers.selection_workspace_bytes,
+                    thrust::raw_pointer_cast(buffers.exhaustive_results.data()),
+                    thrust::raw_pointer_cast(buffers.selected_results.data()),
+                    thrust::raw_pointer_cast(buffers.selected_count.data()),
+                    static_cast<int64_t>(pair_count),
+                    minimum_matches_predicate{minimum_matches}
+                )
+            );
+            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            auto tile = copy_normalised_results(
+                buffers.selected_results,
+                read_result_count(buffers.selected_count),
+                [](auto const& result) {
+                    return normalised_search_result{
+                        result.query_id, result.reference_id, result.summary
+                    };
+                }
+            );
+            output.results.insert(
+                output.results.end(),
+                std::make_move_iterator(tile.begin()),
+                std::make_move_iterator(tile.end())
+            );
+        }
+    ));
+    return output;
+}
+
+struct indexed_search_buffers {
+    thrust::device_vector<uint8_t> workspace;
+    thrust::device_vector<cuddl::batch_search_result> results;
+    thrust::device_vector<uint32_t> result_count;
+};
+
+[[nodiscard]] indexed_search_buffers make_indexed_search_buffers(database_type const& database) {
+    auto const requirements = CUDDL_UNWRAP(database.indexed_all_to_all_search_requirements());
+    return {
+        .workspace = thrust::device_vector<uint8_t>(requirements.workspace_bytes),
+        .results =
+            thrust::device_vector<cuddl::batch_search_result>(requirements.maximum_pair_count),
+        .result_count = thrust::device_vector<uint32_t>(1U),
+    };
+}
+
+template <typename Execute>
+[[nodiscard]] search_output
+execute_indexed_search(database_type const& database, uint32_t minimum_matches, Execute&& execute) {
+    auto buffers = make_indexed_search_buffers(database);
+    execute([&](cudaStream_t stream) {
+        CUDDL_UNWRAP(database.search_all_to_all_indexed_async(
+            buffers.workspace,
+            buffers.results,
+            buffers.result_count,
+            [](uint32_t) {},
             {.minimum_matches = minimum_matches},
             cuda::stream_ref{stream}
         ));
     });
-    auto const count = read_result_count(result_count);
-    return {
-        .results = copy_normalised_results(
-            results,
-            count,
-            [](auto const& result) {
-                return normalised_search_result{
-                    result.query_id, result.reference_id, result.summary
-                };
-            }
-        ),
-        .workspace_bytes = requirements.workspace_bytes,
-    };
+    return {.results = {}, .workspace_bytes = buffers.workspace.size()};
+}
+
+[[nodiscard]] search_output
+collect_indexed_results(database_type const& database, uint32_t minimum_matches) {
+    auto buffers = make_indexed_search_buffers(database);
+    search_output output{.results = {}, .workspace_bytes = buffers.workspace.size()};
+    CUDDL_UNWRAP(database.search_all_to_all_indexed_async(
+        buffers.workspace,
+        buffers.results,
+        buffers.result_count,
+        [&](uint32_t) {
+            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            auto tile = copy_normalised_results(
+                buffers.results, read_result_count(buffers.result_count), [](auto const& result) {
+                    return normalised_search_result{
+                        result.query_id, result.reference_id, result.summary
+                    };
+                }
+            );
+            output.results.insert(
+                output.results.end(),
+                std::make_move_iterator(tile.begin()),
+                std::make_move_iterator(tile.end())
+            );
+        },
+        {.minimum_matches = minimum_matches}
+    ));
+    return output;
 }
 
 void validate_exhaustive_results(
@@ -717,7 +670,7 @@ void validate_exhaustive_results(
     bool first = true;
     for (auto const& result : results) {
         auto const id = std::pair{result.query_id, result.reference_id};
-        if (result.query_id >= settings.query_count ||
+        if (result.query_id >= settings.query_count || result.query_id >= result.reference_id ||
             result.reference_id >= settings.reference_count ||
             result.summary.counts.equal < minimum_matches || (!first && id <= previous_id)) {
             throw std::runtime_error("exhaustive search returned invalid or unstable results");
@@ -743,20 +696,21 @@ struct recall_metrics {
         return std::pair{left.query_id, left.reference_id} <
                std::pair{right.query_id, right.reference_id};
     };
-    auto const oracle_positive = static_cast<uint64_t>(
-        std::count_if(oracle.begin(), oracle.end(), [minimum_matches](auto const& result) {
-            return result.summary.counts.equal >= minimum_matches;
-        })
-    );
+    auto const oracle_positive = static_cast<uint64_t>(oracle.size());
     std::sort(indexed.begin(), indexed.end(), by_id);
     uint64_t recalled_pairs = 0;
     std::pair<uint32_t, uint32_t> previous_id{};
     bool first = true;
     for (auto const& result : indexed) {
         auto const id = std::pair{result.query_id, result.reference_id};
-        if (result.query_id >= settings.query_count ||
+        if (result.query_id >= settings.query_count || result.query_id >= result.reference_id ||
             result.reference_id >= settings.reference_count || (!first && id <= previous_id)) {
             throw std::runtime_error("indexed search returned invalid or unstable results");
+        }
+        if (result.summary.counts.equal < minimum_matches) {
+            previous_id = id;
+            first = false;
+            continue;
         }
         auto const oracle_result = std::lower_bound(
             oracle.begin(), oracle.end(), id, [](auto const& candidate, auto const& target) {
@@ -768,7 +722,7 @@ struct recall_metrics {
             oracle_result->summary != result.summary) {
             throw std::runtime_error("indexed retained summary disagrees with exhaustive oracle");
         }
-        recalled_pairs += result.summary.counts.equal >= minimum_matches;
+        ++recalled_pairs;
         previous_id = id;
         first = false;
     }
@@ -849,11 +803,11 @@ indexed_fixture_metrics add_fixture_metrics(
 }
 
 void compact_build(nvbench::state& state) {
-    auto const settings = read_workload(state, false);
+    auto const settings = read_workload(state);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto const row_bytes = database_type::persistent_row_bytes(settings.reference_count);
     if (!preflight(state, settings, 2U * row_bytes, compatibility)) {
-        stash_state("compact_build", axes_key(settings, nullptr, false), state);
+        stash_state("compact_build", axes_key(settings, nullptr), state);
         return;
     }
 
@@ -879,18 +833,18 @@ void compact_build(nvbench::state& state) {
         );
         do_not_optimise(database);
     });
-    stash_state("compact_build", axes_key(settings, nullptr, false), state);
+    stash_state("compact_build", axes_key(settings, nullptr), state);
 }
 
 void indexed_build(nvbench::state& state) {
-    auto const settings = read_workload(state, false);
+    auto const settings = read_workload(state);
     auto const mode = read_index_mode(state);
     auto const compatibility = indexed_compatibility(mode);
     auto const row_bytes = database_type::persistent_row_bytes(settings.reference_count);
     auto const resident_bytes = indexed_resident_bytes(settings.reference_count, compatibility);
     auto const temporary_bytes = indexed_build_temporary_bytes(compatibility);
     if (!preflight(state, settings, row_bytes + resident_bytes + temporary_bytes, compatibility)) {
-        stash_state("indexed_build", axes_key(settings, &mode, false), state);
+        stash_state("indexed_build", axes_key(settings, &mode), state);
         return;
     }
 
@@ -916,22 +870,20 @@ void indexed_build(nvbench::state& state) {
         );
         do_not_optimise(database);
     });
-    stash_state("indexed_build", axes_key(settings, &mode, false), state);
+    stash_state("indexed_build", axes_key(settings, &mode), state);
 }
 
 void exhaustive_search(nvbench::state& state) {
-    auto const settings = read_workload(state, true);
+    auto const settings = read_workload(state);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto const row_bytes = database_type::persistent_row_bytes(settings.reference_count);
-    auto const query_bytes =
-        static_cast<size_t>(settings.query_count) * k_bucket_count * sizeof(uint16_t);
-    auto const result_bytes = static_cast<size_t>(settings.reference_count) * settings.query_count *
-                              sizeof(cuddl::batch_search_result);
+    auto const result_capacity =
+        database_type::all_to_all_result_capacity(settings.reference_count);
+    auto const result_bytes =
+        static_cast<size_t>(result_capacity) * sizeof(cuddl::batch_search_result);
     auto const search_temporary_bytes = 2U * result_bytes + 32U * 1024U * 1024U;
-    if (!preflight(
-            state, settings, 2U * row_bytes + query_bytes + search_temporary_bytes, compatibility
-        )) {
-        stash_state("exhaustive_search", axes_key(settings, nullptr, true), state);
+    if (!preflight(state, settings, 2U * row_bytes + search_temporary_bytes, compatibility)) {
+        stash_state("exhaustive_search", axes_key(settings, nullptr), state);
         return;
     }
 
@@ -941,7 +893,6 @@ void exhaustive_search(nvbench::state& state) {
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
     started = clock_type::now();
     thrust::device_vector<uint16_t> device_rows(data.rows);
-    thrust::device_vector<uint16_t> device_queries(data.queries);
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
     auto const transfer_ms =
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
@@ -949,16 +900,15 @@ void exhaustive_search(nvbench::state& state) {
 
     auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    auto output = execute_exhaustive_search(
-        database, device_queries, settings, compatibility, k_minimum_matches, [&](auto&& launch) {
-            state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
-                launch(nvbench_launch.get_stream());
-            });
-        }
-    );
+    auto output = execute_exhaustive_search(database, k_minimum_matches, [&](auto&& launch) {
+        state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
+            launch(nvbench_launch.get_stream());
+        });
+    });
 
     started = clock_type::now();
-    validate_exhaustive_results(output.results, settings, k_minimum_matches);
+    auto const validation = collect_exhaustive_results(database, k_minimum_matches);
+    validate_exhaustive_results(validation.results, settings, k_minimum_matches);
     auto const validation_ms =
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
     add_value(state, "validation_ms", validation_ms);
@@ -967,34 +917,35 @@ void exhaustive_search(nvbench::state& state) {
     add_value(
         state,
         "exact_comparisons",
-        static_cast<double>(settings.reference_count) * settings.query_count
+        static_cast<double>(settings.reference_count) * (settings.reference_count - 1U) / 2.0
     );
     add_value(state, "threshold_zero_recall", 1.0);
     state.add_element_count(settings.query_count, "Queries");
-    stash_state("exhaustive_search", axes_key(settings, nullptr, true), state);
+    stash_state("exhaustive_search", axes_key(settings, nullptr), state);
 }
 
 void indexed_search(nvbench::state& state) {
-    auto const settings = read_workload(state, true);
+    auto const settings = read_workload(state);
     auto const mode = read_index_mode(state);
     auto const indexed_metadata = indexed_compatibility(mode);
     auto const exhaustive_metadata =
         cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto const row_bytes = database_type::persistent_row_bytes(settings.reference_count);
-    auto const query_bytes =
-        static_cast<size_t>(settings.query_count) * k_bucket_count * sizeof(uint16_t);
     auto const resident_bytes = indexed_resident_bytes(settings.reference_count, indexed_metadata);
     auto const build_temporary_bytes = indexed_build_temporary_bytes(indexed_metadata);
-    auto const pair_count = static_cast<size_t>(settings.reference_count) * settings.query_count;
-    auto const result_bytes = pair_count * sizeof(cuddl::batch_search_result);
+    auto const result_capacity =
+        database_type::all_to_all_result_capacity(settings.reference_count);
+    auto const result_bytes =
+        static_cast<size_t>(result_capacity) * sizeof(cuddl::batch_search_result);
     auto const indexed_search_temporary_bytes =
-        result_bytes + pair_count * 2U * sizeof(uint32_t) + 32U * 1024U * 1024U;
+        result_bytes + static_cast<size_t>(result_capacity) * 2U * sizeof(uint32_t) +
+        32U * 1024U * 1024U;
     auto const exhaustive_search_temporary_bytes = 2U * result_bytes + 32U * 1024U * 1024U;
-    auto const exhaustive_phase = 2U * row_bytes + query_bytes + exhaustive_search_temporary_bytes;
-    auto const indexed_phase = row_bytes + query_bytes + resident_bytes +
+    auto const exhaustive_phase = 2U * row_bytes + exhaustive_search_temporary_bytes;
+    auto const indexed_phase = row_bytes + resident_bytes +
                                std::max(build_temporary_bytes, indexed_search_temporary_bytes);
     if (!preflight(state, settings, std::max(exhaustive_phase, indexed_phase), indexed_metadata)) {
-        stash_state("indexed_search", axes_key(settings, &mode, true), state);
+        stash_state("indexed_search", axes_key(settings, &mode), state);
         return;
     }
 
@@ -1004,59 +955,33 @@ void indexed_search(nvbench::state& state) {
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
     started = clock_type::now();
     thrust::device_vector<uint16_t> device_rows(data.rows);
-    thrust::device_vector<uint16_t> device_queries(data.queries);
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
     auto const transfer_ms =
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
     auto const indexed_metrics =
         add_fixture_metrics(state, data, settings, generation_ms, transfer_ms, &mode);
 
-    search_output exhaustive;
     search_output oracle;
     {
         auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, exhaustive_metadata));
         CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-        auto const execute_once = [](auto&& launch) {
-            launch(cudaStream_t{nullptr});
-            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-        };
-        exhaustive = execute_exhaustive_search(
-            database,
-            device_queries,
-            settings,
-            exhaustive_metadata,
-            k_minimum_matches,
-            [&](auto&& launch) {
-                state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
-                    launch(nvbench_launch.get_stream());
-                });
-            }
-        );
-        oracle = execute_exhaustive_search(
-            database, device_queries, settings, exhaustive_metadata, 0U, execute_once
-        );
+        oracle = collect_exhaustive_results(database, k_minimum_matches);
     }
 
     auto database = CUDDL_UNWRAP(database_type::build_indexed_async(device_rows, indexed_metadata));
     CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    auto indexed = execute_indexed_search(
-        database,
-        device_queries,
-        settings,
-        indexed_metadata,
-        k_minimum_matches,
-        [&](auto&& launch) {
-            state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
-                launch(nvbench_launch.get_stream());
-            });
-        }
-    );
+    auto indexed = execute_indexed_search(database, k_minimum_matches, [&](auto&& launch) {
+        state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
+            launch(nvbench_launch.get_stream());
+        });
+    });
+    auto const indexed_validation = collect_indexed_results(database, k_minimum_matches);
 
     started = clock_type::now();
-    validate_exhaustive_results(oracle.results, settings, 0U);
-    validate_exhaustive_results(exhaustive.results, settings, k_minimum_matches);
-    auto const recall =
-        validate_indexed_results(oracle.results, indexed.results, settings, k_minimum_matches);
+    validate_exhaustive_results(oracle.results, settings, k_minimum_matches);
+    auto const recall = validate_indexed_results(
+        oracle.results, indexed_validation.results, settings, k_minimum_matches
+    );
     auto const validation_ms =
         std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
     add_value(state, "validation_ms", validation_ms);
@@ -1067,7 +992,7 @@ void indexed_search(nvbench::state& state) {
     );
     add_value(state, "search_workspace_bytes", static_cast<double>(indexed.workspace_bytes));
     add_value(state, "atomic_updates", static_cast<double>(indexed_metrics.posting_visits));
-    auto const selected_candidates = static_cast<double>(indexed.results.size());
+    auto const selected_candidates = static_cast<double>(indexed_validation.results.size());
     add_value(state, "selected_candidates", selected_candidates);
     add_value(state, "exact_comparisons", selected_candidates);
     add_value(
@@ -1081,7 +1006,7 @@ void indexed_search(nvbench::state& state) {
     add_value(state, "oracle_threshold_pairs", static_cast<double>(recall.oracle_pairs));
     add_value(state, "recalled_pairs", static_cast<double>(recall.recalled_pairs));
     state.add_element_count(settings.query_count, "Queries");
-    stash_state("indexed_search", axes_key(settings, &mode, true), state);
+    stash_state("indexed_search", axes_key(settings, &mode), state);
 }
 
 // --- In-process summary collection -------------------------------------------
@@ -1108,13 +1033,10 @@ std::string format_number(double value) {
     return std::string(buffer.data(), result.ptr);
 }
 
-std::string axes_key(workload const& settings, index_mode const* mode, bool with_queries) {
+std::string axes_key(workload const& settings, index_mode const* mode) {
     auto key = std::to_string(settings.reference_count) + "," +
                std::to_string(static_cast<int>(std::llround(settings.fill_ratio * 1000.0))) + "," +
                std::to_string(static_cast<int>(std::llround(settings.hot_fraction * 100.0)));
-    if (with_queries) {
-        key += "," + std::to_string(settings.query_count) + ",copied";
-    }
     if (mode != nullptr) {
         key +=
             "," + std::to_string(mode->indexed_bucket_count) + "," + std::to_string(mode->key_bits);
@@ -1169,8 +1091,6 @@ NVBENCH_BENCH(indexed_build)
 NVBENCH_BENCH(exhaustive_search)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("HotPercent", hot_percentages)
-    .add_int64_axis("Queries", query_counts)
-    .add_string_axis("QueryProfile", query_profiles)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1180,8 +1100,6 @@ NVBENCH_BENCH(exhaustive_search)
 NVBENCH_BENCH(indexed_search)
     .add_int64_axis("References", reference_counts)
     .add_int64_axis("HotPercent", hot_percentages)
-    .add_int64_axis("Queries", query_counts)
-    .add_string_axis("QueryProfile", query_profiles)
     .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
@@ -1249,6 +1167,9 @@ void write_summary_json() {
         auto const text = value_of(state, "nv/cold/time/gpu/" + statistic);
         return text.empty() ? std::string{} : format_number(std::stod(text) * 1000.0);
     };
+    auto integer_of = [](std::string const& text) {
+        return static_cast<uint64_t>(std::llround(std::stod(text)));
+    };
 
     for (auto const& workload : workload_keys) {
         for (auto const& mode : mode_keys) {
@@ -1298,12 +1219,12 @@ void write_summary_json() {
                 error += (error.empty() ? "" : "; ") + note;
             }
 
-            auto const& references = workload[0];
-            auto const& fill_permille = workload[1];
-            auto const& hot_percent = workload[2];
+            auto const references = workload[0];
+            auto const fill_permille = workload[1];
+            auto const hot_percent = workload[2];
             auto const fill_ratio = std::stod(fill_permille) / 1000.0;
-            auto const query_count = workload.size() >= 5U ? workload[3] : "1";
-            auto const query_profile = workload.size() >= 5U ? workload[4] : "copied";
+            auto const query_count = references;
+            auto const query_profile = "all_to_all";
             auto const& buckets = mode[0];
             auto const& bits = mode[1];
 
@@ -1371,7 +1292,7 @@ void write_summary_json() {
             }
             for (auto const* name : {"atomic_updates", "selected_candidates"}) {
                 if (!row[name].empty()) {
-                    metrics[name] = std::stoull(row[name]);
+                    metrics[name] = integer_of(row[name]);
                 }
             }
             json measurement{
@@ -1394,7 +1315,7 @@ void write_summary_json() {
             };
             if (!row["indexed_resident_bytes"].empty()) {
                 measurement["memory_bytes"] = {
-                    {"indexed_resident", std::stoull(row["indexed_resident_bytes"])}
+                    {"indexed_resident", integer_of(row["indexed_resident_bytes"])}
                 };
             }
             measurements.push_back(std::move(measurement));

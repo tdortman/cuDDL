@@ -1391,10 +1391,7 @@ void compact_indexed_zero_threshold_search(nvbench::state& state) {
 void compact_batch_and_all_to_all_search(nvbench::state& state) {
     constexpr uint32_t reference_count = 8U;
     constexpr uint32_t batch_query_count = 3U;
-    constexpr uint32_t all_to_all_tile_count = 4U;
     constexpr uint32_t batch_query_id_offset = 100U;
-    constexpr uint32_t first_all_to_all_tile = 0U;
-    constexpr uint32_t second_all_to_all_tile = all_to_all_tile_count;
 
     std::vector<uint16_t> rows(static_cast<size_t>(reference_count) * k_bucket_count);
     for (size_t offset = 0; offset < rows.size(); ++offset) {
@@ -1419,33 +1416,17 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
 
     auto const batch_requirements =
         CUDDL_UNWRAP(database.batch_search_requirements(batch_query_count));
-    auto const first_tile_requirements = CUDDL_UNWRAP(
-        database.all_to_all_search_requirements(first_all_to_all_tile, all_to_all_tile_count)
-    );
-    auto const second_tile_requirements = CUDDL_UNWRAP(
-        database.all_to_all_search_requirements(second_all_to_all_tile, all_to_all_tile_count)
-    );
-    auto const workspace_bytes = std::max(
-        batch_requirements.workspace_bytes,
-        std::max(first_tile_requirements.workspace_bytes, second_tile_requirements.workspace_bytes)
-    );
+    auto const all_to_all_requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
+    auto const workspace_bytes =
+        std::max(batch_requirements.workspace_bytes, all_to_all_requirements.workspace_bytes);
     auto const maximum_pair_count = std::max(
         static_cast<size_t>(batch_requirements.maximum_pair_count),
-        std::max(
-            static_cast<size_t>(first_tile_requirements.maximum_pair_count),
-            static_cast<size_t>(second_tile_requirements.maximum_pair_count)
-        )
+        static_cast<size_t>(all_to_all_requirements.maximum_pair_count)
     );
-    auto const result_bytes = std::max(
-        batch_requirements.result_bytes,
-        std::max(first_tile_requirements.result_bytes, second_tile_requirements.result_bytes)
-    );
-    auto const match_count_bytes = std::max(
-        batch_requirements.match_count_bytes,
-        std::max(
-            first_tile_requirements.match_count_bytes, second_tile_requirements.match_count_bytes
-        )
-    );
+    auto const result_bytes =
+        std::max(batch_requirements.result_bytes, all_to_all_requirements.result_bytes);
+    auto const match_count_bytes =
+        std::max(batch_requirements.match_count_bytes, all_to_all_requirements.match_count_bytes);
     auto const result_capacity = std::max(
         maximum_pair_count,
         (result_bytes + sizeof(cuddl::batch_search_result) - 1U) /
@@ -1508,17 +1489,9 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
             }
         }
     };
-    auto validate_all_to_all = [&](uint32_t first_query_id) {
+    auto validate_all_to_all = [&] {
         auto const observed_count = read_result_count();
-        auto const expected_count = [&] {
-            uint32_t count = 0;
-            for (uint32_t query_id = first_query_id;
-                 query_id < first_query_id + all_to_all_tile_count;
-                 ++query_id) {
-                count += reference_count > query_id + 1U ? reference_count - query_id - 1U : 0U;
-            }
-            return count;
-        }();
+        auto const expected_count = reference_count * (reference_count - 1U) / 2U;
         if (observed_count != expected_count) {
             throw std::runtime_error("all-to-all search returned the wrong pair count");
         }
@@ -1535,8 +1508,7 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
             cudaMemcpyDeviceToHost
         ));
         uint32_t result_index = 0;
-        for (uint32_t query_id = first_query_id; query_id < first_query_id + all_to_all_tile_count;
-             ++query_id) {
+        for (uint32_t query_id = 0U; query_id < reference_count; ++query_id) {
             for (uint32_t reference_id = query_id + 1U; reference_id < reference_count;
                  ++reference_id) {
                 auto const expected_summary = score_row_oracle_rows(
@@ -1569,26 +1541,15 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
     validate_batch();
 
     CUDDL_UNWRAP(database.search_all_to_all_async(
-        first_all_to_all_tile,
-        all_to_all_tile_count,
         workspace,
         results,
         result_count,
+        [&](uint32_t) {
+            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            validate_all_to_all();
+        },
         result_match_counts
     ));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    validate_all_to_all(first_all_to_all_tile);
-
-    CUDDL_UNWRAP(database.search_all_to_all_async(
-        second_all_to_all_tile,
-        all_to_all_tile_count,
-        workspace,
-        results,
-        result_count,
-        result_match_counts
-    ));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    validate_all_to_all(second_all_to_all_tile);
 
     auto const total_pairs = static_cast<size_t>(batch_query_count) * reference_count +
                              static_cast<size_t>(reference_count) * (reference_count - 1U) / 2U;
@@ -1606,22 +1567,7 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
             stream
         ));
         CUDDL_UNWRAP(database.search_all_to_all_async(
-            first_all_to_all_tile,
-            all_to_all_tile_count,
-            workspace,
-            results,
-            result_count,
-            result_match_counts,
-            stream
-        ));
-        CUDDL_UNWRAP(database.search_all_to_all_async(
-            second_all_to_all_tile,
-            all_to_all_tile_count,
-            workspace,
-            results,
-            result_count,
-            result_match_counts,
-            stream
+            workspace, results, result_count, [](uint32_t) {}, result_match_counts, stream
         ));
     });
 

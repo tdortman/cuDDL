@@ -186,6 +186,17 @@ indexed_posting_count(uint32_t reference_count, score_compatibility const& compa
 }
 
 constexpr size_t indexed_batch_pair_storage_bytes = 50U * 1024U * 1024U;
+constexpr uint32_t all_to_all_query_tile_count = 128U;
+
+[[nodiscard]] constexpr uint32_t all_to_all_query_tile_size(uint32_t reference_count) noexcept {
+    if (reference_count == 0U) {
+        return 0U;
+    }
+    auto const count_capacity = std::numeric_limits<uint32_t>::max() / reference_count;
+    return std::min(
+        reference_count, std::min(all_to_all_query_tile_count, std::max(1U, count_capacity))
+    );
+}
 
 [[nodiscard]] constexpr uint32_t
 indexed_batch_query_tile_size(uint32_t reference_count, uint32_t query_count) noexcept {
@@ -371,21 +382,31 @@ class reference_database_view {
         return make_batch_requirements(pair_count, pair_count, true);
     }
 
-    /// @brief Storage required for one exhaustive all-to-all query tile.
-    [[nodiscard]] Result<cuddl::batch_search_requirements>
-    all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        auto const pair_count = CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
-        return make_batch_requirements(0U, pair_count, false);
+    /// @brief Storage reused while exhaustively searching every unique database-row pair.
+    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements() const {
+        return all_to_all_tile_search_requirements(
+            0U, detail::all_to_all_query_tile_size(metadata_.reference_count)
+        );
     }
 
-    /// @brief Storage required for one indexed all-to-all query tile.
+    [[nodiscard]] static constexpr uint32_t all_to_all_result_capacity(
+        uint32_t reference_count
+    ) noexcept {
+        if (reference_count < 2U) {
+            return 0U;
+        }
+        auto const query_count = detail::all_to_all_query_tile_size(reference_count);
+        auto const pair_count = static_cast<uint64_t>(query_count) *
+                                (2ULL * reference_count - query_count - 1ULL) / 2ULL;
+        return static_cast<uint32_t>(pair_count);
+    }
+
+    /// @brief Storage reused while searching every unique database-row pair through the index.
     [[nodiscard]] Result<cuddl::batch_search_requirements>
-    indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        CUDDL_TRY(validate_index_storage());
-        auto const dense_pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
-        auto const result_pair_count =
-            CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
-        return make_batch_requirements(dense_pair_count, result_pair_count, true);
+    indexed_all_to_all_search_requirements() const {
+        return indexed_all_to_all_tile_search_requirements(
+            0U, detail::all_to_all_query_tile_size(metadata_.reference_count)
+        );
     }
 
     /// @brief Compares one compact query row with every reference row on @p stream.
@@ -742,20 +763,121 @@ class reference_database_view {
         );
     }
 
-    /// @brief Exhaustively searches one database-row tile against later database rows.
+    /**
+     * @brief Exhaustively searches every unique database-row pair using bounded storage.
+     *
+     * @p on_tile is called after each internal tile is enqueued with its exact result count.
+     * Before returning, it must consume the tile synchronously or enqueue dependent work on
+     * @p stream because the supplied storage is reused by the next tile.
+     */
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        auto const tile_size = detail::all_to_all_query_tile_size(metadata_.reference_count);
+        if (tile_size == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        for (uint32_t first_query_id = 0U; first_query_id < metadata_.reference_count;
+             first_query_id += tile_size) {
+            auto const query_count =
+                std::min(tile_size, metadata_.reference_count - first_query_id);
+            auto const requirements =
+                CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count));
+            CUDDL_TRY(search_all_to_all_tile_async(
+                first_query_id,
+                query_count,
+                workspace,
+                results,
+                result_count,
+                result_match_counts,
+                stream
+            ));
+            on_tile(requirements.maximum_pair_count);
+        }
+        return Ok();
+    }
+
+    /**
+     * @brief Indexed search of every unique database-row pair using bounded storage.
+     *
+     * @p on_tile is called after each internal tile is enqueued with its maximum result count.
+     * Before returning, it must consume the tile synchronously or enqueue dependent work on
+     * @p stream because the supplied storage is reused by the next tile. The actual result count
+     * is written to @p result_count.
+     */
+    template <typename OnTile>
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        device_span<uint32_t> result_count,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts = {},
+        indexed_search_options options = {},
+        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    ) const {
+        auto const tile_size = detail::all_to_all_query_tile_size(metadata_.reference_count);
+        if (tile_size == 0U) {
+            return write_batch_result_count(0U, result_count, stream);
+        }
+        for (uint32_t first_query_id = 0U; first_query_id < metadata_.reference_count;
+             first_query_id += tile_size) {
+            auto const query_count =
+                std::min(tile_size, metadata_.reference_count - first_query_id);
+            auto const requirements =
+                CUDDL_TRY(indexed_all_to_all_tile_search_requirements(first_query_id, query_count));
+            CUDDL_TRY(search_all_to_all_indexed_tile_async(
+                first_query_id,
+                query_count,
+                workspace,
+                results,
+                result_count,
+                result_match_counts,
+                options,
+                stream
+            ));
+            on_tile(requirements.maximum_pair_count);
+        }
+        return Ok();
+    }
+
+   private:
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    all_to_all_tile_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+        auto const pair_count = CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
+        return make_batch_requirements(0U, pair_count, false);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    indexed_all_to_all_tile_search_requirements(
+        uint32_t first_query_id,
+        uint32_t query_count
+    ) const {
+        CUDDL_TRY(validate_index_storage());
+        auto const dense_pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
+        auto const result_pair_count =
+            CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
+        return make_batch_requirements(dense_pair_count, result_pair_count, true);
+    }
+
+    [[nodiscard]] Result<void> search_all_to_all_tile_async(
         uint32_t first_query_id,
         uint32_t query_count,
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
-        device_span<uint32_t> result_match_counts = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
     ) const {
         static_cast<void>(workspace);
         CUDDL_TRY(validate_stored_rows());
         auto const requirements =
-            CUDDL_TRY(all_to_all_search_requirements(first_query_id, query_count));
+            CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count));
         CUDDL_TRY(
             validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
         );
@@ -790,25 +912,19 @@ class reference_database_view {
         );
     }
 
-    /**
-     * @brief Indexed search for one database-row tile against later database rows.
-     *
-     * After stream completion, a count larger than @p results reports insufficient pair capacity.
-     * In that case neither results nor optional diagnostics are modified.
-     */
-    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+    [[nodiscard]] Result<void> search_all_to_all_indexed_tile_async(
         uint32_t first_query_id,
         uint32_t query_count,
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
-        device_span<uint32_t> result_match_counts = {},
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         CUDDL_TRY(validate_stored_rows());
         auto const requirements =
-            CUDDL_TRY(indexed_all_to_all_search_requirements(first_query_id, query_count));
+            CUDDL_TRY(indexed_all_to_all_tile_search_requirements(first_query_id, query_count));
         CUDDL_TRY(validate_indexed_batch_inputs(
             requirements, workspace, results, result_count, result_match_counts, options
         ));
@@ -847,7 +963,6 @@ class reference_database_view {
         );
     }
 
-   private:
     [[nodiscard]] Result<void> validate_stored_rows() const {
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (!rows_match_metadata(expected_scores)) {
@@ -1490,14 +1605,19 @@ class reference_database {
         return view().indexed_batch_search_requirements(query_count);
     }
 
-    [[nodiscard]] Result<cuddl::batch_search_requirements>
-    all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        return view().all_to_all_search_requirements(first_query_id, query_count);
+    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements() const {
+        return view().all_to_all_search_requirements();
+    }
+
+    [[nodiscard]] static constexpr uint32_t all_to_all_result_capacity(
+        uint32_t reference_count
+    ) noexcept {
+        return view_type::all_to_all_result_capacity(reference_count);
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements>
-    indexed_all_to_all_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
-        return view().indexed_all_to_all_search_requirements(first_query_id, query_count);
+    indexed_all_to_all_search_requirements() const {
+        return view().indexed_all_to_all_search_requirements();
     }
 
     [[nodiscard]] static constexpr uint32_t single_query_result_count(
@@ -1712,83 +1832,79 @@ class reference_database {
         );
     }
 
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
+        OnTile&& on_tile,
         device_span<uint32_t> result_match_counts = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return view().search_all_to_all_async(
-            first_query_id,
-            query_count,
             workspace,
             results,
             result_count,
+            std::forward<OnTile>(on_tile),
             result_match_counts,
             stream
         );
     }
 
     /// @brief Thrust overload for caller-owned exhaustive all-to-all storage.
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         thrust::device_vector<uint8_t>& workspace,
         thrust::device_vector<batch_result_type>& results,
         thrust::device_vector<uint32_t>& result_count,
+        OnTile&& on_tile,
         thrust::device_vector<uint32_t>& result_match_counts,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return search_all_to_all_async(
-            first_query_id,
-            query_count,
             {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
             {thrust::raw_pointer_cast(results.data()), results.size()},
             {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            std::forward<OnTile>(on_tile),
             {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
             stream
         );
     }
 
     /// @brief Thrust overload without optional match-count diagnostics.
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         thrust::device_vector<uint8_t>& workspace,
         thrust::device_vector<batch_result_type>& results,
         thrust::device_vector<uint32_t>& result_count,
+        OnTile&& on_tile,
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return search_all_to_all_async(
-            first_query_id,
-            query_count,
             {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
             {thrust::raw_pointer_cast(results.data()), results.size()},
             {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            std::forward<OnTile>(on_tile),
             {},
             stream
         );
     }
 
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_indexed_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
+        OnTile&& on_tile,
         device_span<uint32_t> result_match_counts = {},
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return view().search_all_to_all_indexed_async(
-            first_query_id,
-            query_count,
             workspace,
             results,
             result_count,
+            std::forward<OnTile>(on_tile),
             result_match_counts,
             options,
             stream
@@ -1796,22 +1912,21 @@ class reference_database {
     }
 
     /// @brief Thrust overload for caller-owned indexed all-to-all storage.
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_indexed_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         thrust::device_vector<uint8_t>& workspace,
         thrust::device_vector<batch_result_type>& results,
         thrust::device_vector<uint32_t>& result_count,
+        OnTile&& on_tile,
         thrust::device_vector<uint32_t>& result_match_counts,
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return search_all_to_all_indexed_async(
-            first_query_id,
-            query_count,
             {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
             {thrust::raw_pointer_cast(results.data()), results.size()},
             {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            std::forward<OnTile>(on_tile),
             {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
             options,
             stream
@@ -1819,21 +1934,20 @@ class reference_database {
     }
 
     /// @brief Thrust overload without optional match-count diagnostics.
+    template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_indexed_async(
-        uint32_t first_query_id,
-        uint32_t query_count,
         thrust::device_vector<uint8_t>& workspace,
         thrust::device_vector<batch_result_type>& results,
         thrust::device_vector<uint32_t>& result_count,
+        OnTile&& on_tile,
         indexed_search_options options = {},
         cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
     ) const {
         return search_all_to_all_indexed_async(
-            first_query_id,
-            query_count,
             {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
             {thrust::raw_pointer_cast(results.data()), results.size()},
             {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
+            std::forward<OnTile>(on_tile),
             {},
             options,
             stream
