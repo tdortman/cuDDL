@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <istream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,20 +16,41 @@
 
 using json = nlohmann::json;
 
-inline std::string cpu_model() {
-    std::ifstream input("/proc/cpuinfo");
+inline std::string cpu_model(std::istream& input, std::string fallback) {
+    std::string implementer;
+    std::string part;
     for (std::string line; std::getline(input, line);) {
         auto const colon = line.find(':');
-        if (colon == std::string::npos ||
-            line.substr(0, colon).find("model name") == std::string::npos) {
+        if (colon == std::string::npos) {
             continue;
         }
+        auto const key_end = line.find_last_not_of(" \t", colon - 1);
         auto const first = line.find_first_not_of(" \t", colon + 1);
-        if (first != std::string::npos) {
-            return line.substr(first);
+        if (key_end == std::string::npos || first == std::string::npos) {
+            continue;
+        }
+        auto const key = line.substr(0, key_end + 1);
+        auto const value = line.substr(first);
+        if (key == "model name" || key == "Processor" || key == "Hardware" || key == "cpu" ||
+            key == "uarch") {
+            return value;
+        }
+        if (key == "CPU implementer") {
+            implementer = value;
+        } else if (key == "CPU part") {
+            part = value;
         }
     }
-    throw std::runtime_error("cannot determine CPU model from /proc/cpuinfo");
+    if (!implementer.empty() || !part.empty()) {
+        return "ARM implementer " + (implementer.empty() ? "unknown" : implementer) + " part " +
+               (part.empty() ? "unknown" : part);
+    }
+    return fallback;
+}
+
+inline std::string cpu_model(std::string fallback) {
+    std::ifstream input("/proc/cpuinfo");
+    return cpu_model(input, std::move(fallback));
 }
 
 inline json benchmark_host_system() {
@@ -47,7 +69,7 @@ inline json benchmark_host_system() {
         {"os", host.sysname},
         {"kernel", host.release},
         {"architecture", host.machine},
-        {"cpu", cpu_model()},
+        {"cpu", cpu_model(host.machine)},
         {"logical_cpu_count", logical_cpu_count},
         {"ram_bytes", static_cast<uint64_t>(physical_pages) * static_cast<uint64_t>(page_size)},
     };
