@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "pandas", "typer"]
+# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
-"""Plot indexed-versus-exhaustive search decisions from the summary CSV."""
+"""Plot indexed-versus-exhaustive search decisions from shared result JSON."""
 
 import math
 from itertools import pairwise
@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 from matplotlib.patches import Patch
 
@@ -22,13 +23,19 @@ REQUIRED_COLUMNS = {
     "reference_count",
     "skew",
     "query_count",
+    "query_profile",
+    "fill_ratio",
+    "indexed_bucket_count",
     "index_mode",
-    "exhaustive_median_ms",
-    "indexed_median_ms",
+    "exhaustive_p50_ms",
+    "indexed_p50_ms",
     "kill_gate_outcome",
 }
 VALID_OUTCOMES = {"indexed_win", "exhaustive_win", "inconclusive", "recall_loss"}
 REFSEQ_REFERENCE_COUNT = 200687
+PAPER_INDEXED_BUCKET_COUNT = 2048
+PAPER_FILL_RATIO = 1.0
+PAPER_QUERY_PROFILE = "copied"
 
 
 def skew_fraction(value: object) -> float:
@@ -51,48 +58,67 @@ def speedup_label(log2_speedup: float) -> str:
 
 
 def main(
-    csv_path: Annotated[
-        Path, typer.Argument(exists=True, dir_okay=False, help="Decision summary CSV")
+    json_path: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, help="Search-decision result JSON"),
     ],
     output: Annotated[
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-decision.pdf"),
 ) -> None:
     """Render speedup curves across the hot-bucket fraction."""
-    data = pu.load_csv(csv_path)
+    try:
+        result = load_result(json_path, "search_decision")
+    except ValueError as error:
+        raise typer.BadParameter(f"{json_path}: {error}") from error
+    data = pd.DataFrame(flatten_measurements(result))
     missing = sorted(REQUIRED_COLUMNS - set(data.columns))
     if missing:
-        raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
+        raise typer.BadParameter(f"result is missing columns: {', '.join(missing)}")
 
     data = data.loc[data["status"] == "ok"].copy()
     # The 16-bit key is the canonical index key; the 15-bit tradeoff has its
     # own figure (plot_cuddl_search_key_bits.py).
-    data["key_bits"] = data["index_mode"].str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
+    data["key_bits"] = (
+        data["index_mode"].astype("string").str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
+    )
     data = data.loc[data["key_bits"] == 16].copy()
     if data.empty:
-        raise typer.BadParameter("CSV has no successful workloads")
+        raise typer.BadParameter("result has no successful workloads")
     numeric = (
         "reference_count",
         "query_count",
-        "exhaustive_median_ms",
-        "indexed_median_ms",
+        "fill_ratio",
+        "indexed_bucket_count",
+        "exhaustive_p50_ms",
+        "indexed_p50_ms",
     )
     try:
         data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
     except (TypeError, ValueError) as error:
-        raise typer.BadParameter(f"CSV contains non-numeric benchmark values: {error}")
+        raise typer.BadParameter(
+            f"result contains non-numeric benchmark values: {error}"
+        )
 
     timing_columns = [name for name in numeric if name.endswith("_ms")]
     if (data[timing_columns] <= 0).any().any():
-        raise typer.BadParameter("CSV contains non-positive search timings")
+        raise typer.BadParameter("result contains non-positive search timings")
+
+    data = data.loc[
+        (data["indexed_bucket_count"] == PAPER_INDEXED_BUCKET_COUNT)
+        & (data["fill_ratio"] == PAPER_FILL_RATIO)
+        & (data["query_profile"] == PAPER_QUERY_PROFILE)
+    ].copy()
+    if data.empty:
+        raise typer.BadParameter("result has no canonical paper workloads")
 
     data["hot_fraction"] = data["skew"].map(skew_fraction)
-    data["speedup"] = data["exhaustive_median_ms"] / data["indexed_median_ms"]
+    data["speedup"] = data["exhaustive_p50_ms"] / data["indexed_p50_ms"]
     data["log2_speedup"] = data["speedup"].map(math.log2)
     unknown_outcomes = sorted(set(data["kill_gate_outcome"]) - VALID_OUTCOMES)
     if unknown_outcomes:
         raise typer.BadParameter(
-            f"CSV contains unknown kill-gate outcomes: {', '.join(unknown_outcomes)}"
+            f"result contains unknown kill-gate outcomes: {', '.join(unknown_outcomes)}"
         )
 
     references = sorted(data["reference_count"].unique())
@@ -101,15 +127,20 @@ def main(
         "query_count",
         "hot_fraction",
         "reference_count",
+        "fill_ratio",
+        "indexed_bucket_count",
+        "query_profile",
     ]
     if data.duplicated(workload_columns).any():
-        raise typer.BadParameter("CSV contains duplicate workloads")
+        raise typer.BadParameter("result contains duplicate workloads")
 
     # The realistic query regime is a single query and a 128-query batch; older
-    # CSVs carried more query-count axes that no longer reflect the paper workload.
-    panel_columns = [(query_count,) for query_count in query_counts if query_count in {1, 128}]
+    # result JSONs carried more query-count axes that no longer reflect the paper workload.
+    panel_columns = [
+        (query_count,) for query_count in query_counts if query_count in {1, 128}
+    ]
     if not panel_columns:
-        raise typer.BadParameter("CSV has no 1-query or 128-query workloads")
+        raise typer.BadParameter("result has no 1-query or 128-query workloads")
     hot_fractions = sorted(data["hot_fraction"].unique())
     log2_values = data["log2_speedup"]
     maximum_log2 = max(1.0, float(log2_values.abs().max()))
@@ -147,7 +178,9 @@ def main(
     # Gap to panels + tick-label room + bar + rotated label + right margin.
     colorbar_space = 0.10 + 0.55 + 0.06 + 0.95
     fig_width = left_margin + panel_width + colorbar_space
-    fig_height = bottom_margin + len(panel_columns) * panel_height + panel_gap + top_margin
+    fig_height = (
+        bottom_margin + len(panel_columns) * panel_height + panel_gap + top_margin
+    )
     fig, axes = plt.subplots(
         len(panel_columns),
         1,
@@ -232,29 +265,32 @@ def main(
         ax.spines[:].set_visible(False)
 
     if mesh is None:
-        raise typer.BadParameter("CSV has no heatmap workloads")
+        raise typer.BadParameter("result has no heatmap workloads")
     fig.subplots_adjust(
         left=left_margin / fig_width,
         right=(left_margin + panel_width) / fig_width,
         bottom=bottom_margin / fig_height,
-        top=(bottom_margin + len(panel_columns) * panel_height + panel_gap) / fig_height,
+        top=(bottom_margin + len(panel_columns) * panel_height + panel_gap)
+        / fig_height,
         hspace=panel_gap / panel_height,
     )
     colorbar_axes = fig.add_axes(
-        [
+        (
             (left_margin + panel_width + 0.10 + 0.55) / fig_width,
             bottom_margin / fig_height,
             0.06 / fig_width,
             (len(panel_columns) * panel_height + panel_gap) / fig_height,
-        ]
+        )
     )
     colorbar = fig.colorbar(mesh, cax=colorbar_axes)
     # Ticks stay on the log2 scale (diverging colours), but the labels and the
     # cell annotations show the actual exhaustive / indexed time ratio.
-    colour_ticks = [tick for tick in range(-16, 17, 4) if -maximum_log2 <= tick <= maximum_log2]
+    colour_ticks = [
+        tick for tick in range(-16, 17, 4) if -maximum_log2 <= tick <= maximum_log2
+    ]
     colorbar.set_ticks(colour_ticks)
     colorbar.set_ticklabels(
-        [f"1/{2 ** -tick}" if tick < 0 else str(2 ** tick) for tick in colour_ticks]
+        [f"1/{2**-tick}" if tick < 0 else str(2**tick) for tick in colour_ticks]
     )
     colorbar.set_label(
         pu.paper_text("exhaustive / indexed median time") + r" ($\times$)",

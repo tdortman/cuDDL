@@ -4,6 +4,7 @@
 # dependencies = [
 #   "typer",
 #   "pandas",
+#   "jsonschema",
 # ]
 # ///
 
@@ -32,6 +33,7 @@ from typing import Annotated
 
 import pandas as pd
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 app = typer.Typer(help="Run cuDDL acceptance gates", no_args_is_help=True)
 
@@ -104,7 +106,7 @@ def run_ddl(
     backend: str,
     runs: int,
     warmup: int,
-    out_csv: Path,
+    output: Path,
 ) -> Path:
     cmd = [
         str(cli),
@@ -122,19 +124,23 @@ def run_ddl(
         str(runs),
         "--warmup",
         str(warmup),
-        "--csv",
-        str(out_csv),
+        "--output",
+        str(output),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if res.returncode != 0:
         typer.echo(f"{backend} backend failed: {res.stderr[-500:]}", err=True)
         raise typer.Exit(code=1)
-    return out_csv
+    return output
 
 
-def ddl_measured_rows(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    return df[df["phase"] == "measured"]
+def ddl_measured_rows(result_path: Path) -> pd.DataFrame:
+    result = load_result(result_path, operation="fasta_pairwise")
+    df = pd.DataFrame(flatten_measurements(result))
+    measured = df[df["phase"] == "measured"].copy()
+    measured["total_ms"] = measured["total_median_ms"]
+    measured["construction_ms"] = measured["construction_median_ms"]
+    return measured
 
 
 def bbtools_compare(
@@ -212,9 +218,7 @@ def gate(
     xmx: Annotated[str, typer.Option(help="BBTools Java heap (--xmx)")] = "32g",
     runs: Annotated[int, typer.Option(min=1, help="Measured runs")] = 5,
     warmup: Annotated[int, typer.Option(min=0, help="Warm-up runs")] = 1,
-    workdir: Annotated[Path, typer.Option(help="Output dir")] = Path(
-        "results/gpu"
-    ),
+    workdir: Annotated[Path, typer.Option(help="Output dir")] = Path("results/gpu"),
 ):
     """End-to-end GPU-vs-CPU go/no-go gate plus BBTools metric context."""
     workdir.mkdir(parents=True, exist_ok=True)
@@ -228,10 +232,10 @@ def gate(
     ref_d = bbtools_compare(bbtools_dir, query, reference, xmx=xmx)
     typer.echo(ref_d if ref_d else "no metric parsed (reporting only)")
 
-    gpu_csv = run_ddl(cli, reference, query, "gpu", runs, warmup, workdir / "gpu.csv")
-    cpu_csv = run_ddl(cli, reference, query, "cpu", runs, warmup, workdir / "cpu.csv")
-    gpu = ddl_measured_rows(gpu_csv)
-    cpu = ddl_measured_rows(cpu_csv)
+    gpu_json = run_ddl(cli, reference, query, "gpu", runs, warmup, workdir / "gpu.json")
+    cpu_json = run_ddl(cli, reference, query, "cpu", runs, warmup, workdir / "cpu.json")
+    gpu = ddl_measured_rows(gpu_json)
+    cpu = ddl_measured_rows(cpu_json)
 
     g_tot = float(gpu["total_ms"].median())
     c_tot = float(cpu["total_ms"].median())
@@ -315,16 +319,16 @@ def synthetic(
             ref_fa.write_text(f">ref_{ani}_{rep}\n{genome}\n")
             que_fa.write_text(f">query_{ani}_{rep}\n{mutant}\n")
 
-            ddl_csv = run_ddl(
+            ddl_json = run_ddl(
                 cli,
                 ref_fa,
                 que_fa,
                 backend,
                 runs=1,
                 warmup=1,
-                out_csv=workdir / f"ddl_a{ani}_r{rep}.csv",
+                output=workdir / f"ddl_a{ani}_r{rep}.json",
             )
-            row = ddl_measured_rows(ddl_csv).iloc[0]
+            row = ddl_measured_rows(ddl_json).iloc[0]
             ddl_ani = row["ani"]
             ddl_wkid = row["wkid"]
             if pd.isna(ddl_ani) or pd.isna(ddl_wkid):
@@ -355,7 +359,10 @@ def synthetic(
             typer.echo(f"ANI {ani:5.1f}%: FAIL (no BBTools metrics)")
             continue
         if not ddl_signed:
-            per_point[ani] = {"note": "NO DDL metric; gate not evaluated", "pass": False}
+            per_point[ani] = {
+                "note": "NO DDL metric; gate not evaluated",
+                "pass": False,
+            }
             typer.echo(f"ANI {ani:5.1f}%: FAIL (no DDL metrics)")
             continue
 
@@ -420,7 +427,9 @@ def synthetic(
     typer.echo(f"\nSummary written to {workdir / 'synthetic_summary.json'}")
     failed = any(not v.get("pass", False) for v in per_point.values())
     if failed:
-        typer.echo("RESULT: FAIL (some ANI points exceed the metric-equivalence margins)")
+        typer.echo(
+            "RESULT: FAIL (some ANI points exceed the metric-equivalence margins)"
+        )
         raise typer.Exit(code=1)
     typer.echo("RESULT: PASS (all ANI points within the metric-equivalence margins)")
 

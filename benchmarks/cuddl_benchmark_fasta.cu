@@ -1,8 +1,8 @@
 // cuddl-benchmark-fasta: reproducible raw-FASTA end-to-end benchmark for cuDDL.
 //
 // Reads every record in each FASTA file as one complete genome, builds a DDL sketch per genome
-// on the selected backend, compares the single pair, and emits one CSV row per warm-up or measured
-// run. GPU totals run from first input byte read through final host-visible WKID/ANI; the CPU
+// on the selected backend, compares the single pair, and emits one JSON measurement per run. GPU
+// totals run from first input byte read through final host-visible WKID/ANI; the CPU
 // backend covers the same work with a single thread as the exact scalar baseline.
 //
 // This is the bespoke end-to-end gate tooling the acceptance contract prescribes; it intentionally
@@ -26,11 +26,13 @@
 #include <string>
 #include <vector>
 
+#include "result_json.hpp"
+
 namespace {
 
 using steady_clock_t = std::chrono::steady_clock;
 
-/// @brief Per-run timing breakdown and result, emitted as one CSV row.
+/// @brief Per-run timing breakdown and result.
 struct run_result {
     double preprocess_ms = 0;
     double allocation_ms = 0;
@@ -194,12 +196,9 @@ run_cpu(std::vector<uint64_t> const& query_kmers, std::vector<uint64_t> const& r
     return r;
 }
 
-/// @brief Emits one complete CSV row matching the 60-column acceptance schema.
-///
-/// Machine/tool provenance columns are left blank; the acceptance runner fills them. Empty
-/// numeric columns are blank, never zero. @p is_warmup distinguishes warm-up from measured rows.
+/// @brief Appends one shared-schema measurement.
 void emit_row(
-    std::ofstream& csv,
+    json& measurements,
     run_result const& r,
     uint32_t run_index,
     bool is_warmup,
@@ -216,31 +215,55 @@ void emit_row(
     std::string const& status,
     std::string const& error
 ) {
-    auto dur = [&](double v) -> std::string {
-        return v > 0.0 ? std::to_string(v) : "";
+    json metrics{
+        {"status", status},
+        {"sequence_bases", seq_bases},
+        {"valid_kmers", valid_kmers},
+        {"invalid_windows", invalid_windows},
+        {"lower", r.lower},
+        {"equal", r.equal},
+        {"higher", r.higher},
     };
-    auto metric = [&](double v) -> std::string {
-        return r.valid_metric ? std::to_string(v) : "";
-    };
-    csv << "1," << run_index << ","                                 // schema_version,run_id
-        << "" << "," << (is_warmup ? "warmup" : "measured") << ","  // timestamp_utc,phase
-        << "" << ","                                                // dataset
-        << ref_path << "," << ref_sha << ","                 // reference_path,reference_sha256
-        << query_path << "," << query_sha << ","             // query_path,query_sha256
-        << backend << "," << k << "," << buckets << ","      // backend,k,buckets
-        << "42," << "" << "," << (is_warmup ? 1 : 0) << ","  // root_seed,derived_seed,warmup
-        << run_index << "," << status << ","                 // run_index,status
-        << seq_bases << "," << valid_kmers << "," << invalid_windows << ","  // counts
-        << dur(r.preprocess_ms) << "," << dur(r.allocation_ms) << "," << dur(r.h2d_ms) << ","
-        << dur(r.construction_ms) << "," << dur(r.comparison_ms) << "," << dur(r.d2h_ms) << ","
-        << dur(r.metric_ms) << "," << dur(r.total_ms) << ","               // timings
-        << r.lower << "," << r.equal << "," << r.higher << ","             // counts
-        << metric(r.wkid) << "," << metric(r.ani) << "," << error << ",";  // metrics,error
-    // 19 provenance placeholders (git_commit through kernel); 26 total remaining columns.
-    for (int i = 0; i < 25; ++i) {
-        csv << "" << ",";
+    if (r.valid_metric) {
+        metrics["wkid"] = r.wkid;
+        metrics["ani"] = r.ani;
     }
-    csv << "" << "\n";
+    if (!error.empty()) {
+        metrics["error"] = error;
+    }
+    json timings = json::object();
+    auto add_timing = [&](char const* name, double milliseconds) {
+        if (milliseconds > 0.0) {
+            timings[name] = {{"samples", 1}, {"median_ms", milliseconds}, {"source", "wall_clock"}};
+        }
+    };
+    add_timing("preprocess", r.preprocess_ms);
+    add_timing("allocation", r.allocation_ms);
+    add_timing("host_to_device", r.h2d_ms);
+    add_timing("construction", r.construction_ms);
+    add_timing("comparison", r.comparison_ms);
+    add_timing("device_to_host", r.d2h_ms);
+    add_timing("metric", r.metric_ms);
+    add_timing("total", r.total_ms);
+    measurements.push_back({
+        {"implementation", {{"name", "cuddl"}, {"variant", backend}}},
+        {"case",
+         {
+             {"run_id", run_index},
+             {"phase", is_warmup ? "warmup" : "measured"},
+             {"reference_path", ref_path},
+             {"reference_sha256", ref_sha},
+             {"query_path", query_path},
+             {"query_sha256", query_sha},
+             {"k", k},
+             {"buckets", buckets},
+             {"root_seed", 42},
+             {"warmup", is_warmup},
+             {"run_index", run_index},
+         }},
+        {"metrics", std::move(metrics)},
+        {"timings", std::move(timings)},
+    });
 }
 
 /// @brief Normalises and validates the backend name.
@@ -267,7 +290,7 @@ std::string normalise_backend(const std::string& backend) {
 int main(int argc, char** argv) {
     try {
         CLI::App app{"cuDDL  raw-FASTA end-to-end benchmark"};
-        std::string reference, query, backend = "gpu", csv_path;
+        std::string reference, query, backend = "gpu", output_path;
         uint32_t k = 25;
         size_t buckets = 2048;
         uint32_t runs = 5;
@@ -280,10 +303,8 @@ int main(int argc, char** argv) {
         app.add_option("--backend", backend, "Backend: gpu or cpu");
         app.add_option("--runs", runs, "Number of measured runs");
         app.add_option("--warmup", warmup, "Number of untimed warm-up runs");
-        app.add_option(
-            "--threads", threads, "FASTA parse worker count (0 = all cores)"
-        );
-        app.add_option("--csv", csv_path, "Output CSV path")->required();
+        app.add_option("--threads", threads, "FASTA parse worker count (0 = all cores)");
+        app.add_option("--output", output_path, "Output JSON path")->required();
         CLI11_PARSE(app, argc, argv);
 
         backend = normalise_backend(backend);
@@ -308,20 +329,7 @@ int main(int argc, char** argv) {
         auto const valid_kmers = query_parsed.valid_kmers + ref_parsed.valid_kmers;
         auto const invalid_windows = query_parsed.invalid_windows + ref_parsed.invalid_windows;
 
-        std::ofstream csv(csv_path);
-        if (!csv) {
-            throw std::runtime_error("cannot open CSV output: " + csv_path);
-        }
-        csv << "schema_version,run_id,timestamp_utc,phase,dataset,reference_path,reference_sha256,"
-               "query_path,query_sha256,backend,k,buckets,root_seed,derived_seed,warmup,run_index,"
-               "status,sequence_bases,valid_kmers,invalid_windows,preprocess_ms,allocation_ms,"
-               "h2d_ms,construction_ms,comparison_ms,d2h_ms,metric_ms,total_ms,lower,equal,higher,"
-               "wkid,ani,error,git_commit,manifest_sha256,bbtools_revision,cuda_version,"
-               "driver_version,compiler_version,nvbench_revision,cccl_revision,cuco_revision,"
-               "hostname,gpu_name,gpu_uuid,compute_capability,gpu_memory_bytes,"
-               "free_gpu_memory_bytes,power_limit_w,persistence_mode,application_clocks,"
-               "gpu_temperature_c,other_gpu_processes,cpu_model,cpu_logical_count,cpu_affinity,"
-               "host_memory_bytes,os,kernel\n";
+        json measurements = json::array();
 
         if (backend == "gpu") {
             cuddl::sketch<25, 2048> query_gpu;
@@ -337,7 +345,7 @@ int main(int argc, char** argv) {
                 r.total_ms = r.preprocess_ms + r.allocation_ms + r.h2d_ms + r.construction_ms +
                              r.comparison_ms + r.d2h_ms + r.metric_ms;
                 emit_row(
-                    csv,
+                    measurements,
                     r,
                     idx,
                     is_warmup,
@@ -363,7 +371,7 @@ int main(int argc, char** argv) {
                 r.total_ms = r.preprocess_ms + r.allocation_ms + r.h2d_ms + r.construction_ms +
                              r.comparison_ms + r.d2h_ms + r.metric_ms;
                 emit_row(
-                    csv,
+                    measurements,
                     r,
                     idx,
                     is_warmup,
@@ -383,7 +391,15 @@ int main(int argc, char** argv) {
             }
         }
 
-        csv.close();
+        write_benchmark_result(
+            output_path,
+            make_benchmark_result(
+                "Raw FASTA pairwise benchmark",
+                "fasta_pairwise",
+                "end_to_end",
+                std::move(measurements)
+            )
+        );
         return 0;
     } catch (std::exception const& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

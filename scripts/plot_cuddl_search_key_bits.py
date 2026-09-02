@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "pandas", "typer"]
+# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
-"""Plot 15-bit versus 16-bit index keys from the search decision CSV.
+"""Plot 15-bit versus 16-bit index keys from shared result JSON.
 
 RefSeq register scores occupy the 15-bit space (the top bit is empirically
 dead, paper Section 8.2), so masking to 15 bits halves the index offset table
@@ -19,12 +19,16 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 PAPER_REFERENCE_COUNT = 200687
+PAPER_INDEXED_BUCKET_COUNT = 2048
+PAPER_FILL_RATIO = 1.0
+PAPER_QUERY_PROFILE = "copied"
 
 METRICS = (
     ("atomic_updates", "Index entries visited", "log"),
-    ("indexed_median_ms", "Indexed median time (ms)", "linear"),
+    ("indexed_p50_ms", "Indexed median time (ms)", "linear"),
 )
 
 KEY_BIT_STYLES = {
@@ -43,40 +47,66 @@ def skew_fraction(value: object) -> float:
 
 
 def main(
-    csv_path: Annotated[
-        Path, typer.Argument(exists=True, dir_okay=False, help="Decision summary CSV")
+    json_path: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, help="Search-decision result JSON"),
     ],
     output: Annotated[
         Path, typer.Option(dir_okay=False, help="Figure output path")
     ] = Path("results/cuddl-search-key-bits.pdf"),
 ) -> None:
     """Render posting work and time for both key widths."""
-    data = pu.load_csv(csv_path)
+    try:
+        result = load_result(json_path, "search_decision")
+    except ValueError as error:
+        raise typer.BadParameter(f"{json_path}: {error}") from error
+    data = pd.DataFrame(flatten_measurements(result))
     required = {
         "status",
         "reference_count",
         "query_count",
+        "query_profile",
+        "fill_ratio",
+        "indexed_bucket_count",
         "skew",
         "index_mode",
         *(name for name, _, _ in METRICS),
     }
     missing = sorted(required - set(data.columns))
     if missing:
-        raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
+        raise typer.BadParameter(f"result is missing columns: {', '.join(missing)}")
 
     data = data.loc[data["status"] == "ok"].copy()
-    data = data.loc[data["reference_count"] == PAPER_REFERENCE_COUNT].copy()
-    data = data.loc[data["query_count"] == 128].copy()
+    numeric = (
+        "reference_count",
+        "query_count",
+        "fill_ratio",
+        "indexed_bucket_count",
+        *(name for name, _, _ in METRICS),
+    )
+    try:
+        data[list(numeric)] = data[list(numeric)].apply(pd.to_numeric)
+    except (TypeError, ValueError) as error:
+        raise typer.BadParameter(
+            f"result contains non-numeric benchmark values: {error}"
+        ) from error
+    data = data.loc[
+        (data["reference_count"] == PAPER_REFERENCE_COUNT)
+        & (data["query_count"] == 128)
+        & (data["query_profile"] == PAPER_QUERY_PROFILE)
+        & (data["fill_ratio"] == PAPER_FILL_RATIO)
+        & (data["indexed_bucket_count"] == PAPER_INDEXED_BUCKET_COUNT)
+    ].copy()
     if data.empty:
-        raise typer.BadParameter("CSV has no paper-scale, 128-query workloads")
+        raise typer.BadParameter("result has no paper-scale, 128-query workloads")
 
     data["hot_fraction"] = data["skew"].map(skew_fraction)
-    data["key_bits"] = data["index_mode"].str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
-    for name, _, _ in METRICS:
-        data[name] = pd.to_numeric(data[name])
+    data["key_bits"] = (
+        data["index_mode"].astype("string").str.extract(r"b(\d+)_k(\d+)")[1].astype(int)
+    )
     hot_fractions = sorted(data["hot_fraction"].unique())
     if not hot_fractions:
-        raise typer.BadParameter("CSV has no hot-fraction sweep")
+        raise typer.BadParameter("result has no hot-fraction sweep")
 
     fig, axes = plt.subplots(
         1,

@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "jsonschema",
 #   "matplotlib",
 #   "pandas",
 #   "numpy",
@@ -10,15 +11,14 @@
 # ///
 """Plot cuDDL vs cuCollections HyperLogLog benchmarks.
 
-Three figures:
+The four figures are loaded from one validated benchmark result JSON:
 
-- `throughput`: construction items/s against item count.
-- `accuracy`: relative cardinality error against item count.
-- `cardinality_estimates`: exact, cuDDL, and cuCollections estimated counts.
-- `similarity`: similarity-estimation time against item count.
+- throughput: construction items/s against item count.
+- accuracy: relative cardinality error against item count.
+- cardinality_estimates: exact, cuDDL, and cuCollections estimated counts.
+- similarity: similarity-estimation time against item count.
 
-All come from the single benchmark `--csv` output. Styling comes from
-`./scripts/plot_utils.py`.
+Styling comes from ./scripts/plot_utils.py.
 """
 
 from __future__ import annotations
@@ -26,33 +26,56 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 app = typer.Typer(help="Plot cuDDL vs cuco HLL benchmarks", no_args_is_help=True)
 
 
 @app.command()
 def plot(
-    nvbench_csv: Annotated[Path, typer.Option(help="Benchmark --csv output")],
-    accuracy_csv: Annotated[
-        Path | None, typer.Option(help="Independent accuracy-trial CSV")
-    ] = None,
+    result_json: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, help="HLL comparison result JSON"),
+    ],
     output_dir: Annotated[Path, typer.Option(help="Where to write the figures")] = Path(
         "results/hll"
     ),
-):
+) -> None:
     """Render throughput, cardinality, estimate-accuracy, and similarity figures."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    bench = pu.load_csv(nvbench_csv)
-    bench = bench.rename(columns={"Iters": "Items", "Benchmark": "Estimator"})
-    construction = bench[bench["Estimator"].str.endswith("_construction")].copy()
+    try:
+        result = load_result(result_json, operation="hll_comparison")
+    except ValueError as error:
+        raise typer.BadParameter(f"{result_json}: {error}") from error
+    bench = pd.DataFrame(flatten_measurements(result))
+    if bench.empty:
+        raise typer.BadParameter(f"{result_json}: result has no measurements")
+    required = {
+        "implementation",
+        "phase",
+        "items",
+        "gpu_min_ms",
+        "gpu_median_ms",
+        "exact",
+        "estimate",
+        "absolute_error",
+    }
+    missing = sorted(required - set(bench.columns))
+    if missing:
+        raise typer.BadParameter(
+            f"{result_json}: result is missing columns: {', '.join(missing)}"
+        )
+
+    construction = bench[bench["phase"] == "construction"].copy()
     # Minimum time is immune to the box's periodic clock stretching, unlike the median.
-    construction["Gigaelem/s"] = (
-        construction["Items"] / construction["Min GPU Time"] / pu.THROUGHPUT_SCALE
+    construction["gigaelem_per_s"] = (
+        construction["items"] / (construction["gpu_min_ms"] / 1e3) / pu.THROUGHPUT_SCALE
     )
-    cardinality = bench[bench["Estimator"].str.endswith("_cardinality")]
+    cardinality = bench[bench["phase"] == "cardinality"]
 
     construction_estimators = [
         (
@@ -91,18 +114,15 @@ def plot(
         )
         for estimator in ("cuddl", "cuddl_bbtools", "cuddl_paper", "cuco_hll")
     ]
-    timing_estimators = [
-        *accuracy_estimators,
-    ]
+    timing_estimators = [*accuracy_estimators]
 
     # --- Throughput figure ---------------------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, label, color, marker in construction_estimators:
-        estimator = f"{estimator}_construction"
-        data = construction[construction["Estimator"] == estimator]
+        data = construction[construction["implementation"] == estimator]
         ax.semilogx(
-            data["Items"],
-            data["Gigaelem/s"],
+            data["items"],
+            data["gigaelem_per_s"],
             color=color,
             marker=marker,
             label=label,
@@ -115,12 +135,12 @@ def plot(
     # --- Cardinality-estimation figure --------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, label, color, marker in timing_estimators:
-        data = cardinality[cardinality["Estimator"] == f"{estimator}_cardinality"]
+        data = cardinality[cardinality["implementation"] == estimator]
         if data.empty:
             continue
         ax.semilogx(
-            data["Items"],
-            data["Median GPU Time"] * 1e6,
+            data["items"],
+            data["gpu_median_ms"] * 1e3,
             color=color,
             marker=marker,
             label=label,
@@ -133,18 +153,12 @@ def plot(
     typer.echo(f"Wrote {output_dir / 'cardinality.pdf'}")
 
     # --- Cardinality-accuracy figure ----------------------------------------
-    accuracy = pu.load_csv(accuracy_csv) if accuracy_csv else cardinality.copy()
-    if accuracy_csv is None:
-        accuracy["Estimator"] = accuracy["Estimator"].str.removesuffix("_cardinality")
-        accuracy["Absolute Error"] = (
-            (accuracy["Estimate"] - accuracy["Exact"]) / accuracy["Exact"]
-        ).abs()
-
+    accuracy = bench[bench["phase"] == "accuracy"]
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, label, color, marker in accuracy_estimators:
-        data = accuracy[accuracy["Estimator"] == estimator].copy()
-        data["Absolute Error"] *= 100.0
-        mean = data.groupby("Items")["Absolute Error"].mean()
+        data = accuracy[accuracy["implementation"] == estimator].copy()
+        data["absolute_error"] *= 100.0
+        mean = data.groupby("items")["absolute_error"].mean()
         ax.semilogx(
             mean.index,
             mean,
@@ -161,22 +175,25 @@ def plot(
     pu.save_figure(fig, output_dir / "accuracy.pdf", message="Wrote accuracy plot")
     typer.echo(f"Wrote {output_dir / 'accuracy.pdf'}")
 
-    # --- Cardinality-accuracy figure ----------------------------------------
+    # --- Cardinality-estimate figure ----------------------------------------
     fig, ax = pu.setup_figure(figsize=(12, 8))
-    exact = cardinality.groupby("Items", as_index=False)["Exact"].first()
+    exact = (
+        cardinality.dropna(subset=["exact"])
+        .groupby("items", as_index=False)["exact"]
+        .first()
+    )
     ax.loglog(
-        exact["Items"],
-        exact["Exact"],
+        exact["items"],
+        exact["exact"],
         color="#333333",
         linestyle="--",
         label="Exact",
     )
     for estimator, label, color, marker in estimators:
-        estimator = f"{estimator}_cardinality"
-        data = cardinality[cardinality["Estimator"] == estimator]
+        data = cardinality[cardinality["implementation"] == estimator]
         ax.loglog(
-            data["Items"],
-            data["Estimate"],
+            data["items"],
+            data["estimate"],
             color=color,
             marker=marker,
             label=label,
@@ -191,14 +208,13 @@ def plot(
     typer.echo(f"Wrote {output_dir / 'cardinality_estimates.pdf'}")
 
     # --- Similarity-estimation figure ---------------------------------------
-    similarity = bench[bench["Estimator"].str.endswith("_similarity")]
+    similarity = bench[bench["phase"] == "similarity"]
     fig, ax = pu.setup_figure(figsize=(12, 8))
     for estimator, label, color, marker in estimators:
-        estimator = f"{estimator}_similarity"
-        data = similarity[similarity["Estimator"] == estimator]
+        data = similarity[similarity["implementation"] == estimator]
         ax.semilogx(
-            data["Items"],
-            data["Median GPU Time"] * 1e6,
+            data["items"],
+            data["gpu_median_ms"] * 1e3,
             color=color,
             marker=marker,
             label=label,

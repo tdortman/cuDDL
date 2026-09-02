@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -30,6 +29,7 @@
 #include <vector>
 
 #include "common.cuh"
+#include "result_json.hpp"
 
 namespace {
 
@@ -172,7 +172,20 @@ void add_common_metadata(
     int driver_version = 0;
     CUDDL_CUDA_CALL(cudaRuntimeGetVersion(&runtime_version));
     CUDDL_CUDA_CALL(cudaDriverGetVersion(&driver_version));
+    static json const host = benchmark_host_system();
 
+    add_string(state, "system_os", host.at("os").get<std::string>());
+    add_string(state, "system_kernel", host.at("kernel").get<std::string>());
+    add_string(state, "system_architecture", host.at("architecture").get<std::string>());
+    add_string(state, "system_cpu", host.at("cpu").get<std::string>());
+    add_string(
+        state,
+        "system_logical_cpu_count",
+        std::to_string(host.at("logical_cpu_count").get<uint64_t>())
+    );
+    add_string(
+        state, "system_ram_bytes", std::to_string(host.at("ram_bytes").get<uint64_t>())
+    );
     add_value(state, "fixture_seed", static_cast<double>(k_fixture_seed));
     add_value(state, "hot_fraction", value.hot_fraction);
     add_value(state, "minimum_matches", k_minimum_matches);
@@ -253,7 +266,9 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
 }
 
 [[nodiscard]] uint64_t congruent_reference_count(
-    uint32_t reference_count, uint32_t reference_id, uint32_t period = k_score_period
+    uint32_t reference_count,
+    uint32_t reference_id,
+    uint32_t period = k_score_period
 ) {
     auto const residue = reference_id % period;
     if (residue >= reference_count) {
@@ -276,15 +291,14 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         static_cast<size_t>(std::llround(settings.hot_fraction * fill_count)), 0U, fill_count
     );
     auto const hot_reference_count =
-        hot_count == 0U
-            ? 0U
-            : std::clamp<size_t>(
-                  static_cast<size_t>(
-                      std::llround(k_hot_value_fraction * settings.reference_count)
-                  ),
-                  1U,
-                  settings.reference_count
-              );
+        hot_count == 0U ? 0U
+                        : std::clamp<size_t>(
+                              static_cast<size_t>(
+                                  std::llround(k_hot_value_fraction * settings.reference_count)
+                              ),
+                              1U,
+                              settings.reference_count
+                          );
 
     std::vector<size_t> buckets(fill_count);
     std::vector<uint32_t> shifts(fill_count);
@@ -333,11 +347,11 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
                            ? uint16_t{1U}
                            : static_cast<uint16_t>(
                                  2U + (static_cast<uint64_t>(reference_id) + shifts[index]) %
-                                         (k_score_period - 1U)
+                                          (k_score_period - 1U)
                              ))
                     : static_cast<uint16_t>(
-                          1U + (static_cast<uint64_t>(reference_id) + shifts[index]) %
-                                  k_score_period
+                          1U +
+                          (static_cast<uint64_t>(reference_id) + shifts[index]) % k_score_period
                       );
             value.rows[static_cast<size_t>(reference_id) * k_bucket_count + bucket] = score;
             value.bucket_top_bit_counts[bucket] += (score & 0x8000U) != 0U;
@@ -348,9 +362,8 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         // With skew, queries copy rows from the hot group so every query
         // exercises the hot posting lists (the hard case the kill gate decides).
         auto const query_pool = hot_count == 0U ? settings.reference_count : hot_reference_count;
-        auto const reference_id = static_cast<uint32_t>(
-            query_reference_id(settings, query_id) % query_pool
-        );
+        auto const reference_id =
+            static_cast<uint32_t>(query_reference_id(settings, query_id) % query_pool);
         auto* query = value.queries.data() + static_cast<size_t>(query_id) * k_bucket_count;
         std::memcpy(
             query,
@@ -362,7 +375,11 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
 }
 
 [[nodiscard]] uint64_t distinct_index_keys(
-    uint32_t reference_count, uint32_t shift, uint16_t key_mask, uint32_t period, uint32_t base = 1U
+    uint32_t reference_count,
+    uint32_t shift,
+    uint16_t key_mask,
+    uint32_t period,
+    uint32_t base = 1U
 ) {
     if (key_mask == std::numeric_limits<uint16_t>::max()) {
         return std::min<uint64_t>(reference_count, period);
@@ -373,9 +390,8 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     }
     std::vector<uint8_t> seen(key_count);
     for (uint32_t reference_id = 0; reference_id < reference_count; ++reference_id) {
-        auto const score = static_cast<uint16_t>(
-            base + (static_cast<uint64_t>(reference_id) + shift) % period
-        );
+        auto const score =
+            static_cast<uint16_t>(base + (static_cast<uint64_t>(reference_id) + shift) % period);
         seen[score & key_mask] = 1U;
     }
     return static_cast<uint64_t>(std::count(seen.begin(), seen.end(), uint8_t{1}));
@@ -414,21 +430,20 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
         metrics.nonzero_scores += settings.reference_count;
         metrics.top_bit_count += data.bucket_top_bit_counts[bucket];
         if (data.bucket_hot[bucket] != 0U) {
-            metrics.populated_posting_lists += 1U + distinct_index_keys(
-                static_cast<uint32_t>(settings.reference_count - data.hot_reference_count),
-                static_cast<uint32_t>(
-                    static_cast<uint64_t>(data.hot_reference_count) + data.bucket_shifts[bucket]
-                ),
-                mode.key_mask,
-                k_score_period - 1U,
-                2U
-            );
+            metrics.populated_posting_lists +=
+                1U +
+                distinct_index_keys(
+                    static_cast<uint32_t>(settings.reference_count - data.hot_reference_count),
+                    static_cast<uint32_t>(
+                        static_cast<uint64_t>(data.hot_reference_count) + data.bucket_shifts[bucket]
+                    ),
+                    mode.key_mask,
+                    k_score_period - 1U,
+                    2U
+                );
         } else {
             metrics.populated_posting_lists += distinct_index_keys(
-                settings.reference_count,
-                data.bucket_shifts[bucket],
-                mode.key_mask,
-                k_score_period
+                settings.reference_count, data.bucket_shifts[bucket], mode.key_mask, k_score_period
             );
         }
     }
@@ -451,13 +466,11 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
                         // folded score only exists when the fixture spans 16 bits.
                         constexpr uint32_t period = k_score_period - 1U;
                         auto const shift = data.bucket_shifts[bucket];
-                        auto const folded = static_cast<uint32_t>(
-                            (32767ULL + period - (shift % period)) % period
-                        );
-                        visits += congruent_reference_count(
-                                      settings.reference_count, folded, period
-                                  ) -
-                                  congruent_reference_count(data.hot_reference_count, folded, period);
+                        auto const folded =
+                            static_cast<uint32_t>((32767ULL + period - (shift % period)) % period);
+                        visits +=
+                            congruent_reference_count(settings.reference_count, folded, period) -
+                            congruent_reference_count(data.hot_reference_count, folded, period);
                     }
                     metrics.posting_visits += visits;
                 }
@@ -1060,9 +1073,8 @@ void indexed_search(nvbench::state& state) {
     add_value(
         state,
         "candidate_inflation",
-        recall.oracle_pairs == 0U
-            ? 0.0
-            : selected_candidates / static_cast<double>(recall.oracle_pairs)
+        recall.oracle_pairs == 0U ? 0.0
+                                  : selected_candidates / static_cast<double>(recall.oracle_pairs)
     );
     add_value(state, "threshold_zero_recall", recall.recall);
     add_value(state, "exact_result_recall", recall.recall);
@@ -1077,8 +1089,7 @@ void indexed_search(nvbench::state& state) {
 // four benchmark functions stash their per-state results here instead of relying on
 // the JSON + sidecar pipeline.
 
-std::vector<std::string> g_summary_argv;
-std::string g_summary_csv_path = "results/cuddl-search-decision.csv";
+std::string g_summary_json_path = "results/cuddl-search-decision.json";
 
 struct collected_state {
     std::map<std::string, std::string> values;  // summary tag -> stringified value
@@ -1105,8 +1116,8 @@ std::string axes_key(workload const& settings, index_mode const* mode, bool with
         key += "," + std::to_string(settings.query_count) + ",copied";
     }
     if (mode != nullptr) {
-        key += "," + std::to_string(mode->indexed_bucket_count) + "," +
-               std::to_string(mode->key_bits);
+        key +=
+            "," + std::to_string(mode->indexed_bucket_count) + "," + std::to_string(mode->key_bits);
     }
     return key;
 }
@@ -1138,7 +1149,7 @@ void stash_state(std::string const& benchmark, std::string const& key, nvbench::
 
 NVBENCH_BENCH(compact_build)
     .add_int64_axis("References", reference_counts)
-        .add_int64_axis("HotPercent", hot_percentages)
+    .add_int64_axis("HotPercent", hot_percentages)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1147,8 +1158,8 @@ NVBENCH_BENCH(compact_build)
 
 NVBENCH_BENCH(indexed_build)
     .add_int64_axis("References", reference_counts)
-        .add_int64_axis("HotPercent", hot_percentages)
-        .add_int64_axis("KeyBits", key_bits)
+    .add_int64_axis("HotPercent", hot_percentages)
+    .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1157,7 +1168,7 @@ NVBENCH_BENCH(indexed_build)
 
 NVBENCH_BENCH(exhaustive_search)
     .add_int64_axis("References", reference_counts)
-        .add_int64_axis("HotPercent", hot_percentages)
+    .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .add_string_axis("QueryProfile", query_profiles)
     .set_stopping_criterion("sample-count")
@@ -1168,10 +1179,10 @@ NVBENCH_BENCH(exhaustive_search)
 
 NVBENCH_BENCH(indexed_search)
     .add_int64_axis("References", reference_counts)
-        .add_int64_axis("HotPercent", hot_percentages)
+    .add_int64_axis("HotPercent", hot_percentages)
     .add_int64_axis("Queries", query_counts)
     .add_string_axis("QueryProfile", query_profiles)
-        .add_int64_axis("KeyBits", key_bits)
+    .add_int64_axis("KeyBits", key_bits)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20)
@@ -1190,25 +1201,10 @@ std::vector<std::string> split(std::string const& text, char separator) {
     return parts;
 }
 
-std::string csv_field(std::string value) {
-    if (value.find_first_of(",\"\n") != std::string::npos) {
-        auto quoted = std::string("\"");
-        for (char c : value) {
-            if (c == '"') {
-                quoted += '"';
-            }
-            quoted += c;
-        }
-        quoted += '"';
-        return quoted;
-    }
-    return value;
-}
-
-// The decision CSV joins the four benchmark states per workload and index mode.
+// The decision result joins the four benchmark states per workload and index mode.
 // Timing values come from nvbench's own cold-measurement summaries; the full
 // per-state evidence remains available through nvbench's --csv output.
-void write_summary_csv() {
+void write_summary_json() {
     if (g_collected.empty()) {
         return;
     }
@@ -1243,26 +1239,7 @@ void write_summary_csv() {
         workload_keys.insert({key.begin(), key.end() - 2});
     }
 
-    std::vector<std::string> fields{
-        "status", "reference_count", "fill_ratio", "skew", "query_count", "query_profile",
-        "index_mode", "threshold_zero_recall", "exhaustive_min_ms", "exhaustive_mean_ms",
-        "exhaustive_median_ms", "exhaustive_max_ms", "indexed_min_ms", "indexed_mean_ms",
-        "indexed_median_ms", "indexed_max_ms", "atomic_updates", "selected_candidates",
-        "candidate_inflation", "indexed_resident_bytes", "kill_gate_outcome", "error",
-    };
-
-    std::ofstream csv(g_summary_csv_path);
-    if (!csv) {
-        std::cerr << "could not open summary CSV " << g_summary_csv_path << "\n";
-        return;
-    }
-    for (size_t i = 0; i < fields.size(); ++i) {
-        if (i != 0U) {
-            csv << ',';
-        }
-        csv << fields[i];
-    }
-    csv << '\n';
+    json measurements = json::array();
 
     auto value_of = [](collected_state const& state, std::string const& tag) {
         auto found = state.values.find(tag);
@@ -1311,7 +1288,8 @@ void write_summary_csv() {
                     skipped.push_back(name + ": " + state->skip_reason);
                 }
             }
-            auto const status = missing.empty() && skipped.empty() ? std::string_view("ok") : std::string_view("skipped");
+            auto const status = missing.empty() && skipped.empty() ? std::string_view("ok")
+                                                                   : std::string_view("skipped");
             std::string error;
             for (auto const& name : missing) {
                 error += (error.empty() ? "" : "; ") + ("missing " + name);
@@ -1374,34 +1352,78 @@ void write_summary_csv() {
                 }
             }
 
-            for (size_t i = 0; i < fields.size(); ++i) {
-                if (i != 0U) {
-                    csv << ',';
+            json metrics{{"kill_gate_outcome", row["kill_gate_outcome"]}};
+            for (auto const* name : {
+                     "threshold_zero_recall",
+                     "exhaustive_min_ms",
+                     "exhaustive_mean_ms",
+                     "exhaustive_median_ms",
+                     "exhaustive_max_ms",
+                     "indexed_min_ms",
+                     "indexed_mean_ms",
+                     "indexed_median_ms",
+                     "indexed_max_ms",
+                     "candidate_inflation",
+                 }) {
+                if (!row[name].empty()) {
+                    metrics[name] = std::stod(row[name]);
                 }
-                csv << csv_field(row[fields[i]]);
             }
-            csv << '\n';
+            for (auto const* name : {"atomic_updates", "selected_candidates"}) {
+                if (!row[name].empty()) {
+                    metrics[name] = std::stoull(row[name]);
+                }
+            }
+            json measurement{
+                {"implementation", {{"name", "cuddl"}}},
+                {"case",
+                 {
+                     {"status", row["status"]},
+                     {"reference_count", std::stoull(references)},
+                     {"fill_ratio", fill_ratio},
+                     {"hot_fraction", std::stod(hot_percent) / 100.0},
+                     {"skew", row["skew"]},
+                     {"query_count", std::stoull(query_count)},
+                     {"query_profile", query_profile},
+                     {"index_mode", row["index_mode"]},
+                     {"indexed_bucket_count", std::stoull(buckets)},
+                     {"key_bits", std::stoull(bits)},
+                     {"error", error},
+                 }},
+                {"metrics", std::move(metrics)},
+            };
+            if (!row["indexed_resident_bytes"].empty()) {
+                measurement["memory_bytes"] = {
+                    {"indexed_resident", std::stoull(row["indexed_resident_bytes"])}
+                };
+            }
+            measurements.push_back(std::move(measurement));
         }
     }
+    write_benchmark_result(
+        g_summary_json_path,
+        make_benchmark_result(
+            "cuDDL search decision", "search_decision", "kernel", std::move(measurements)
+        )
+    );
 }
 
 }  // namespace
 
 int main(int argc, char** argv) try {
-    g_summary_argv.assign(argv, argv + argc);
     nvbench::detail::main_initialize(argc, argv);
     {
         std::vector<char*> remaining{argv[0]};
         for (int i = 1; i < argc; ++i) {
             std::string_view const argument = argv[i];
-            if (argument == "--summary-csv") {
+            if (argument == "--summary-json") {
                 if (i + 1 < argc) {
-                    g_summary_csv_path = argv[++i];
+                    g_summary_json_path = argv[++i];
                 }
                 continue;
             }
-            if (argument.starts_with("--summary-csv=")) {
-                g_summary_csv_path = std::string(argument.substr(14));
+            if (argument.starts_with("--summary-json=")) {
+                g_summary_json_path = std::string(argument.substr(15));
                 continue;
             }
             remaining.push_back(argv[i]);
@@ -1417,7 +1439,7 @@ int main(int argc, char** argv) try {
         nvbench::detail::main_print_results(parser);
     }
     nvbench::detail::main_finalize();
-    write_summary_csv();
+    write_summary_json();
     return 0;
 } catch (std::exception& error) {
     std::cerr << "\nNVBench encountered an error:\n\n" << error.what() << "\n";

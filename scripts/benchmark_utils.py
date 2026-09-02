@@ -9,13 +9,13 @@ This module provides common functionality for benchmark runner scripts, includin
 
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional, Callable
 
 import typer
 
 
-def get_build_dir(script_path: Optional[Path] = None) -> Path:
+def get_build_dir(script_path: Path | None = None) -> Path:
     """Get the build directory relative to script location.
 
     Args:
@@ -30,7 +30,7 @@ def get_build_dir(script_path: Optional[Path] = None) -> Path:
     return Path(script_path).parent.parent / "build"
 
 
-def get_benchmark_dir(script_path: Optional[Path] = None) -> Path:
+def get_benchmark_dir(script_path: Path | None = None) -> Path:
     """Get the benchmark build directory relative to script location.
 
     Args:
@@ -43,7 +43,7 @@ def get_benchmark_dir(script_path: Optional[Path] = None) -> Path:
     return get_build_dir(script_path) / "benchmarks"
 
 
-def get_examples_dir(script_path: Optional[Path] = None) -> Path:
+def get_examples_dir(script_path: Path | None = None) -> Path:
     """Get the examples build directory relative to script location.
 
     Returns:
@@ -52,7 +52,7 @@ def get_examples_dir(script_path: Optional[Path] = None) -> Path:
     return get_build_dir(script_path) / "examples"
 
 
-def get_tests_dir(script_path: Optional[Path] = None) -> Path:
+def get_tests_dir(script_path: Path | None = None) -> Path:
     """Get the tests build directory relative to script location.
 
     Returns:
@@ -82,8 +82,8 @@ def validate_executable(executable: Path) -> None:
 def run_benchmark_to_csv(
     executable: Path,
     csv_output: Path,
-    extra_args: Optional[list[str]] = None,
-    env: Optional[dict] = None,
+    extra_args: list[str] | None = None,
+    env: dict | None = None,
 ) -> None:
     """Run a Google Benchmark executable with CSV output.
 
@@ -106,7 +106,7 @@ def run_benchmark_to_csv(
     if extra_args:
         cmd.extend(extra_args)
 
-    result = subprocess.run(cmd, env=env)
+    result = subprocess.run(cmd, env=env, check=False)
 
     if result.returncode != 0:
         typer.secho(
@@ -120,7 +120,7 @@ def run_benchmark_to_csv(
 def merge_csv_files(
     csv_paths: list[Path],
     output: Path,
-    line_transformers: Optional[list[Callable[[str], str]]] = None,
+    line_transformers: list[Callable[[str], str]] | None = None,
 ) -> None:
     """Merge multiple CSV files into one, handling headers correctly.
 
@@ -155,7 +155,7 @@ def merge_csv_files(
             lines = [
                 line.rstrip()
                 for line in f
-                if line.strip() and (line.startswith('"') or line.startswith("name"))
+                if line.strip() and line.startswith(('"', "name"))
             ]
 
         if not lines:
@@ -180,12 +180,13 @@ def merge_csv_files(
     # Write merged CSV
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w") as f:
-        for line in all_lines:
-            f.write(line + "\n")
+        f.writelines(line + "\n" for line in all_lines)
 
 
 def run_benchmarks_and_merge(
-    benchmarks: list[tuple[Path, Optional[dict], Optional[Callable[[str], str]], Optional[list[str]]]],
+    benchmarks: list[
+        tuple[Path, dict | None, Callable[[str], str] | None, list[str] | None]
+    ],
     output: Path,
     show_progress: bool = True,
 ) -> None:

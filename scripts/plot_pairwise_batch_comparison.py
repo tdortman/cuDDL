@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "pandas", "typer"]
+# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Plot pairwise quality, throughput, runtime composition, and speedup separately."""
 
@@ -12,6 +12,7 @@ from typing import Annotated
 import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 QUALITY_METRICS = (
     ("containment_absolute_error", "Containment"),
@@ -47,21 +48,39 @@ def add_top_legend(fig, ax, *, ncol: int) -> None:
 
 
 def main(
-    quality_csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
-    batch_csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    quality_json: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, help="Pairwise accuracy benchmark result JSON"
+        ),
+    ],
+    batch_json: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, help="Pairwise batch benchmark result JSON"
+        ),
+    ],
     output_dir: Annotated[
         Path, typer.Option(file_okay=False, help="Figure output directory")
     ] = Path("results/pairwise-batch-comparison"),
 ) -> None:
-    """Render four standalone comparison figures."""
+    """Render four standalone comparison figures from shared JSON results."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    quality = pu.load_csv(quality_csv)
+    try:
+        quality_result = load_result(quality_json, "pairwise_accuracy")
+    except ValueError as error:
+        raise typer.BadParameter(f"{quality_json}: {error}") from error
+    quality = pd.DataFrame(flatten_measurements(quality_result))
     require(
         quality,
         {"implementation", "orientation", *(column for column, _ in QUALITY_METRICS)},
-        "quality CSV",
+        "quality JSON",
     )
-    batch = pu.load_csv(batch_csv)
+    try:
+        batch_result = load_result(batch_json, "pairwise_batch")
+    except ValueError as error:
+        raise typer.BadParameter(f"{batch_json}: {error}") from error
+    batch = pd.DataFrame(flatten_measurements(batch_result))
     require(
         batch,
         {
@@ -72,7 +91,7 @@ def main(
             "seconds_per_batch",
             "comparisons_per_second",
         },
-        "combined batch CSV",
+        "batch JSON",
     )
 
     cuddl = batch[batch["implementation"] == "cuddl"]
@@ -105,7 +124,7 @@ def main(
     missing_implementations = {"cuddl", "bbtools"} - set(quality["implementation"])
     if missing_implementations:
         raise typer.BadParameter(
-            "quality CSV is missing implementations: "
+            "quality JSON is missing implementations: "
             + ", ".join(sorted(missing_implementations))
         )
     positions = list(range(len(QUALITY_METRICS)))
@@ -219,15 +238,11 @@ def main(
         },
         index=gpu.index,
     )
-    components["Other runtime"] = (
-        gpu["transfer_each_batch"] - components.sum(axis=1)
-    ).clip(lower=0)
-    shares = components.div(gpu["transfer_each_batch"], axis=0) * 100
+    shares = components.div(components.sum(axis=1), axis=0) * 100
     stage_names = [
         "Host to device",
         "Comparison kernel",
         "Device to host",
-        "Other runtime",
     ]
     matrix = shares[stage_names].T
     fig, stages_ax = pu.setup_figure()
@@ -236,11 +251,11 @@ def main(
         range(len(batches)),
         [rf"$2^{{{int(math.log2(batch))}}}$" for batch in batches],
     )
-    stages_ax.set_yticks(range(len(stage_names)), ["H2D", "Kernel", "D2H", "Overhead"])
+    stages_ax.set_yticks(range(len(stage_names)), ["H2D", "Kernel", "D2H"])
     for row, stage in enumerate(stage_names):
         for column, value in enumerate(matrix.loc[stage]):
             label = (
-                "<0.1"
+                r"$<0.1$"
                 if value < 0.1
                 else f"{value:.1f}"
                 if value < 10
@@ -259,7 +274,7 @@ def main(
         stages_ax,
         xlabel="Comparisons per batch",
         ylabel="",
-        title="End-to-end runtime share (%)",
+        title="Isolated phase timing share (%)",
         xscale=None,
         grid=False,
     )

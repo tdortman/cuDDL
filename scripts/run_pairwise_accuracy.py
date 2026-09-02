@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["typer"]
+# dependencies = ["jsonschema", "typer"]
 # ///
-"""Run cuDDL and BBTools pairwise accuracy cases into one CSV."""
+"""Run cuDDL and BBTools pairwise accuracy cases into one JSON result."""
 
 import csv
 import hashlib
@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, TextIO
 
+import benchmark_schema
 import typer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,6 +106,46 @@ KEY_FIELDS = (
     "right_cardinality",
     "intersection",
 )
+CASE_FIELDS = tuple(field for field in KEY_FIELDS if field not in PATH_FIELDS)
+INTEGER_FIELDS = {
+    "generator_seed",
+    "k",
+    "buckets",
+    "power",
+    "trial",
+    "size_ratio",
+    "mutation_count",
+    "reference_bases",
+    "query_bases",
+    "left_cardinality",
+    "right_cardinality",
+    "intersection",
+    "lower",
+    "equal",
+    "higher",
+    "both_empty",
+}
+FLOAT_FIELDS = {
+    "requested_ani",
+    "actual_ani",
+    "exact_containment",
+    "sketch_containment",
+    "containment_signed_error",
+    "containment_absolute_error",
+    "exact_completeness",
+    "sketch_completeness",
+    "completeness_signed_error",
+    "completeness_absolute_error",
+    "exact_wkid",
+    "sketch_wkid",
+    "wkid_signed_error",
+    "wkid_absolute_error",
+    "exact_set_derived_ani",
+    "exact_ani",
+    "sketch_ani",
+    "ani_signed_error",
+    "ani_absolute_error",
+}
 COUNT_FIELDS = ("lower", "equal", "higher", "both_empty")
 app = typer.Typer(
     help="Run both pairwise accuracy implementations on deterministic raw DNA.",
@@ -137,7 +178,20 @@ def run(
 
 def read_csv(source: TextIO) -> tuple[list[str], list[dict[str, str]]]:
     reader = csv.DictReader(source)
-    return reader.fieldnames or [], list(reader)
+    return list(reader.fieldnames or []), list(reader)
+
+
+def coerce_row(row: dict[str, str]) -> dict[str, object]:
+    return {
+        field: (
+            int(row[field])
+            if field in INTEGER_FIELDS
+            else float(row[field])
+            if field in FLOAT_FIELDS
+            else row[field]
+        )
+        for field in PUBLIC_FIELDS
+    }
 
 
 def splitmix64(value: int) -> int:
@@ -287,8 +341,8 @@ def write_cases(
 @app.command()
 def main(
     output: Annotated[
-        Path, typer.Option(dir_okay=False, help="Combined accuracy CSV output")
-    ] = Path("results/pairwise-accuracy.csv"),
+        Path, typer.Option(dir_okay=False, help="Combined accuracy JSON output")
+    ] = Path("results/pairwise-accuracy.json"),
     build_dir: Annotated[
         Path, typer.Option(file_okay=False, help="Configured Meson build directory")
     ] = Path("build"),
@@ -315,7 +369,7 @@ def main(
     ] = 8,
     seed: Annotated[int, typer.Option(min=0, help="Root generator seed")] = 42,
 ) -> None:
-    """Build and run both implementations, then publish one CSV."""
+    """Build and run both implementations, then publish one JSON result."""
     powers = powers or list(DEFAULT_POWERS)
     ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
     size_ratios = size_ratios or list(DEFAULT_SIZE_RATIOS)
@@ -355,6 +409,7 @@ def main(
         cases_csv = write_cases(
             temporary_dir, powers, ani_levels, size_ratios, trials, seed
         )
+        cuddl_json = temporary_dir / "cuddl.json"
         cuddl_csv = temporary_dir / "cuddl.csv"
         classes = temporary_dir / "classes"
         classes.mkdir()
@@ -363,18 +418,34 @@ def main(
                 str(cuddl_benchmark),
                 "--cases",
                 str(cases_csv),
-                "--csv",
-                str(cuddl_csv),
+                "--output",
+                str(cuddl_json),
             ]
         )
-        with cuddl_csv.open(newline="") as source:
-            fields, rows = read_csv(source)
-        if fields != list(CSV_FIELDS):
-            raise RuntimeError("cuDDL emitted an unexpected CSV schema")
+        cuddl_result = benchmark_schema.load_result(
+            cuddl_json, operation="pairwise_accuracy"
+        )
+        rows = [
+            {
+                field: (
+                    "1"
+                    if flattened[field] is True
+                    else "0"
+                    if flattened[field] is False
+                    else str(flattened[field])
+                )
+                for field in CSV_FIELDS
+            }
+            for flattened in benchmark_schema.flatten_measurements(cuddl_result)
+        ]
         if not rows:
-            raise RuntimeError("cuDDL emitted no rows")
+            raise RuntimeError("cuDDL emitted no measurements")
         if {row["implementation"] for row in rows} != {"cuddl"}:
             raise RuntimeError("cuDDL emitted an unexpected implementation")
+        with cuddl_csv.open("w", newline="") as destination:
+            writer = csv.DictWriter(destination, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
 
         run(
             [
@@ -417,19 +488,23 @@ def main(
                 raise RuntimeError(
                     f"{implementation} counts do not sum to buckets at row {index}"
                 )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", newline="", dir=output.parent, prefix=output.name, delete=False
-    ) as destination:
-        temporary_output = Path(destination.name)
-        writer = csv.DictWriter(destination, fieldnames=PUBLIC_FIELDS)
-        writer.writeheader()
-        for row in (*rows, *reference):
-            writer.writerow({field: row[field] for field in PUBLIC_FIELDS})
-    temporary_output.replace(output)
+    typed_rows = [coerce_row(row) for row in (*rows, *reference)]
+    result = benchmark_schema.make_result(
+        name="Pairwise sketch accuracy",
+        operation="pairwise_accuracy",
+        scope="end_to_end",
+        datasets={},
+        system=cuddl_result["system"],
+        measurements=benchmark_schema.measurements_from_rows(
+            typed_rows,
+            case_fields=CASE_FIELDS,
+            omit_fields=PATH_FIELDS,
+        ),
+    )
+    benchmark_schema.write_result(output, result)
 
     typer.echo(f"Verified {len(rows)} matched raw-DNA pair rows")
-    typer.echo(f"Saved {len(rows) + len(reference)} rows to {output}")
+    typer.echo(f"Saved {len(typed_rows)} measurements to {output}")
 
 
 if __name__ == "__main__":

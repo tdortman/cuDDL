@@ -3,7 +3,6 @@
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/refseq_parity.hpp>
-#include <nlohmann/json.hpp>
 
 #include <cuda_runtime.h>
 
@@ -26,12 +25,13 @@
 #include <thread>
 #include <vector>
 
+#include "result_json.hpp"
+
 namespace {
 
 using namespace std::chrono;
 using refseq_register_layout = cuddl::register_layout<5, 11>;
 using ddl_t = cuddl::reference_database<25, 4096, refseq_register_layout>;
-using json = nlohmann::json;
 
 /// @brief The official BBTools RefSeq DDL sketch asset pinned for parity validation.
 ///
@@ -102,6 +102,68 @@ double median(std::vector<double> values) {
     std::sort(values.begin(), values.end());
     auto const size = values.size();
     return (values[size / 2U] + values[(size - 1U) / 2U]) / 2.0;
+}
+
+json timing_summary(std::vector<double> const& values, std::string const& source) {
+    if (values.empty()) {
+        throw std::runtime_error("cannot summarize an empty timing sample");
+    }
+    auto sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    auto const size = sorted.size();
+    return {
+        {"samples", size},
+        {"median_ms", (sorted[size / 2U] + sorted[(size - 1U) / 2U]) / 2.0},
+        {"min_ms", sorted.front()},
+        {"max_ms", sorted.back()},
+        {"source", source},
+    };
+}
+
+json timing_summary(double value, std::string const& source) {
+    return {
+        {"samples", 1},
+        {"median_ms", value},
+        {"min_ms", value},
+        {"max_ms", value},
+        {"source", source},
+    };
+}
+
+json timing_summary_seconds(json const& values, std::string const& source) {
+    auto seconds = values.get<std::vector<double>>();
+    for (auto& value : seconds) {
+        value *= 1000.0;
+    }
+    return timing_summary(seconds, source);
+}
+
+void append_measurement(
+    json& measurements,
+    std::string const& implementation,
+    std::string const& variant,
+    json case_values,
+    json metrics,
+    json timings,
+    json memory_bytes
+) {
+    json measurement = {
+        {"implementation", {{"name", implementation}}},
+        {"case", std::move(case_values)},
+    };
+    if (!variant.empty()) {
+        measurement["implementation"]["variant"] = variant;
+    }
+    if (!metrics.empty()) {
+        measurement["metrics"] = std::move(metrics);
+    }
+    if (!timings.empty()) {
+        measurement["timings"] = std::move(timings);
+    }
+    if (!memory_bytes.empty()) {
+        measurement["memory_bytes"] = std::move(memory_bytes);
+    }
+    measurements.push_back(std::move(measurement));
 }
 
 double now_ms() {
@@ -640,20 +702,32 @@ int main(int argc, char** argv) {
         if (asset_path.empty()) {
             open_evidence();
             report_prerequisite(prereq, false);
-            json evidence;
-            evidence["ok"] = false;
-            evidence["reason"] = "ASSET_NOT_AVAILABLE";
-            evidence["prerequisite"] = {
-                {"resource", prereq.resource},
-                {"release", prereq.release},
-                {"url", prereq.url},
-                {"size_bytes", prereq.size_bytes},
+            json evidence = make_benchmark_result(
+                "cuDDL RefSeq parity",
+                "refseq_parity",
+                "end_to_end",
+                json::array()
+            );
+            evidence["datasets"]["refseq"] = {
+                {"path", prereq.resource},
                 {"sha256", prereq.sha256},
-                {"k", prereq.k},
-                {"buckets", prereq.buckets},
-                {"exponent", prereq.exponent},
-                {"merged", prereq.merged},
             };
+            evidence["measurements"].push_back({
+                {"implementation", {{"name", "cuDDL"}, {"variant", "GPU"}}},
+                {"case", {{"phase", "prerequisite"}}},
+                {"metrics", {
+                    {"ok", false},
+                    {"reason", "ASSET_NOT_AVAILABLE"},
+                    {"resource", prereq.resource},
+                    {"release", prereq.release},
+                    {"url", prereq.url},
+                    {"size_bytes_expected", prereq.size_bytes},
+                    {"k", prereq.k},
+                    {"buckets", prereq.buckets},
+                    {"exponent", prereq.exponent},
+                    {"merged", prereq.merged},
+                }},
+            });
             auto const text = evidence.dump(2);
             FILE* out = evidence_file != nullptr ? evidence_file : stdout;
             std::fwrite(text.data(), 1, text.size(), out);
@@ -663,7 +737,6 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-
         // Load the asset and verify on-disk size + checksum before any results are accepted
         auto const t_load_start = now_ms();
         std::string opaque = read_file_any(asset_path);
@@ -799,11 +872,8 @@ int main(int argc, char** argv) {
         bool gpu_available = !no_gpu && cuda_available();
         double host_to_device_ms = 0;
         std::vector<double> index_build_runs;
-        double index_build_ms = 0;
         std::vector<double> query_runs;
-        double query_ms = 0;
         std::vector<double> exhaustive_batch_runs;
-        double exhaustive_batch_ms = 0;
         size_t device_free_before = 0, device_free_low = 0, device_total = 0;
         size_t device_peak_bytes = 0;
         size_t device_rows_bytes = 0, device_index_bytes = 0;
@@ -1036,9 +1106,6 @@ int main(int argc, char** argv) {
                 device_free_low = std::min(device_free_low, free_now);
             }
 
-            index_build_ms = median(index_build_runs);
-            query_ms = median(query_runs);
-            exhaustive_batch_ms = median(exhaustive_batch_runs);
         } else {
             std::fputs(
                 "No CUDA device available (or --no-gpu): skipping the cuDDL GPU phases.\n", stderr
@@ -1173,104 +1240,265 @@ int main(int argc, char** argv) {
             ok = ok && report_ok;
         }
 
-        // Compose evidence
+        // Compose the repository-wide benchmark result.
         open_evidence();
-
-        json queries_json = json::array();
-        for (auto const& report : reports) {
-            queries_json.push_back({
-                {"ordinal", report.query.ordinal},
-                {"name", report.query.name},
-                {"row_checksum", report.row_checksum},
-                {"row_nonzero", report.row_nonzero},
-                {"oracle_candidate_count", report.oracle_candidates.size()},
-                {"cuddl_candidate_count", report.gpu_ran ? report.cuddl_candidate_count : 0},
-                {"bbtools_candidate_count", report.bbtools_candidates.size()},
-                {"decode_matches_bbtools", report.decode_matches_bbtools},
-                {"counts_match_bbtools", report.counts_match_bbtools},
-                {"candidates_match_bbtools", report.candidates_match_bbtools},
-                {"summaries_match_bbtools", report.summaries_match_bbtools},
-                {"candidates_match_oracle", report.candidates_match_oracle},
-                {"summaries_match_oracle", report.summaries_match_oracle},
-                {"summaries_match_exhaustive", report.summaries_match_exhaustive},
-                {"gpu_ran", report.gpu_ran},
-                {"bbtools_ran", report.bbtools_ran},
-                {"exact_refinement_ms", report.exact_refinement_ms},
-                {"bbtools_query_seconds", report.bbtools_query_seconds},
-                {"bbtools_query_runs", report.bbtools_query_runs},
-                {"bbtools_query_csr_seconds", report.bbtools_query_csr_seconds},
-                {"bbtools_query_csr_runs", report.bbtools_query_csr_runs},
-            });
-        }
-
-        json evidence;
-        evidence["ok"] = ok;
-        evidence["min_hits"] = min_hits;
-        evidence["measurement"] = {
-            {"warmup", warmup},
-            {"runs", runs},
-            {"query_mode", "batch"},
+        json measurements = json::array();
+        auto const make_case = [&](std::string const& phase) {
+            return json{
+                {"phase", phase},
+                {"query_mode", "batch"},
+                {"query_count", reports.size()},
+                {"min_hits", min_hits},
+                {"warmup", warmup},
+                {"runs", runs},
+            };
         };
-        evidence["manifest"] = manifest_path.empty() ? "built-in" : manifest_path;
-        evidence["selection"] = {
-            {"queries", selection.queries},
-        };
-        evidence["asset"] = {
-            {"path", asset_path},
-            {"resource", prereq.resource},
+
+        auto const asset_sha256 = sha256_of_file(asset_path);
+        auto const asset_size = std::filesystem::file_size(asset_path);
+        auto const manifest_name = manifest_path.empty() ? std::string("built-in") : manifest_path;
+        auto const asset_metrics = json{
+            {"ok", ok},
+            {"asset_path", asset_path},
+            {"asset_resource", prereq.resource},
             {"release", prereq.release},
             {"url", prereq.url},
             {"sha256_expected", prereq.sha256},
-            {"sha256_computed", sha256_of_file(asset_path)},
+            {"sha256_computed", asset_sha256},
             {"size_bytes_expected", prereq.size_bytes},
-            {"size_bytes_actual", std::filesystem::file_size(asset_path)},
+            {"size_bytes_actual", asset_size},
             {"merged", prereq.merged},
             {"k", prereq.k},
             {"buckets", prereq.buckets},
             {"exponent", prereq.exponent},
             {"records_expected", prereq.records},
+            {"records", db.records.size()},
+            {"db_records", db.records.size()},
             {"seed", db.metadata.has_seed ? db.metadata.seed : seed},
             {"blacklist", db.metadata.blacklist},
+            {"manifest", manifest_name},
         };
-        evidence["records"] = db.records.size();
-        evidence["db_records"] = db.records.size();
-        evidence["phases_ms"] = {
-            {"asset_read", t_load_end - t_load_start},
-            {"a48_parse", t_parse_end - t_parse_start},
-            {"host_oracle_total", oracle_total_ms},
-            {"host_to_device", host_to_device_ms},
-            {"index_build", index_build_ms},
-            {"index_build_runs", index_build_runs},
-            {"query_total", query_ms},
-            {"query_runs", query_runs},
-            {"exhaustive_gpu_total", exhaustive_batch_ms},
-            {"exhaustive_gpu_runs", exhaustive_batch_runs},
-        };
+        append_measurement(
+            measurements,
+            "cuDDL",
+            "host",
+            make_case("asset_read"),
+            asset_metrics,
+            {{"wall_clock", timing_summary(t_load_end - t_load_start, "steady_clock")}},
+            {}
+        );
+        append_measurement(
+            measurements,
+            "cuDDL",
+            "host",
+            make_case("a48_parse"),
+            {{"ok", ok}, {"records", db.records.size()}},
+            {{"wall_clock", timing_summary(t_parse_end - t_parse_start, "steady_clock")}},
+            {}
+        );
+        append_measurement(
+            measurements,
+            "cuDDL",
+            "host",
+            make_case("host_oracle"),
+            {{"ok", ok}, {"records", db.records.size()}},
+            {{"wall_clock", timing_summary(oracle_total_ms, "steady_clock")}},
+            {}
+        );
+        append_measurement(
+            measurements,
+            "cuDDL",
+            "host",
+            make_case("host_to_device"),
+            {{"ok", ok}, {"gpu_available", gpu_available}},
+            {{"wall_clock", timing_summary(host_to_device_ms, "CUDA events")}},
+            {}
+        );
+
         int cuda_runtime_version = 0;
         cudaRuntimeGetVersion(&cuda_runtime_version);
-        evidence["gpu"] = {
-            {"available", gpu_available},
-            {"cuda_runtime_version", cuda_runtime_version},
-            {"device_free_before", device_free_before},
-            {"device_free_low", device_free_low},
-            {"device_total", device_total},
+        json cuddl_memory = {
             {"persistent_rows_bytes", device_rows_bytes},
             {"persistent_index_bytes", device_index_bytes},
             {"peak_allocated_bytes", device_peak_bytes},
+            {"device_free_before", device_free_before},
+            {"device_free_low", device_free_low},
+            {"device_total", device_total},
         };
+        if (gpu_available) {
+            append_measurement(
+                measurements,
+                "cuDDL",
+                "GPU",
+                make_case("index_build"),
+                {{"ok", ok}, {"cuda_runtime_version", cuda_runtime_version}},
+                {{"wall_clock", timing_summary(index_build_runs, "CUDA events")}},
+                cuddl_memory
+            );
+            append_measurement(
+                measurements,
+                "cuDDL",
+                "GPU",
+                make_case("query_batch"),
+                {{"ok", ok}, {"cuda_runtime_version", cuda_runtime_version}},
+                {{"wall_clock", timing_summary(query_runs, "CUDA events")}},
+                cuddl_memory
+            );
+            append_measurement(
+                measurements,
+                "cuDDL",
+                "GPU",
+                make_case("exhaustive_batch"),
+                {{"ok", ok}, {"cuda_runtime_version", cuda_runtime_version}},
+                {{"wall_clock", timing_summary(exhaustive_batch_runs, "CUDA events")}},
+                cuddl_memory
+            );
+        }
+
         if (bbtools_ran) {
-            evidence["bbtools"] = {
+            auto const bbtools_timings = bbtools.at("timings_seconds");
+            auto const bbtools_raw_memory = bbtools.value("memory_bytes", json::object());
+            auto const bbtools_memory = json{
+                {"heap_used_before_index", bbtools_raw_memory.value("heap_used_before_index", size_t{0})},
+                {"heap_used_after_csr", bbtools_raw_memory.value("heap_used_after_csr", size_t{0})},
+                {"heap_used_after_csr2", bbtools_raw_memory.value("heap_used_after_csr2", size_t{0})},
+                {"heap_used_peak", bbtools_raw_memory.value("heap_used_peak", size_t{0})},
+                {"nonempty_slots", bbtools_raw_memory.value("nonempty_slots", size_t{0})},
+                {"index_csr_bytes", bbtools_raw_memory.value("index_csr_bytes", size_t{0})},
+                {"index_csr2_bytes", bbtools_raw_memory.value("index_csr2_bytes", size_t{0})},
+            };
+            auto const bbtools_metrics = json{
+                {"ok", ok},
                 {"harness", harness_source},
                 {"java_heap", java_heap},
                 {"threads", bbtools_threads},
-                {"timings_seconds", bbtools.value("timings_seconds", json::object())},
-                {"memory_bytes", bbtools.value("memory_bytes", json::object())},
                 {"db_records", bbtools.value("db_records", size_t{0})},
             };
-        } else {
-            evidence["bbtools"] = json::object();
+            append_measurement(
+                measurements,
+                "BBTools CSR",
+                "Java",
+                make_case("index_build"),
+                bbtools_metrics,
+                {{"wall_clock", timing_summary_seconds(
+                    bbtools_timings.at("index_build_csr_runs"), "BBTools Java"
+                )}},
+                bbtools_memory
+            );
+            append_measurement(
+                measurements,
+                "BBTools CSR2",
+                "Java",
+                make_case("index_build"),
+                bbtools_metrics,
+                {{"wall_clock", timing_summary_seconds(
+                    bbtools_timings.at("index_build_csr2_runs"), "BBTools Java"
+                )}},
+                bbtools_memory
+            );
+            append_measurement(
+                measurements,
+                "BBTools CSR",
+                "Java",
+                make_case("query_batch"),
+                bbtools_metrics,
+                {{"wall_clock", timing_summary_seconds(
+                    bbtools_timings.at("query_batch_csr_runs"), "BBTools Java"
+                )}},
+                bbtools_memory
+            );
+            append_measurement(
+                measurements,
+                "BBTools CSR2",
+                "Java",
+                make_case("query_batch"),
+                bbtools_metrics,
+                {{"wall_clock", timing_summary_seconds(
+                    bbtools_timings.at("query_batch_runs"), "BBTools Java"
+                )}},
+                bbtools_memory
+            );
         }
-        evidence["queries"] = std::move(queries_json);
+
+        size_t queries_ok = 0;
+        for (auto const& report : reports) {
+            bool const report_ok =
+                report.gpu_ran && report.candidates_match_oracle && report.summaries_match_oracle &&
+                report.summaries_match_exhaustive && report.decode_matches_bbtools &&
+                report.counts_match_bbtools && report.candidates_match_bbtools &&
+                report.summaries_match_bbtools;
+            queries_ok += report_ok ? 1U : 0U;
+            append_measurement(
+                measurements,
+                "RefSeq parity",
+                "query",
+                {
+                    {"phase", "query_correctness"},
+                    {"query_mode", "batch"},
+                    {"query_ordinal", report.query.ordinal},
+                    {"query_name", report.query.name},
+                    {"query_count", reports.size()},
+                    {"min_hits", min_hits},
+                },
+                {
+                    {"ok", report_ok},
+                    {"row_checksum", report.row_checksum},
+                    {"row_nonzero", report.row_nonzero},
+                    {"oracle_candidate_count", report.oracle_candidates.size()},
+                    {"cuddl_candidate_count", report.gpu_ran ? report.cuddl_candidate_count : 0},
+                    {"bbtools_candidate_count", report.bbtools_candidates.size()},
+                    {"decode_matches_bbtools", report.decode_matches_bbtools},
+                    {"counts_match_bbtools", report.counts_match_bbtools},
+                    {"candidates_match_bbtools", report.candidates_match_bbtools},
+                    {"summaries_match_bbtools", report.summaries_match_bbtools},
+                    {"candidates_match_oracle", report.candidates_match_oracle},
+                    {"summaries_match_oracle", report.summaries_match_oracle},
+                    {"summaries_match_exhaustive", report.summaries_match_exhaustive},
+                    {"gpu_ran", report.gpu_ran},
+                    {"bbtools_ran", report.bbtools_ran},
+                    {"exact_refinement_ms", report.exact_refinement_ms},
+                    {"bbtools_query_seconds", report.bbtools_query_seconds},
+                    {"bbtools_query_csr_seconds", report.bbtools_query_csr_seconds},
+                },
+                {},
+                {}
+            );
+        }
+        append_measurement(
+            measurements,
+            "RefSeq parity",
+            "validation",
+            {
+                {"phase", "correctness"},
+                {"query_mode", "batch"},
+                {"query_count", reports.size()},
+                {"min_hits", min_hits},
+                {"warmup", warmup},
+                {"runs", runs},
+            },
+            {
+                {"ok", ok},
+                {"queries_ok", queries_ok},
+                {"queries_total", reports.size()},
+                {"gpu_available", gpu_available},
+                {"bbtools_ran", bbtools_ran},
+                {"skip_verify", skip_verify},
+                {"cuda_runtime_version", cuda_runtime_version},
+            },
+            {},
+            {}
+        );
+
+        json evidence = make_benchmark_result(
+            "cuDDL RefSeq parity",
+            "refseq_parity",
+            "end_to_end",
+            std::move(measurements)
+        );
+        evidence["datasets"]["refseq"] = {
+            {"path", asset_path},
+            {"sha256", asset_sha256},
+        };
 
         auto const text = evidence.dump(2);
         FILE* out = evidence_file != nullptr ? evidence_file : stdout;

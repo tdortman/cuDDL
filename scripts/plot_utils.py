@@ -12,7 +12,6 @@ from pathlib import Path
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import typer
 
@@ -157,7 +156,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
             return pd.read_csv(buffer, usecols=list(header_df.columns))
         header_df = pd.read_csv(csv_path, nrows=0)
         return pd.read_csv(csv_path, usecols=list(header_df.columns))
-    except Exception as e:
+    except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as e:
         typer.secho(f"Error reading CSV {csv_path}: {e}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
 

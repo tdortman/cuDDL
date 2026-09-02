@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -18,6 +17,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "result_json.hpp"
 
 namespace {
 
@@ -296,23 +297,9 @@ sketch_metrics(sketch_type const& left, cuddl::pairwise_summary const& summary) 
     };
 }
 
-void emit_csv_field(std::ofstream& csv, std::string const& value) {
-    if (value.find_first_of(",\"\r\n") == std::string::npos) {
-        csv << value;
-        return;
-    }
-    csv << '"';
-    for (auto const ch : value) {
-        if (ch == '"') {
-            csv << '"';
-        }
-        csv << ch;
-    }
-    csv << '"';
-}
-
 void emit_metric(
-    std::ofstream& csv,
+    json& output,
+    char const* name,
     double exact,
     double estimate,
     std::vector<double>& errors,
@@ -320,14 +307,17 @@ void emit_metric(
 ) {
     auto const signed_error = estimate - exact;
     auto const absolute_error = std::abs(signed_error);
-    csv << ',' << exact << ',' << estimate << ',' << signed_error << ',' << absolute_error;
+    output[std::string{"exact_"} + name] = exact;
+    output[std::string{"sketch_"} + name] = estimate;
+    output[std::string{name} + "_signed_error"] = signed_error;
+    output[std::string{name} + "_absolute_error"] = absolute_error;
     if (record_error) {
         errors.push_back(absolute_error);
     }
 }
 
 void emit_orientation(
-    std::ofstream& csv,
+    json& measurements,
     case_record const& input,
     sketch_type const& left,
     sketch_type const& right,
@@ -347,25 +337,51 @@ void emit_orientation(
         throw std::runtime_error("pairwise counts do not sum to the bucket count");
     }
 
-    csv << "cuddl," << input.generator_seed << ',' << k_kmer_length << ',' << k_bucket_count << ','
-        << input.power << ',' << input.trial << ',' << input.size_ratio << ','
-        << input.requested_ani << ',' << input.actual_ani << ',' << input.mutation_count << ','
-        << input.reference_bases << ',' << input.query_bases << ',';
-    emit_csv_field(csv, input.reference_sha256);
-    csv << ',';
-    emit_csv_field(csv, input.query_sha256);
-    csv << ',';
-    emit_csv_field(csv, input.reference_path);
-    csv << ',';
-    emit_csv_field(csv, input.query_path);
-    csv << ',' << orientation << ',' << left_size << ',' << right_size << ',' << intersection << ','
-        << counts.lower << ',' << counts.equal << ',' << counts.higher << ',' << counts.both_empty;
-    emit_metric(csv, exact.values.containment, estimate.containment, errors.containment);
-    emit_metric(csv, exact.values.completeness, estimate.completeness, errors.completeness);
-    emit_metric(csv, exact.values.wkid, estimate.wkid, errors.wkid, primary_orientation);
-    csv << ',' << exact.set_derived_ani;
-    emit_metric(csv, exact.values.ani, estimate.ani, errors.ani, primary_orientation);
-    csv << '\n';
+    json output{
+        {"orientation", orientation},
+        {"left_cardinality", left_size},
+        {"right_cardinality", right_size},
+        {"intersection", intersection},
+        {"lower", counts.lower},
+        {"equal", counts.equal},
+        {"higher", counts.higher},
+        {"both_empty", counts.both_empty},
+        {"exact_set_derived_ani", exact.set_derived_ani},
+    };
+    emit_metric(
+        output, "containment", exact.values.containment, estimate.containment, errors.containment
+    );
+    emit_metric(
+        output,
+        "completeness",
+        exact.values.completeness,
+        estimate.completeness,
+        errors.completeness
+    );
+    emit_metric(output, "wkid", exact.values.wkid, estimate.wkid, errors.wkid, primary_orientation);
+    emit_metric(output, "ani", exact.values.ani, estimate.ani, errors.ani, primary_orientation);
+    measurements.push_back({
+        {"implementation", {{"name", "cuddl"}}},
+        {"case",
+         {
+             {"generator_seed", input.generator_seed},
+             {"k", k_kmer_length},
+             {"buckets", k_bucket_count},
+             {"power", input.power},
+             {"trial", input.trial},
+             {"size_ratio", input.size_ratio},
+             {"requested_ani", input.requested_ani},
+             {"actual_ani", input.actual_ani},
+             {"mutation_count", input.mutation_count},
+             {"reference_bases", input.reference_bases},
+             {"query_bases", input.query_bases},
+             {"reference_sha256", input.reference_sha256},
+             {"query_sha256", input.query_sha256},
+             {"reference_path", input.reference_path},
+             {"query_path", input.query_path},
+         }},
+        {"metrics", std::move(output)},
+    });
 }
 
 [[nodiscard]] double quantile(std::vector<double> const& sorted, double q) {
@@ -389,9 +405,9 @@ int main(int argc, char** argv) {
         CLI::App app{"cuDDL pairwise sketch accuracy on raw FASTA mutation cases"};
 
         std::string cases_path;
-        std::string csv_path;
+        std::string output_path;
         app.add_option("--cases", cases_path, "Input cases CSV path")->required();
-        app.add_option("--csv", csv_path, "Output CSV path")->required();
+        app.add_option("--output", output_path, "Output JSON path")->required();
         CLI11_PARSE(app, argc, argv);
 
         std::ifstream cases(cases_path);
@@ -407,21 +423,7 @@ int main(int argc, char** argv) {
         }
         require_header(parse_csv_line(line));
 
-        std::ofstream csv(csv_path);
-        if (!csv) {
-            throw std::runtime_error("cannot open CSV output: " + csv_path);
-        }
-        csv << std::setprecision(17);
-        csv << "implementation,generator_seed,k,buckets,power,trial,size_ratio,requested_ani,"
-               "actual_ani,mutation_count,reference_bases,query_bases,reference_sha256,"
-               "query_sha256,reference_path,query_path,orientation,left_cardinality,"
-               "right_cardinality,intersection,lower,equal,higher,both_empty,exact_containment,"
-               "sketch_containment,containment_signed_error,containment_absolute_error,"
-               "exact_completeness,sketch_completeness,completeness_signed_error,"
-               "completeness_absolute_error,exact_wkid,sketch_wkid,wkid_signed_error,"
-               "wkid_absolute_error,exact_set_derived_ani,exact_ani,sketch_ani,"
-               "ani_signed_error,ani_absolute_error\n";
-
+        json measurements = json::array();
         error_samples errors;
         std::optional<prepared_sequence> cached_reference;
         size_t case_count = 0;
@@ -451,7 +453,7 @@ int main(int argc, char** argv) {
                 intersection_size(query.unique_kmers, cached_reference->unique_kmers);
 
             emit_orientation(
-                csv,
+                measurements,
                 input,
                 query.sketch,
                 cached_reference->sketch,
@@ -463,7 +465,7 @@ int main(int argc, char** argv) {
             );
             if (input.size_ratio != 1U) {
                 emit_orientation(
-                    csv,
+                    measurements,
                     input,
                     cached_reference->sketch,
                     query.sketch,
@@ -485,6 +487,15 @@ int main(int argc, char** argv) {
         print_summary("completeness absolute error", std::move(errors.completeness));
         print_summary("WKID absolute error", std::move(errors.wkid));
         print_summary("ANI absolute error", std::move(errors.ani));
+        write_benchmark_result(
+            output_path,
+            make_benchmark_result(
+                "Pairwise sketch accuracy",
+                "pairwise_accuracy",
+                "end_to_end",
+                std::move(measurements)
+            )
+        );
     } catch (std::exception const& error) {
         std::cerr << error.what() << '\n';
         return 1;

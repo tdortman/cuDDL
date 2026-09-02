@@ -9,7 +9,10 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "result_json.hpp"
 
 namespace {
 
@@ -19,6 +22,29 @@ std::vector<nvbench::int64_t> const batch_sizes{1, 8, 32, 128, 512, 2048, 8192};
 void check(cudaError_t error) {
     if (error != cudaSuccess) {
         throw std::runtime_error(cudaGetErrorString(error));
+    }
+}
+
+void add_system_metadata(nvbench::state& state) {
+    auto const system = benchmark_system();
+    for (auto const& [column, field] : std::array{
+             std::pair{"System OS", "os"},
+             std::pair{"System Kernel", "kernel"},
+             std::pair{"System Architecture", "architecture"},
+             std::pair{"System CPU", "cpu"},
+             std::pair{"System Logical CPU Count", "logical_cpu_count"},
+             std::pair{"System RAM Bytes", "ram_bytes"},
+             std::pair{"Compute Capability", "compute_capability"},
+             std::pair{"SM Count", "sm_count"},
+             std::pair{"GPU RAM Bytes", "gpu_ram_bytes"},
+             std::pair{"CUDA Runtime Version", "cuda_runtime_version"},
+             std::pair{"CUDA Driver Version", "cuda_driver_version"},
+             std::pair{"CUDA Compile Version", "cuda_compile_version"},
+         }) {
+        auto& summary = state.add_summary(column);
+        summary.set_string("name", column);
+        auto const& value = system.at(field);
+        summary.set_string("value", value.is_string() ? value.get<std::string>() : value.dump());
     }
 }
 
@@ -143,6 +169,7 @@ class batch_fixture {
 };
 
 void profile_kernel(nvbench::state& state) {
+    add_system_metadata(state);
     batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());
@@ -156,6 +183,7 @@ void profile_kernel(nvbench::state& state) {
 }
 
 void profile_h2d(nvbench::state& state) {
+    add_system_metadata(state);
     batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_writes<uint32_t>(2U * fixture.register_count());
@@ -165,6 +193,7 @@ void profile_h2d(nvbench::state& state) {
 }
 
 void profile_d2h(nvbench::state& state) {
+    add_system_metadata(state);
     batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
     fixture.compare(cudaStream_t{nullptr});
     check(cudaDeviceSynchronize());
@@ -177,6 +206,7 @@ void profile_d2h(nvbench::state& state) {
 }
 
 void profile_end_to_end(nvbench::state& state) {
+    add_system_metadata(state);
     batch_fixture fixture(static_cast<size_t>(state.get_int64("Batch")));
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());

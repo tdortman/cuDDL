@@ -1,15 +1,17 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "pandas", "typer"]
+# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Plot cuDDL raw-DNA pairwise estimation error as heatmaps by size ratio."""
 
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 METRICS = (
     ("containment_absolute_error", "Containment"),
@@ -20,15 +22,19 @@ METRICS = (
 
 
 def main(
-    csv_path: Annotated[
-        Path, typer.Argument(exists=True, dir_okay=False, help="Pairwise accuracy CSV")
+    result_path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="Pairwise accuracy JSON")
     ],
     output_dir: Annotated[
         Path, typer.Option(file_okay=False, help="Figure output directory")
     ] = Path("results/pairwise-accuracy"),
 ) -> None:
     """Render median absolute error over the raw-DNA parameter sweep."""
-    data = pu.load_csv(csv_path)
+    try:
+        result = load_result(result_path, "pairwise_accuracy")
+    except ValueError as error:
+        raise typer.BadParameter(f"{result_path}: {error}") from error
+    data = pd.DataFrame(flatten_measurements(result))
     required = {
         "implementation",
         "orientation",
@@ -39,15 +45,15 @@ def main(
     }
     missing = sorted(required - set(data.columns))
     if missing:
-        raise typer.BadParameter(f"CSV is missing columns: {', '.join(missing)}")
+        raise typer.BadParameter(f"JSON is missing fields: {', '.join(missing)}")
     if data.empty:
-        raise typer.BadParameter("CSV has no pairwise accuracy rows")
+        raise typer.BadParameter("JSON has no pairwise accuracy measurements")
     data = data[
         (data["implementation"] == "cuddl")
         & (data["orientation"] == "query_to_reference")
     ]
     if data.empty:
-        raise typer.BadParameter("CSV has no cuDDL query-to-reference rows")
+        raise typer.BadParameter("JSON has no cuDDL query-to-reference measurements")
 
     powers = sorted(int(value) for value in data["power"].unique())
     ani_levels = sorted(float(value) for value in data["requested_ani"].unique())
@@ -62,8 +68,8 @@ def main(
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     for ratio in size_ratios:
-        fig, axes = pu.setup_figure(nrows=2, ncols=2)
-        for ax, (column, title) in zip(axes.flat, METRICS, strict=True):
+        fig, _ = pu.setup_figure(nrows=2, ncols=2)
+        for ax, (column, title) in zip(fig.axes, METRICS, strict=True):
             values = (
                 data[data["size_ratio"] == ratio]
                 .groupby(["requested_ani", "power"])[column]
@@ -73,7 +79,7 @@ def main(
             )
             if values.isna().any().any():
                 raise typer.BadParameter(
-                    "CSV does not contain every target-ANI/query-length/"
+                    "JSON does not contain every target-ANI/query-length/"
                     "size-ratio combination"
                 )
             image = ax.imshow(

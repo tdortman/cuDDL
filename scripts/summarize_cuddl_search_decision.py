@@ -1,11 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["typer"]
+# dependencies = ["jsonschema", "typer"]
 # ///
-"""Convert cuDDL search-decision NVBench samples into one CSV row per workload."""
+"""Convert cuDDL search-decision NVBench samples into shared result JSON."""
 
-import csv
 import json
 import math
 import shlex
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from benchmark_schema import make_result, measurements_from_rows, write_result
 
 BUILD_BENCHMARKS = ("compact_build", "indexed_build")
 SEARCH_BENCHMARKS = ("exhaustive_search", "indexed_search")
@@ -26,14 +26,7 @@ FIELDS = (
     "timestamp_utc",
     "benchmark_command",
     "nvbench_version",
-    "gpu_name",
-    "compute_capability",
-    "multiprocessor_count",
-    "global_memory_bytes",
     "free_memory_before_bytes",
-    "cuda_runtime_version",
-    "cuda_driver_version",
-    "cuda_compile_version",
     "compiler",
     "build_configuration",
     "kmer_length",
@@ -111,6 +104,125 @@ FIELDS = (
     "error",
 )
 
+CASE_FIELDS = (
+    "schema_version",
+    "timestamp_utc",
+    "benchmark_command",
+    "nvbench_version",
+    "free_memory_before_bytes",
+    "compiler",
+    "build_configuration",
+    "kmer_length",
+    "bucket_count",
+    "indexed_bucket_count",
+    "score_encoder_identity",
+    "exponent_bits",
+    "mantissa_bits",
+    "hash_identity",
+    "hash_seed",
+    "canonicalisation_policy",
+    "blacklist_identity",
+    "blacklist_version",
+    "key_mask",
+    "index_mode",
+    "key_bits",
+    "fixture_seed",
+    "reference_count",
+    "fill_ratio",
+    "filled_cells_per_row",
+    "skew",
+    "hot_fraction",
+    "minimum_matches",
+    "query_count",
+    "query_profile",
+    "warmup",
+    "kill_gate_rule",
+    "kill_gate_outcome",
+    "paper_scale_suitability",
+    "status",
+    "error",
+)
+
+INTEGER_FIELDS = {
+    "schema_version",
+    "multiprocessor_count",
+    "global_memory_bytes",
+    "free_memory_before_bytes",
+    "cuda_runtime_version",
+    "cuda_driver_version",
+    "cuda_compile_version",
+    "system_logical_cpu_count",
+    "system_ram_bytes",
+    "kmer_length",
+    "bucket_count",
+    "indexed_bucket_count",
+    "score_encoder_identity",
+    "exponent_bits",
+    "mantissa_bits",
+    "hash_identity",
+    "hash_seed",
+    "canonicalisation_policy",
+    "blacklist_identity",
+    "blacklist_version",
+    "key_mask",
+    "key_bits",
+    "fixture_seed",
+    "reference_count",
+    "filled_cells_per_row",
+    "minimum_matches",
+    "query_count",
+    "warmup",
+    "exhaustive_repetitions",
+    "indexed_repetitions",
+    "compact_resident_bytes",
+    "indexed_resident_bytes",
+    "compact_build_temporary_bytes",
+    "indexed_build_temporary_bytes",
+    "compact_search_workspace_bytes",
+    "indexed_search_workspace_bytes",
+    "peak_temporary_bytes",
+    "offset_bytes",
+    "posting_bytes",
+    "populated_posting_lists",
+    "posting_entries",
+    "posting_visits",
+    "atomic_updates",
+    "selected_candidates",
+    "exhaustive_exact_comparisons",
+    "indexed_exact_comparisons",
+    "oracle_threshold_pairs",
+    "recalled_pairs",
+}
+
+FLOAT_FIELDS = {
+    "fill_ratio",
+    "hot_fraction",
+    "compact_build_fixture_generation_ms",
+    "compact_build_host_to_device_ms",
+    "indexed_build_fixture_generation_ms",
+    "indexed_build_host_to_device_ms",
+    "exhaustive_fixture_generation_ms",
+    "exhaustive_host_to_device_ms",
+    "exhaustive_validation_ms",
+    "indexed_fixture_generation_ms",
+    "indexed_host_to_device_ms",
+    "indexed_validation_ms",
+    "compact_build_p50_ms",
+    "compact_build_p95_ms",
+    "indexed_build_p50_ms",
+    "indexed_build_p95_ms",
+    "top_bit_frequency",
+    "candidate_inflation",
+    "exact_result_recall",
+    "threshold_zero_recall",
+    "exhaustive_p50_ms",
+    "exhaustive_p95_ms",
+    "exhaustive_queries_per_second",
+    "indexed_p50_ms",
+    "indexed_p95_ms",
+    "indexed_queries_per_second",
+}
+
 
 def axis_values(state: dict[str, Any]) -> dict[str, str]:
     return {value["name"]: value["value"] for value in state["axis_values"]}
@@ -150,7 +262,9 @@ def sample_times(path: Path, state: dict[str, Any]) -> list[float]:
 def mode_key(state: dict[str, Any]) -> tuple[str, str]:
     axes = axis_values(state)
     try:
-        buckets = axes["IndexedBuckets"]
+        buckets = axes.get("IndexedBuckets") or summary_value(
+            state, "indexed_bucket_count"
+        )
         bits = axes["KeyBits"]
     except KeyError as error:
         missing = ", ".join(
@@ -168,7 +282,7 @@ def state_key(
     axes = axis_values(state)
     key = (
         axes["References"],
-        axes["FillPermille"],
+        axes.get("FillPermille", "1000"),
         axes["HotPercent"],
     )
     if include_queries:
@@ -228,10 +342,35 @@ def phase_metrics(prefix: str, state: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def typed_value(name: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if value == "":
+        return ""
+    if name in INTEGER_FIELDS:
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        integer = int(number)
+        if number != integer:
+            raise ValueError(
+                f"normalized integer field {name!r} is not integral: {value!r}"
+            )
+        return integer
+    if name in FLOAT_FIELDS:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return str(value)
+
+
+def typed_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {name: typed_value(name, value) for name, value in row.items()}
+
+
 def main(
     input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     output: Annotated[Path, typer.Option(dir_okay=False)] = Path(
-        "results/cuddl-search-decision.csv"
+        "results/cuddl-search-decision.json"
     ),
 ) -> None:
     document = json.loads(input_path.read_text())
@@ -297,7 +436,7 @@ def main(
                 "multiprocessor_count": device["number_of_sms"],
                 "global_memory_bytes": device["global_memory_size"],
                 "reference_count": axes["References"],
-                "fill_ratio": int(axes["FillPermille"]) / 1000.0,
+                "fill_ratio": int(axes.get("FillPermille", "1000")) / 1000.0,
                 "skew": f"{int(axes['HotPercent'])}%",
                 "query_count": workload_key[3],
                 "query_profile": workload_key[4],
@@ -317,7 +456,14 @@ def main(
                 "status": status,
                 "error": error,
             }
+            row["implementation"] = "cuddl"
             for tag in (
+                "system_os",
+                "system_kernel",
+                "system_architecture",
+                "system_cpu",
+                "system_logical_cpu_count",
+                "system_ram_bytes",
                 "free_memory_before_bytes",
                 "cuda_runtime_version",
                 "cuda_driver_version",
@@ -467,11 +613,64 @@ def main(
                 row["paper_scale_suitability"] = outcome
             rows.append(row)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    typed_rows = [typed_row(row) for row in rows]
+    system_fields = {
+        "os": "system_os",
+        "kernel": "system_kernel",
+        "architecture": "system_architecture",
+        "cpu": "system_cpu",
+        "logical_cpu_count": "system_logical_cpu_count",
+        "ram_bytes": "system_ram_bytes",
+        "gpu": "gpu_name",
+        "compute_capability": "compute_capability",
+        "sm_count": "multiprocessor_count",
+        "gpu_ram_bytes": "global_memory_bytes",
+        "cuda_runtime_version": "cuda_runtime_version",
+        "cuda_driver_version": "cuda_driver_version",
+        "cuda_compile_version": "cuda_compile_version",
+    }
+    systems = {
+        tuple(row[field] for field in system_fields.values()) for row in typed_rows
+    }
+    if len(systems) != 1:
+        raise ValueError("benchmark states do not describe exactly one GPU system")
+    system_values = next(iter(systems))
+    missing_system_fields = [
+        output
+        for output, value in zip(system_fields, system_values, strict=True)
+        if value in (None, "")
+    ]
+    if missing_system_fields:
+        raise ValueError(
+            "benchmark states are missing system metadata: "
+            + ", ".join(missing_system_fields)
+        )
+    system = {
+        output: value
+        for output, value in zip(system_fields, system_values, strict=True)
+    }
+    measurements = measurements_from_rows(
+        typed_rows,
+        case_fields=CASE_FIELDS,
+        omit_fields=system_fields.values(),
+    )
+    for row, measurement in zip(typed_rows, measurements, strict=True):
+        for name in FIELDS:
+            if row.get(name) == "":
+                section = (
+                    measurement["case"]
+                    if name in CASE_FIELDS
+                    else measurement["metrics"]
+                )
+                section[name] = ""
+    result = make_result(
+        name="cuDDL search decision",
+        operation="search_decision",
+        scope="kernel",
+        system=system,
+        measurements=measurements,
+    )
+    write_result(output, result)
 
 
 if __name__ == "__main__":

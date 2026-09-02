@@ -5,12 +5,12 @@
 #include <cuda/std/cstdint>
 
 #include <cmath>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "CLI/CLI.hpp"
+#include "result_json.hpp"
 
 namespace {
 
@@ -28,7 +28,7 @@ std::vector<uint64_t> make_inputs(size_t count, uint64_t seed) {
 }
 
 void emit(
-    std::ofstream& csv,
+    json& measurements,
     char const* estimator,
     size_t count,
     uint32_t trial,
@@ -36,10 +36,18 @@ void emit(
     double estimate
 ) {
     auto const signed_error = (estimate - static_cast<double>(exact)) / static_cast<double>(exact);
-    csv << estimator << ',' << count << ',' << trial << ',' << exact << ',' << estimate << ','
-        << signed_error << ',' << std::abs(signed_error) << '\n';
+    measurements.push_back({
+        {"implementation", {{"name", estimator}}},
+        {"case", {{"phase", "accuracy"}, {"items", count}, {"trial", trial}}},
+        {"metrics",
+         {
+             {"exact", exact},
+             {"estimate", estimate},
+             {"signed_error", signed_error},
+             {"absolute_error", std::abs(signed_error)},
+         }},
+    });
 }
-
 
 }  // namespace
 
@@ -47,13 +55,13 @@ int main(int argc, char** argv) {
     try {
         CLI::App app{"Paired cuDDL and cuco HLL cardinality accuracy experiment"};
 
-        std::string csv_path;
+        std::string output_path;
         uint32_t trials = 32;
         uint32_t min_power = 8;
         uint32_t max_power = 24;
         uint64_t root_seed = 42;
 
-        app.add_option("--csv", csv_path, "Output CSV path")->required();
+        app.add_option("--output", output_path, "Output JSON path")->required();
         app.add_option("--trials", trials, "Independent trials per cardinality")
             ->check(CLI::PositiveNumber);
         app.add_option("--min-power", min_power, "Smallest base-2 cardinality exponent")
@@ -63,16 +71,12 @@ int main(int argc, char** argv) {
         app.add_option("--seed", root_seed, "Root seed");
 
         CLI11_PARSE(app, argc, argv);
-        
+
         if (min_power > max_power) {
             throw std::runtime_error("--min-power must not exceed --max-power");
         }
 
-        std::ofstream csv(csv_path);
-        if (!csv) {
-            throw std::runtime_error("cannot open CSV output: " + csv_path);
-        }
-        csv << "Estimator,Items,Trial,Exact,Estimate,Signed Error,Absolute Error\n";
+        json measurements = json::array();
 
         for (uint32_t power = min_power; power <= max_power; ++power) {
             auto const count = size_t{1} << power;
@@ -91,19 +95,25 @@ int main(int argc, char** argv) {
 
                 cuddl::sketch<25, k_bucket_count> cuddl;
                 CUDDL_UNWRAP(cuddl.add({device, count}));
-                emit(csv, "cuddl", count, trial, exact, CUDDL_UNWRAP(cuddl.cardinality()));
+                emit(measurements, "cuddl", count, trial, exact, CUDDL_UNWRAP(cuddl.cardinality()));
                 auto const hybrids = CUDDL_UNWRAP(cuddl.hybrid_cardinality());
-                emit(csv, "cuddl_bbtools", count, trial, exact, hybrids.bbtools);
-                emit(csv, "cuddl_paper", count, trial, exact, hybrids.paper);
+                emit(measurements, "cuddl_bbtools", count, trial, exact, hybrids.bbtools);
+                emit(measurements, "cuddl_paper", count, trial, exact, hybrids.paper);
 
                 cuco::hyperloglog<uint64_t> hll(cuco::precision{k_hll_precision});
                 hll.add(device, device + count);
-                emit(csv, "cuco_hll", count, trial, exact, hll.estimate());
+                emit(measurements, "cuco_hll", count, trial, exact, hll.estimate());
 
                 CUDDL_CUDA_CALL(cudaFree(device));
             }
             std::cerr << "Completed 2^" << power << '\n';
         }
+        write_benchmark_result(
+            output_path,
+            make_benchmark_result(
+                "HLL cardinality accuracy", "hll_comparison", "kernel", std::move(measurements)
+            )
+        );
     } catch (std::exception const& error) {
         std::cerr << error.what() << '\n';
         return 1;

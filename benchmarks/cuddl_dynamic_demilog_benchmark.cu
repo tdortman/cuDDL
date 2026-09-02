@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <vector>
 
+#include "result_json.hpp"
+
 namespace {
 
 using clock_type = std::chrono::steady_clock;
@@ -45,9 +47,11 @@ int main(int argc, char** argv) {
     size_t count = 1U << 20;
     int warmup = 3;
     int runs = 10;
+    std::string output_path;
     app.add_option("--count", count)->check(CLI::PositiveNumber);
     app.add_option("--warmup", warmup)->check(CLI::NonNegativeNumber);
     app.add_option("--runs", runs)->check(CLI::PositiveNumber);
+    app.add_option("--output", output_path, "Output JSON path")->required();
     CLI11_PARSE(app, argc, argv);
 
     for (int i = 0; i < warmup; ++i) {
@@ -55,20 +59,38 @@ int main(int argc, char** argv) {
         double estimate = 0;
         run(host, estimate);
     }
+    json measurements = json::array();
     for (int i = 0; i < runs; ++i) {
         auto const host = make_inputs(count, i);
         double estimate = 0;
         auto const seconds = run(host, estimate);
         auto const bounded_estimate = std::min(estimate, static_cast<double>(count));
-        std::printf(
-            "cuddl,%zu,%zu,,%d,%.9f,%.3f,%.0f,%.0f\n",
-            count,
-            bucket_count,
-            i,
-            seconds,
-            count / seconds,
-            estimate,
-            bounded_estimate
-        );
+        measurements.push_back({
+            {"implementation", {{"name", "cuddl"}}},
+            {"case", {{"count", count}, {"buckets", bucket_count}, {"trial", i}}},
+            {"metrics",
+             {
+                 {"seconds", seconds},
+                 {"adds_per_second", count / seconds},
+                 {"estimate", estimate},
+                 {"bounded_estimate", bounded_estimate},
+             }},
+            {"timings",
+             {{"construction",
+               {
+                   {"samples", 1},
+                   {"median_ms", seconds * 1'000.0},
+                   {"source", "wall_clock"},
+               }}}},
+        });
     }
+    write_benchmark_result(
+        output_path,
+        make_benchmark_result(
+            "DynamicDemiLog construction and cardinality",
+            "dynamic_demilog",
+            "end_to_end",
+            std::move(measurements)
+        )
+    );
 }

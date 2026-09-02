@@ -11,7 +11,7 @@ executable(
 executable(
     'cuddl-hll-accuracy',
     'cuddl_hll_accuracy.cu',
-    dependencies: [cuddl_dep, cuco_bench_dep, cli11_dep],
+    dependencies: [cuddl_dep, cuco_bench_dep, cli11_dep, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
@@ -19,7 +19,7 @@ executable(
 executable(
     'cuddl-pairwise-accuracy',
     'cuddl_pairwise_accuracy.cu',
-    dependencies: [cuddl_dep, cli11_dep],
+    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
@@ -27,7 +27,7 @@ executable(
 executable(
     'cuddl-pairwise-batch-benchmark',
     'cuddl_pairwise_batch_benchmark.cu',
-    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
@@ -37,7 +37,7 @@ executable(
 executable(
     'cuddl-benchmark-fasta',
     'cuddl_benchmark_fasta.cu',
-    dependencies: [cuddl_dep, cli11_dep],
+    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
@@ -45,7 +45,7 @@ executable(
 executable(
     'cuddl-dynamic-demilog-benchmark',
     'cuddl_dynamic_demilog_benchmark.cu',
-    dependencies: [cuddl_dep, cli11_dep],
+    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
@@ -53,18 +53,18 @@ executable(
 executable(
     'cuddl-compact-search-benchmark',
     'cuddl_compact_search_benchmark.cu',
-    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
 
-# Provides its own main (strips --summary-csv, runs nvbench, then writes the summary CSV).
+# Provides its own main (strips --summary-json, runs nvbench, then writes shared JSON).
 # nvbench_main stays linked: its static archive member is skipped when main is already
 # defined, while its cuda driver/nvml/cupti link dependencies are still required.
 executable(
     'cuddl-search-decision-benchmark',
     'cuddl_search_decision_benchmark.cu',
-    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )

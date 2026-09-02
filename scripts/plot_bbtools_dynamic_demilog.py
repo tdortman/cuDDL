@@ -1,15 +1,17 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["matplotlib", "pandas", "typer"]
+# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Plot cuDDL versus original BBTools DynamicDemiLog results."""
 
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import plot_utils as pu
 import typer
+from benchmark_schema import flatten_measurements, load_result
 
 IMPLEMENTATIONS = (
     ("cuddl", "cuDDL", pu.FILTER_STYLES["cuddl"]),
@@ -38,13 +40,17 @@ ESTIMATORS = (
 
 
 def main(
-    csv_path: Annotated[Path, typer.Option(help="Comparison benchmark CSV")],
+    json_path: Annotated[Path, typer.Option(help="Comparison benchmark JSON")],
     output_dir: Annotated[Path, typer.Option(help="Figure output directory")] = Path(
         "results/bbtools"
     ),
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    data = pu.load_csv(csv_path)
+    try:
+        result = load_result(json_path, "dynamic_demilog")
+    except ValueError as error:
+        raise typer.BadParameter(f"{json_path}: {error}") from error
+    data = pd.DataFrame(flatten_measurements(result))
 
     throughput = data.groupby(["implementation", "count"])["adds_per_second"].median()
     fig, ax = pu.setup_figure(figsize=(12, 8))
@@ -77,9 +83,10 @@ def main(
     for implementation, column, label, style in ESTIMATORS:
         selected = data[data["implementation"] == implementation]
         series = (
-            ((selected[column] - selected["count"]) / selected["count"]).abs()
-            * 100.0
-        ).groupby(selected["count"]).mean()
+            (((selected[column] - selected["count"]) / selected["count"]).abs() * 100.0)
+            .groupby(selected["count"])
+            .mean()
+        )
         ax.semilogx(
             series.index,
             series,

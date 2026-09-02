@@ -1,23 +1,34 @@
 #include <cuddl/cuddl.cuh>
 #include <cuddl/detail/comparison.cuh>
+#include <cuddl/detail/fasta_parser.hpp>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cub/warp/warp_reduce.cuh>
 #include <nvbench/nvbench.cuh>
+#include <nvbench/main.cuh>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include "common.cuh"
+#include "result_json.hpp"
 
 namespace {
 namespace cg = cooperative_groups;
@@ -650,7 +661,490 @@ void compact_exhaustive_parameter_sweep(nvbench::state& state) {
     add_median_time(state);
     add_median_throughput(state, reference_count);
 }
-}  // namespace
+
+/// @brief Sequence-level FASTA end-to-end pipeline mode (activated with
+///        `--reference <fasta> --query <fasta>` instead of nvbench axes).
+using pipeline_database = cuddl::reference_database<25U, 4096U>;
+constexpr uint32_t k_pipeline_k = 25U;
+constexpr size_t k_pipeline_buckets = 4096U;
+constexpr nvbench::int64_t k_pipeline_samples = 20;
+constexpr nvbench::int64_t k_pipeline_warmup_runs = 3;
+class pipeline_failure : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+__global__ void extract_winner_scores_kernel(
+    uint32_t const* registers, uint16_t* scores, size_t count
+) {
+    for (auto i = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x); i < count;
+         i += static_cast<size_t>(blockDim.x * gridDim.x)) {
+        scores[i] = cuddl::detail::winner(registers[i]);
+    }
+}
+
+/// @brief Aborts into a pipeline failure carrying the wrapped error message.
+template <typename T>
+T pipeline_unwrap(cuddl::Result<T> result) {
+    if (!result) {
+        throw pipeline_failure(result.error().message());
+    }
+    return std::move(*result);
+}
+
+void pipeline_check(cuddl::Result<void> result) {
+    if (!result) {
+        throw pipeline_failure(result.error().message());
+    }
+}
+
+int pipeline_run(std::string const& command, std::string& output) {
+    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+    if (pipe == nullptr) {
+        throw pipeline_failure("cannot invoke: " + command);
+    }
+    output.clear();
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+    return pclose(pipe);
+}
+
+std::string pipeline_quote(std::string_view value) {
+    std::string quoted = "'";
+    for (char const character : value) {
+        if (character == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(character);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+std::string pipeline_sha256(std::string const& path) {
+    std::string output;
+    if (pipeline_run("sha256sum " + pipeline_quote(path), output) != 0) {
+        throw pipeline_failure("sha256sum failed for " + path + ": " + output);
+    }
+    std::string hex;
+    for (char const character : output) {
+        if (hex.size() == 64U) {
+            break;
+        }
+        if (std::isxdigit(static_cast<unsigned char>(character))) {
+            hex.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(character)))
+            );
+        }
+    }
+    if (hex.size() != 64U) {
+        throw pipeline_failure("unexpected sha256sum output for " + path);
+    }
+    return hex;
+}
+
+std::string pipeline_revision() {
+    std::string output;
+    if (pipeline_run("git rev-parse HEAD", output) != 0) {
+        return "(no revision)";
+    }
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
+    }
+    return output;
+}
+
+uint64_t pipeline_host_peak_bytes() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmHWM:", 0U) == 0U) {
+            return std::stoull(line.substr(line.find_first_of("0123456789"))) * 1024U;
+        }
+    }
+    return 0U;
+}
+
+uint64_t pipeline_device_used_bytes() {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    CUDDL_CUDA_CALL(cudaMemGetInfo(&free_bytes, &total_bytes));
+    return total_bytes - free_bytes;
+}
+
+struct pipeline_options {
+    std::string name;
+    std::string reference;
+    std::string query;
+    std::string output;
+    uint32_t minimum_matches = 5U;
+};
+
+template <typename Function>
+struct pipeline_callable {
+    Function function;
+
+    void operator()(nvbench::state& state, nvbench::type_list<>) { function(state); }
+};
+
+template <typename Function>
+json pipeline_measure(
+    std::string const& name,
+    std::vector<std::string> stages,
+    bool cpu_only,
+    Function&& function
+) {
+    using function_type = std::decay_t<Function>;
+    using callable_type = pipeline_callable<function_type>;
+    nvbench::benchmark<callable_type> benchmark(
+        callable_type{std::forward<Function>(function)}
+    );
+    benchmark.set_name(name)
+        .add_string_axis("Stage", std::move(stages))
+        .set_stopping_criterion("sample-count")
+        .set_min_samples(k_pipeline_samples)
+        .set_criterion_param_int64("target-samples", k_pipeline_samples)
+        .set_cold_warmup_runs(k_pipeline_warmup_runs)
+        .set_skip_batched(true);
+    if (cpu_only) {
+        benchmark.set_is_cpu_only(true);
+    } else {
+        int device = 0;
+        CUDDL_CUDA_CALL(cudaGetDevice(&device));
+        benchmark.add_device(device);
+    }
+    benchmark.run();
+
+    auto const clock = cpu_only ? "cpu" : "gpu";
+    auto const measurement = cpu_only ? "nv/cpu_only" : "nv/cold";
+    json measurements = json::object();
+    for (auto const& state : benchmark.get_states()) {
+        if (state.is_skipped()) {
+            throw pipeline_failure(state.get_skip_reason());
+        }
+        auto const prefix = std::string{measurement} + "/time/" + clock;
+        measurements[state.get_string("Stage")] = {
+            {"samples", state.get_summary(std::string{measurement} + "/sample_size")
+                            .get_int64("value")},
+            {"median_ms",
+             state.get_summary(prefix + "/median").get_float64("value") * 1000.0},
+            {"min_ms", state.get_summary(prefix + "/min").get_float64("value") * 1000.0},
+            {"max_ms", state.get_summary(prefix + "/max").get_float64("value") * 1000.0},
+            {"relative_stddev_percent",
+             state.get_summary(prefix + "/stdev/relative").get_float64("value") * 100.0},
+        };
+    }
+    return measurements;
+}
+
+json run_pipeline(pipeline_options const& options) {
+    auto const benchmark_name = options.name.empty()
+                                    ? std::filesystem::path(options.reference).stem().string() +
+                                          " vs " +
+                                          std::filesystem::path(options.query).stem().string()
+                                    : options.name;
+    auto const checksum_reference = pipeline_sha256(options.reference);
+    auto const checksum_query = pipeline_sha256(options.query);
+
+    auto const device_baseline = pipeline_device_used_bytes();
+    uint64_t device_peak = 0;
+    auto sample_device = [&]() {
+        auto const used = pipeline_device_used_bytes();
+        device_peak = std::max(device_peak, used - device_baseline);
+    };
+
+    auto const reference_kmers =
+        pipeline_unwrap(cuddl::detail::parse_fasta(options.reference, k_pipeline_k));
+    auto const query_kmers =
+        pipeline_unwrap(cuddl::detail::parse_fasta(options.query, k_pipeline_k));
+
+    thrust::device_vector<uint64_t> device_reference_kmers(reference_kmers.kmers);
+    thrust::device_vector<uint64_t> device_query_kmers(query_kmers.kmers);
+
+    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> reference_sketch;
+    pipeline_check(reference_sketch.add_async(device_reference_kmers));
+
+    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> query_sketch;
+    pipeline_check(query_sketch.add_async(device_query_kmers));
+
+    thrust::device_vector<uint16_t> device_reference_rows(k_pipeline_buckets);
+    thrust::device_vector<uint16_t> device_query_rows(k_pipeline_buckets);
+    constexpr uint32_t extract_block = 256;
+    constexpr uint32_t extract_grid =
+        static_cast<uint32_t>((k_pipeline_buckets + extract_block - 1) / extract_block);
+    extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
+        thrust::raw_pointer_cast(reference_sketch.ref().data().data()),
+        thrust::raw_pointer_cast(device_reference_rows.data()),
+        k_pipeline_buckets
+    );
+    extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
+        thrust::raw_pointer_cast(query_sketch.ref().data().data()),
+        thrust::raw_pointer_cast(device_query_rows.data()),
+        k_pipeline_buckets
+    );
+    CUDDL_CUDA_CALL(cudaGetLastError());
+    sample_device();
+
+    auto const compatibility =
+        cuddl::score_compatibility::current<k_pipeline_k, k_pipeline_buckets>();
+
+    auto bare_database = pipeline_unwrap(
+        pipeline_database::build_async(device_reference_rows, compatibility)
+    );
+
+    auto database = pipeline_unwrap(
+        pipeline_database::build_indexed_async(device_reference_rows, compatibility)
+    );
+
+    auto const workspace_bytes =
+        pipeline_unwrap(database.ref().indexed_single_query_workspace_bytes());
+    thrust::device_vector<cuddl::reference_search_result> exhaustive_results(
+        database.ref().reference_count()
+    );
+    thrust::device_vector<cuddl::reference_search_result> indexed_results(
+        database.ref().reference_count()
+    );
+    thrust::device_vector<uint8_t> workspace(workspace_bytes);
+    thrust::device_vector<uint32_t> result_count(1U);
+
+    auto const query_span = cuddl::device_span<uint16_t const>{
+        thrust::raw_pointer_cast(device_query_rows.data()), device_query_rows.size()};
+    auto exhaustive_span = cuddl::device_span<cuddl::reference_search_result>{
+        thrust::raw_pointer_cast(exhaustive_results.data()), exhaustive_results.size()};
+    auto indexed_span = cuddl::device_span<cuddl::reference_search_result>{
+        thrust::raw_pointer_cast(indexed_results.data()), indexed_results.size()};
+    auto workspace_span = cuddl::device_span<uint8_t>{
+        thrust::raw_pointer_cast(workspace.data()), workspace.size()};
+    auto count_span = cuddl::device_span<uint32_t>{
+        thrust::raw_pointer_cast(result_count.data()), result_count.size()};
+
+    pipeline_check(
+        database.ref().search_async(query_span, compatibility, {}, exhaustive_span)
+    );
+
+    pipeline_check(database.ref().search_indexed_async(
+        query_span,
+        compatibility,
+        workspace_span,
+        indexed_span,
+        count_span,
+        {.minimum_matches = options.minimum_matches}
+    ));
+    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+
+    thrust::host_vector<cuddl::reference_search_result> exhaustive_host(exhaustive_results);
+    thrust::host_vector<cuddl::reference_search_result> indexed_host(indexed_results);
+    thrust::host_vector<uint32_t> count_host(result_count);
+    auto const host_peak = pipeline_host_peak_bytes();
+
+    auto timing_statistics = pipeline_measure(
+        "pipeline_parse",
+        {"parse_reference", "parse_query"},
+        true,
+        [&](nvbench::state& state) {
+            auto const& path = state.get_string("Stage") == "parse_reference"
+                                   ? options.reference
+                                   : options.query;
+            state.exec(nvbench::exec_tag::timer, [&](nvbench::launch&, auto& timer) {
+                timer.start();
+                auto parsed = cuddl::detail::parse_fasta(path, k_pipeline_k);
+                timer.stop();
+                if (!parsed) {
+                    throw pipeline_failure(parsed.error().message());
+                }
+                do_not_optimise(*parsed);
+            });
+        }
+    );
+
+    auto gpu_statistics = pipeline_measure(
+        "pipeline_device",
+        {
+            "host_to_device_transfer",
+            "sketch_reference",
+            "sketch_query",
+            "sketch_extract",
+            "database_build",
+            "index_build",
+            "search_exhaustive",
+            "search_indexed",
+        },
+        false,
+        [&](nvbench::state& state) {
+            auto const stage = state.get_string("Stage");
+            state.exec(
+                nvbench::exec_tag::sync | nvbench::exec_tag::timer,
+                [&](nvbench::launch& launch, auto& timer) {
+                auto const stream = cuda::stream_ref{launch.get_stream()};
+                if (stage == "host_to_device_transfer") {
+                    timer.start();
+                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                        thrust::raw_pointer_cast(device_reference_kmers.data()),
+                        reference_kmers.kmers.data(),
+                        reference_kmers.kmers.size() * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice,
+                        launch.get_stream()
+                    ));
+                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                        thrust::raw_pointer_cast(device_query_kmers.data()),
+                        query_kmers.kmers.data(),
+                        query_kmers.kmers.size() * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice,
+                        launch.get_stream()
+                    ));
+                    timer.stop();
+                } else if (stage == "sketch_reference") {
+                    pipeline_check(reference_sketch.clear_async(stream));
+                    timer.start();
+                    pipeline_check(reference_sketch.add_async(device_reference_kmers, stream));
+                    timer.stop();
+                } else if (stage == "sketch_query") {
+                    pipeline_check(query_sketch.clear_async(stream));
+                    timer.start();
+                    pipeline_check(query_sketch.add_async(device_query_kmers, stream));
+                    timer.stop();
+                } else if (stage == "sketch_extract") {
+                    timer.start();
+                    extract_winner_scores_kernel<<<extract_grid, extract_block, 0, launch.get_stream()>>>(
+                        thrust::raw_pointer_cast(reference_sketch.ref().data().data()),
+                        thrust::raw_pointer_cast(device_reference_rows.data()),
+                        k_pipeline_buckets
+                    );
+                    extract_winner_scores_kernel<<<extract_grid, extract_block, 0, launch.get_stream()>>>(
+                        thrust::raw_pointer_cast(query_sketch.ref().data().data()),
+                        thrust::raw_pointer_cast(device_query_rows.data()),
+                        k_pipeline_buckets
+                    );
+                    CUDDL_CUDA_CALL(cudaGetLastError());
+                    timer.stop();
+                } else if (stage == "database_build") {
+                    timer.start();
+                    auto measured = pipeline_database::build_async(
+                        device_reference_rows, compatibility, stream
+                    );
+                    timer.stop();
+                    auto measured_database = pipeline_unwrap(std::move(measured));
+                    do_not_optimise(measured_database);
+                } else if (stage == "index_build") {
+                    timer.start();
+                    auto measured = pipeline_database::build_indexed_async(
+                        device_reference_rows, compatibility, stream
+                    );
+                    timer.stop();
+                    auto measured_database = pipeline_unwrap(std::move(measured));
+                    do_not_optimise(measured_database);
+                } else if (stage == "search_exhaustive") {
+                    timer.start();
+                    pipeline_check(database.ref().search_async(
+                        query_span, compatibility, {}, exhaustive_span, stream
+                    ));
+                    timer.stop();
+                } else if (stage == "search_indexed") {
+                    timer.start();
+                    pipeline_check(database.ref().search_indexed_async(
+                        query_span,
+                        compatibility,
+                        workspace_span,
+                        indexed_span,
+                        count_span,
+                        {.minimum_matches = options.minimum_matches},
+                        stream
+                    ));
+                    timer.stop();
+                } else {
+                    throw pipeline_failure("unknown pipeline timing stage: " + stage);
+                }
+                }
+            );
+        }
+    );
+    timing_statistics.update(gpu_statistics);
+    sample_device();
+
+    auto const candidate_count = count_host.front();
+    bool agreement = true;
+    json matches = json::array();
+    for (uint32_t candidate = 0U; candidate < candidate_count; ++candidate) {
+        auto const indexed = indexed_host[candidate];
+        auto const exhaustive = exhaustive_host[indexed.reference_id];
+        if (!(indexed.summary == exhaustive.summary)) {
+            agreement = false;
+        }
+        matches.push_back({
+            {"implementation", {{"name", "cuddl"}, {"revision", pipeline_revision()}}},
+            {"case", {{"measurement", "match"}, {"reference_id", indexed.reference_id}}},
+            {"metrics",
+             {
+                 {"exhaustive_lower", exhaustive.summary.counts.lower},
+                 {"exhaustive_equal", exhaustive.summary.counts.equal},
+                 {"exhaustive_higher", exhaustive.summary.counts.higher},
+                 {"exhaustive_both_empty", exhaustive.summary.counts.both_empty},
+                 {"indexed_lower", indexed.summary.counts.lower},
+                 {"indexed_equal", indexed.summary.counts.equal},
+                 {"indexed_higher", indexed.summary.counts.higher},
+                 {"indexed_both_empty", indexed.summary.counts.both_empty},
+             }},
+        });
+    }
+
+    uint64_t posting_visits = 0;
+    for (auto const& result : exhaustive_host) {
+        posting_visits += result.summary.counts.equal;
+    }
+
+    json measurements = json::array({
+        {
+            {"implementation", {{"name", "cuddl"}, {"revision", pipeline_revision()}}},
+            {"case",
+             {
+                 {"measurement", "pipeline"},
+                 {"k", k_pipeline_k},
+                 {"buckets", k_pipeline_buckets},
+                 {"exponent_bits", compatibility.exponent_bits},
+                 {"mantissa_bits", compatibility.mantissa_bits},
+                 {"hash_identity", compatibility.hash_identity},
+                 {"hash_seed", compatibility.hash_seed},
+                 {"canonicalisation_policy", compatibility.canonicalisation_policy},
+                 {"minimum_matches", options.minimum_matches},
+                 {"references", 1U},
+                 {"queries", 1U},
+                 {"reference_kmers", reference_kmers.valid_kmers},
+                 {"query_kmers", query_kmers.valid_kmers},
+                 {"reference_bases", reference_kmers.bases},
+                 {"query_bases", query_kmers.bases},
+                 {"reference_invalid_windows", reference_kmers.invalid_windows},
+                 {"query_invalid_windows", query_kmers.invalid_windows},
+                 {"warmup_runs", k_pipeline_warmup_runs},
+                 {"target_samples", k_pipeline_samples},
+             }},
+            {"metrics",
+             {
+                 {"posting_visits", posting_visits},
+                 {"candidates", candidate_count},
+                 {"indexed_vs_exhaustive", agreement},
+                 {"checked_candidates", candidate_count},
+             }},
+            {"timings", timing_statistics},
+            {"memory_bytes", {{"host_peak", host_peak}, {"device_peak", device_peak}}},
+        },
+    });
+    for (auto& match : matches) {
+        measurements.push_back(std::move(match));
+    }
+
+    return make_benchmark_result(
+        benchmark_name,
+        "indexed_search",
+        "end_to_end",
+        std::move(measurements),
+        {
+            {"reference", {{"path", options.reference}, {"sha256", checksum_reference}}},
+            {"query", {{"path", options.query}, {"sha256", checksum_query}}},
+        }
+    );
+}
 
 void compact_exhaustive_search(nvbench::state& state) {
     auto const reference_count = static_cast<size_t>(state.get_int64("References"));
@@ -1139,6 +1633,8 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
     add_value(state, "Median Throughput", static_cast<double>(total_pairs) / median);
 }
 
+}  // namespace
+
 NVBENCH_BENCH(compact_exhaustive_search)
     .add_int64_power_of_two_axis("References", reference_powers);
 NVBENCH_BENCH(compact_exhaustive_launch_shape)
@@ -1161,3 +1657,76 @@ NVBENCH_BENCH(compact_indexed_search)
 NVBENCH_BENCH(compact_indexed_zero_threshold_search)
     .add_int64_power_of_two_axis("References", indexed_reference_powers);
 NVBENCH_BENCH(compact_batch_and_all_to_all_search);
+
+/// @brief Intercepts FASTA pipeline options; the rest reaches nvbench.
+int main(int argc, char** argv) try {
+    ::pipeline_options options;
+    bool pipeline_mode = false;
+    std::vector<char*> remaining{argv[0]};
+    for (int argument = 1; argument < argc; ++argument) {
+        std::string_view const value = argv[argument];
+        auto const split = value.find('=');
+        auto const name = value.substr(0U, split);
+        if (name == "--name" || name == "--reference" || name == "--query" ||
+            name == "--output" || name == "--minimum-matches") {
+            std::string_view take = value.substr(split + 1U);
+            if (split == std::string_view::npos) {
+                if (argument + 1 >= argc) {
+                    throw pipeline_failure(std::string(name) + " needs a value");
+                }
+                take = argv[++argument];
+            }
+            if (name == "--minimum-matches") {
+                options.minimum_matches =
+                    static_cast<uint32_t>(std::stoul(std::string(take)));
+            } else if (name == "--name") {
+                options.name = take;
+            } else if (name == "--reference") {
+                options.reference = take;
+            } else if (name == "--query") {
+                options.query = take;
+            } else {
+                options.output = take;
+            }
+            pipeline_mode = true;
+            continue;
+        }
+        remaining.push_back(argv[argument]);
+    }
+
+    if (!pipeline_mode) {
+        nvbench::detail::main_initialize(argc, argv);
+        {
+            auto args = nvbench::detail::main_convert_args(
+                static_cast<int>(remaining.size()), remaining.data()
+            );
+            nvbench::option_parser parser;
+            parser.parse(args);
+            nvbench::detail::main_print_preamble(parser);
+            nvbench::detail::main_run_benchmarks(parser);
+            nvbench::detail::main_print_epilogue(parser);
+            nvbench::detail::main_print_results(parser);
+        }
+        nvbench::detail::main_finalize();
+        return 0;
+    }
+
+    if (options.reference.empty() || options.query.empty()) {
+        throw pipeline_failure("--reference and --query both need a FASTA path");
+    }
+    auto const report = ::run_pipeline(options);
+    auto const text = report.dump(2);
+    if (options.output.empty()) {
+        std::cout << text << '\n';
+    } else {
+        std::ofstream target(options.output);
+        if (!target) {
+            throw pipeline_failure("cannot write " + options.output);
+        }
+        target << text << '\n';
+    }
+    return 0;
+} catch (std::exception& error) {
+    std::cerr << "\ncuddl-compact-search error: " << error.what() << "\n";
+    return 1;
+}

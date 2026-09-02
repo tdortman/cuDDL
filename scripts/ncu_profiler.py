@@ -1,7 +1,12 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pandas", "typer"]
+# ///
+
 import io
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import typer
@@ -42,7 +47,7 @@ def run_ncu_profile(
     capacity_exponent: int,
     load_factor: float,
     metrics: list[str],
-) -> Optional[dict[str, float]]:
+) -> dict[str, float] | None:
     """
     Run ncu profiling for a specific configuration and return requested metrics.
 
@@ -123,7 +128,7 @@ def run_ncu_profile(
                 on_bad_lines="skip",
                 skiprows=[1],  # Skip the units row (2nd row)
             )
-        except Exception as e:
+        except (pd.errors.ParserError, ValueError) as e:
             typer.secho(
                 f"Failed to parse CSV: {e}",
                 fg=typer.colors.RED,
@@ -193,13 +198,6 @@ def run_ncu_profile(
     except subprocess.CalledProcessError as e:
         typer.secho(
             f"NCU profiling failed: {e.stderr[:200]}",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        return None
-    except Exception as e:
-        typer.secho(
-            f"Error: {e}",
             fg=typer.colors.RED,
             err=True,
         )

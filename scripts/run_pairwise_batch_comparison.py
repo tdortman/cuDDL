@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["typer"]
+# dependencies = ["jsonschema", "typer"]
 # ///
-"""Run cuDDL and BBTools batch comparisons into one normalized CSV."""
+"""Run cuDDL and BBTools batch comparisons into one normalized JSON result."""
 
 import csv
 import io
@@ -12,9 +12,10 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
+from benchmark_schema import make_result, measurements_from_rows, write_result
 
 ROOT = Path(__file__).resolve().parent.parent
 NVBENCH_MODES = {
@@ -27,18 +28,30 @@ BBTOOLS_MODES = {
     "bbtools_sequential": "sequential",
     "bbtools_parallel": "parallel",
 }
-FIELDS = (
-    "implementation",
-    "mode",
-    "batch",
-    "threads",
-    "trial",
-    "samples",
-    "iterations",
-    "seconds_per_batch",
-    "comparisons_per_second",
-    "device",
-)
+SYSTEM_FIELDS = {
+    "System OS": "os",
+    "System Kernel": "kernel",
+    "System Architecture": "architecture",
+    "System CPU": "cpu",
+    "System Logical CPU Count": "logical_cpu_count",
+    "System RAM Bytes": "ram_bytes",
+    "Device Name": "gpu",
+    "Compute Capability": "compute_capability",
+    "SM Count": "sm_count",
+    "GPU RAM Bytes": "gpu_ram_bytes",
+    "CUDA Runtime Version": "cuda_runtime_version",
+    "CUDA Driver Version": "cuda_driver_version",
+    "CUDA Compile Version": "cuda_compile_version",
+}
+SYSTEM_INTEGER_FIELDS = {
+    "logical_cpu_count",
+    "ram_bytes",
+    "sm_count",
+    "gpu_ram_bytes",
+    "cuda_runtime_version",
+    "cuda_driver_version",
+    "cuda_compile_version",
+}
 
 
 def available_cpus() -> int:
@@ -65,34 +78,43 @@ def run(
     )
 
 
-def read_nvbench(path: Path) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+def read_nvbench(path: Path) -> tuple[list[dict[str, object]], dict[str, int | str]]:
+    rows: list[dict[str, object]] = []
+    systems: set[tuple[str, ...]] = set()
     with path.open(newline="") as stream:
         for source in csv.DictReader(stream):
             mode = NVBENCH_MODES.get(source["Benchmark"])
             if mode is None or source["Skipped"] != "No":
                 continue
+            systems.add(tuple(source[field] for field in SYSTEM_FIELDS))
             batch = int(source["Batch"])
             seconds = float(source["GPU Time (sec)"])
             rows.append(
                 {
                     "implementation": "cuddl",
                     "mode": mode,
-                    "batch": str(batch),
-                    "threads": "0",
-                    "trial": "",
-                    "samples": source["Samples"],
-                    "iterations": "",
-                    "seconds_per_batch": f"{seconds:.17g}",
-                    "comparisons_per_second": f"{batch / seconds:.17g}",
+                    "batch": batch,
+                    "threads": 0,
+                    "trial": None,
+                    "samples": int(source["Samples"]),
+                    "iterations": None,
+                    "seconds_per_batch": seconds,
+                    "comparisons_per_second": batch / seconds,
                     "device": source["Device Name"],
                 }
             )
-    return rows
+    if len(systems) != 1:
+        raise RuntimeError("NVBench rows do not describe exactly one system")
+    values = next(iter(systems))
+    system = {
+        output: int(value) if output in SYSTEM_INTEGER_FIELDS else value
+        for output, value in zip(SYSTEM_FIELDS.values(), values, strict=True)
+    }
+    return rows, system
 
 
-def read_bbtools(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+def read_bbtools(text: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
     for source in csv.DictReader(io.StringIO(text)):
         mode = BBTOOLS_MODES.get(source["implementation"])
         if mode is None:
@@ -101,14 +123,14 @@ def read_bbtools(text: str) -> list[dict[str, str]]:
             {
                 "implementation": "bbtools",
                 "mode": mode,
-                "batch": source["batch"],
-                "threads": source["threads"],
-                "trial": source["trial"],
-                "samples": "",
-                "iterations": source["iterations"],
-                "seconds_per_batch": source["seconds_per_batch"],
-                "comparisons_per_second": source["comparisons_per_second"],
-                "device": "",
+                "batch": int(source["batch"]),
+                "threads": int(source["threads"]),
+                "trial": int(source["trial"]),
+                "samples": None,
+                "iterations": int(source["iterations"]),
+                "seconds_per_batch": float(source["seconds_per_batch"]),
+                "comparisons_per_second": float(source["comparisons_per_second"]),
+                "device": None,
             }
         )
     return rows
@@ -116,8 +138,8 @@ def read_bbtools(text: str) -> list[dict[str, str]]:
 
 def main(
     output: Annotated[
-        Path, typer.Option(dir_okay=False, help="Normalized combined CSV output")
-    ] = Path("results/pairwise-batch-comparison.csv"),
+        Path, typer.Option(dir_okay=False, help="Normalized combined JSON output")
+    ] = Path("results/pairwise-batch-comparison.json"),
     build_dir: Annotated[
         Path, typer.Option(file_okay=False, help="Configured Meson build directory")
     ] = Path("build"),
@@ -138,7 +160,7 @@ def main(
         int, typer.Option(min=1, help="Maximum JVM heap in GiB")
     ] = 8,
 ) -> None:
-    """Build and run both implementations, then publish one CSV."""
+    """Build and run both implementations, then publish one JSON result."""
     build_dir = project_path(build_dir)
     bbtools_jar = project_path(bbtools_jar)
     output = project_path(output)
@@ -196,7 +218,8 @@ def main(
             ],
             capture=True,
         )
-        rows = read_nvbench(nvbench_csv) + read_bbtools(java.stdout)
+        cuddl_rows, system = read_nvbench(nvbench_csv)
+        rows = cuddl_rows + read_bbtools(java.stdout)
 
     expected = len(NVBENCH_MODES) + len(BBTOOLS_MODES)
     if len({(row["implementation"], row["mode"]) for row in rows}) != expected:
@@ -205,18 +228,22 @@ def main(
         key=lambda row: (
             row["implementation"],
             row["mode"],
-            int(row["batch"]),
-            int(row["trial"] or -1),
+            cast(int, row["batch"]),
+            cast(int | None, row["trial"]) or -1,
         )
     )
-    with tempfile.NamedTemporaryFile(
-        "w", newline="", dir=output.parent, prefix=output.name, delete=False
-    ) as stream:
-        temporary_output = Path(stream.name)
-        writer = csv.DictWriter(stream, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-    temporary_output.replace(output)
+    result = make_result(
+        name="Pairwise batch comparison",
+        operation="pairwise_batch",
+        scope="end_to_end",
+        system=system,
+        measurements=measurements_from_rows(
+            rows,
+            case_fields=("mode", "batch", "threads", "trial"),
+            omit_fields=("device",),
+        ),
+    )
+    write_result(output, result)
     typer.echo(f"Saved {len(rows)} rows to {output}")
 
 
