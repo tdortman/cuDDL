@@ -1,13 +1,17 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <thrust/device_vector.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/memory.h>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_sort.cuh>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_transform.cuh>
+#include <cuda/algorithm>
+#include <cuda/buffer>
+#include <cuda/iterator>
+#include <cuda/memory_pool>
 #include <cuda/std/cstdint>
-#include <cuda/stream_ref>
+#include <cuda/std/functional>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <limits>
@@ -22,6 +26,9 @@
 #include <cuddl/pairwise_counts.cuh>
 
 namespace cuddl {
+
+/// @brief Dense offsets favor query latency; sparse sorted keys reduce index memory and build time.
+enum class index_storage { dense, sparse };
 
 /// @brief Construction parameters shared by compatible compact and packed rows.
 struct score_compatibility {
@@ -108,6 +115,27 @@ struct indexed_search_options {
 };
 
 namespace detail {
+
+struct sparse_index_key {
+    uint16_t mask;
+    template <typename Row>
+    __host__ __device__ uint16_t operator()(Row row) const noexcept {
+        auto const score = reference_score(row);
+        return score == 0U || mask == 0xffffU ? score : static_cast<uint16_t>((score & mask) + 1U);
+    }
+};
+struct sparse_reference_id {
+    uint32_t reference_count;
+    __host__ __device__ uint32_t operator()(uint32_t i) const noexcept {
+        return i % reference_count;
+    }
+};
+struct sparse_segment_offset {
+    uint32_t reference_count;
+    __host__ __device__ int64_t operator()(uint32_t bucket) const noexcept {
+        return static_cast<int64_t>(bucket) * reference_count;
+    }
+};
 
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 [[nodiscard]] inline Result<void> validate_score_compatibility(
@@ -236,12 +264,14 @@ class reference_database_view {
         reference_database_metadata metadata,
         device_span<uint32_t const> index_offsets = {},
         device_span<uint32_t const> index_postings = {},
-        bool indexed = false
+        bool indexed = false,
+        device_span<uint16_t const> index_keys = {}
     ) noexcept
         : rows_(rows),
           metadata_(metadata),
           index_offsets_(index_offsets),
           index_postings_(index_postings),
+          index_keys_(index_keys),
           indexed_(indexed) {}
 
     __host__ __device__ constexpr reference_database_view(
@@ -250,13 +280,15 @@ class reference_database_view {
         reference_database_metadata metadata,
         device_span<uint32_t const> index_offsets = {},
         device_span<uint32_t const> index_postings = {},
-        bool indexed = false
+        bool indexed = false,
+        device_span<uint16_t const> index_keys = {}
     ) noexcept
         : packed_rows_(packed_rows),
           saturation_states_(saturation_states),
           metadata_(metadata),
           index_offsets_(index_offsets),
           index_postings_(index_postings),
+          index_keys_(index_keys),
           packed_(true),
           indexed_(indexed) {}
 
@@ -310,7 +342,8 @@ class reference_database_view {
     }
 
     [[nodiscard]] constexpr size_t persistent_index_bytes() const noexcept {
-        return index_offsets_.size_bytes() + index_postings_.size_bytes();
+        return index_offsets_.size_bytes() + index_postings_.size_bytes() +
+               index_keys_.size_bytes();
     }
 
     [[nodiscard]] static constexpr size_t single_query_workspace_bytes(uint32_t) noexcept {
@@ -332,14 +365,16 @@ class reference_database_view {
     }
 
     /// @brief Caller-owned bytes required by one positive-threshold indexed query.
-    [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes() const {
+    [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes(
+        cuda::stream_ref stream
+    ) const {
         CUDDL_TRY(validate_index_storage());
         if (metadata_.reference_count == 0U) {
             return size_t{0};
         }
 
         size_t selection_bytes = 0;
-        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        auto const ids = cuda::make_counting_iterator(uint32_t{0});
         auto const selection = cuda_try(
             cub::DeviceSelect::If(
                 nullptr,
@@ -348,7 +383,8 @@ class reference_database_view {
                 static_cast<uint32_t*>(nullptr),
                 static_cast<uint32_t*>(nullptr),
                 static_cast<int64_t>(metadata_.reference_count),
-                detail::minimum_match_predicate{nullptr, 1U}
+                detail::minimum_match_predicate{nullptr, 1U},
+                stream.get()
             )
         );
         if (!selection) {
@@ -365,30 +401,32 @@ class reference_database_view {
     }
 
     /// @brief Storage reused while exhaustively searching @p query_count compact rows.
-    [[nodiscard]] Result<cuddl::batch_search_requirements> batch_search_requirements(
-        uint32_t query_count
-    ) const {
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
         auto const pair_count = CUDDL_TRY(dense_batch_pair_count(
             detail::batch_query_tile_size(metadata_.reference_count, query_count)
         ));
-        return make_batch_requirements(pair_count, pair_count, false);
+        return make_batch_requirements(pair_count, pair_count, false, stream);
     }
 
     /// @brief Storage reused while searching @p query_count compact rows through the index.
-    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
-        uint32_t query_count
-    ) const {
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    indexed_batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
         CUDDL_TRY(validate_index_storage());
         auto const pair_count = CUDDL_TRY(dense_batch_pair_count(
             detail::batch_query_tile_size(metadata_.reference_count, query_count)
         ));
-        return make_batch_requirements(pair_count, pair_count, true);
+        return make_batch_requirements(pair_count, pair_count, true, stream);
     }
 
     /// @brief Storage reused while exhaustively searching every unique database-row pair.
-    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements() const {
+    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements(
+        cuda::stream_ref stream
+    ) const {
         return all_to_all_tile_search_requirements(
-            0U, detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count)
+            0U,
+            detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count),
+            stream
         );
     }
 
@@ -405,10 +443,13 @@ class reference_database_view {
     }
 
     /// @brief Storage reused while searching every unique database-row pair through the index.
-    [[nodiscard]] Result<cuddl::batch_search_requirements>
-    indexed_all_to_all_search_requirements() const {
+    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_all_to_all_search_requirements(
+        cuda::stream_ref stream
+    ) const {
         return indexed_all_to_all_tile_search_requirements(
-            0U, detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count)
+            0U,
+            detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count),
+            stream
         );
     }
 
@@ -418,7 +459,7 @@ class reference_database_view {
         score_compatibility const& query_compatibility,
         device_span<uint8_t> workspace,
         device_span<result_type> results,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const {
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (!rows_match_metadata(expected_scores)) {
@@ -529,8 +570,8 @@ class reference_database_view {
         device_span<uint8_t> workspace,
         device_span<result_type> results,
         device_span<uint32_t> result_count,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (!rows_match_metadata(expected_scores)) {
@@ -566,17 +607,13 @@ class reference_database_view {
 
         if (options.minimum_matches == 0U) {
             CUDDL_TRY(search_async(query, query_compatibility, {}, results, stream));
-            detail::write_result_count_kernel<<<1, 1, 0, stream.get()>>>(
-                metadata_.reference_count, result_count.data()
-            );
-            return cuda_try(cudaGetLastError());
+            return write_batch_result_count(metadata_.reference_count, result_count, stream);
         }
         if (metadata_.reference_count == 0U) {
-            detail::write_result_count_kernel<<<1, 1, 0, stream.get()>>>(0U, result_count.data());
-            return cuda_try(cudaGetLastError());
+            return write_batch_result_count(0U, result_count, stream);
         }
 
-        auto const required_workspace = CUDDL_TRY(indexed_single_query_workspace_bytes());
+        auto const required_workspace = CUDDL_TRY(indexed_single_query_workspace_bytes(stream));
         if (workspace.size_bytes() < required_workspace) {
             return Err(Error::resource("indexed single-query workspace is too small"));
         }
@@ -602,12 +639,13 @@ class reference_database_view {
         auto* selection_workspace = reinterpret_cast<void*>(address);
         auto selection_bytes = static_cast<size_t>(workspace_end - address);
 
-        CUDDL_CUDA_TRY(cudaMemsetAsync(
-            match_counts,
-            0,
-            static_cast<size_t>(metadata_.reference_count) * sizeof(uint32_t),
-            stream.get()
-        ));
+        CUDDL_CUDA_TRY(
+            cuda::fill_bytes(
+                stream,
+                cuda::std::span{match_counts, static_cast<size_t>(metadata_.reference_count)},
+                0
+            )
+        );
         auto const indexed_bucket_count = metadata_.compatibility.indexed_bucket_count;
         constexpr uint32_t warp_width = 32;
         constexpr uint32_t warps_per_block = detail::block_size / warp_width;
@@ -620,11 +658,13 @@ class reference_database_view {
                 index_postings_.data(),
                 indexed_bucket_count,
                 metadata_.compatibility.key_mask,
-                match_counts
+                match_counts,
+                index_keys_.data(),
+                metadata_.reference_count
             );
         CUDDL_CUDA_TRY(cudaGetLastError());
 
-        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        auto const ids = cuda::make_counting_iterator(uint32_t{0});
         CUDDL_CUDA_TRY(
             cub::DeviceSelect::If(
                 selection_workspace,
@@ -675,13 +715,13 @@ class reference_database_view {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
     ) const {
         static_cast<void>(workspace);
         auto const query_count =
             CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
-        auto const requirements = CUDDL_TRY(batch_search_requirements(query_count));
+        auto const requirements = CUDDL_TRY(batch_search_requirements(query_count, stream));
         CUDDL_TRY(
             validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
         );
@@ -696,7 +736,8 @@ class reference_database_view {
             auto const tile_requirements = CUDDL_TRY(make_batch_requirements(
                 CUDDL_TRY(dense_batch_pair_count(tile_query_count)),
                 CUDDL_TRY(dense_batch_pair_count(tile_query_count)),
-                false
+                false,
+                stream
             ));
             if (packed_) {
                 CUDDL_TRY(
@@ -750,13 +791,13 @@ class reference_database_view {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         auto const query_count =
             CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
-        auto const requirements = CUDDL_TRY(indexed_batch_search_requirements(query_count));
+        auto const requirements = CUDDL_TRY(indexed_batch_search_requirements(query_count, stream));
         CUDDL_TRY(validate_indexed_batch_inputs(
             requirements, workspace, results, result_count, result_match_counts, options
         ));
@@ -771,7 +812,8 @@ class reference_database_view {
             auto const tile_requirements = CUDDL_TRY(make_batch_requirements(
                 CUDDL_TRY(dense_batch_pair_count(tile_query_count)),
                 CUDDL_TRY(dense_batch_pair_count(tile_query_count)),
-                true
+                true,
+                stream
             ));
             if (packed_) {
                 CUDDL_TRY(
@@ -826,8 +868,8 @@ class reference_database_view {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
     ) const {
         auto const tile_size =
             detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count);
@@ -839,7 +881,7 @@ class reference_database_view {
             auto const query_count =
                 std::min(tile_size, metadata_.reference_count - first_query_id);
             auto const requirements =
-                CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count));
+                CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count, stream));
             CUDDL_TRY(search_all_to_all_tile_async(
                 first_query_id,
                 query_count,
@@ -868,9 +910,9 @@ class reference_database_view {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         auto const tile_size =
             detail::batch_query_tile_size(metadata_.reference_count, metadata_.reference_count);
@@ -881,8 +923,9 @@ class reference_database_view {
              first_query_id += tile_size) {
             auto const query_count =
                 std::min(tile_size, metadata_.reference_count - first_query_id);
-            auto const requirements =
-                CUDDL_TRY(indexed_all_to_all_tile_search_requirements(first_query_id, query_count));
+            auto const requirements = CUDDL_TRY(
+                indexed_all_to_all_tile_search_requirements(first_query_id, query_count, stream)
+            );
             CUDDL_TRY(search_all_to_all_indexed_tile_async(
                 first_query_id,
                 query_count,
@@ -899,22 +942,26 @@ class reference_database_view {
     }
 
    private:
-    [[nodiscard]] Result<cuddl::batch_search_requirements>
-    all_to_all_tile_search_requirements(uint32_t first_query_id, uint32_t query_count) const {
+    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_tile_search_requirements(
+        uint32_t first_query_id,
+        uint32_t query_count,
+        cuda::stream_ref stream
+    ) const {
         auto const pair_count = CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
-        return make_batch_requirements(0U, pair_count, false);
+        return make_batch_requirements(0U, pair_count, false, stream);
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     indexed_all_to_all_tile_search_requirements(
         uint32_t first_query_id,
-        uint32_t query_count
+        uint32_t query_count,
+        cuda::stream_ref stream
     ) const {
         CUDDL_TRY(validate_index_storage());
         auto const dense_pair_count = CUDDL_TRY(dense_batch_pair_count(query_count));
         auto const result_pair_count =
             CUDDL_TRY(all_to_all_pair_count(first_query_id, query_count));
-        return make_batch_requirements(dense_pair_count, result_pair_count, true);
+        return make_batch_requirements(dense_pair_count, result_pair_count, true, stream);
     }
 
     [[nodiscard]] Result<void> search_all_to_all_tile_async(
@@ -929,7 +976,7 @@ class reference_database_view {
         static_cast<void>(workspace);
         CUDDL_TRY(validate_stored_rows());
         auto const requirements =
-            CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count));
+            CUDDL_TRY(all_to_all_tile_search_requirements(first_query_id, query_count, stream));
         CUDDL_TRY(
             validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
         );
@@ -975,8 +1022,9 @@ class reference_database_view {
         cuda::stream_ref stream
     ) const {
         CUDDL_TRY(validate_stored_rows());
-        auto const requirements =
-            CUDDL_TRY(indexed_all_to_all_tile_search_requirements(first_query_id, query_count));
+        auto const requirements = CUDDL_TRY(
+            indexed_all_to_all_tile_search_requirements(first_query_id, query_count, stream)
+        );
         CUDDL_TRY(validate_indexed_batch_inputs(
             requirements, workspace, results, result_count, result_match_counts, options
         ));
@@ -1031,8 +1079,14 @@ class reference_database_view {
         auto const expected_postings = static_cast<size_t>(
             detail::indexed_posting_count(metadata_.reference_count, metadata_.compatibility)
         );
-        if (!indexed_ || index_offsets_.size() != static_cast<size_t>(cell_count + 1U) ||
-            index_offsets_.data() == nullptr || index_postings_.size() != expected_postings ||
+        auto const sparse = index_offsets_.empty();
+        auto const valid_keys =
+            sparse ? index_keys_.size() == expected_postings &&
+                         (expected_postings == 0U || index_keys_.data() != nullptr)
+                   : index_keys_.empty() &&
+                         index_offsets_.size() == static_cast<size_t>(cell_count + 1U) &&
+                         index_offsets_.data() != nullptr;
+        if (!indexed_ || !valid_keys || index_postings_.size() != expected_postings ||
             (expected_postings != 0U && index_postings_.data() == nullptr)) {
             return Err(Error::invalid_argument("database has no valid retrieval index"));
         }
@@ -1075,7 +1129,8 @@ class reference_database_view {
     [[nodiscard]] Result<cuddl::batch_search_requirements> make_batch_requirements(
         uint32_t dense_pair_count,
         uint32_t maximum_pair_count,
-        bool indexed
+        bool indexed,
+        cuda::stream_ref stream
     ) const {
         cuddl::batch_search_requirements requirements{
             .maximum_pair_count = maximum_pair_count,
@@ -1091,7 +1146,7 @@ class reference_database_view {
             detail::indexed_batch_query_tile_size(metadata_.reference_count, query_count);
         auto const tile_pair_count = tile_query_count * metadata_.reference_count;
         size_t selection_bytes = 0;
-        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        auto const ids = cuda::make_counting_iterator(uint32_t{0});
         auto const selection = cuda_try(
             cub::DeviceSelect::If(
                 nullptr,
@@ -1102,7 +1157,8 @@ class reference_database_view {
                 static_cast<int64_t>(tile_pair_count),
                 detail::batch_minimum_match_predicate{
                     nullptr, 0U, metadata_.reference_count, 0U, false
-                }
+                },
+                stream.get()
             )
         );
         if (!selection) {
@@ -1224,8 +1280,15 @@ class reference_database_view {
         device_span<uint32_t> result_count,
         cuda::stream_ref stream
     ) {
-        detail::write_result_count_kernel<<<1, 1, 0, stream.get()>>>(count, result_count.data());
-        return cuda_try(cudaGetLastError());
+        return cuda_try(
+            cub::DeviceTransform::Transform(
+                cuda::make_constant_iterator(count),
+                result_count.data(),
+                1,
+                cuda::std::identity{},
+                stream
+            )
+        );
     }
 
     template <bool AllToAll, typename QueryRow, typename ReferenceRow>
@@ -1260,10 +1323,11 @@ class reference_database_view {
                 rows.data(),
                 metadata_.reference_count,
                 results.data(),
-                result_match_counts.empty() ? nullptr : result_match_counts.data()
+                result_match_counts.empty() ? nullptr : result_match_counts.data(),
+                result_count.data(),
+                pair_count
             );
-        CUDDL_CUDA_TRY(cudaGetLastError());
-        return write_batch_result_count(pair_count, result_count, stream);
+        return cuda_try(cudaGetLastError());
     }
 
     template <bool AllToAll, typename QueryRow, typename ReferenceRow>
@@ -1306,7 +1370,7 @@ class reference_database_view {
                                           ? results.size()
                                           : requirements.maximum_pair_count;
         auto const capacity = static_cast<uint32_t>(written_capacity);
-        auto const ids = thrust::make_counting_iterator(uint32_t{0});
+        auto const ids = cuda::make_counting_iterator(uint32_t{0});
         auto const launch_tiles = [&](bool refine,
                                       uint32_t* result_offset,
                                       uint32_t const* required_count) -> Result<void> {
@@ -1318,12 +1382,13 @@ class reference_database_view {
                 auto const tile_query_count =
                     remaining < query_tile_size ? remaining : query_tile_size;
                 auto const tile_pair_count = tile_query_count * metadata_.reference_count;
-                CUDDL_CUDA_TRY(cudaMemsetAsync(
-                    match_counts,
-                    0,
-                    static_cast<size_t>(tile_pair_count) * sizeof(uint32_t),
-                    stream.get()
-                ));
+                CUDDL_CUDA_TRY(
+                    cuda::fill_bytes(
+                        stream,
+                        cuda::std::span{match_counts, static_cast<size_t>(tile_pair_count)},
+                        0
+                    )
+                );
                 auto const query_buckets = static_cast<size_t>(tile_query_count) *
                                            metadata_.compatibility.indexed_bucket_count;
                 auto const required_bucket_blocks =
@@ -1341,7 +1406,8 @@ class reference_database_view {
                         metadata_.reference_count,
                         metadata_.compatibility.indexed_bucket_count,
                         metadata_.compatibility.key_mask,
-                        match_counts
+                        match_counts,
+                        index_keys_.data()
                     );
                 CUDDL_CUDA_TRY(cudaGetLastError());
                 CUDDL_CUDA_TRY(
@@ -1390,12 +1456,36 @@ class reference_database_view {
             return Ok();
         };
 
-        CUDDL_CUDA_TRY(cudaMemsetAsync(result_count.data(), 0, sizeof(uint32_t), stream.get()));
+        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, result_count.first(1), 0));
         if (written_capacity == requirements.maximum_pair_count) {
             return launch_tiles(true, result_count.data(), nullptr);
         }
         CUDDL_TRY(launch_tiles(false, result_count.data(), nullptr));
-        CUDDL_CUDA_TRY(cudaMemsetAsync(write_offset, 0, sizeof(uint32_t), stream.get()));
+        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, cuda::std::span{write_offset, size_t{1}}, 0));
+        if (query_count ==
+            detail::indexed_batch_query_tile_size(metadata_.reference_count, query_count)) {
+            // The first pass retained all candidates and match counts. The device-side
+            // capacity guard preserves the no-partial-output contract on overflow.
+            detail::refine_batch_index_candidates_kernel<BucketCount>
+                <<<128U, detail::block_size, 0, stream.get()>>>(
+                    queries.data(),
+                    query_row_offset,
+                    query_id_offset,
+                    rows.data(),
+                    metadata_.reference_count,
+                    match_counts,
+                    candidate_ids,
+                    tile_candidate_count,
+                    write_offset,
+                    result_count.data(),
+                    capacity,
+                    results.data(),
+                    result_match_counts.empty() ? nullptr : result_match_counts.data()
+                );
+            return cuda_try(cudaGetLastError());
+        }
+        // ponytail: batches exceeding the 200 MiB workspace replay selection; retaining
+        // every tile would require additional caller-owned storage.
         return launch_tiles(true, write_offset, result_count.data());
     }
 
@@ -1419,6 +1509,7 @@ class reference_database_view {
     reference_database_metadata metadata_;
     device_span<uint32_t const> index_offsets_;
     device_span<uint32_t const> index_postings_;
+    device_span<uint16_t const> index_keys_;
     bool packed_{};
     bool indexed_{};
 };
@@ -1429,7 +1520,8 @@ class reference_database_view {
  * @brief Move-only owner of one immutable contiguous reference database.
  *
  * Building enqueues row copies on the supplied stream. Inputs and the returned database must
- * remain alive until that stream completes.
+ * remain alive until that stream completes. The allocation stream must outlive the database.
+ * Complete work on other streams before destroying or move-assigning the database.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class reference_database {
@@ -1448,56 +1540,36 @@ class reference_database {
     reference_database& operator=(reference_database const&) = delete;
 
     reference_database(reference_database&& other) noexcept
-        : rows_(other.rows_),
-          saturation_states_(other.saturation_states_),
-          index_offsets_(other.index_offsets_),
-          index_postings_(other.index_postings_),
-          index_posting_capacity_(other.index_posting_capacity_),
-          metadata_(other.metadata_),
-          packed_(other.packed_),
-          indexed_(other.indexed_) {
-        other.rows_ = nullptr;
-        other.saturation_states_ = nullptr;
-        other.index_offsets_ = nullptr;
-        other.index_postings_ = nullptr;
-        other.index_posting_capacity_ = 0;
-        other.metadata_ = {};
-        other.packed_ = false;
-        other.indexed_ = false;
-    }
+        : rows_(std::move(other.rows_)),
+          saturation_states_(std::move(other.saturation_states_)),
+          index_offsets_(std::move(other.index_offsets_)),
+          index_postings_(std::move(other.index_postings_)),
+          index_keys_(std::move(other.index_keys_)),
+          index_posting_capacity_(std::exchange(other.index_posting_capacity_, 0)),
+          metadata_(std::exchange(other.metadata_, {})),
+          packed_(std::exchange(other.packed_, false)),
+          indexed_(std::exchange(other.indexed_, false)) {}
 
     reference_database& operator=(reference_database&& other) noexcept {
         if (this != &other) {
-            destroy();
-            rows_ = other.rows_;
-            saturation_states_ = other.saturation_states_;
-            index_offsets_ = other.index_offsets_;
-            index_postings_ = other.index_postings_;
-            index_posting_capacity_ = other.index_posting_capacity_;
-            metadata_ = other.metadata_;
-            packed_ = other.packed_;
-            indexed_ = other.indexed_;
-            other.rows_ = nullptr;
-            other.saturation_states_ = nullptr;
-            other.index_offsets_ = nullptr;
-            other.index_postings_ = nullptr;
-            other.index_posting_capacity_ = 0;
-            other.metadata_ = {};
-            other.packed_ = false;
-            other.indexed_ = false;
+            rows_ = std::move(other.rows_);
+            saturation_states_ = std::move(other.saturation_states_);
+            index_offsets_ = std::move(other.index_offsets_);
+            index_postings_ = std::move(other.index_postings_);
+            index_keys_ = std::move(other.index_keys_);
+            index_posting_capacity_ = std::exchange(other.index_posting_capacity_, 0);
+            metadata_ = std::exchange(other.metadata_, {});
+            packed_ = std::exchange(other.packed_, false);
+            indexed_ = std::exchange(other.indexed_, false);
         }
         return *this;
-    }
-
-    ~reference_database() {
-        destroy();
     }
 
     /// @brief Builds a database by copying flat row-major scores on @p stream.
     [[nodiscard]] static Result<reference_database> build_async(
         device_span<score_type const> rows,
         score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) {
         return build_rows_async(rows, {}, compatibility, stream);
     }
@@ -1507,80 +1579,30 @@ class reference_database {
         device_span<register_type const> rows,
         device_span<uint32_t const> saturation_states,
         score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) {
         return build_rows_async(rows, saturation_states, compatibility, stream);
     }
 
-    /// @brief Thrust overload for flat row-major compact device storage.
-    [[nodiscard]] static Result<reference_database> build_async(
-        thrust::device_vector<score_type> const& rows,
-        score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) {
-        return build_async(
-            {thrust::raw_pointer_cast(rows.data()), rows.size()}, compatibility, stream
-        );
-    }
-
-    /// @brief Thrust overload for packed rows and per-reference saturation states.
-    [[nodiscard]] static Result<reference_database> build_async(
-        thrust::device_vector<register_type> const& rows,
-        thrust::device_vector<uint32_t> const& saturation_states,
-        score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) {
-        return build_async(
-            {thrust::raw_pointer_cast(rows.data()), rows.size()},
-            {thrust::raw_pointer_cast(saturation_states.data()), saturation_states.size()},
-            compatibility,
-            stream
-        );
-    }
-
-    /// @brief Builds compact rows and their indexed dense-offset index.
+    /// @brief Builds compact rows and their retrieval index.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         device_span<score_type const> rows,
         score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream,
+        index_storage storage = index_storage::dense
     ) {
-        return build_indexed_rows_async(rows, {}, compatibility, stream);
+        return build_indexed_rows_async(rows, {}, compatibility, stream, storage);
     }
 
-    /// @brief Builds packed rows and their indexed winner-score dense-offset index.
+    /// @brief Builds packed rows and their winner-score retrieval index.
     [[nodiscard]] static Result<reference_database> build_indexed_async(
         device_span<register_type const> rows,
         device_span<uint32_t const> saturation_states,
         score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream,
+        index_storage storage = index_storage::dense
     ) {
-        return build_indexed_rows_async(rows, saturation_states, compatibility, stream);
-    }
-
-    /// @brief Thrust overload for indexed flat row-major compact device storage.
-    [[nodiscard]] static Result<reference_database> build_indexed_async(
-        thrust::device_vector<score_type> const& rows,
-        score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) {
-        return build_indexed_async(
-            {thrust::raw_pointer_cast(rows.data()), rows.size()}, compatibility, stream
-        );
-    }
-
-    /// @brief Thrust overload for indexed packed rows and saturation states.
-    [[nodiscard]] static Result<reference_database> build_indexed_async(
-        thrust::device_vector<register_type> const& rows,
-        thrust::device_vector<uint32_t> const& saturation_states,
-        score_compatibility compatibility,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) {
-        return build_indexed_async(
-            {thrust::raw_pointer_cast(rows.data()), rows.size()},
-            {thrust::raw_pointer_cast(saturation_states.data()), saturation_states.size()},
-            compatibility,
-            stream
-        );
+        return build_indexed_rows_async(rows, saturation_states, compatibility, stream, storage);
     }
 
     [[nodiscard]] device_span<score_type const> data() const noexcept {
@@ -1641,24 +1663,26 @@ class reference_database {
         return view().single_query_workspace_bytes();
     }
 
-    [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes() const {
-        return view().indexed_single_query_workspace_bytes();
-    }
-
-    [[nodiscard]] Result<cuddl::batch_search_requirements> batch_search_requirements(
-        uint32_t query_count
+    [[nodiscard]] Result<size_t> indexed_single_query_workspace_bytes(
+        cuda::stream_ref stream
     ) const {
-        return view().batch_search_requirements(query_count);
+        return view().indexed_single_query_workspace_bytes(stream);
     }
 
-    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_batch_search_requirements(
-        uint32_t query_count
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
+        return view().batch_search_requirements(query_count, stream);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements>
+    indexed_batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
+        return view().indexed_batch_search_requirements(query_count, stream);
+    }
+
+    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements(
+        cuda::stream_ref stream
     ) const {
-        return view().indexed_batch_search_requirements(query_count);
-    }
-
-    [[nodiscard]] Result<cuddl::batch_search_requirements> all_to_all_search_requirements() const {
-        return view().all_to_all_search_requirements();
+        return view().all_to_all_search_requirements(stream);
     }
 
     [[nodiscard]] static constexpr uint32_t all_to_all_result_capacity(
@@ -1667,9 +1691,10 @@ class reference_database {
         return view_type::all_to_all_result_capacity(reference_count);
     }
 
-    [[nodiscard]] Result<cuddl::batch_search_requirements>
-    indexed_all_to_all_search_requirements() const {
-        return view().indexed_all_to_all_search_requirements();
+    [[nodiscard]] Result<cuddl::batch_search_requirements> indexed_all_to_all_search_requirements(
+        cuda::stream_ref stream
+    ) const {
+        return view().indexed_all_to_all_search_requirements(stream);
     }
 
     [[nodiscard]] static constexpr uint32_t single_query_result_count(
@@ -1687,26 +1712,9 @@ class reference_database {
         score_compatibility const& query_compatibility,
         device_span<uint8_t> workspace,
         device_span<result_type> results,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const {
         return view().search_async(query, query_compatibility, workspace, results, stream);
-    }
-
-    /// @brief Thrust overload for caller-owned query, workspace, and result storage.
-    [[nodiscard]] Result<void> search_async(
-        thrust::device_vector<score_type> const& query,
-        score_compatibility const& query_compatibility,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<result_type>& results,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_async(
-            {thrust::raw_pointer_cast(query.data()), query.size()},
-            query_compatibility,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            stream
-        );
     }
 
     [[nodiscard]] Result<void> search_indexed_async(
@@ -1715,32 +1723,11 @@ class reference_database {
         device_span<uint8_t> workspace,
         device_span<result_type> results,
         device_span<uint32_t> result_count,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         return view().search_indexed_async(
             query, query_compatibility, workspace, results, result_count, options, stream
-        );
-    }
-
-    /// @brief Thrust overload for caller-owned indexed-query storage.
-    [[nodiscard]] Result<void> search_indexed_async(
-        thrust::device_vector<score_type> const& query,
-        score_compatibility const& query_compatibility,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_indexed_async(
-            {thrust::raw_pointer_cast(query.data()), query.size()},
-            query_compatibility,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            options,
-            stream
         );
     }
 
@@ -1753,8 +1740,8 @@ class reference_database {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
     ) const {
         return view().search_batch_async(
             queries,
@@ -1769,57 +1756,6 @@ class reference_database {
         );
     }
 
-    /// @brief Thrust overload for caller-owned exhaustive batch-search storage.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_batch_async(
-        thrust::device_vector<score_type> const& queries,
-        score_compatibility const& query_compatibility,
-        uint32_t query_id_offset,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        thrust::device_vector<uint32_t>& result_match_counts,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_batch_async(
-            {thrust::raw_pointer_cast(queries.data()), queries.size()},
-            query_compatibility,
-            query_id_offset,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
-            stream
-        );
-    }
-
-    /// @brief Thrust overload without optional match-count diagnostics.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_batch_async(
-        thrust::device_vector<score_type> const& queries,
-        score_compatibility const& query_compatibility,
-        uint32_t query_id_offset,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_batch_async(
-            {thrust::raw_pointer_cast(queries.data()), queries.size()},
-            query_compatibility,
-            query_id_offset,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {},
-            stream
-        );
-    }
-
     template <typename OnTile>
     [[nodiscard]] Result<void> search_batch_indexed_async(
         device_span<score_type const> queries,
@@ -1829,9 +1765,9 @@ class reference_database {
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         return view().search_batch_indexed_async(
             queries,
@@ -1847,69 +1783,14 @@ class reference_database {
         );
     }
 
-    /// @brief Thrust overload for caller-owned indexed batch-search storage.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_batch_indexed_async(
-        thrust::device_vector<score_type> const& queries,
-        score_compatibility const& query_compatibility,
-        uint32_t query_id_offset,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        thrust::device_vector<uint32_t>& result_match_counts,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_batch_indexed_async(
-            {thrust::raw_pointer_cast(queries.data()), queries.size()},
-            query_compatibility,
-            query_id_offset,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
-            options,
-            stream
-        );
-    }
-
-    /// @brief Thrust overload without optional match-count diagnostics.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_batch_indexed_async(
-        thrust::device_vector<score_type> const& queries,
-        score_compatibility const& query_compatibility,
-        uint32_t query_id_offset,
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_batch_indexed_async(
-            {thrust::raw_pointer_cast(queries.data()), queries.size()},
-            query_compatibility,
-            query_id_offset,
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {},
-            options,
-            stream
-        );
-    }
-
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream
     ) const {
         return view().search_all_to_all_async(
             workspace,
@@ -1921,54 +1802,15 @@ class reference_database {
         );
     }
 
-    /// @brief Thrust overload for caller-owned exhaustive all-to-all storage.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_all_to_all_async(
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        thrust::device_vector<uint32_t>& result_match_counts,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_all_to_all_async(
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
-            stream
-        );
-    }
-
-    /// @brief Thrust overload without optional match-count diagnostics.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_all_to_all_async(
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_all_to_all_async(
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {},
-            stream
-        );
-    }
-
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_indexed_async(
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_count,
         OnTile&& on_tile,
-        device_span<uint32_t> result_match_counts = {},
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        device_span<uint32_t> result_match_counts,
+        indexed_search_options options,
+        cuda::stream_ref stream
     ) const {
         return view().search_all_to_all_indexed_async(
             workspace,
@@ -1981,79 +1823,42 @@ class reference_database {
         );
     }
 
-    /// @brief Thrust overload for caller-owned indexed all-to-all storage.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        thrust::device_vector<uint32_t>& result_match_counts,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_all_to_all_indexed_async(
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {thrust::raw_pointer_cast(result_match_counts.data()), result_match_counts.size()},
-            options,
-            stream
-        );
-    }
-
-    /// @brief Thrust overload without optional match-count diagnostics.
-    template <typename OnTile>
-    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
-        thrust::device_vector<uint8_t>& workspace,
-        thrust::device_vector<batch_result_type>& results,
-        thrust::device_vector<uint32_t>& result_count,
-        OnTile&& on_tile,
-        indexed_search_options options = {},
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const {
-        return search_all_to_all_indexed_async(
-            {thrust::raw_pointer_cast(workspace.data()), workspace.size()},
-            {thrust::raw_pointer_cast(results.data()), results.size()},
-            {thrust::raw_pointer_cast(result_count.data()), result_count.size()},
-            std::forward<OnTile>(on_tile),
-            {},
-            options,
-            stream
-        );
-    }
-
    private:
     using view_type = detail::reference_database_view<K, BucketCount, Layout>;
 
     [[nodiscard]] view_type view() const noexcept {
-        auto const offset_count =
-            indexed_ ? static_cast<size_t>(detail::indexed_cell_count(metadata_.compatibility) + 1U)
-                     : 0U;
+        auto const offset_count = index_offsets_.size();
         auto const row_count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
-        auto const offsets = device_span<uint32_t const>{index_offsets_, offset_count};
-        auto const postings = device_span<uint32_t const>{index_postings_, index_posting_capacity_};
+        auto const offsets = device_span<uint32_t const>{index_offsets_.data(), offset_count};
+        auto const postings =
+            device_span<uint32_t const>{index_postings_.data(), index_posting_capacity_};
         if (packed_) {
             return view_type(
-                {static_cast<register_type const*>(rows_), row_count},
-                {saturation_states_, metadata_.reference_count},
+                {reinterpret_cast<register_type const*>(rows_.data()), row_count},
+                {saturation_states_.data(), metadata_.reference_count},
                 metadata_,
                 offsets,
                 postings,
-                indexed_
+                indexed_,
+                index_keys_
             );
         }
         return view_type(
-            {static_cast<score_type const*>(rows_), row_count},
+            {reinterpret_cast<score_type const*>(rows_.data()), row_count},
             metadata_,
             offsets,
             postings,
-            indexed_
+            indexed_,
+            index_keys_
         );
     }
 
-    reference_database() = default;
+    explicit reference_database(cuda::stream_ref stream)
+        : rows_(stream, cuda::device_default_memory_pool(stream.device())),
+          saturation_states_(stream, cuda::device_default_memory_pool(stream.device())),
+          index_offsets_(stream, cuda::device_default_memory_pool(stream.device())),
+          index_postings_(stream, cuda::device_default_memory_pool(stream.device())),
+          index_keys_(stream, cuda::device_default_memory_pool(stream.device())) {}
 
     template <typename Row>
     [[nodiscard]] static Result<uint32_t> validate_rows(
@@ -2113,45 +1918,20 @@ class reference_database {
         uint32_t reference_count,
         cuda::stream_ref stream
     ) {
-        reference_database database;
-        database.metadata_ = {
-            .compatibility = compatibility,
-            .reference_count = reference_count,
-        };
+        auto database = CUDDL_CUDA_TRY(reference_database(stream));
+        database.metadata_ = {.compatibility = compatibility, .reference_count = reference_count};
         database.packed_ = std::is_same_v<Row, register_type>;
-        if (rows.empty()) {
-            return Result<reference_database>::ok(std::move(database));
-        }
-        if (auto const allocation = cuda_try(cudaMalloc(&database.rows_, rows.size_bytes()));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        if (auto const copy = cuda_try(cudaMemcpyAsync(
-                database.rows_,
-                rows.data(),
-                rows.size_bytes(),
-                cudaMemcpyDeviceToDevice,
-                stream.get()
-            ));
-            !copy) {
-            return Err(copy.error());
-        }
-        if constexpr (std::is_same_v<Row, register_type>) {
-            if (auto const allocation = cuda_try(
-                    cudaMalloc(&database.saturation_states_, saturation_states.size_bytes())
+        if (!rows.empty()) {
+            database.rows_ = CUDDL_CUDA_TRY(
+                cuda::make_device_buffer<uint8_t>(
+                    stream, stream.device(), rows.size_bytes(), cuda::no_init
+                )
+            );
+            CUDDL_CUDA_TRY(cuda::copy_bytes(stream, rows, database.rows_));
+            if constexpr (std::is_same_v<Row, register_type>) {
+                database.saturation_states_ = CUDDL_CUDA_TRY(
+                    cuda::make_device_buffer<uint32_t>(stream, stream.device(), saturation_states)
                 );
-                !allocation) {
-                return Err(allocation.error());
-            }
-            if (auto const copy = cuda_try(cudaMemcpyAsync(
-                    database.saturation_states_,
-                    saturation_states.data(),
-                    saturation_states.size_bytes(),
-                    cudaMemcpyDeviceToDevice,
-                    stream.get()
-                ));
-                !copy) {
-                return Err(copy.error());
             }
         }
         return Result<reference_database>::ok(std::move(database));
@@ -2176,8 +1956,12 @@ class reference_database {
         device_span<Row const> rows,
         device_span<uint32_t const> saturation_states,
         score_compatibility compatibility,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        index_storage storage
     ) {
+        if (storage != index_storage::dense && storage != index_storage::sparse) {
+            return Err(Error::invalid_argument("unsupported index storage"));
+        }
         auto const validated = validate_rows(rows, saturation_states, compatibility, true);
         if (!validated) {
             return Err(validated.error());
@@ -2201,62 +1985,27 @@ class reference_database {
             return Err(built.error());
         }
         auto database = std::move(*built);
-        auto const offset_bytes = static_cast<size_t>(offset_count) * sizeof(uint32_t);
-        if (auto const allocation = cuda_try(cudaMalloc(&database.index_offsets_, offset_bytes));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        if (rows.empty()) {
-            CUDDL_CUDA_TRY(cudaMemsetAsync(database.index_offsets_, 0, offset_bytes, stream.get()));
+        if (storage == index_storage::sparse) {
+            CUDDL_TRY(database.template build_sparse_index<Row>(compatibility, *validated, stream));
             database.indexed_ = true;
             return Result<reference_database>::ok(std::move(database));
         }
-
-        auto const posting_bytes = static_cast<size_t>(posting_capacity) * sizeof(uint32_t);
-        if (auto const allocation = cuda_try(cudaMalloc(&database.index_postings_, posting_bytes));
-            !allocation) {
-            return Err(allocation.error());
+        database.index_offsets_ = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), static_cast<size_t>(offset_count), cuda::no_init
+            )
+        );
+        if (rows.empty()) {
+            CUDDL_CUDA_TRY(cuda::fill_bytes(stream, database.index_offsets_, 0));
+            database.indexed_ = true;
+            return Result<reference_database>::ok(std::move(database));
         }
+        database.index_postings_ = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), static_cast<size_t>(posting_capacity), cuda::no_init
+            )
+        );
         database.index_posting_capacity_ = static_cast<size_t>(posting_capacity);
-
-        size_t scan_bytes = 0;
-        if (auto const query = cuda_try(
-                cub::DeviceScan::ExclusiveSum(
-                    nullptr,
-                    scan_bytes,
-                    database.index_offsets_,
-                    static_cast<int64_t>(cell_count + 1U),
-                    stream.get()
-                )
-            );
-            !query) {
-            return Err(query.error());
-        }
-        auto const scratch_bytes =
-            detail::align_up(static_cast<uintptr_t>(scan_bytes), alignof(uint8_t));
-        uint8_t* scratch = nullptr;
-        if (auto const allocation =
-                cuda_try(cudaMallocAsync(&scratch, scratch_bytes, stream.get()));
-            !allocation) {
-            return Err(allocation.error());
-        }
-        Row* transposed = nullptr;
-        auto fail = [&](Error const& error) -> Result<reference_database> {
-            if (transposed != nullptr) {
-                auto const release = cuda_try(cudaFreeAsync(transposed, stream.get()));
-                if (!release) {
-                    return Err(release.error());
-                }
-            }
-            auto const release = cuda_try(cudaFreeAsync(scratch, stream.get()));
-            if (!release) {
-                return Err(release.error());
-            }
-            return Err(error);
-        };
-        // Construction scratch is scan storage plus one bucket-major transpose of the indexed
-        // rows; the scatter's per-key ranks live in shared memory, so no per-cell cursor array
-        // is allocated at all.
 
         auto const indexed_row_count = static_cast<size_t>(posting_capacity);
         auto const reference_count = static_cast<uint32_t>(rows.size() / BucketCount);
@@ -2264,12 +2013,9 @@ class reference_database {
         // Bucket-major transpose of the indexed buckets: the per-bucket count and scatter
         // passes read contiguous references from it instead of striding across rows, keeping
         // each bucket's dense key range L2-resident for its atomics.
-        auto const transpose_bytes = indexed_row_count * sizeof(Row);
-        if (auto const allocation =
-                cuda_try(cudaMallocAsync(&transposed, transpose_bytes, stream.get()));
-            !allocation) {
-            return fail(allocation.error());
-        }
+        auto transposed = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<Row>(stream, stream.device(), indexed_row_count, cuda::no_init)
+        );
         constexpr uint32_t transpose_tile = 32U;
         dim3 const transpose_grid(
             (compatibility.indexed_bucket_count + transpose_tile - 1U) / transpose_tile,
@@ -2280,15 +2026,13 @@ class reference_database {
             dim3(transpose_tile, transpose_tile),
             0,
             stream.get()>>>(
-            static_cast<Row const*>(database.rows_),
+            reinterpret_cast<Row const*>(database.rows_.data()),
             reference_count,
             compatibility.indexed_bucket_count,
             static_cast<uint32_t>(BucketCount),
-            transposed
+            transposed.data()
         );
-        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
-            return fail(launch.error());
-        }
+        CUDDL_CUDA_TRY(cudaGetLastError());
 
         // A small wave-blocked grid sweeps the buckets in rounds so the in-flight buckets'
         // dense key slices and cursor ranges stay L2-resident; one bucket per resident wave
@@ -2303,22 +2047,16 @@ class reference_database {
         // depends on this build's key width, so the limit is (re)configured before every launch.
         auto const key_count = static_cast<uint32_t>(compatibility.key_mask) + 1U;
         auto const bucket_smem_bytes = static_cast<size_t>(key_count / 4U) * sizeof(uint32_t);
-        if (auto const attribute = cuda_try(cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(detail::count_index_cells_bucket_kernel<Row>),
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(bucket_smem_bytes)
-            ));
-            !attribute) {
-            return fail(attribute.error());
-        }
-        if (auto const attribute = cuda_try(cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(detail::scatter_index_postings_bucket_kernel<Row>),
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(bucket_smem_bytes)
-            ));
-            !attribute) {
-            return fail(attribute.error());
-        }
+        CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+            reinterpret_cast<void const*>(detail::count_index_cells_bucket_kernel<Row>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(bucket_smem_bytes)
+        ));
+        CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+            reinterpret_cast<void const*>(detail::scatter_index_postings_bucket_kernel<Row>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(bucket_smem_bytes)
+        ));
 
         // The count flush writes every cell of every bucket slice exactly once (plain stores
         // from the owning block), so the offsets array needs no separate zeroing before the
@@ -2328,78 +2066,114 @@ class reference_database {
             build_bucket_block_size,
             bucket_smem_bytes,
             stream.get()>>>(
-            transposed,
+            transposed.data(),
             compatibility.indexed_bucket_count,
             reference_count,
             compatibility.key_mask,
-            database.index_offsets_
+            database.index_offsets_.data()
         );
-        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
-            return fail(launch.error());
-        }
-        if (auto const scan = cuda_try(
-                cub::DeviceScan::ExclusiveSum(
-                    scratch,
-                    scan_bytes,
-                    database.index_offsets_,
-                    static_cast<int64_t>(cell_count + 1U),
-                    stream.get()
-                )
-            );
-            !scan) {
-            return fail(scan.error());
-        }
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        // CUB allocates and releases scan scratch on this stream through its pooled resource.
+        CUDDL_CUDA_TRY(
+            cub::DeviceScan::ExclusiveSum(
+                database.index_offsets_.data(), static_cast<int64_t>(cell_count + 1U), stream
+            )
+        );
 
         detail::scatter_index_postings_bucket_kernel<<<
             bucket_blocks,
             build_bucket_block_size,
             bucket_smem_bytes,
             stream.get()>>>(
-            transposed,
+            transposed.data(),
             compatibility.indexed_bucket_count,
             reference_count,
             compatibility.key_mask,
-            database.index_offsets_,
-            database.index_postings_
+            database.index_offsets_.data(),
+            database.index_postings_.data()
         );
-        if (auto const launch = cuda_try(cudaGetLastError()); !launch) {
-            return fail(launch.error());
-        }
-        if (auto const release = cuda_try(cudaFreeAsync(transposed, stream.get())); !release) {
-            return Err(release.error());
-        }
-        transposed = nullptr;
-        if (auto const release = cuda_try(cudaFreeAsync(scratch, stream.get())); !release) {
-            return Err(release.error());
-        }
-
+        CUDDL_CUDA_TRY(cudaGetLastError());
         database.indexed_ = true;
         return Result<reference_database>::ok(std::move(database));
     }
 
-    void destroy() noexcept {
-        if (index_postings_ != nullptr) {
-            CUDDL_CUDA_ABORT(cudaFree(index_postings_));
-            index_postings_ = nullptr;
+    template <typename Row>
+    [[nodiscard]] Result<void> build_sparse_index(
+        score_compatibility const& compatibility,
+        uint32_t reference_count,
+        cuda::stream_ref stream
+    ) {
+        auto const size =
+            static_cast<size_t>(detail::indexed_posting_count(reference_count, compatibility));
+        index_posting_capacity_ = size;
+        if (size == 0U) {
+            return Ok();
         }
-        if (index_offsets_ != nullptr) {
-            CUDDL_CUDA_ABORT(cudaFree(index_offsets_));
-            index_offsets_ = nullptr;
-        }
-        if (saturation_states_ != nullptr) {
-            CUDDL_CUDA_ABORT(cudaFree(saturation_states_));
-            saturation_states_ = nullptr;
-        }
-        if (rows_ != nullptr) {
-            CUDDL_CUDA_ABORT(cudaFree(rows_));
-            rows_ = nullptr;
-        }
+        auto const device = stream.device();
+        index_keys_ =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
+        index_postings_ =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, device, size, cuda::no_init));
+        auto keys =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
+        auto ids =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, device, size, cuda::no_init));
+        auto transposed =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<Row>(stream, device, size, cuda::no_init));
+        detail::transpose_indexed_scores_kernel<<<
+            dim3((compatibility.indexed_bucket_count + 31U) / 32U, (reference_count + 31U) / 32U),
+            dim3(32U, 32U),
+            0,
+            stream.get()>>>(
+            reinterpret_cast<Row const*>(rows_.data()),
+            reference_count,
+            compatibility.indexed_bucket_count,
+            static_cast<uint32_t>(BucketCount),
+            transposed.data()
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        auto const mask = compatibility.key_mask;
+        // Zero denotes an empty row. Folded 15-bit keys are shifted by one so that
+        // a nonempty score masked to zero remains distinguishable from an empty row.
+        CUDDL_CUDA_TRY(
+            cub::DeviceTransform::Transform(
+                transposed.data(), keys.data(), size, detail::sparse_index_key{mask}, stream
+            )
+        );
+        CUDDL_CUDA_TRY(
+            cub::DeviceTransform::Transform(
+                cuda::make_counting_iterator(uint32_t{0}),
+                ids.data(),
+                size,
+                detail::sparse_reference_id{reference_count},
+                stream
+            )
+        );
+        auto const segment_offsets = cuda::make_transform_iterator(
+            cuda::make_counting_iterator(uint32_t{0}),
+            detail::sparse_segment_offset{reference_count}
+        );
+        CUDDL_CUDA_TRY(
+            cub::DeviceSegmentedSort::SortPairs(
+                keys.data(),
+                index_keys_.data(),
+                ids.data(),
+                index_postings_.data(),
+                static_cast<int64_t>(size),
+                static_cast<int64_t>(compatibility.indexed_bucket_count),
+                segment_offsets,
+                segment_offsets + 1,
+                stream
+            )
+        );
+        return Ok();
     }
 
-    void* rows_ = nullptr;
-    uint32_t* saturation_states_ = nullptr;
-    uint32_t* index_offsets_ = nullptr;
-    uint32_t* index_postings_ = nullptr;
+    cuda::device_buffer<uint8_t> rows_;
+    cuda::device_buffer<uint32_t> saturation_states_;
+    cuda::device_buffer<uint32_t> index_offsets_;
+    cuda::device_buffer<uint32_t> index_postings_;
+    cuda::device_buffer<uint16_t> index_keys_;
     size_t index_posting_capacity_{};
     reference_database_metadata metadata_{};
     bool packed_{};

@@ -2,7 +2,7 @@
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
 
-#include <thrust/device_vector.h>
+#include <cuda/buffer>
 
 #include <algorithm>
 #include <array>
@@ -210,12 +210,12 @@ void require_header(std::vector<std::string> const& fields) {
     }
 }
 
-[[nodiscard]] thrust::device_vector<uint64_t> copy_to_device(std::vector<uint64_t> const& host) {
-    return {host.begin(), host.end()};
-}
-
-[[nodiscard]] prepared_sequence
-prepare_sequence(std::string const& path, std::string const& sha256, uint64_t expected_bases) {
+[[nodiscard]] prepared_sequence prepare_sequence(
+    std::string const& path,
+    std::string const& sha256,
+    uint64_t expected_bases,
+    cuda::stream_ref stream
+) {
     auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k_kmer_length));
     if (parsed.bases != expected_bases) {
         throw std::runtime_error(
@@ -227,9 +227,9 @@ prepare_sequence(std::string const& path, std::string const& sha256, uint64_t ex
         throw std::runtime_error("FASTA contains no valid 25-mers: " + path);
     }
 
-    auto device = copy_to_device(parsed.kmers);
-    sketch_type sketch;
-    CUDDL_UNWRAP(sketch.add(device));
+    auto device = cuda::make_device_buffer<uint64_t>(stream, stream.device(), parsed.kmers);
+    sketch_type sketch(stream);
+    CUDDL_UNWRAP(sketch.add(device, stream));
 
     std::sort(parsed.kmers.begin(), parsed.kmers.end());
     parsed.kmers.erase(std::unique(parsed.kmers.begin(), parsed.kmers.end()), parsed.kmers.end());
@@ -323,9 +323,10 @@ void emit_orientation(
     size_t left_size,
     size_t right_size,
     size_t intersection,
-    error_samples& errors
+    error_samples& errors,
+    cuda::stream_ref stream
 ) {
-    auto const summary = CUDDL_UNWRAP(left.compare(right));
+    auto const summary = CUDDL_UNWRAP(left.compare(right, stream));
     auto const exact = exact_pair_metrics(left_size, right_size, intersection, input.actual_ani);
     auto const estimate = sketch_metrics(summary);
     auto const& counts = summary.counts;
@@ -422,6 +423,7 @@ int main(int argc, char** argv) {
         require_header(parse_csv_line(line));
 
         json measurements = json::array();
+        cuda::stream stream{cuda::devices[0]};
         error_samples errors;
         std::optional<prepared_sequence> cached_reference;
         size_t case_count = 0;
@@ -436,7 +438,7 @@ int main(int argc, char** argv) {
 
             if (!cached_reference || cached_reference->path != input.reference_path) {
                 cached_reference = prepare_sequence(
-                    input.reference_path, input.reference_sha256, input.reference_bases
+                    input.reference_path, input.reference_sha256, input.reference_bases, stream
                 );
             } else if (
                 cached_reference->sha256 != input.reference_sha256 ||
@@ -446,7 +448,8 @@ int main(int argc, char** argv) {
                     "reference metadata changed for cached path: " + input.reference_path
                 );
             }
-            auto query = prepare_sequence(input.query_path, input.query_sha256, input.query_bases);
+            auto query =
+                prepare_sequence(input.query_path, input.query_sha256, input.query_bases, stream);
             auto const intersection =
                 intersection_size(query.unique_kmers, cached_reference->unique_kmers);
 
@@ -459,7 +462,8 @@ int main(int argc, char** argv) {
                 query.unique_kmers.size(),
                 cached_reference->unique_kmers.size(),
                 intersection,
-                errors
+                errors,
+                stream
             );
             if (input.size_ratio != 1U) {
                 emit_orientation(
@@ -471,7 +475,8 @@ int main(int argc, char** argv) {
                     cached_reference->unique_kmers.size(),
                     query.unique_kmers.size(),
                     intersection,
-                    errors
+                    errors,
+                    stream
                 );
             }
             ++case_count;

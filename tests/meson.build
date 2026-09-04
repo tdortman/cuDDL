@@ -15,7 +15,7 @@ test('cuddl-tests', test_exe)
 result_json_test_exe = executable(
     'test-result-json',
     files('result_json_test.cu'),
-    dependencies: [gtest_dep, gtest_main_dep, nlohmann_json_test_dep],
+    dependencies: [cccl_dep, gtest_dep, gtest_main_dep, nlohmann_json_test_dep],
     include_directories: include_directories('../benchmarks'),
     cuda_args: cuda_args,
     install: false,

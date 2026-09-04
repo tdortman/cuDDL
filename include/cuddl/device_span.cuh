@@ -9,8 +9,7 @@ namespace cuddl {
 /**
  * @brief A span that is assumed to point to device-accessible memory.
  *
- * Layout-identical to cuda::std::span<T> so it can be passed to kernels
- * by value.
+ * Host-side API view. Pass its raw pointer and size to CUDA kernels.
  *
  * The distinct type prevents accidentally mixing host and device
  * pointers at compile time.

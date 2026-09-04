@@ -58,6 +58,15 @@ executable(
     install: false,
 )
 
+# Measures launch overhead and bounded-output indexed selection on resident inputs.
+executable(
+    'cuddl-search-overhead-benchmark',
+    'cuddl_search_overhead_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 # Provides its own main (strips --summary-json, runs nvbench, then writes shared JSON).
 # nvbench_main stays linked: its static archive member is skipped when main is already
 # defined, while its cuda driver/nvml/cupti link dependencies are still required.

@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/NVIDIA/cccl.git
+revision = 486de1c44daf7d1a343cbbf0f5477e9bea8ad600
+depth = 1
+patch_directory = cccl
+
+[provide]
+dependency_names = cccl

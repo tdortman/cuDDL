@@ -3,7 +3,9 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_histogram.cuh>
 #include <cub/block/block_reduce.cuh>
+#include <cuda/std/algorithm>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 
@@ -425,6 +427,10 @@ __global__ void count_index_cells_bucket_kernel(
     extern __shared__ uint32_t key_counts[];
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
     auto const quarter_keys = key_count / 4U;
+    // The exclusive scan also reads the trailing element used for the CSR end offset.
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+        cell_counts[static_cast<size_t>(indexed_bucket_count) * key_count] = 0U;
+    }
     for (auto i = threadIdx.x; i < quarter_keys; i += blockDim.x) {
         key_counts[i] = 0U;
     }
@@ -510,6 +516,32 @@ __global__ void scatter_index_postings_bucket_kernel(
     }
 }
 
+/// @brief Finds one bucket/key posting range, with one binary search per warp.
+__device__ inline uint2 index_posting_range(
+    uint32_t const* offsets,
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    uint32_t bucket,
+    uint32_t key,
+    uint32_t key_count
+) {
+    if (sorted_keys == nullptr) {
+        auto const cell = static_cast<size_t>(bucket) * key_count + key;
+        return {offsets[cell], offsets[cell + 1U]};
+    }
+    uint32_t begin = 0U;
+    uint32_t end = 0U;
+    if ((threadIdx.x & 31U) == 0U) {
+        auto const* first = sorted_keys + static_cast<size_t>(bucket) * reference_count;
+        auto const* last = first + reference_count;
+        auto const sparse_key = static_cast<uint16_t>(key + (key_count == 32768U));
+        auto const range = cuda::std::equal_range(first, last, sparse_key);
+        begin = static_cast<uint32_t>(range.first - sorted_keys);
+        end = static_cast<uint32_t>(range.second - sorted_keys);
+    }
+    return {__shfl_sync(0xffffffffU, begin, 0), __shfl_sync(0xffffffffU, end, 0)};
+}
+
 /// @brief Counts the query's non-empty posting matches for every reference.
 ///
 /// One warp owns each bucket cell and walks its posting list with a lane stride,
@@ -522,7 +554,9 @@ __global__ void count_index_matches_kernel(
     uint32_t const* postings,
     uint32_t indexed_bucket_count,
     uint16_t key_mask,
-    uint32_t* match_counts
+    uint32_t* match_counts,
+    uint16_t const* sorted_keys = nullptr,
+    uint32_t reference_count = 0U
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = block_size / warp_width;
@@ -538,9 +572,11 @@ __global__ void count_index_matches_kernel(
     }
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
     auto const key = static_cast<uint32_t>(score & key_mask);
-    auto const cell = static_cast<uint64_t>(bucket) * key_count + key;
-    auto const begin = offsets[cell];
-    auto const end = offsets[cell + 1U];
+    auto const range = index_posting_range(
+        offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
+    );
+    auto const begin = range.x;
+    auto const end = range.y;
     for (auto posting = begin + lane; posting < end; posting += warp_width) {
         atomicAdd(&match_counts[postings[posting]], 1U);
     }
@@ -555,13 +591,6 @@ struct minimum_match_predicate {
         return match_counts[reference_id] >= minimum_matches;
     }
 };
-
-/// @brief Writes a known exhaustive result count without host-lifetime coupling.
-__global__ void write_result_count_kernel(uint32_t value, uint32_t* result_count) {
-    if (threadIdx.x == 0) {
-        *result_count = value;
-    }
-}
 
 /// @brief Exactly refines every selected reference over its full winner-score row.
 template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
@@ -618,8 +647,13 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
     ReferenceRow const* rows,
     uint32_t reference_count,
     SearchResult* results,
-    uint32_t* result_match_counts
+    uint32_t* result_match_counts,
+    uint32_t* result_count,
+    uint32_t pair_count
 ) {
+    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
+        *result_count = pair_count;
+    }
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = block_size / warp_width;
     using count_reduce = cub::WarpReduce<pairwise_counts>;
@@ -736,7 +770,8 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     uint32_t reference_count,
     uint32_t indexed_bucket_count,
     uint16_t key_mask,
-    uint32_t* match_counts
+    uint32_t* match_counts,
+    uint16_t const* sorted_keys = nullptr
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = block_size / warp_width;
@@ -755,9 +790,11 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
             continue;
         }
         auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const index_cell = static_cast<uint64_t>(bucket) * key_count + key;
-        auto const begin = offsets[index_cell];
-        auto const end = offsets[index_cell + 1U];
+        auto const range = index_posting_range(
+            offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
+        );
+        auto const begin = range.x;
+        auto const end = range.y;
         auto* const counts = match_counts + static_cast<size_t>(query_index) * reference_count;
         for (auto posting = begin + lane; posting < end; posting += warp_width) {
             atomicAdd(&counts[postings[posting]], 1U);
@@ -985,46 +1022,41 @@ __global__ void advance_indexed_result_count_kernel(
     }
 }
 
+struct cardinality_payload {
+    uint32_t empty{};
+    float restored{};
+
+    friend __device__ cardinality_payload
+    operator+(cardinality_payload left, cardinality_payload right) noexcept {
+        return {left.empty + right.empty, left.restored + right.restored};
+    }
+};
+
 /**
  * @brief Computes the cardinality of a single constructed sketch.
  *
  * @p empty_out receives the empty-register count; @p estimate_out receives the estimate.
  */
 template <size_t BucketCount, typename Layout = default_register_layout>
-__global__ void cardinality_kernel(
-    uint32_t const* const registers,
-    uint64_t* const empty_out,
-    double* const estimate_out
-) {
-    __shared__ uint32_t empty[block_size];
-    __shared__ float restored[block_size];
-
-    uint32_t local_empty = 0U;
-    float local_restored = 0.0f;
+__global__ void
+cardinality_kernel(uint32_t const* registers, uint64_t* empty_out, double* estimate_out) {
+    using block_reduce = cub::BlockReduce<cardinality_payload, block_size>;
+    __shared__ typename block_reduce::TempStorage storage;
+    cardinality_payload local{};
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
         auto const stored = winner(__ldcs(&registers[bucket]));
         if (stored == 0U) {
-            ++local_empty;
+            ++local.empty;
         } else {
-            local_restored += static_cast<float>(restore_midpoint<Layout>(stored));
+            local.restored += static_cast<float>(restore_midpoint<Layout>(stored));
         }
     }
-    empty[threadIdx.x] = local_empty;
-    restored[threadIdx.x] = local_restored;
-    __syncthreads();
-
-    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            empty[threadIdx.x] += empty[threadIdx.x + stride];
-            restored[threadIdx.x] += restored[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
+    auto const total = block_reduce(storage).Sum(local);
     if (threadIdx.x == 0) {
-        *empty_out = empty[0];
+        *empty_out = total.empty;
         *estimate_out = static_cast<double>(cardinality_f32(
-            static_cast<float>(BucketCount), static_cast<float>(empty[0]), restored[0]
+            static_cast<float>(BucketCount), static_cast<float>(total.empty), total.restored
         ));
     }
 }
@@ -1035,34 +1067,30 @@ __global__ void hybrid_cardinality_kernel(
     hybrid_cardinality_estimates* const estimates
 ) {
     __shared__ uint32_t bins[nlz_bins];
-    __shared__ float restored[block_size];
-    for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
-        bins[bin] = 0U;
-    }
+    using block_histogram =
+        cub::BlockHistogram<uint32_t, block_size, 1, nlz_bins, cub::BLOCK_HISTO_ATOMIC>;
+    using block_reduce = cub::BlockReduce<float, block_size>;
+    __shared__ typename block_reduce::TempStorage storage;
+    block_histogram histogram;
+    histogram.InitHistogram(bins);
     float local_restored = 0.0f;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
         auto const stored = winner(__ldcs(&registers[bucket]));
-        if (stored == 0U) {
-            atomicAdd(bins, 1U);
-        } else {
-            atomicAdd(bins + static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U, 1U);
+        uint32_t bin[1]{
+            stored == 0U ? 0U : static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U
+        };
+        histogram.Composite(bin, bins);
+        if (stored != 0U) {
             local_restored += static_cast<float>(restore<Layout>(stored));
         }
     }
-    restored[threadIdx.x] = local_restored;
     __syncthreads();
-
-    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            restored[threadIdx.x] += restored[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
+    auto const restored = block_reduce(storage).Sum(local_restored);
     if (threadIdx.x == 0) {
-        *estimates = hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored[0]);
+        *estimates = hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored);
     }
 }
 
@@ -1070,35 +1098,31 @@ template <size_t BucketCount, hybrid_variant Variant, typename Layout = default_
 __global__ void
 hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const estimate) {
     __shared__ uint32_t bins[nlz_bins];
-    __shared__ float restored[block_size];
-    for (auto bin = static_cast<uint32_t>(threadIdx.x); bin < nlz_bins; bin += blockDim.x) {
-        bins[bin] = 0U;
-    }
+    using block_histogram =
+        cub::BlockHistogram<uint32_t, block_size, 1, nlz_bins, cub::BLOCK_HISTO_ATOMIC>;
+    using block_reduce = cub::BlockReduce<float, block_size>;
+    __shared__ typename block_reduce::TempStorage storage;
+    block_histogram histogram;
+    histogram.InitHistogram(bins);
     float local_restored = 0.0f;
     __syncthreads();
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
         auto const stored = winner(__ldcs(&registers[bucket]));
-        if (stored == 0U) {
-            atomicAdd(bins, 1U);
-        } else {
-            atomicAdd(bins + static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U, 1U);
+        uint32_t bin[1]{
+            stored == 0U ? 0U : static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U
+        };
+        histogram.Composite(bin, bins);
+        if (stored != 0U) {
             local_restored += static_cast<float>(restore<Layout>(stored));
         }
     }
-    restored[threadIdx.x] = local_restored;
     __syncthreads();
-
-    for (auto stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            restored[threadIdx.x] += restored[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
+    auto const restored = block_reduce(storage).Sum(local_restored);
     if (threadIdx.x == 0) {
         auto const estimates =
-            hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored[0]);
+            hybrid_estimates_f32(bins, static_cast<float>(BucketCount), restored);
         if constexpr (Variant == hybrid_variant::bbtools) {
             *estimate = estimates.bbtools;
         } else {

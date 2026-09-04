@@ -26,13 +26,32 @@
           cudaPkgs = pkgs.cudaPackages_13_3;
           llvmPkgs = pkgs.llvmPackages_22;
 
+          # Compute Sanitizer 2026.3 adds initcheck support for CCCL's batched copies.
+          cudaSanitizer = cudaPkgs.cuda_sanitizer_api.overrideAttrs (
+            final: _: {
+              version = "13.4.46";
+              src =
+                let
+                  platform = if system == "x86_64-linux" then "linux-x86_64" else "linux-sbsa";
+                in
+                pkgs.fetchurl {
+                  url = "https://packages.nvidia.com/bin-archive/pool/${platform}/5B515474-7E78-11F1-8656-C51E4F4B317F/cuda_sanitizer_api-${platform}-${final.version}-archive.tar.xz";
+                  sha256 =
+                    {
+                      x86_64-linux = "cbffa4277abe42dd451519b1e367176415d71925e061356780291ccb58116869";
+                      aarch64-linux = "880b5165f88318599c037730b62ceca7db2a0a7b24dc34ebed00acd784459209";
+                    }
+                    .${system};
+                };
+            }
+          );
+
           cudaToolkit = pkgs.symlinkJoin {
             name = "cuda-toolkit";
             paths = with cudaPkgs; [
               cuda_nvcc
               cuda_crt
               cuda_cudart
-              cccl
               cuda_profiler_api.include
               cuda_cuobjdump
               cuda_nvdisasm
@@ -40,6 +59,7 @@
               cuda_gdb.bin
               nsight_systems
               nsight_compute
+              cudaSanitizer
 
               # NVML and CUPTI are required by nvbench (benchmark GPU monitoring).
               cuda_nvml_dev.include # nvml.h
@@ -104,6 +124,7 @@
             };
 
             shellHook = ''
+                  export PATH="${cuda.path}/compute-sanitizer:$PATH"
                   export PYTHONPATH=$(pwd)/scripts:$PYTHONPATH
                   if [ ! -e .clangd ]; then
                     cat > .clangd <<EOF
@@ -115,6 +136,9 @@
                   - --cuda-path=${cuda.path}
                   - -D__INTELLISENSE__
                   - -D__CLANGD__
+                  - -I$(pwd)/subprojects/cccl/libcudacxx/include
+                  - -I$(pwd)/subprojects/cccl/cub
+                  - -I$(pwd)/subprojects/cccl/thrust
                   - -I${cuda.path}/include
                   - -I$(pwd)/include
                   - -I$(pwd)/subprojects/nvbench

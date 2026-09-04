@@ -26,9 +26,10 @@ cuda_args = [
 # The FASTA parser reuses cuSBF's FASTX reader, pulled in as a pinned Meson subproject. cuSBF's
 # exported `cusbf_dep` carries its headers and propagates its own zlib dependency, so no direct
 # sibling include path or zlib wiring is needed here.
+cccl_dep = subproject('cccl').get_variable('cccl_dep')
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [subproject('cusbf').get_variable('cusbf_dep')],
+    dependencies: [cccl_dep, subproject('cusbf').get_variable('cusbf_dep')],
 )
 
 build_examples = (
@@ -63,7 +64,11 @@ if build_benchmarks
     cmake = import('cmake')
 
     nvbench_opts = cmake.subproject_options()
-    nvbench_opts.add_cmake_defines({'CMAKE_CXX_STANDARD': '20'})
+    nvbench_opts.add_cmake_defines({
+        'CMAKE_CXX_STANDARD': '20',
+        'CCCL_DIR': meson.project_source_root() / 'subprojects/cccl/lib/cmake/cccl',
+        'CMAKE_PROJECT_NVBench_INCLUDE': meson.project_source_root() / 'subprojects/packagefiles/nvbench/cccl.cmake',
+    })
     # nvbench is imported as a CMake subproject; its `nvbench` and `nvbench.main` targets are
     # exposed through Meson's cmake module. NVML and CUPTI are provided by the dev shell's
     # CUDA toolkit. C++20 is forced: building at nvbench's default C++17 trips a GCC 15.3

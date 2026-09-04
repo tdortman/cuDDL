@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--min-power must not exceed --max-power");
         }
 
+        cuda::stream setup_stream{cuda::devices[0]};
         json measurements = json::array();
 
         for (uint32_t power = min_power; power <= max_power; ++power) {
@@ -86,25 +87,30 @@ int main(int argc, char** argv) {
                 );
                 auto const host = make_inputs(count, seed);
                 auto const exact = count;
+                auto device_storage =
+                    cuda::make_device_buffer<uint64_t>(setup_stream, setup_stream.device(), host);
+                auto* device = device_storage.data();
+                setup_stream.sync();
 
-                uint64_t* device = nullptr;
-                CUDDL_CUDA_CALL(cudaMalloc(&device, count * sizeof(uint64_t)));
-                CUDDL_CUDA_CALL(cudaMemcpy(
-                    device, host.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice
-                ));
-
-                cuddl::sketch<25, k_bucket_count> cuddl;
-                CUDDL_UNWRAP(cuddl.add({device, count}));
-                emit(measurements, "cuddl", count, trial, exact, CUDDL_UNWRAP(cuddl.cardinality()));
-                auto const hybrids = CUDDL_UNWRAP(cuddl.hybrid_cardinality());
+                cuddl::sketch<25, k_bucket_count> cuddl(setup_stream);
+                CUDDL_UNWRAP(cuddl.add({device, count}, setup_stream));
+                emit(
+                    measurements,
+                    "cuddl",
+                    count,
+                    trial,
+                    exact,
+                    CUDDL_UNWRAP(cuddl.cardinality(setup_stream))
+                );
+                auto const hybrids = CUDDL_UNWRAP(cuddl.hybrid_cardinality(setup_stream));
                 emit(measurements, "cuddl_bbtools", count, trial, exact, hybrids.bbtools);
                 emit(measurements, "cuddl_paper", count, trial, exact, hybrids.paper);
 
-                cuco::hyperloglog<uint64_t> hll(cuco::precision{k_hll_precision});
-                hll.add(device, device + count);
-                emit(measurements, "cuco_hll", count, trial, exact, hll.estimate());
-
-                CUDDL_CUDA_CALL(cudaFree(device));
+                cuco::hyperloglog<uint64_t> hll(
+                    cuco::precision{k_hll_precision}, {}, {}, setup_stream
+                );
+                hll.add(device, device + count, setup_stream);
+                emit(measurements, "cuco_hll", count, trial, exact, hll.estimate(setup_stream));
             }
             std::cerr << "Completed 2^" << power << '\n';
         }

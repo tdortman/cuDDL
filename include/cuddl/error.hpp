@@ -2,7 +2,9 @@
 
 #include <cuda_runtime.h>
 #include <cuda/std/expected>
+#include <cuda/stream>
 
+#include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <format>
@@ -186,6 +188,28 @@ cuda_try(cudaError_t error, std::source_location location = std::source_location
     return Err(Error::cuda(error, location));
 }
 
+/// @brief Converts CCCL exceptions to the same Result errors as CUDA status-returning APIs.
+template <std::invocable Operation>
+[[nodiscard]] auto
+cuda_try(Operation&& operation, std::source_location location = std::source_location::current()) {
+    using Value = std::invoke_result_t<Operation>;
+    using Return = Result<std::conditional_t<std::is_same_v<Value, cudaError_t>, void, Value>>;
+    try {
+        if constexpr (std::is_void_v<Value>) {
+            std::forward<Operation>(operation)();
+            return Return::ok();
+        } else if constexpr (std::is_same_v<Value, cudaError_t>) {
+            return cuda_try(std::forward<Operation>(operation)(), location);
+        } else {
+            return Return::ok(std::forward<Operation>(operation)());
+        }
+    } catch (cuda::cuda_error const& error) {
+        return Return::err(Error::cuda(static_cast<cudaError_t>(error.status()), location));
+    } catch (std::bad_alloc const& error) {
+        return Return::err(Error::resource(error.what()));
+    }
+}
+
 }  // namespace cuddl
 
 /// @brief Propagates a @ref cuddl::Result failure from the enclosing function (GNU statement
@@ -218,4 +242,4 @@ cuda_try(cudaError_t error, std::source_location location = std::source_location
 #define CUDDL_CUDA_ABORT(expr) ::cuddl::cuda_abort_on_error((expr))
 
 /// @brief Propagates a CUDA error wrapped in @ref cuddl::Result<void>.
-#define CUDDL_CUDA_TRY(expr) CUDDL_TRY(::cuddl::cuda_try((expr)))
+#define CUDDL_CUDA_TRY(...) CUDDL_TRY(::cuddl::cuda_try([&] { return (__VA_ARGS__); }))

@@ -92,7 +92,7 @@ struct host_sketch {
 /// @brief Size cap (bytes) per device chunk during construction, below 80% of free memory.
 size_t construction_chunk_bytes() {
     size_t free_bytes = 0, total_bytes = 0;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
+    CUDDL_CUDA_CALL(cudaMemGetInfo(&free_bytes, &total_bytes));
     auto const cap = free_bytes * 4U / 5U;
     // Leave room for the two sketches (registers + flags) plus a modest headroom.
     auto const target = cap / 3;
@@ -107,41 +107,46 @@ run_result run_gpu(
     cuddl::sketch<25, BucketCount>& query_sketch,
     cuddl::sketch<25, BucketCount>& ref_sketch,
     std::vector<uint64_t> const& query_kmers,
-    std::vector<uint64_t> const& ref_kmers
+    std::vector<uint64_t> const& ref_kmers,
+    cuda::stream_ref stream
 ) {
     run_result r;
 
     auto t0 = steady_clock_t::now();
-    CUDDL_UNWRAP(query_sketch.clear());
-    CUDDL_UNWRAP(ref_sketch.clear());
+    CUDDL_UNWRAP(query_sketch.clear(stream));
+    CUDDL_UNWRAP(ref_sketch.clear(stream));
     auto const sketch_chunk_elements = construction_chunk_bytes() / sizeof(uint64_t);
     if (sketch_chunk_elements == 0) {
         throw std::runtime_error("insufficient free device memory for construction");
     }
     double h2d = 0.0, construction = 0.0;
     // Transfer + construct each genome in chunks so a whole-genome stream fits any device.
-    // One reusable chunk buffer avoids a device-wide sync per chunk; async adds keep the GPU
-    // draining the previous chunk while the copy engine streams the next one.
+    auto storage = cuda::make_device_buffer<uint64_t>(
+        stream,
+        stream.device(),
+        std::min(sketch_chunk_elements, std::max(query_kmers.size(), ref_kmers.size())),
+        cuda::no_init
+    );
+    auto* d = storage.data();
+    // Both genomes reuse this buffer; the stream orders each copy after the previous add.
     auto build = [&](cuddl::sketch<25, BucketCount>& target, std::vector<uint64_t> const& kmers) {
-        uint64_t* d = nullptr;
-        CUDDL_CUDA_CALL(cudaMalloc(&d, sketch_chunk_elements * sizeof(uint64_t)));
         for (size_t offset = 0; offset < kmers.size(); offset += sketch_chunk_elements) {
             auto const n = std::min(sketch_chunk_elements, kmers.size() - offset);
             auto t = steady_clock_t::now();
-            CUDDL_CUDA_CALL(
-                cudaMemcpy(d, kmers.data() + offset, n * sizeof(uint64_t), cudaMemcpyHostToDevice)
+            cuda::copy_bytes(
+                stream, cuda::std::span{kmers.data() + offset, n}, cuda::std::span{d, n}
             );
+            stream.sync();
             h2d += std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
             t = steady_clock_t::now();
-            CUDDL_UNWRAP(target.add_async({d, n}));
+            CUDDL_UNWRAP(target.add_async({d, n}, stream));
             construction +=
                 std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
         }
         auto t = steady_clock_t::now();
-        CUDDL_CUDA_CALL(cudaStreamSynchronize(cudaStream_t{nullptr}));
+        stream.sync();
         construction +=
             std::chrono::duration<double, std::milli>(steady_clock_t::now() - t).count();
-        CUDDL_CUDA_CALL(cudaFree(d));
     };
     build(query_sketch, query_kmers);
     build(ref_sketch, ref_kmers);
@@ -149,7 +154,7 @@ run_result run_gpu(
     r.construction_ms = construction;
 
     t0 = steady_clock_t::now();
-    auto const summary = CUDDL_UNWRAP(query_sketch.compare(ref_sketch));
+    auto const summary = CUDDL_UNWRAP(query_sketch.compare(ref_sketch, stream));
     r.comparison_ms = std::chrono::duration<double, std::milli>(steady_clock_t::now() - t0).count();
 
     r.lower = summary.counts.lower;
@@ -331,12 +336,14 @@ int main(int argc, char** argv) {
         json measurements = json::array();
 
         if (backend == "gpu") {
-            cuddl::sketch<25, 2048> query_gpu;
-            cuddl::sketch<25, 2048> ref_gpu;
+            cuda::stream stream{cuda::devices[0]};
+            cuddl::sketch<25, 2048> query_gpu(stream);
+            cuddl::sketch<25, 2048> ref_gpu(stream);
             auto const total_runs = warmup + runs;
             for (uint32_t idx = 0; idx < total_runs; ++idx) {
                 auto const is_warmup = idx < warmup;
-                auto r = run_gpu<2048>(query_gpu, ref_gpu, query_parsed.kmers, ref_parsed.kmers);
+                auto r =
+                    run_gpu<2048>(query_gpu, ref_gpu, query_parsed.kmers, ref_parsed.kmers, stream);
                 r.preprocess_ms = preprocess_ms;
                 r.allocation_ms = 0;
                 r.d2h_ms = 0;

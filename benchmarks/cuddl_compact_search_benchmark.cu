@@ -1,3 +1,4 @@
+#include <cub/device/device_transform.cuh>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/detail/comparison.cuh>
 #include <cuddl/detail/fasta_parser.hpp>
@@ -9,8 +10,7 @@
 #include <nvbench/nvbench.cuh>
 
 #include <cuda_runtime.h>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
+#include <cuda/buffer>
 
 #include <algorithm>
 #include <cstdint>
@@ -31,6 +31,12 @@
 #include "result_json.hpp"
 
 namespace {
+
+struct winner_score {
+    __device__ uint16_t operator()(uint32_t reg) const {
+        return cuddl::detail::winner(reg);
+    }
+};
 namespace cg = cooperative_groups;
 
 constexpr uint32_t k_kmer_length = 25;
@@ -39,11 +45,12 @@ constexpr uint32_t k_launch_block_size = 256;
 std::vector<nvbench::int64_t> const reference_powers{8, 10, 12, 14, 16, 18, 20};
 std::vector<nvbench::int64_t> const indexed_reference_powers{8, 10, 12, 14, 16, 18};
 std::vector<nvbench::int64_t> const
+    index_layout_reference_counts{33, 1024, 4096, 16384, 65536, 131072, 196608};
+std::vector<nvbench::int64_t> const
     launch_reference_counts{1, 8, 64, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 200687};
 std::vector<std::string> const launch_shapes{
     "current_cub_warp",
     "raw_cub_warp",
-    "span_cub_warp",
     "cg_1_warp",
     "cg_2_warps",
     "cg_4_warps",
@@ -79,7 +86,7 @@ indexed_fixture make_indexed_fixture(size_t reference_count) {
         fixture.candidate_count += matches >= 5U;
         for (size_t bucket = 0; bucket < k_bucket_count; ++bucket) {
             auto score = make_score(seed + k_bucket_count + reference_id * k_bucket_count + bucket);
-            if (score == fixture.query[bucket]) {
+            if (score != 0U && score == fixture.query[bucket]) {
                 score = score == std::numeric_limits<uint16_t>::max()
                             ? 1U
                             : static_cast<uint16_t>(score + 1U);
@@ -132,11 +139,10 @@ __device__ void write_search_result(
     results[reference_id].summary.counts = counts;
     results[reference_id].summary.cardinality = 0.0;
 }
-template <typename Rows, typename Query>
 __global__ __launch_bounds__(k_launch_block_size) void cub_warp_exhaustive_search_kernel(
-    Rows rows,
+    uint16_t const* rows,
     uint32_t reference_count,
-    Query query,
+    uint16_t const* query,
     cuddl::reference_search_result* results
 ) {
     constexpr uint32_t warp_width = 32;
@@ -163,37 +169,16 @@ __global__ __launch_bounds__(k_launch_block_size) void cub_warp_exhaustive_searc
 }
 
 void launch_raw_cub_exhaustive(
-    thrust::device_vector<uint16_t> const& rows,
+    cuda::device_buffer<uint16_t> const& rows,
     uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
+    cuda::device_buffer<uint16_t> const& query,
+    cuda::device_buffer<cuddl::reference_search_result>& results,
     cudaStream_t stream
 ) {
     constexpr uint32_t references_per_block = k_launch_block_size / 32U;
     auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
     cub_warp_exhaustive_search_kernel<<<blocks, k_launch_block_size, 0, stream>>>(
-        thrust::raw_pointer_cast(rows.data()),
-        reference_count,
-        thrust::raw_pointer_cast(query.data()),
-        thrust::raw_pointer_cast(results.data())
-    );
-    CUDDL_CUDA_CALL(cudaGetLastError());
-}
-
-void launch_span_cub_exhaustive(
-    thrust::device_vector<uint16_t> const& rows,
-    uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
-    cudaStream_t stream
-) {
-    constexpr uint32_t references_per_block = k_launch_block_size / 32U;
-    auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
-    cub_warp_exhaustive_search_kernel<<<blocks, k_launch_block_size, 0, stream>>>(
-        cuddl::device_span<uint16_t const>{thrust::raw_pointer_cast(rows.data()), rows.size()},
-        reference_count,
-        cuddl::device_span<uint16_t const>{thrust::raw_pointer_cast(query.data()), query.size()},
-        thrust::raw_pointer_cast(results.data())
+        rows.data(), reference_count, query.data(), results.data()
     );
     CUDDL_CUDA_CALL(cudaGetLastError());
 }
@@ -260,20 +245,17 @@ __global__ __launch_bounds__(k_launch_block_size) void cooperative_exhaustive_se
 
 template <uint32_t WarpsPerReference>
 void launch_cooperative_exhaustive(
-    thrust::device_vector<uint16_t> const& rows,
+    cuda::device_buffer<uint16_t> const& rows,
     uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
+    cuda::device_buffer<uint16_t> const& query,
+    cuda::device_buffer<cuddl::reference_search_result>& results,
     cudaStream_t stream
 ) {
     constexpr uint32_t references_per_block = k_launch_block_size / (32U * WarpsPerReference);
     auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
     cooperative_exhaustive_search_kernel<WarpsPerReference>
         <<<blocks, k_launch_block_size, 0, stream>>>(
-            thrust::raw_pointer_cast(rows.data()),
-            reference_count,
-            thrust::raw_pointer_cast(query.data()),
-            thrust::raw_pointer_cast(results.data())
+            rows.data(), reference_count, query.data(), results.data()
         );
     CUDDL_CUDA_CALL(cudaGetLastError());
 }
@@ -396,39 +378,33 @@ __global__ __launch_bounds__(BlockSize) void parameterised_cooperative_exhaustiv
 
 template <uint32_t BlockSize, typename ReferenceRow>
 void launch_parameterised_cub(
-    thrust::device_vector<ReferenceRow> const& rows,
+    cuda::device_buffer<ReferenceRow> const& rows,
     uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
+    cuda::device_buffer<uint16_t> const& query,
+    cuda::device_buffer<cuddl::reference_search_result>& results,
     cudaStream_t stream
 ) {
     constexpr uint32_t references_per_block = BlockSize / 32U;
     auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
     parameterised_cub_exhaustive_search_kernel<BlockSize><<<blocks, BlockSize, 0, stream>>>(
-        thrust::raw_pointer_cast(rows.data()),
-        reference_count,
-        thrust::raw_pointer_cast(query.data()),
-        thrust::raw_pointer_cast(results.data())
+        rows.data(), reference_count, query.data(), results.data()
     );
     CUDDL_CUDA_CALL(cudaGetLastError());
 }
 
 template <uint32_t BlockSize, uint32_t WarpsPerReference, typename ReferenceRow>
 void launch_parameterised_cooperative(
-    thrust::device_vector<ReferenceRow> const& rows,
+    cuda::device_buffer<ReferenceRow> const& rows,
     uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
+    cuda::device_buffer<uint16_t> const& query,
+    cuda::device_buffer<cuddl::reference_search_result>& results,
     cudaStream_t stream
 ) {
     constexpr uint32_t references_per_block = BlockSize / (32U * WarpsPerReference);
     auto const blocks = (reference_count + references_per_block - 1U) / references_per_block;
     parameterised_cooperative_exhaustive_search_kernel<BlockSize, WarpsPerReference>
         <<<blocks, BlockSize, 0, stream>>>(
-            thrust::raw_pointer_cast(rows.data()),
-            reference_count,
-            thrust::raw_pointer_cast(query.data()),
-            thrust::raw_pointer_cast(results.data())
+            rows.data(), reference_count, query.data(), results.data()
         );
     CUDDL_CUDA_CALL(cudaGetLastError());
 }
@@ -436,10 +412,10 @@ void launch_parameterised_cooperative(
 template <typename ReferenceRow>
 void launch_parameterised(
     std::string const& launch,
-    thrust::device_vector<ReferenceRow> const& rows,
+    cuda::device_buffer<ReferenceRow> const& rows,
     uint32_t reference_count,
-    thrust::device_vector<uint16_t> const& query,
-    thrust::device_vector<cuddl::reference_search_result>& results,
+    cuda::device_buffer<uint16_t> const& query,
+    cuda::device_buffer<cuddl::reference_search_result>& results,
     cudaStream_t stream
 ) {
     auto const block_begin = launch.find("_b") + 2U;
@@ -610,20 +586,27 @@ void run_parameterised_exhaustive(
     nvbench::state& state,
     std::vector<ReferenceRow> const& rows,
     std::vector<uint16_t> const& query,
-    thrust::host_vector<cuddl::reference_search_result> const& expected,
+    std::vector<cuddl::reference_search_result> const& expected,
     uint32_t reference_count,
     std::string const& launch
 ) {
-    thrust::device_vector<ReferenceRow> device_rows(rows);
-    thrust::device_vector<uint16_t> device_query(query);
-    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
+    auto device_rows =
+        cuda::make_device_buffer<ReferenceRow>(setup_stream, setup_stream.device(), rows);
+    auto device_query =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), query);
+    auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), reference_count, cuda::no_init
+    );
     auto const execute = [&](cudaStream_t stream) {
         launch_parameterised(launch, device_rows, reference_count, device_query, results, stream);
     };
 
-    execute(cudaStream_t{nullptr});
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    thrust::host_vector<cuddl::reference_search_result> observed(results);
+    execute(setup_stream.get());
+    setup_stream.sync();
+    std::vector<cuddl::reference_search_result> observed(results.size());
+    cuda::copy_bytes(setup_stream, results, observed);
+    setup_stream.sync();
     if (!std::equal(expected.begin(), expected.end(), observed.begin())) {
         throw std::runtime_error("parameterised exhaustive search disagrees with scalar oracle");
     }
@@ -636,7 +619,7 @@ void compact_exhaustive_parameter_sweep(nvbench::state& state) {
     auto const row_type = state.get_string("Row");
     auto const launch = state.get_string("Launch");
     auto const fixture = make_indexed_fixture(reference_count);
-    thrust::host_vector<cuddl::reference_search_result> expected_host(reference_count);
+    std::vector<cuddl::reference_search_result> expected_host(reference_count);
     for (uint32_t reference_id = 0; reference_id < reference_count; ++reference_id) {
         expected_host[reference_id] = {
             .reference_id = reference_id,
@@ -671,14 +654,6 @@ class pipeline_failure : public std::runtime_error {
    public:
     using std::runtime_error::runtime_error;
 };
-__global__ void
-extract_winner_scores_kernel(uint32_t const* registers, uint16_t* scores, size_t count) {
-    for (auto i = static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x); i < count;
-         i += static_cast<size_t>(blockDim.x * gridDim.x)) {
-        scores[i] = cuddl::detail::winner(registers[i]);
-    }
-}
-
 /// @brief Aborts into a pipeline failure carrying the wrapped error message.
 template <typename T>
 T pipeline_unwrap(cuddl::Result<T> result) {
@@ -806,9 +781,7 @@ json pipeline_measure(
     if (cpu_only) {
         benchmark.set_is_cpu_only(true);
     } else {
-        int device = 0;
-        CUDDL_CUDA_CALL(cudaGetDevice(&device));
-        benchmark.add_device(device);
+        benchmark.add_device(cuda::devices[0].get());
     }
     benchmark.run();
 
@@ -834,6 +807,7 @@ json pipeline_measure(
 }
 
 json run_pipeline(pipeline_options const& options) {
+    cuda::stream setup_stream{cuda::devices[0]};
     auto const benchmark_name =
         options.name.empty() ? std::filesystem::path(options.reference).stem().string() + " vs " +
                                    std::filesystem::path(options.query).stem().string()
@@ -853,69 +827,84 @@ json run_pipeline(pipeline_options const& options) {
     auto const query_kmers =
         pipeline_unwrap(cuddl::detail::parse_fasta(options.query, k_pipeline_k));
 
-    thrust::device_vector<uint64_t> device_reference_kmers(reference_kmers.kmers);
-    thrust::device_vector<uint64_t> device_query_kmers(query_kmers.kmers);
-
-    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> reference_sketch;
-    pipeline_check(reference_sketch.add_async(device_reference_kmers));
-
-    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> query_sketch;
-    pipeline_check(query_sketch.add_async(device_query_kmers));
-
-    thrust::device_vector<uint16_t> device_reference_rows(k_pipeline_buckets);
-    thrust::device_vector<uint16_t> device_query_rows(k_pipeline_buckets);
-    constexpr uint32_t extract_block = 256;
-    constexpr uint32_t extract_grid =
-        static_cast<uint32_t>((k_pipeline_buckets + extract_block - 1) / extract_block);
-    extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
-        thrust::raw_pointer_cast(reference_sketch.data().data()),
-        thrust::raw_pointer_cast(device_reference_rows.data()),
-        k_pipeline_buckets
+    auto device_reference_kmers = cuda::make_device_buffer<uint64_t>(
+        setup_stream, setup_stream.device(), reference_kmers.kmers
     );
-    extract_winner_scores_kernel<<<extract_grid, extract_block>>>(
-        thrust::raw_pointer_cast(query_sketch.data().data()),
-        thrust::raw_pointer_cast(device_query_rows.data()),
-        k_pipeline_buckets
+    auto device_query_kmers =
+        cuda::make_device_buffer<uint64_t>(setup_stream, setup_stream.device(), query_kmers.kmers);
+
+    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> reference_sketch(setup_stream);
+    pipeline_check(reference_sketch.add_async(device_reference_kmers, setup_stream));
+
+    cuddl::sketch<k_pipeline_k, k_pipeline_buckets> query_sketch(setup_stream);
+    pipeline_check(query_sketch.add_async(device_query_kmers, setup_stream));
+
+    auto device_reference_rows = cuda::make_device_buffer<uint16_t>(
+        setup_stream, setup_stream.device(), k_pipeline_buckets, cuda::no_init
     );
-    CUDDL_CUDA_CALL(cudaGetLastError());
+    auto device_query_rows = cuda::make_device_buffer<uint16_t>(
+        setup_stream, setup_stream.device(), k_pipeline_buckets, cuda::no_init
+    );
+    CUDDL_CUDA_CALL(
+        cub::DeviceTransform::Transform(
+            reference_sketch.data().data(),
+            device_reference_rows.data(),
+            k_pipeline_buckets,
+            winner_score{},
+            setup_stream
+        )
+    );
+    CUDDL_CUDA_CALL(
+        cub::DeviceTransform::Transform(
+            query_sketch.data().data(),
+            device_query_rows.data(),
+            k_pipeline_buckets,
+            winner_score{},
+            setup_stream
+        )
+    );
+
     sample_device();
 
     auto const compatibility =
         cuddl::score_compatibility::current<k_pipeline_k, k_pipeline_buckets>();
 
-    auto bare_database =
-        pipeline_unwrap(pipeline_database::build_async(device_reference_rows, compatibility));
+    auto bare_database = pipeline_unwrap(
+        pipeline_database::build_async(device_reference_rows, compatibility, setup_stream)
+    );
 
     auto database = pipeline_unwrap(
-        pipeline_database::build_indexed_async(device_reference_rows, compatibility)
+        pipeline_database::build_indexed_async(device_reference_rows, compatibility, setup_stream)
     );
 
-    auto const workspace_bytes = pipeline_unwrap(database.indexed_single_query_workspace_bytes());
-    thrust::device_vector<cuddl::reference_search_result> exhaustive_results(
-        database.reference_count()
+    auto const workspace_bytes =
+        pipeline_unwrap(database.indexed_single_query_workspace_bytes(setup_stream));
+    auto exhaustive_results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), database.reference_count(), cuda::no_init
     );
-    thrust::device_vector<cuddl::reference_search_result> indexed_results(
-        database.reference_count()
+    auto indexed_results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), database.reference_count(), cuda::no_init
     );
-    thrust::device_vector<uint8_t> workspace(workspace_bytes);
-    thrust::device_vector<uint32_t> result_count(1U);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        setup_stream, setup_stream.device(), workspace_bytes, cuda::no_init
+    );
+    auto result_count =
+        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1U, cuda::no_init);
 
-    auto const query_span = cuddl::device_span<uint16_t const>{
-        thrust::raw_pointer_cast(device_query_rows.data()), device_query_rows.size()
-    };
+    auto const query_span =
+        cuddl::device_span<uint16_t const>{device_query_rows.data(), device_query_rows.size()};
     auto exhaustive_span = cuddl::device_span<cuddl::reference_search_result>{
-        thrust::raw_pointer_cast(exhaustive_results.data()), exhaustive_results.size()
+        exhaustive_results.data(), exhaustive_results.size()
     };
     auto indexed_span = cuddl::device_span<cuddl::reference_search_result>{
-        thrust::raw_pointer_cast(indexed_results.data()), indexed_results.size()
+        indexed_results.data(), indexed_results.size()
     };
-    auto workspace_span =
-        cuddl::device_span<uint8_t>{thrust::raw_pointer_cast(workspace.data()), workspace.size()};
-    auto count_span = cuddl::device_span<uint32_t>{
-        thrust::raw_pointer_cast(result_count.data()), result_count.size()
-    };
+    auto workspace_span = cuddl::device_span<uint8_t>{workspace.data(), workspace.size()};
+    auto count_span = cuddl::device_span<uint32_t>{result_count.data(), result_count.size()};
 
-    pipeline_check(database.search_async(query_span, compatibility, {}, exhaustive_span));
+    pipeline_check(
+        database.search_async(query_span, compatibility, {}, exhaustive_span, setup_stream)
+    );
 
     pipeline_check(database.search_indexed_async(
         query_span,
@@ -923,13 +912,20 @@ json run_pipeline(pipeline_options const& options) {
         workspace_span,
         indexed_span,
         count_span,
-        {.minimum_matches = options.minimum_matches}
+        {.minimum_matches = options.minimum_matches},
+        setup_stream
     ));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    setup_stream.sync();
 
-    thrust::host_vector<cuddl::reference_search_result> exhaustive_host(exhaustive_results);
-    thrust::host_vector<cuddl::reference_search_result> indexed_host(indexed_results);
-    thrust::host_vector<uint32_t> count_host(result_count);
+    std::vector<cuddl::reference_search_result> exhaustive_host(exhaustive_results.size());
+    cuda::copy_bytes(setup_stream, exhaustive_results, exhaustive_host);
+    setup_stream.sync();
+    std::vector<cuddl::reference_search_result> indexed_host(indexed_results.size());
+    cuda::copy_bytes(setup_stream, indexed_results, indexed_host);
+    setup_stream.sync();
+    std::vector<uint32_t> count_host(result_count.size());
+    cuda::copy_bytes(setup_stream, result_count, count_host);
+    setup_stream.sync();
     auto const host_peak = pipeline_host_peak_bytes();
 
     auto timing_statistics = pipeline_measure(
@@ -969,20 +965,20 @@ json run_pipeline(pipeline_options const& options) {
                     auto const stream = cuda::stream_ref{launch.get_stream()};
                     if (stage == "host_to_device_transfer") {
                         timer.start();
-                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                            thrust::raw_pointer_cast(device_reference_kmers.data()),
-                            reference_kmers.kmers.data(),
-                            reference_kmers.kmers.size() * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice,
-                            launch.get_stream()
-                        ));
-                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                            thrust::raw_pointer_cast(device_query_kmers.data()),
-                            query_kmers.kmers.data(),
-                            query_kmers.kmers.size() * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice,
-                            launch.get_stream()
-                        ));
+                        cuda::copy_bytes(
+                            cuda::stream_ref{launch.get_stream()},
+                            cuda::std::span{
+                                reference_kmers.kmers.data(), reference_kmers.kmers.size()
+                            },
+                            cuda::std::span{
+                                device_reference_kmers.data(), reference_kmers.kmers.size()
+                            }
+                        );
+                        cuda::copy_bytes(
+                            cuda::stream_ref{launch.get_stream()},
+                            cuda::std::span{query_kmers.kmers.data(), query_kmers.kmers.size()},
+                            cuda::std::span{device_query_kmers.data(), query_kmers.kmers.size()}
+                        );
                         timer.stop();
                     } else if (stage == "sketch_reference") {
                         pipeline_check(reference_sketch.clear_async(stream));
@@ -996,25 +992,25 @@ json run_pipeline(pipeline_options const& options) {
                         timer.stop();
                     } else if (stage == "sketch_extract") {
                         timer.start();
-                        extract_winner_scores_kernel<<<
-                            extract_grid,
-                            extract_block,
-                            0,
-                            launch.get_stream()>>>(
-                            thrust::raw_pointer_cast(reference_sketch.data().data()),
-                            thrust::raw_pointer_cast(device_reference_rows.data()),
-                            k_pipeline_buckets
+                        CUDDL_CUDA_CALL(
+                            cub::DeviceTransform::Transform(
+                                reference_sketch.data().data(),
+                                device_reference_rows.data(),
+                                k_pipeline_buckets,
+                                winner_score{},
+                                stream
+                            )
                         );
-                        extract_winner_scores_kernel<<<
-                            extract_grid,
-                            extract_block,
-                            0,
-                            launch.get_stream()>>>(
-                            thrust::raw_pointer_cast(query_sketch.data().data()),
-                            thrust::raw_pointer_cast(device_query_rows.data()),
-                            k_pipeline_buckets
+                        CUDDL_CUDA_CALL(
+                            cub::DeviceTransform::Transform(
+                                query_sketch.data().data(),
+                                device_query_rows.data(),
+                                k_pipeline_buckets,
+                                winner_score{},
+                                stream
+                            )
                         );
-                        CUDDL_CUDA_CALL(cudaGetLastError());
+
                         timer.stop();
                     } else if (stage == "database_build") {
                         timer.start();
@@ -1144,6 +1140,7 @@ json run_pipeline(pipeline_options const& options) {
 }
 
 void compact_exhaustive_search(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const reference_count = static_cast<size_t>(state.get_int64("References"));
     constexpr uint64_t seed = 42;
 
@@ -1156,23 +1153,31 @@ void compact_exhaustive_search(nvbench::state& state) {
         rows[offset] = make_score(seed + k_bucket_count + offset);
     }
 
-    thrust::device_vector<uint16_t> device_rows(rows);
-    thrust::device_vector<uint16_t> device_query(query);
-    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
-    thrust::device_vector<uint8_t> workspace;
+    auto device_rows =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), rows);
+    auto device_query =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), query);
+    auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), reference_count, cuda::no_init
+    );
+    auto workspace =
+        cuda::make_device_buffer<uint8_t>(setup_stream, setup_stream.device(), 0, cuda::no_init);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
-            device_rows, compatibility
+            device_rows, compatibility, setup_stream
         )));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    setup_stream.sync();
 
-    CUDDL_UNWRAP(database.search_async(device_query, compatibility, workspace, results));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    CUDDL_UNWRAP(
+        database.search_async(device_query, compatibility, workspace, results, setup_stream)
+    );
+    setup_stream.sync();
     cuddl::reference_search_result first{};
-    CUDDL_CUDA_CALL(cudaMemcpy(
-        &first, thrust::raw_pointer_cast(results.data()), sizeof(first), cudaMemcpyDeviceToHost
-    ));
+    cuda::copy_bytes(
+        setup_stream, cuda::std::span{results.data(), size_t{1}}, cuda::std::span{&first, size_t{1}}
+    );
+    setup_stream.sync();
     if (first.reference_id != 0U || first.summary != score_row_oracle(query, rows)) {
         throw std::runtime_error("compact search disagrees with the scalar oracle");
     }
@@ -1190,18 +1195,26 @@ void compact_exhaustive_search(nvbench::state& state) {
     add_value(state, "Median Throughput", static_cast<double>(reference_count) / median);
 }
 void compact_exhaustive_launch_shape(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const reference_count = static_cast<uint32_t>(state.get_int64("References"));
     auto const launch_shape = state.get_string("Launch");
     auto const fixture = make_indexed_fixture(reference_count);
-    thrust::device_vector<uint16_t> device_rows(fixture.rows);
-    thrust::device_vector<uint16_t> device_query(fixture.query);
-    thrust::device_vector<cuddl::reference_search_result> expected(reference_count);
-    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
-    thrust::device_vector<uint8_t> workspace;
+    auto device_rows =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), fixture.rows);
+    auto device_query =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), fixture.query);
+    auto expected = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), reference_count, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), reference_count, cuda::no_init
+    );
+    auto workspace =
+        cuda::make_device_buffer<uint8_t>(setup_stream, setup_stream.device(), 0, cuda::no_init);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
-            device_rows, compatibility
+            device_rows, compatibility, setup_stream
         )));
 
     auto const launch = [&](cudaStream_t stream) {
@@ -1211,8 +1224,7 @@ void compact_exhaustive_launch_shape(nvbench::state& state) {
             ));
         } else if (launch_shape == "raw_cub_warp") {
             launch_raw_cub_exhaustive(device_rows, reference_count, device_query, results, stream);
-        } else if (launch_shape == "span_cub_warp") {
-            launch_span_cub_exhaustive(device_rows, reference_count, device_query, results, stream);
+
         } else if (launch_shape == "cg_1_warp") {
             launch_cooperative_exhaustive<1U>(
                 device_rows, reference_count, device_query, results, stream
@@ -1234,11 +1246,17 @@ void compact_exhaustive_launch_shape(nvbench::state& state) {
         }
     };
 
-    CUDDL_UNWRAP(database.search_async(device_query, compatibility, workspace, expected));
-    launch(cudaStream_t{nullptr});
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
-    thrust::host_vector<cuddl::reference_search_result> expected_host(expected);
-    thrust::host_vector<cuddl::reference_search_result> results_host(results);
+    CUDDL_UNWRAP(
+        database.search_async(device_query, compatibility, workspace, expected, setup_stream)
+    );
+    launch(setup_stream.get());
+    setup_stream.sync();
+    std::vector<cuddl::reference_search_result> expected_host(expected.size());
+    cuda::copy_bytes(setup_stream, expected, expected_host);
+    setup_stream.sync();
+    std::vector<cuddl::reference_search_result> results_host(results.size());
+    cuda::copy_bytes(setup_stream, results, results_host);
+    setup_stream.sync();
     if (!std::equal(expected_host.begin(), expected_host.end(), results_host.begin())) {
         throw std::runtime_error("cooperative exhaustive search disagrees with current search");
     }
@@ -1253,19 +1271,24 @@ void compact_exhaustive_launch_shape(nvbench::state& state) {
 }
 
 void compact_indexed_build(nvbench::state& state) {
+    auto const index_kind = state.get_string("Index");
+    auto const storage =
+        index_kind == "sparse" ? cuddl::index_storage::sparse : cuddl::index_storage::dense;
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const reference_count = static_cast<size_t>(state.get_int64("References"));
     auto const fixture = make_indexed_fixture(reference_count);
-    thrust::device_vector<uint16_t> device_rows(fixture.rows);
+    auto device_rows =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), fixture.rows);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
 
     size_t resident_bytes = 0;
     {
         auto database = CUDDL_UNWRAP(
             (cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-                device_rows, compatibility
+                device_rows, compatibility, setup_stream, storage
             ))
         );
-        CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+        setup_stream.sync();
         resident_bytes = database.persistent_row_bytes() + database.persistent_index_bytes();
     }
 
@@ -1273,7 +1296,7 @@ void compact_indexed_build(nvbench::state& state) {
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto database = CUDDL_UNWRAP(
             (cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-                device_rows, compatibility, cuda::stream_ref{launch.get_stream()}
+                device_rows, compatibility, cuda::stream_ref{launch.get_stream()}, storage
             ))
         );
         do_not_optimise(database);
@@ -1286,20 +1309,32 @@ void compact_indexed_build(nvbench::state& state) {
 }
 
 void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches) {
+    auto const index_kind = state.get_string("Index");
+    auto const storage =
+        index_kind == "sparse" ? cuddl::index_storage::sparse : cuddl::index_storage::dense;
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const reference_count = static_cast<size_t>(state.get_int64("References"));
     auto const fixture = make_indexed_fixture(reference_count);
-    thrust::device_vector<uint16_t> device_rows(fixture.rows);
-    thrust::device_vector<uint16_t> device_query(fixture.query);
-    thrust::device_vector<cuddl::reference_search_result> results(reference_count);
-    thrust::device_vector<uint32_t> result_count(1);
+    auto device_rows =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), fixture.rows);
+    auto device_query =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), fixture.query);
+    auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        setup_stream, setup_stream.device(), reference_count, cuda::no_init
+    );
+    auto result_count =
+        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1, cuda::no_init);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-            device_rows, compatibility
+            device_rows, compatibility, setup_stream, storage
         )));
-    auto const workspace_bytes = CUDDL_UNWRAP(database.indexed_single_query_workspace_bytes());
-    thrust::device_vector<uint8_t> workspace(workspace_bytes);
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    auto const workspace_bytes =
+        CUDDL_UNWRAP(database.indexed_single_query_workspace_bytes(setup_stream));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        setup_stream, setup_stream.device(), workspace_bytes, cuda::no_init
+    );
+    setup_stream.sync();
 
     CUDDL_UNWRAP(database.search_indexed_async(
         device_query,
@@ -1307,27 +1342,34 @@ void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches
         workspace,
         results,
         result_count,
-        {.minimum_matches = minimum_matches}
+        {.minimum_matches = minimum_matches},
+        setup_stream
     ));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    setup_stream.sync();
     uint32_t observed_count = 0;
-    CUDDL_CUDA_CALL(cudaMemcpy(
-        &observed_count,
-        thrust::raw_pointer_cast(result_count.data()),
-        sizeof(observed_count),
-        cudaMemcpyDeviceToHost
-    ));
+    cuda::copy_bytes(
+        setup_stream,
+        cuda::std::span{result_count.data(), size_t{1}},
+        cuda::std::span{&observed_count, size_t{1}}
+    );
+    setup_stream.sync();
     auto const expected_count = minimum_matches == 0U ? reference_count : fixture.candidate_count;
     if (observed_count != expected_count) {
         throw std::runtime_error("indexed search returned the wrong candidate count");
     }
     std::vector<cuddl::reference_search_result> observed_results(expected_count);
-    CUDDL_CUDA_CALL(cudaMemcpy(
-        observed_results.data(),
-        thrust::raw_pointer_cast(results.data()),
-        observed_results.size() * sizeof(observed_results.front()),
-        cudaMemcpyDeviceToHost
-    ));
+    cuda::copy_bytes(
+        setup_stream,
+        cuda::std::span{
+            results.data(),
+            (observed_results.size() * sizeof(observed_results.front())) / sizeof(*(results.data()))
+        },
+        cuda::std::span{
+            observed_results.data(),
+            (observed_results.size() * sizeof(observed_results.front())) / sizeof(*(results.data()))
+        }
+    );
+    setup_stream.sync();
 
     size_t true_positives = 0;
     size_t result_index = 0;
@@ -1388,7 +1430,149 @@ void compact_indexed_zero_threshold_search(nvbench::state& state) {
     compact_indexed_search_impl(state, 0U);
 }
 
+// Distinct reference rows supply the query batch when Queries <= References.
+// Smaller databases repeat sampled rows; no upload/allocation is timed.
+void compact_indexed_batch_search(nvbench::state& state) {
+    using database_type = cuddl::reference_database<k_kmer_length, k_bucket_count>;
+    auto const stream = cuda::stream_ref{state.get_cuda_stream()};
+    auto const references = static_cast<uint32_t>(state.get_int64("References"));
+    auto const queries = static_cast<uint32_t>(state.get_int64("Queries"));
+    if (references == 0U || queries < 2U) {
+        throw std::invalid_argument(
+            "batch search requires positive references and at least two queries"
+        );
+    }
+    auto const storage = state.get_string("Index") == "sparse" ? cuddl::index_storage::sparse
+                                                               : cuddl::index_storage::dense;
+    auto const fixture = make_indexed_fixture(references);
+    std::vector<uint16_t> query_rows(static_cast<size_t>(queries) * k_bucket_count);
+    auto source_reference = [&](uint32_t query) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(query) * references / queries);
+    };
+    for (uint32_t query = 0; query < queries; ++query) {
+        std::copy_n(
+            fixture.rows.data() + static_cast<size_t>(source_reference(query)) * k_bucket_count,
+            k_bucket_count,
+            query_rows.data() + static_cast<size_t>(query) * k_bucket_count
+        );
+    }
+    auto input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), fixture.rows);
+    auto query_input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
+    auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
+    auto database =
+        CUDDL_UNWRAP(database_type::build_indexed_async(input, compatibility, stream, storage));
+    auto const requirements =
+        CUDDL_UNWRAP(database.indexed_batch_search_requirements(queries, stream));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init);
+
+    // An independent scalar oracle checks completeness for the first and last queries.
+    std::vector<uint32_t> expected_first, expected_last;
+    for (uint32_t reference = 0U; reference < references; ++reference) {
+        for (uint32_t query : {0U, queries - 1U}) {
+            auto const summary = score_row_oracle_rows(
+                query_rows.data() + static_cast<size_t>(query) * k_bucket_count,
+                fixture.rows.data() + static_cast<size_t>(reference) * k_bucket_count
+            );
+            if (summary.counts.equal >= 5U) {
+                (query == 0U ? expected_first : expected_last).push_back(reference);
+            }
+        }
+    }
+    uint32_t next_query = 0U;
+    uint64_t candidate_count = 0U;
+    std::vector<uint32_t> observed_first, observed_last;
+    std::vector<bool> self_seen(queries, false);
+    CUDDL_UNWRAP(database.search_batch_indexed_async(
+        query_input,
+        compatibility,
+        0U,
+        workspace,
+        results,
+        count,
+        [&](uint32_t maximum_count) {
+            uint32_t actual = 0U;
+            cuda::copy_bytes(stream, count, cuda::std::span{&actual, size_t{1}});
+            stream.sync();
+            if (actual > maximum_count) {
+                throw std::runtime_error("indexed batch exceeded tile capacity");
+            }
+            std::vector<cuddl::batch_search_result> host(actual);
+            cuda::copy_bytes(stream, cuda::std::span{results.data(), host.size()}, host);
+            stream.sync();
+            auto const tile_queries = maximum_count / references;
+            uint64_t previous = 0U;
+            for (size_t i = 0U; i < host.size(); ++i) {
+                auto const& result = host[i];
+                auto const pair =
+                    static_cast<uint64_t>(result.query_id) * references + result.reference_id;
+                if (result.query_id < next_query || result.query_id >= next_query + tile_queries ||
+                    result.reference_id >= references || (i != 0U && pair <= previous) ||
+                    result.summary.counts.equal < 5U) {
+                    throw std::runtime_error("invalid or unordered indexed batch result");
+                }
+                previous = pair;
+                if (result.reference_id == source_reference(result.query_id)) {
+                    self_seen[result.query_id] = true;
+                }
+                if (result.query_id == 0U) observed_first.push_back(result.reference_id);
+                if (result.query_id == queries - 1U) observed_last.push_back(result.reference_id);
+                if (i == 0U || i + 1U == host.size()) {
+                    auto const expected = score_row_oracle_rows(
+                        query_rows.data() + static_cast<size_t>(result.query_id) * k_bucket_count,
+                        fixture.rows.data() +
+                            static_cast<size_t>(result.reference_id) * k_bucket_count
+                    );
+                    if (result.summary != expected) {
+                        throw std::runtime_error("indexed batch disagrees with scalar refinement");
+                    }
+                }
+            }
+            candidate_count += actual;
+            next_query += tile_queries;
+        },
+        {},
+        {.minimum_matches = 5U},
+        stream
+    ));
+    if (observed_first != expected_first || observed_last != expected_last ||
+        next_query != queries ||
+        std::find(self_seen.begin(), self_seen.end(), false) != self_seen.end()) {
+        throw std::runtime_error("indexed batch omitted expected references");
+    }
+    state.add_element_count(queries, "Queries Searched");
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        CUDDL_UNWRAP(database.search_batch_indexed_async(
+            query_input,
+            compatibility,
+            0U,
+            workspace,
+            results,
+            count,
+            [](uint32_t) {},
+            {},
+            {.minimum_matches = 5U},
+            cuda::stream_ref{launch.get_stream()}
+        ));
+    });
+    add_value(
+        state, "Median GPU Time", state.get_summary("nv/cold/time/gpu/median").get_float64("value")
+    );
+    add_value(state, "Exact Comparisons", static_cast<double>(candidate_count));
+    add_value(
+        state,
+        "Resident Bytes",
+        static_cast<double>(database.persistent_row_bytes() + database.persistent_index_bytes())
+    );
+}
+
 void compact_batch_and_all_to_all_search(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     constexpr uint32_t reference_count = 8U;
     constexpr uint32_t batch_query_count = 3U;
     constexpr uint32_t batch_query_id_offset = 100U;
@@ -1405,18 +1589,21 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         }
     }
 
-    thrust::device_vector<uint16_t> device_rows(rows);
-    thrust::device_vector<uint16_t> device_queries(queries);
+    auto device_rows =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), rows);
+    auto device_queries =
+        cuda::make_device_buffer<uint16_t>(setup_stream, setup_stream.device(), queries);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
-            device_rows, compatibility
+            device_rows, compatibility, setup_stream
         )));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    setup_stream.sync();
 
     auto const batch_requirements =
-        CUDDL_UNWRAP(database.batch_search_requirements(batch_query_count));
-    auto const all_to_all_requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
+        CUDDL_UNWRAP(database.batch_search_requirements(batch_query_count, setup_stream));
+    auto const all_to_all_requirements =
+        CUDDL_UNWRAP(database.all_to_all_search_requirements(setup_stream));
     auto const workspace_bytes =
         std::max(batch_requirements.workspace_bytes, all_to_all_requirements.workspace_bytes);
     auto const maximum_pair_count = std::max(
@@ -1436,21 +1623,28 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         maximum_pair_count, (match_count_bytes + sizeof(uint32_t) - 1U) / sizeof(uint32_t)
     );
 
-    thrust::device_vector<uint8_t> workspace(workspace_bytes);
-    thrust::device_vector<cuddl::batch_search_result> results(result_capacity);
-    thrust::device_vector<uint32_t> result_count(1);
-    thrust::device_vector<uint32_t> result_match_counts(match_count_capacity);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        setup_stream, setup_stream.device(), workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        setup_stream, setup_stream.device(), result_capacity, cuda::no_init
+    );
+    auto result_count =
+        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1, cuda::no_init);
+    auto result_match_counts = cuda::make_device_buffer<uint32_t>(
+        setup_stream, setup_stream.device(), match_count_capacity, cuda::no_init
+    );
     std::vector<cuddl::batch_search_result> observed_results(result_capacity);
     std::vector<uint32_t> observed_match_counts(match_count_capacity);
 
     auto read_result_count = [&] {
         uint32_t count = 0;
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            &count,
-            thrust::raw_pointer_cast(result_count.data()),
-            sizeof(count),
-            cudaMemcpyDeviceToHost
-        ));
+        cuda::copy_bytes(
+            setup_stream,
+            cuda::std::span{result_count.data(), size_t{1}},
+            cuda::std::span{&count, size_t{1}}
+        );
+        setup_stream.sync();
         return count;
     };
     auto validate_batch = [&] {
@@ -1459,18 +1653,34 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         if (observed_count != expected_count) {
             throw std::runtime_error("batch search returned the wrong pair count");
         }
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            observed_results.data(),
-            thrust::raw_pointer_cast(results.data()),
-            static_cast<size_t>(observed_count) * sizeof(observed_results.front()),
-            cudaMemcpyDeviceToHost
-        ));
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            observed_match_counts.data(),
-            thrust::raw_pointer_cast(result_match_counts.data()),
-            static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front()),
-            cudaMemcpyDeviceToHost
-        ));
+        cuda::copy_bytes(
+            setup_stream,
+            cuda::std::span{
+                results.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
+                    sizeof(*(results.data()))
+            },
+            cuda::std::span{
+                observed_results.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
+                    sizeof(*(results.data()))
+            }
+        );
+        setup_stream.sync();
+        cuda::copy_bytes(
+            setup_stream,
+            cuda::std::span{
+                result_match_counts.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
+                    sizeof(*(result_match_counts.data()))
+            },
+            cuda::std::span{
+                observed_match_counts.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
+                    sizeof(*(result_match_counts.data()))
+            }
+        );
+        setup_stream.sync();
         for (uint32_t result_index = 0; result_index < observed_count; ++result_index) {
             auto const query_index = result_index / reference_count;
             auto const reference_id = result_index % reference_count;
@@ -1495,18 +1705,34 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         if (observed_count != expected_count) {
             throw std::runtime_error("all-to-all search returned the wrong pair count");
         }
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            observed_results.data(),
-            thrust::raw_pointer_cast(results.data()),
-            static_cast<size_t>(observed_count) * sizeof(observed_results.front()),
-            cudaMemcpyDeviceToHost
-        ));
-        CUDDL_CUDA_CALL(cudaMemcpy(
-            observed_match_counts.data(),
-            thrust::raw_pointer_cast(result_match_counts.data()),
-            static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front()),
-            cudaMemcpyDeviceToHost
-        ));
+        cuda::copy_bytes(
+            setup_stream,
+            cuda::std::span{
+                results.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
+                    sizeof(*(results.data()))
+            },
+            cuda::std::span{
+                observed_results.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
+                    sizeof(*(results.data()))
+            }
+        );
+        setup_stream.sync();
+        cuda::copy_bytes(
+            setup_stream,
+            cuda::std::span{
+                result_match_counts.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
+                    sizeof(*(result_match_counts.data()))
+            },
+            cuda::std::span{
+                observed_match_counts.data(),
+                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
+                    sizeof(*(result_match_counts.data()))
+            }
+        );
+        setup_stream.sync();
         uint32_t result_index = 0;
         for (uint32_t query_id = 0U; query_id < reference_count; ++query_id) {
             for (uint32_t reference_id = query_id + 1U; reference_id < reference_count;
@@ -1536,9 +1762,10 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         results,
         result_count,
         [](uint32_t) {},
-        result_match_counts
+        result_match_counts,
+        setup_stream
     ));
-    CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+    setup_stream.sync();
     validate_batch();
 
     CUDDL_UNWRAP(database.search_all_to_all_async(
@@ -1546,10 +1773,11 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         results,
         result_count,
         [&](uint32_t) {
-            CUDDL_CUDA_CALL(cudaDeviceSynchronize());
+            setup_stream.sync();
             validate_all_to_all();
         },
-        result_match_counts
+        result_match_counts,
+        setup_stream
     ));
 
     auto const total_pairs = static_cast<size_t>(batch_query_count) * reference_count +
@@ -1595,12 +1823,19 @@ NVBENCH_BENCH(compact_exhaustive_parameter_sweep)
     .set_stopping_criterion("sample-count")
     .set_min_samples(20)
     .set_criterion_param_int64("target-samples", 20);
+NVBENCH_BENCH(compact_indexed_batch_search)
+    .add_int64_axis("References", index_layout_reference_counts)
+    .add_int64_axis("Queries", {1024, 4096})
+    .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_indexed_build)
-    .add_int64_power_of_two_axis("References", indexed_reference_powers);
+    .add_int64_axis("References", index_layout_reference_counts)
+    .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_indexed_search)
-    .add_int64_power_of_two_axis("References", indexed_reference_powers);
+    .add_int64_power_of_two_axis("References", indexed_reference_powers)
+    .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_indexed_zero_threshold_search)
-    .add_int64_power_of_two_axis("References", indexed_reference_powers);
+    .add_int64_power_of_two_axis("References", indexed_reference_powers)
+    .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_batch_and_all_to_all_search);
 
 /// @brief Intercepts FASTA pipeline options; the rest reaches nvbench.

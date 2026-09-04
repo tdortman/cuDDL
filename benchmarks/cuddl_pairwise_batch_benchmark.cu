@@ -1,6 +1,7 @@
 #include <cuddl/cuddl.cuh>
 
-#include <cuda_runtime.h>
+#include <cuda/algorithm>
+#include <cuda/buffer>
 #include <nvbench/nvbench.cuh>
 
 #include <algorithm>
@@ -38,12 +39,6 @@ std::vector<nvbench::int64_t> const sketch_pair_counts{
     131072
 };
 
-void check(cudaError_t error) {
-    if (error != cudaSuccess) {
-        throw std::runtime_error(cudaGetErrorString(error));
-    }
-}
-
 void add_system_metadata(nvbench::state& state) {
     auto const system = benchmark_system();
     for (auto const& [column, field] : std::array{
@@ -69,14 +64,43 @@ void add_system_metadata(nvbench::state& state) {
 
 class batch_fixture {
    public:
-    explicit batch_fixture(size_t pairs) : pairs_(pairs), register_count_(pairs * bucket_count) {
-        check(cudaMallocHost(&host_left_, register_count_ * sizeof(uint32_t)));
-        check(cudaMallocHost(&host_right_, register_count_ * sizeof(uint32_t)));
-        check(cudaMallocHost(&host_outputs_, pairs_ * sizeof(cuddl::pairwise_summary)));
-        check(cudaMalloc(&device_left_, register_count_ * sizeof(uint32_t)));
-        check(cudaMalloc(&device_right_, register_count_ * sizeof(uint32_t)));
-        check(cudaMalloc(&device_outputs_, pairs_ * sizeof(cuddl::pairwise_summary)));
-
+    explicit batch_fixture(size_t pairs, cuda::stream_ref setup_stream)
+        : pairs_(pairs),
+          register_count_(pairs * bucket_count),
+          host_left_(
+              cuda::make_pinned_buffer<uint32_t>(setup_stream, register_count_, cuda::no_init)
+          ),
+          host_right_(
+              cuda::make_pinned_buffer<uint32_t>(setup_stream, register_count_, cuda::no_init)
+          ),
+          host_outputs_(
+              cuda::make_pinned_buffer<cuddl::pairwise_summary>(setup_stream, pairs_, cuda::no_init)
+          ),
+          device_left_(
+              cuda::make_device_buffer<uint32_t>(
+                  setup_stream,
+                  setup_stream.device(),
+                  register_count_,
+                  cuda::no_init
+              )
+          ),
+          device_right_(
+              cuda::make_device_buffer<uint32_t>(
+                  setup_stream,
+                  setup_stream.device(),
+                  register_count_,
+                  cuda::no_init
+              )
+          ),
+          device_outputs_(
+              cuda::make_device_buffer<cuddl::pairwise_summary>(
+                  setup_stream,
+                  setup_stream.device(),
+                  pairs_,
+                  cuda::no_init
+              )
+          ) {
+        setup_stream.sync();
         for (size_t index = 0; index < register_count_; ++index) {
             auto const left_hash = cuddl::detail::splitmix64(0x1234'5678'9abc'def0ULL + index);
             auto const right_hash = cuddl::detail::splitmix64(0xfedc'ba98'7654'3210ULL + index);
@@ -87,47 +111,27 @@ class batch_fixture {
                                                ? uint16_t{0}
                                                : static_cast<uint16_t>((right_hash >> 48U) | 1U);
             auto const right_score = index % 4U == 0U ? left_score : independent_right;
-            host_left_[index] = cuddl::detail::pack(left_score, left_score == 0U ? 0U : 1U);
-            host_right_[index] = cuddl::detail::pack(right_score, right_score == 0U ? 0U : 1U);
+            host_left_.data()[index] = cuddl::detail::pack(left_score, left_score == 0U ? 0U : 1U);
+            host_right_.data()[index] =
+                cuddl::detail::pack(right_score, right_score == 0U ? 0U : 1U);
         }
-        upload(cudaStream_t{nullptr});
-        check(cudaDeviceSynchronize());
-    }
-
-    ~batch_fixture() {
-        cudaFree(device_outputs_);
-        cudaFree(device_right_);
-        cudaFree(device_left_);
-        cudaFreeHost(host_outputs_);
-        cudaFreeHost(host_right_);
-        cudaFreeHost(host_left_);
+        upload(setup_stream);
+        setup_stream.sync();
     }
 
     batch_fixture(batch_fixture const&) = delete;
     batch_fixture& operator=(batch_fixture const&) = delete;
 
-    void upload(cudaStream_t stream) const {
-        check(cudaMemcpyAsync(
-            device_left_,
-            host_left_,
-            register_count_ * sizeof(uint32_t),
-            cudaMemcpyHostToDevice,
-            stream
-        ));
-        check(cudaMemcpyAsync(
-            device_right_,
-            host_right_,
-            register_count_ * sizeof(uint32_t),
-            cudaMemcpyHostToDevice,
-            stream
-        ));
+    void upload(cuda::stream_ref stream) const {
+        cuda::copy_bytes(stream, host_left_, device_left_);
+        cuda::copy_bytes(stream, host_right_, device_right_);
     }
 
-    void compare(cudaStream_t stream) const {
+    void compare(cuda::stream_ref stream) const {
         auto result = cuddl::compare_batch_async<bucket_count>(
-            {device_left_, register_count_},
-            {device_right_, register_count_},
-            {device_outputs_, pairs_},
+            {device_left_.data(), register_count_},
+            {device_right_.data(), register_count_},
+            {device_outputs_.data(), pairs_},
             cuda::stream_ref{stream}
         );
         if (!result.has_value()) {
@@ -135,14 +139,8 @@ class batch_fixture {
         }
     }
 
-    void download(cudaStream_t stream) const {
-        check(cudaMemcpyAsync(
-            host_outputs_,
-            device_outputs_,
-            pairs_ * sizeof(cuddl::pairwise_summary),
-            cudaMemcpyDeviceToHost,
-            stream
-        ));
+    void download(cuda::stream_ref stream) const {
+        cuda::copy_bytes(stream, device_outputs_, host_outputs_);
     }
 
     void verify() const {
@@ -151,8 +149,8 @@ class batch_fixture {
             cuddl::pairwise_counts expected{};
             auto const offset = pair * bucket_count;
             for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
-                auto const left = cuddl::detail::winner(host_left_[offset + bucket]);
-                auto const right = cuddl::detail::winner(host_right_[offset + bucket]);
+                auto const left = cuddl::detail::winner(host_left_.data()[offset + bucket]);
+                auto const right = cuddl::detail::winner(host_right_.data()[offset + bucket]);
                 if (left == 0U && right == 0U) {
                     ++expected.both_empty;
                 } else if (left < right) {
@@ -163,7 +161,7 @@ class batch_fixture {
                     ++expected.equal;
                 }
             }
-            if (!(host_outputs_[pair].counts == expected)) {
+            if (!(host_outputs_.data()[pair].counts == expected)) {
                 throw std::runtime_error("batched comparison verification failed");
             }
         }
@@ -179,63 +177,67 @@ class batch_fixture {
    private:
     size_t pairs_;
     size_t register_count_;
-    uint32_t* host_left_{};
-    uint32_t* host_right_{};
-    cuddl::pairwise_summary* host_outputs_{};
-    uint32_t* device_left_{};
-    uint32_t* device_right_{};
-    cuddl::pairwise_summary* device_outputs_{};
+    cuda::host_buffer<uint32_t> host_left_;
+    cuda::host_buffer<uint32_t> host_right_;
+    mutable cuda::host_buffer<cuddl::pairwise_summary> host_outputs_;
+    mutable cuda::device_buffer<uint32_t> device_left_;
+    mutable cuda::device_buffer<uint32_t> device_right_;
+    mutable cuda::device_buffer<cuddl::pairwise_summary> device_outputs_;
 };
 
 void profile_kernel(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")), setup_stream);
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());
     state.add_global_memory_writes<cuddl::pairwise_summary>(fixture.pairs());
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        fixture.compare(launch.get_stream());
+        fixture.compare(cuda::stream_ref{launch.get_stream()});
     });
-    fixture.download(cudaStream_t{nullptr});
-    check(cudaDeviceSynchronize());
+    fixture.download(setup_stream);
+    setup_stream.sync();
     fixture.verify();
 }
 
 void profile_h2d(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")), setup_stream);
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_writes<uint32_t>(2U * fixture.register_count());
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        fixture.upload(launch.get_stream());
+        fixture.upload(cuda::stream_ref{launch.get_stream()});
     });
 }
 
 void profile_d2h(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
-    fixture.compare(cudaStream_t{nullptr});
-    check(cudaDeviceSynchronize());
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")), setup_stream);
+    fixture.compare(setup_stream);
+    setup_stream.sync();
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<cuddl::pairwise_summary>(fixture.pairs());
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        fixture.download(launch.get_stream());
+        fixture.download(cuda::stream_ref{launch.get_stream()});
     });
     fixture.verify();
 }
 
 void profile_end_to_end(nvbench::state& state) {
+    auto const setup_stream = cuda::stream_ref{state.get_cuda_stream()};
     add_system_metadata(state);
-    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")));
+    batch_fixture fixture(static_cast<size_t>(state.get_int64("Sketch Pairs")), setup_stream);
     state.add_element_count(fixture.pairs(), "Pairs");
     state.add_global_memory_reads<uint32_t>(2U * fixture.register_count());
     state.add_global_memory_writes<uint32_t>(2U * fixture.register_count());
     state.add_global_memory_reads<cuddl::pairwise_summary>(fixture.pairs());
     state.add_global_memory_writes<cuddl::pairwise_summary>(fixture.pairs());
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        fixture.upload(launch.get_stream());
-        fixture.compare(launch.get_stream());
-        fixture.download(launch.get_stream());
+        fixture.upload(cuda::stream_ref{launch.get_stream()});
+        fixture.compare(cuda::stream_ref{launch.get_stream()});
+        fixture.download(cuda::stream_ref{launch.get_stream()});
     });
     fixture.verify();
 }

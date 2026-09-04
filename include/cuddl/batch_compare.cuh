@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <algorithm>
 #include <cstddef>
@@ -25,7 +25,7 @@ template <size_t BucketCount>
     device_span<uint32_t const> left_rows,
     device_span<uint32_t const> right_rows,
     device_span<pairwise_summary> outputs,
-    cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+    cuda::stream_ref stream
 ) {
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cuda_runtime_api.h>
+#include <cuda/devices>
+#include <cuda/stream>
 
 #include <cstdint>
 #include <fstream>
@@ -87,17 +89,23 @@ inline json benchmark_system() {
         system["cuda_driver_version"] = version;
     }
 
-    int device{};
-    cudaDeviceProp properties{};
-    if (cudaGetDevice(&device) == cudaSuccess &&
-        cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+    int device_ordinal{};
+    if (cudaGetDevice(&device_ordinal) != cudaSuccess) {
+        return system;
+    }
+    try {
+        auto const device = cuda::devices[device_ordinal];
+        auto const name = device.name();
+        auto const major = device.attribute(cuda::device_attributes::compute_capability_major);
+        auto const minor = device.attribute(cuda::device_attributes::compute_capability_minor);
         system.update({
-            {"gpu", properties.name},
-            {"compute_capability",
-             std::to_string(properties.major) + "." + std::to_string(properties.minor)},
-            {"sm_count", properties.multiProcessorCount},
-            {"gpu_ram_bytes", properties.totalGlobalMem},
+            {"gpu", std::string(name.data(), name.size())},
+            {"compute_capability", std::to_string(major) + "." + std::to_string(minor)},
+            {"sm_count", device.attribute(cuda::device_attributes::multiprocessor_count)},
+            {"gpu_ram_bytes", device.attribute(cuda::device_attributes::total_global_memory)},
         });
+    } catch (cuda::cuda_error const&) {
+        // CPU-only benchmarks still report host metadata when CUDA is unavailable.
     }
     return system;
 }

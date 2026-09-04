@@ -1,8 +1,8 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include <cuda/algorithm>
 #include <cuda/std/cstdint>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <cuddl/detail/construction.cuh>
 #include <cuddl/detail/kernels.cuh>
@@ -61,23 +61,19 @@ class sketch_view {
     ///
     /// The backing allocation is contractually `BucketCount` registers followed by the aligned
     /// saturation flag, so one memset covers both.
-    [[nodiscard]] Result<void> clear_async(
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const noexcept {
-        return cuda_try(cudaMemsetAsync(
-            registers_.data(), 0, registers_.size_bytes() + sizeof(saturation_), stream.get()
-        ));
+    [[nodiscard]] Result<void> clear_async(cuda::stream_ref stream) const noexcept {
+        return cuda_try([&] {
+            cuda::fill_bytes(stream, cuda::std::span{registers_.data(), registers_.size() + 1U}, 0);
+        });
     }
 
     /// @brief Constructs the sketch from packed k-mers in @p input.
     ///
     /// The input must remain valid until @p stream completes.
-    [[nodiscard]] Result<void> add_async(
-        device_span<uint64_t const> input,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
-    ) const noexcept {
+    [[nodiscard]] Result<void>
+    add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
         return detail::launch_construction<BucketCount, Layout>(
-            input, registers_, saturation_, stream.get()
+            input, registers_, saturation_, stream
         );
     }
 
@@ -88,7 +84,7 @@ class sketch_view {
     [[nodiscard]] Result<void> summary_async(
         sketch_view other,
         pairwise_summary& output,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const noexcept {
         detail::summary_kernel<BucketCount, IncludeCardinality, Layout>
             <<<1, detail::block_size, 0, stream.get()>>>(
@@ -103,7 +99,7 @@ class sketch_view {
     [[nodiscard]] Result<void> cardinality_async(
         uint64_t* empty_out,
         double* estimate_out,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const noexcept {
         detail::cardinality_kernel<BucketCount, Layout><<<1, detail::block_size, 0, stream.get()>>>(
             registers_.data(), empty_out, estimate_out
@@ -114,7 +110,7 @@ class sketch_view {
     /// @brief Computes BBTools and paper-style HybridDDL estimates in one GPU register scan.
     [[nodiscard]] Result<void> hybrid_cardinality_async(
         hybrid_cardinality_estimates* output,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const noexcept {
         detail::hybrid_cardinality_kernel<BucketCount, Layout>
             <<<1, detail::block_size, 0, stream.get()>>>(registers_.data(), output);
@@ -128,7 +124,7 @@ class sketch_view {
     [[nodiscard]] Result<void> winner_counts_async(
         uint16_t* counts_out,
         uint32_t* saturation_out,
-        cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}}
+        cuda::stream_ref stream
     ) const noexcept {
         detail::winner_counts_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
             registers_.data(), &saturation_, counts_out, saturation_out

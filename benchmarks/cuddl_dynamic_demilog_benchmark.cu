@@ -26,17 +26,16 @@ std::vector<uint64_t> make_inputs(size_t count, int64_t trial) {
 }
 
 double run(std::vector<uint64_t> const& host, double& estimate) {
-    uint64_t* device = nullptr;
-    CUDDL_CUDA_CALL(cudaMalloc(&device, host.size() * sizeof(uint64_t)));
-    CUDDL_CUDA_CALL(
-        cudaMemcpy(device, host.data(), host.size() * sizeof(uint64_t), cudaMemcpyHostToDevice)
-    );
-    cuddl::sketch<25, bucket_count> sketch;
+    cuda::stream setup_stream{cuda::devices[0]};
+    auto device_storage =
+        cuda::make_device_buffer<uint64_t>(setup_stream, setup_stream.device(), host);
+    auto* device = device_storage.data();
+    setup_stream.sync();
+    cuddl::sketch<25, bucket_count> sketch(setup_stream);
     auto const start = clock_type::now();
-    CUDDL_UNWRAP(sketch.add({device, host.size()}));
-    estimate = CUDDL_UNWRAP(sketch.cardinality());
+    CUDDL_UNWRAP(sketch.add({device, host.size()}, setup_stream));
+    estimate = CUDDL_UNWRAP(sketch.cardinality(setup_stream));
     auto const seconds = std::chrono::duration<double>(clock_type::now() - start).count();
-    CUDDL_CUDA_CALL(cudaFree(device));
     return seconds;
 }
 

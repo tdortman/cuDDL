@@ -248,15 +248,11 @@ row_fingerprint fingerprint_row(std::vector<uint16_t> const& row) {
 
 /// @brief True when the CUDA runtime can enumerate at least one device.
 bool cuda_available() {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+    try {
+        return cuda::devices.size() != 0;
+    } catch (cuda::cuda_error const&) {
         return false;
     }
-    cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, 0) != cudaSuccess) {
-        return false;
-    }
-    return true;
 }
 
 /// @brief Prints the exact external prerequisite when the official asset is not available.
@@ -703,17 +699,18 @@ int main(int argc, char** argv) {
         size_t device_peak_bytes = 0;
         size_t device_rows_bytes = 0, device_index_bytes = 0;
         if (gpu_available) {
+            cuda::stream stream{cuda::devices[0]};
             CUDDL_CUDA_CALL(cudaMemGetInfo(&device_free_before, &device_total));
             device_free_low = device_free_before;
 
             // One-shot upload: the rows are identical across iterations, so the copy is not a
             // measured phase.
             auto const t_upload_start = now_ms();
-            thrust::device_vector<uint16_t> device_scores(flat_scores);
+            auto device_scores =
+                cuda::make_device_buffer<uint16_t>(stream, stream.device(), flat_scores);
+            stream.sync();
             auto const t_upload_end = now_ms();
             host_to_device_ms = t_upload_end - t_upload_start;
-
-            auto const stream = cuda::stream_ref{cudaStream_t{nullptr}};
 
             // All selected queries share one row-major tile. One indexed call and one
             // exhaustive call answer the whole tile per measured iteration.
@@ -724,14 +721,20 @@ int main(int argc, char** argv) {
                     flat_queries.end(), report.query.row.begin(), report.query.row.end()
                 );
             }
-            thrust::device_vector<uint16_t> device_queries(flat_queries);
-            thrust::device_vector<uint32_t> batch_count(1U);
-            thrust::device_vector<uint32_t> batch_exhaustive_count(1U);
+            auto device_queries =
+                cuda::make_device_buffer<uint16_t>(stream, stream.device(), flat_queries);
+            auto batch_count =
+                cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+            auto batch_exhaustive_count =
+                cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
 
-            thrust::device_vector<uint8_t> batch_workspace;
+            auto batch_workspace =
+                cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
             using batch_result_t = ddl_t::batch_result_type;
-            thrust::device_vector<batch_result_t> batch_results;
-            thrust::device_vector<batch_result_t> batch_exhaustive_results;
+            auto batch_results =
+                cuda::make_device_buffer<batch_result_t>(stream, stream.device(), 0, cuda::no_init);
+            auto batch_exhaustive_results =
+                cuda::make_device_buffer<batch_result_t>(stream, stream.device(), 0, cuda::no_init);
             std::vector<batch_result_t> batch_host;
             std::vector<batch_result_t> batch_exhaustive_host;
 
@@ -765,7 +768,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("index build failed: " + built.error().message());
                 }
                 auto database = std::move(*built);
-                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream.get()));
+                cuda::stream_ref{stream.get()}.sync();
                 auto const t_index_end = now_ms();
                 if (measured) {
                     index_build_runs.push_back(t_index_end - t_index_start);
@@ -782,27 +785,36 @@ int main(int argc, char** argv) {
                     device_index_bytes = database.persistent_index_bytes();
 
                     auto const batch_requirements = database.indexed_batch_search_requirements(
-                        static_cast<uint32_t>(reports.size())
+                        static_cast<uint32_t>(reports.size()), stream
                     );
                     auto const exhaustive_requirements = database.indexed_batch_search_requirements(
-                        static_cast<uint32_t>(reports.size())
+                        static_cast<uint32_t>(reports.size()), stream
                     );
                     if (!batch_requirements || !exhaustive_requirements) {
                         throw std::runtime_error("batch workspace sizing failed");
                     }
-                    batch_workspace =
-                        thrust::device_vector<uint8_t>(batch_requirements->workspace_bytes);
-                    batch_results = thrust::device_vector<batch_result_t>(
-                        batch_requirements->maximum_pair_count
+                    batch_workspace = cuda::make_device_buffer<uint8_t>(
+                        stream, stream.device(), batch_requirements->workspace_bytes, uint8_t{}
                     );
-                    batch_exhaustive_results = thrust::device_vector<batch_result_t>(
-                        exhaustive_requirements->maximum_pair_count
+                    batch_results = cuda::make_device_buffer<batch_result_t>(
+                        stream,
+                        stream.device(),
+                        batch_requirements->maximum_pair_count,
+                        batch_result_t{}
+                    );
+                    batch_exhaustive_results = cuda::make_device_buffer<batch_result_t>(
+                        stream,
+                        stream.device(),
+                        exhaustive_requirements->maximum_pair_count,
+                        batch_result_t{}
                     );
                 }
 
                 // Batched exhaustive pass: the exact-refinement bound for the whole tile.
-                thrust::device_vector<uint8_t> batch_exhaustive_workspace;
-                thrust::device_vector<uint32_t> batch_exhaustive_match_counts;
+                auto batch_exhaustive_workspace =
+                    cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+                auto batch_exhaustive_match_counts =
+                    cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
                 auto const t_exhaustive_start = now_ms();
                 auto const exhaustive_batch_res = database.search_batch_async(
                     device_queries,
@@ -815,7 +827,7 @@ int main(int argc, char** argv) {
                     batch_exhaustive_match_counts,
                     stream
                 );
-                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream.get()));
+                cuda::stream_ref{stream.get()}.sync();
                 auto const t_exhaustive_end = now_ms();
                 if (!exhaustive_batch_res) {
                     throw std::runtime_error(
@@ -825,24 +837,25 @@ int main(int argc, char** argv) {
                 }
 
                 uint32_t exhaustive_pair_count = 0;
-                CUDDL_CUDA_CALL(cudaMemcpy(
-                    &exhaustive_pair_count,
-                    thrust::raw_pointer_cast(batch_exhaustive_count.data()),
-                    sizeof(exhaustive_pair_count),
-                    cudaMemcpyDeviceToHost
-                ));
+                cuda::copy_bytes(
+                    stream,
+                    cuda::std::span{batch_exhaustive_count.data(), size_t{1}},
+                    cuda::std::span{&exhaustive_pair_count, size_t{1}}
+                );
+                stream.sync();
                 batch_exhaustive_host.resize(exhaustive_pair_count);
                 if (exhaustive_pair_count != 0U) {
-                    CUDDL_CUDA_CALL(cudaMemcpy(
-                        batch_exhaustive_host.data(),
-                        thrust::raw_pointer_cast(batch_exhaustive_results.data()),
-                        exhaustive_pair_count * sizeof(batch_result_t),
-                        cudaMemcpyDeviceToHost
-                    ));
+                    cuda::copy_bytes(
+                        stream,
+                        cuda::std::span{batch_exhaustive_results.data(), exhaustive_pair_count},
+                        cuda::std::span{batch_exhaustive_host.data(), exhaustive_pair_count}
+                    );
+                    stream.sync();
                 }
 
                 // Batched indexed search for the whole query tile.
-                thrust::device_vector<uint32_t> batch_match_counts;
+                auto batch_match_counts =
+                    cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
                 auto const t_batch_start = now_ms();
                 auto const batch_res = database.search_batch_indexed_async(
                     device_queries,
@@ -856,7 +869,7 @@ int main(int argc, char** argv) {
                     {.minimum_matches = min_hits},
                     stream
                 );
-                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream.get()));
+                cuda::stream_ref{stream.get()}.sync();
                 auto const t_batch_end = now_ms();
                 if (!batch_res) {
                     throw std::runtime_error(
@@ -865,20 +878,20 @@ int main(int argc, char** argv) {
                 }
 
                 uint32_t batch_pair_count = 0;
-                CUDDL_CUDA_CALL(cudaMemcpy(
-                    &batch_pair_count,
-                    thrust::raw_pointer_cast(batch_count.data()),
-                    sizeof(batch_pair_count),
-                    cudaMemcpyDeviceToHost
-                ));
+                cuda::copy_bytes(
+                    stream,
+                    cuda::std::span{batch_count.data(), size_t{1}},
+                    cuda::std::span{&batch_pair_count, size_t{1}}
+                );
+                stream.sync();
                 batch_host.resize(batch_pair_count);
                 if (batch_pair_count != 0U) {
-                    CUDDL_CUDA_CALL(cudaMemcpy(
-                        batch_host.data(),
-                        thrust::raw_pointer_cast(batch_results.data()),
-                        batch_pair_count * sizeof(batch_result_t),
-                        cudaMemcpyDeviceToHost
-                    ));
+                    cuda::copy_bytes(
+                        stream,
+                        cuda::std::span{batch_results.data(), batch_pair_count},
+                        cuda::std::span{batch_host.data(), batch_pair_count}
+                    );
+                    stream.sync();
                 }
 
                 if (measured) {
@@ -1152,6 +1165,7 @@ int main(int argc, char** argv) {
             {"device_total", device_total},
         };
         if (gpu_available) {
+            cuda::stream stream{cuda::devices[0]};
             append_measurement(
                 measurements,
                 "cuDDL",
