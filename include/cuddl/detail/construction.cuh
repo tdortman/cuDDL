@@ -36,10 +36,19 @@ __host__ inline Result<void> launch_construction(
             auto const needed = input.size() / capacity + (input.size() % capacity != 0U);
             auto const blocks =
                 static_cast<uint32_t>(cuda::std::min<size_t>(multiprocessors * 2U, needed));
-            add_shared_kernel<BucketCount, Layout>
-                <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
-                    input.data(), input.size(), registers.data(), saturation, vector_input
-                );
+            // Genome window sweeps on sm_120 support the floor from 24 Mi k-mers.
+            // Smaller calls may not repay the warm-up and reduction.
+            if (input.size() >= (size_t{24} << 20U)) {
+                add_shared_kernel<BucketCount, Layout, 32U>
+                    <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
+                        input.data(), input.size(), registers.data(), saturation, vector_input
+                    );
+            } else {
+                add_shared_kernel<BucketCount, Layout>
+                    <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
+                        input.data(), input.size(), registers.data(), saturation, vector_input
+                    );
+            }
 
         } else {
             auto const capacity = static_cast<size_t>(block_size) * 2U;

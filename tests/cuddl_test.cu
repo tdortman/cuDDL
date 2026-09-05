@@ -2799,6 +2799,30 @@ TEST(SketchTest, CardinalityRemainsAccurateThroughSparseTransition) {
     }
 }
 
+TEST(SketchTest, ConstructionFloorBoundaryMatchesScalarOracleAndAppend) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t threshold = size_t{24} << 20U;
+    for (auto const size : {threshold - 1U, threshold, threshold + 1U}) {
+        SCOPED_TRACE(size);
+        auto const inputs = make_inputs(size);
+        auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
+        cuddl::sketch<k_default, b_default> gpu(stream);
+        scalar_sketch<b_default> oracle;
+        for (uint32_t pass = 0; pass < 2U; ++pass) {
+            ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
+            oracle.add(inputs);
+            oracle.pack_registers();
+            std::vector<uint32_t> actual(b_default);
+            cuda::copy_bytes(stream, gpu.data(), actual);
+            stream.sync();
+            EXPECT_EQ(actual, oracle.registers);
+            auto counts = gpu.winner_counts(stream);
+            ASSERT_TRUE(counts.has_value());
+            EXPECT_EQ(counts->second, oracle.saturated);
+        }
+    }
+}
+
 TEST(SketchTest, WinnerCountsAndSaturationMatchScalarOracle) {
     cuda::stream stream{cuda::devices[0]};
     // A repeated k-mer so a single bucket sees many equal observations.

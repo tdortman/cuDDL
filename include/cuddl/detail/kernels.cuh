@@ -108,8 +108,12 @@ constexpr uint32_t shared_construction_block_size = 768;
  * The host launches two CTAs per SM and the kernel walks the input with a runtime grid-stride
  * loop over 256-bit chunks, so the grid is a single balanced wave for every input size and the
  * per-CTA merge traffic stays minimal.
+ *
+ * With FloorRounds > 0, drain pending ties after that many uniform input epochs and reduce
+ * the minimum local winner. Subsequent scores strictly below that bound skip the atomic;
+ * ties still count. The default instantiation retains the original ungated kernel.
  */
-template <size_t BucketCount, typename Layout = default_register_layout>
+template <size_t BucketCount, typename Layout = default_register_layout, uint32_t FloorRounds = 0>
 __global__ __launch_bounds__(shared_construction_block_size) void add_shared_kernel(
     uint64_t const* input,
     size_t input_size,
@@ -124,6 +128,7 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     }
     __syncthreads();
 
+    uint32_t floor = 0U;
     uint32_t prev_bucket = 0U;
     uint32_t prev_score = 0xffffU;  // primes the first settle off without a `have` flag
     uint32_t prev_old = 0U;
@@ -151,6 +156,11 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     auto const process = [&](uint64_t value) {
         auto const hash = hash_kmer(value);
         auto const incoming = static_cast<uint32_t>(score<Layout>(hash));
+        if constexpr (FloorRounds != 0U) {
+            if (incoming < floor) {
+                return;
+            }
+        }
         auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
         auto const old = atomicMax(&state[bucket], (incoming << 16U) | 1U);
         settle();
@@ -161,7 +171,43 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
 
     auto const stride = static_cast<size_t>(gridDim.x) * blockDim.x * 4U;
     auto const index = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4U;
-    for (auto offset = index; offset < input_size; offset += stride) {
+    if constexpr (FloorRounds != 0U) {
+        // All lanes complete the same warm-up epochs before reducing the actual local
+        // winners. Strictly smaller scores cannot affect counts or saturation either.
+        using reduce = cub::BlockReduce<uint32_t, shared_construction_block_size>;
+        __shared__ typename reduce::TempStorage floor_storage;
+        __shared__ uint32_t shared_floor;
+        for (uint32_t round = 0; round < FloorRounds; ++round) {
+            auto const offset = index + stride * round;
+            if (vector_input && offset + 4U <= input_size) {
+                uint64_t values[4];
+                load_256_global_nc(input + offset, values);
+                _Pragma("unroll")
+                for (auto& value : values) process(value);
+            } else {
+                _Pragma("unroll")
+                for (uint32_t item = 0; item < 4U; ++item) {
+                    if (offset + item < input_size) process(input[offset + item]);
+                }
+            }
+        }
+        settle();
+        prev_score = 0xffffU;
+        prev_old = 0U;
+        __syncthreads();
+        uint32_t minimum = 0xffffU;
+        for (auto bucket = threadIdx.x; bucket < BucketCount; bucket += blockDim.x) {
+            minimum = cuda::std::min(minimum, state[bucket] >> 16U);
+        }
+        auto const reduced =
+            reduce(floor_storage).Reduce(minimum, [] __device__(uint32_t a, uint32_t b) {
+                return a < b ? a : b;
+            });
+        if (threadIdx.x == 0U) shared_floor = reduced;
+        __syncthreads();
+        floor = shared_floor;
+    }
+    for (auto offset = index + stride * FloorRounds; offset < input_size; offset += stride) {
         if (vector_input && offset + 4U <= input_size) {
             uint64_t values[4];
             load_256_global_nc(input + offset, values);

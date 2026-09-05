@@ -90,3 +90,12 @@ executable(
     cuda_args: cuda_args,
     install: false,
 )
+
+# A/B experiments against the production kernels; each state validates before timing.
+executable(
+    'cuddl-efficiency-benchmark',
+    'cuddl_efficiency_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
