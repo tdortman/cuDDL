@@ -5,3 +5,9 @@ add_compile_options(
   "-I${cccl_source}/libcudacxx/include"
   "-I${cccl_source}/cub"
   "-I${cccl_source}/thrust")
+
+# Export the same precedence to Meson consumers after NVBench creates its targets.
+cmake_language(DEFER CALL target_compile_options nvbench INTERFACE
+  "-I${cccl_source}/libcudacxx/include"
+  "-I${cccl_source}/cub"
+  "-I${cccl_source}/thrust")
