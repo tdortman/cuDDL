@@ -35,13 +35,26 @@ void add(uint64_t const* input, size_t n, uint32_t* output, uint32_t blocks, cud
     check(cudaGetLastError());
 }
 
+// Share parsed inputs across bucket-count instantiations.
+std::vector<uint64_t> const& genome_kmers(std::string const& path) {
+    static std::map<std::string, std::vector<uint64_t>> genomes;
+    auto [entry, inserted] = genomes.try_emplace(path);
+    if (inserted) {
+        auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, 25U));
+        entry->second = std::move(parsed.kmers);
+    }
+    if (entry->second.empty()) throw std::runtime_error("genome contains no valid 25-mers: " + path);
+    return entry->second;
+}
+
 template <size_t B>
 void construction(nvbench::state& state) {
     auto const stream = cuda::stream_ref{state.get_cuda_stream()};
     auto n = static_cast<size_t>(state.get_int64("Items"));
     auto const distribution = state.get_string("Input");
     if (distribution != "random" && distribution != "duplicates" && distribution != "repeated" &&
-        distribution != "ecoli" && distribution != "worm" && distribution != "chr14")
+        distribution != "ecoli" && distribution != "worm" && distribution != "chr14" &&
+        !distribution.starts_with("fasta="))
         throw std::runtime_error("unknown construction input");
     auto const rounds = state.get_int64("FloorRounds");
     auto const offset = static_cast<size_t>(state.get_int64("Misaligned"));
@@ -49,21 +62,13 @@ void construction(nvbench::state& state) {
     if (start_percent < 0 || start_percent > 100)
         throw std::runtime_error("StartPercent must be between 0 and 100");
     std::vector<uint64_t> host;
-    if (distribution == "ecoli" || distribution == "worm" || distribution == "chr14") {
-        // Cache parsing outside timing across the size/window sweep.
-        static std::map<std::string, std::vector<uint64_t>> genomes;
-        auto& genome = genomes[distribution];
-        if (genome.empty()) {
-            auto parsed = CUDDL_UNWRAP(
-                cuddl::parse_fasta_file(
-                    distribution == "ecoli" ? "data/genomes/ecoli_k12_mg1655.fna"
-                                            : (distribution == "worm" ? "data/genomes/WBcel235.fna"
-                                                                      : "data/genomes/chr14.fna"),
-                    25U
-                )
-            );
-            genome = std::move(parsed.kmers);
-        }
+    if (distribution == "ecoli" || distribution == "worm" || distribution == "chr14" ||
+        distribution.starts_with("fasta=")) {
+        auto const path = distribution.starts_with("fasta=") ? distribution.substr(6)
+                        : distribution == "ecoli" ? "data/genomes/ecoli_k12_mg1655.fna"
+                        : distribution == "worm" ? "data/genomes/WBcel235.fna"
+                                                 : "data/genomes/chr14.fna";
+        auto const& genome = genome_kmers(path);
         if (n == 0U) n = genome.size();  // Items=0 retains the full-genome benchmark.
         if (n > genome.size()) throw std::runtime_error("Items exceeds genome size");
         auto const begin = (genome.size() - n) * static_cast<size_t>(start_percent) / 100U;
@@ -79,23 +84,44 @@ void construction(nvbench::state& state) {
                 host[i] = host[offset + (i - offset) % 4096U];
         }
     }
-    if (rounds != 0 && rounds != 8 && rounds != 32)
-        throw std::runtime_error("FloorRounds must be 0, 8, or 32");
     auto input = cuda::make_device_buffer<uint64_t>(stream, stream.device(), host);
     auto reference =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1U, uint32_t{0});
     auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1U, uint32_t{0});
-    int sms = 0;
-    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    auto const sms = stream.device().attribute(cuda::device_attributes::multiprocessor_count);
     auto const blocks = static_cast<uint32_t>(std::min<size_t>(2U * sms, (n + 3071U) / 3072U));
     auto launch = [&](cudaStream_t execution_stream) {
         auto const* data = input.data() + offset;
-        if (rounds == 0)
-            add<B, 0>(data, n, output.data(), blocks, execution_stream);
-        else if (rounds == 8)
-            add<B, 8>(data, n, output.data(), blocks, execution_stream);
-        else
-            add<B, 32>(data, n, output.data(), blocks, execution_stream);
+        switch (rounds) {
+            case 0:
+                return add<B, 0>(data, n, output.data(), blocks, execution_stream);
+            case 1:
+                return add<B, 1>(data, n, output.data(), blocks, execution_stream);
+            case 2:
+                return add<B, 2>(data, n, output.data(), blocks, execution_stream);
+            case 4:
+                return add<B, 4>(data, n, output.data(), blocks, execution_stream);
+            case 8:
+                return add<B, 8>(data, n, output.data(), blocks, execution_stream);
+            case 12:
+                return add<B, 12>(data, n, output.data(), blocks, execution_stream);
+            case 16:
+                return add<B, 16>(data, n, output.data(), blocks, execution_stream);
+            case 24:
+                return add<B, 24>(data, n, output.data(), blocks, execution_stream);
+            case 32:
+                return add<B, 32>(data, n, output.data(), blocks, execution_stream);
+            case 48:
+                return add<B, 48>(data, n, output.data(), blocks, execution_stream);
+            case 64:
+                return add<B, 64>(data, n, output.data(), blocks, execution_stream);
+            case 96:
+                return add<B, 96>(data, n, output.data(), blocks, execution_stream);
+            case 128:
+                return add<B, 128>(data, n, output.data(), blocks, execution_stream);
+            default:
+                throw std::runtime_error("unsupported FloorRounds sweep value");
+        }
     };
     add<B, 0>(input.data() + offset, n, reference.data(), blocks, stream.get());
     launch(stream.get());
