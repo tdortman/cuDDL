@@ -111,9 +111,7 @@ def analyze(frame: pd.DataFrame):
     proposed = reverse.merge(
         lookup[["Buckets", "Items", "FloorRounds"]], validate="many_to_one"
     ).assign(Policy="Size lookup")
-    current = reverse[
-        reverse.FloorRounds == np.where(reverse.Items >= 25165824, 32, 0)
-    ].assign(Policy="Current rule")
+    current = reverse[reverse.FloorRounds == 1].assign(Policy="Current rule")
     oracle = best[best.Order == "reverse"].assign(Policy="Fastest tested")
     evaluation = pd.concat([proposed, current, oracle], ignore_index=True)
     return best, near, lookup, evaluation
@@ -295,7 +293,7 @@ def figures(frame, best, lookup, evaluation, directory):
                         )
                         ax.plot(
                             x,
-                            np.where(np.array(sizes) >= 25165824, 32, 0),
+                            np.ones(len(sizes)),
                             "D:",
                             color=pu.FILTER_COLORS["cuddl_bbtools"],
                             label="Current rule",

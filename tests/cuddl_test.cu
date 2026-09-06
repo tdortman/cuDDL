@@ -2799,15 +2799,15 @@ TEST(SketchTest, CardinalityRemainsAccurateThroughSparseTransition) {
     }
 }
 
-TEST(SketchTest, ConstructionFloorBoundaryMatchesScalarOracleAndAppend) {
+TEST(SketchTest, ConstructionFloorMatchesScalarOracleAndAppend) {
     cuda::stream stream{cuda::devices[0]};
     constexpr size_t threshold = size_t{24} << 20U;
     auto const multiprocessors =
         stream.device().attribute(cuda::device_attributes::multiprocessor_count);
     auto const stride = size_t{2} * multiprocessors * cuddl::detail::shared_construction_block_size * 4U;
     // Exercise post-warm-up iterations and a partial final warp on this device.
-    auto const tail_size = std::max(threshold, stride * 33U) + 7U;
-    for (auto const size : {threshold - 1U, threshold, threshold + 1U, tail_size}) {
+    auto const tail_size = stride * 2U + 7U;
+    for (auto const size : {size_t{0}, size_t{7}, size_t{3073}, tail_size, threshold}) {
         SCOPED_TRACE(size);
         auto const inputs = make_inputs(size);
         auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
