@@ -1,0 +1,308 @@
+--- a/include/cuco/bloom_filter.cuh
++++ b/include/cuco/bloom_filter.cuh
+@@ -16,7 +16,7 @@
+ #include <cuda/atomic>
+ #include <cuda/std/array>
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ #include <cstdint>
+--- a/include/cuco/bloom_filter_ref.cuh
++++ b/include/cuco/bloom_filter_ref.cuh
+@@ -9,7 +9,7 @@
+ #include <cuco/utility/cuda_thread_scope.cuh>
+ 
+ #include <cuda/atomic>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco {
+ 
+--- a/include/cuco/bucket_storage.cuh
++++ b/include/cuco/bucket_storage.cuh
+@@ -12,7 +12,7 @@
+ #include <cuda/std/array>
+ #include <cuda/std/bit>
+ #include <cuda/std/functional>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ #include <cstdint>
+--- a/include/cuco/detail/bloom_filter/bloom_filter.inl
++++ b/include/cuco/detail/bloom_filter/bloom_filter.inl
+@@ -9,7 +9,7 @@
+ #include <cuco/utility/cuda_thread_scope.cuh>
+ 
+ #include <cuda/atomic>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ 
+--- a/include/cuco/detail/bloom_filter/bloom_filter_impl.cuh
++++ b/include/cuco/detail/bloom_filter/bloom_filter_impl.cuh
+@@ -28,7 +28,7 @@
+ #include <cuda/std/functional>
+ #include <cuda/std/tuple>
+ #include <cuda/std/type_traits>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ #include <cuda/utility>
+ 
+ #include <cooperative_groups.h>
+--- a/include/cuco/detail/bloom_filter/bloom_filter_ref.inl
++++ b/include/cuco/detail/bloom_filter/bloom_filter_ref.inl
+@@ -8,7 +8,7 @@
+ #include <cuco/utility/cuda_thread_scope.cuh>
+ 
+ #include <cuda/atomic>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco {
+ 
+--- a/include/cuco/detail/dynamic_map/dynamic_map.inl
++++ b/include/cuco/detail/dynamic_map/dynamic_map.inl
+@@ -9,7 +9,7 @@
+ #include <cuco/operator.hpp>
+ 
+ #include <cuda/std/atomic>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <algorithm>
+ #include <cstddef>
+--- a/include/cuco/detail/hyperloglog/hyperloglog_impl.cuh
++++ b/include/cuco/detail/hyperloglog/hyperloglog_impl.cuh
+@@ -25,7 +25,7 @@
+ #include <cuda/std/span>
+ #include <cuda/std/type_traits>
+ #include <cuda/std/utility>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
+--- a/include/cuco/detail/roaring_bitmap/roaring_bitmap.inl
++++ b/include/cuco/detail/roaring_bitmap/roaring_bitmap.inl
+@@ -6,7 +6,7 @@
+ #pragma once
+ 
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::experimental {
+ 
+--- a/include/cuco/detail/roaring_bitmap/roaring_bitmap_impl.cuh
++++ b/include/cuco/detail/roaring_bitmap/roaring_bitmap_impl.cuh
+@@ -17,7 +17,7 @@
+ #include <cuda/std/cstdint>
+ #include <cuda/std/functional>
+ #include <cuda/std/iterator>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::experimental::detail {
+ 
+--- a/include/cuco/detail/roaring_bitmap/roaring_bitmap_ref.inl
++++ b/include/cuco/detail/roaring_bitmap/roaring_bitmap_ref.inl
+@@ -9,7 +9,7 @@
+ 
+ #include <cuda/std/cstddef>
+ #include <cuda/std/type_traits>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::experimental {
+ 
+--- a/include/cuco/detail/roaring_bitmap/roaring_bitmap_storage.cuh
++++ b/include/cuco/detail/roaring_bitmap/roaring_bitmap_storage.cuh
+@@ -12,7 +12,7 @@
+ 
+ #include <cuda/std/cstddef>
+ #include <cuda/std/cstdint>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <memory>
+ #include <nv/target>
+--- a/include/cuco/detail/static_map/static_map.inl
++++ b/include/cuco/detail/static_map/static_map.inl
+@@ -13,7 +13,7 @@
+ #include <cuco/storage.cuh>
+ 
+ #include <cuda/std/tuple>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <algorithm>
+ #include <cstddef>
+--- a/include/cuco/detail/storage/bucket_storage.inl
++++ b/include/cuco/detail/storage/bucket_storage.inl
+@@ -13,7 +13,7 @@
+ #include <cuda/std/array>
+ #include <cuda/std/bit>
+ #include <cuda/std/cstdint>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cassert>
+ #include <memory>
+--- a/include/cuco/detail/storage/counter_storage.cuh
++++ b/include/cuco/detail/storage/counter_storage.cuh
+@@ -10,7 +10,7 @@
+ #include <cuco/extent.cuh>
+ 
+ #include <cuda/atomic>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <memory>
+ 
+--- a/include/cuco/detail/storage/storage.cuh
++++ b/include/cuco/detail/storage/storage.cuh
+@@ -7,7 +7,7 @@
+ 
+ #include <cuco/bucket_storage.cuh>
+ 
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::detail {
+ /**
+--- a/include/cuco/detail/storage/storage_base.cuh
++++ b/include/cuco/detail/storage/storage_base.cuh
+@@ -5,7 +5,7 @@
+ 
+ #pragma once
+ 
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ 
+--- a/include/cuco/detail/trie/dynamic_bitset/dynamic_bitset.cuh
++++ b/include/cuco/detail/trie/dynamic_bitset/dynamic_bitset.cuh
+@@ -7,7 +7,7 @@
+ 
+ #include <cuda/std/array>
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ #include <thrust/device_malloc_allocator.h>
+ #include <thrust/device_vector.h>
+ 
+--- a/include/cuco/detail/utility/memcpy_async.hpp
++++ b/include/cuco/detail/utility/memcpy_async.hpp
+@@ -7,7 +7,7 @@
+ 
+ #include <cuco/detail/error.hpp>
+ 
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ 
+--- a/include/cuco/hyperloglog.cuh
++++ b/include/cuco/hyperloglog.cuh
+@@ -11,7 +11,7 @@
+ #include <cuco/utility/cuda_thread_scope.cuh>
+ 
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <iterator>
+ #include <memory>
+--- a/include/cuco/hyperloglog_ref.cuh
++++ b/include/cuco/hyperloglog_ref.cuh
+@@ -9,7 +9,7 @@
+ #include <cuco/utility/cuda_thread_scope.cuh>
+ 
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cooperative_groups.h>
+ 
+--- a/include/cuco/roaring_bitmap.cuh
++++ b/include/cuco/roaring_bitmap.cuh
+@@ -10,7 +10,7 @@
+ #include <cuco/utility/allocator.hpp>
+ 
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::experimental {
+ 
+--- a/include/cuco/roaring_bitmap_ref.cuh
++++ b/include/cuco/roaring_bitmap_ref.cuh
+@@ -8,7 +8,7 @@
+ #include <cuco/detail/roaring_bitmap/roaring_bitmap_impl.cuh>
+ 
+ #include <cuda/std/cstddef>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ namespace cuco::experimental {
+ 
+--- a/include/cuco/static_map.cuh
++++ b/include/cuco/static_map.cuh
+@@ -18,7 +18,7 @@
+ #include <cuda/std/atomic>
+ #include <cuda/std/functional>
+ #include <cuda/std/utility>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #if defined(CUCO_HAS_CUDA_BARRIER)
+ #include <cuda/barrier>
+--- a/include/cuco/static_multimap.cuh
++++ b/include/cuco/static_multimap.cuh
+@@ -15,7 +15,7 @@
+ 
+ #include <cuda/std/atomic>
+ #include <cuda/std/functional>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #if defined(CUCO_HAS_CUDA_BARRIER)
+ #include <cuda/barrier>
+--- a/include/cuco/static_multiset.cuh
++++ b/include/cuco/static_multiset.cuh
+@@ -18,7 +18,7 @@
+ 
+ #include <cuda/atomic>
+ #include <cuda/std/functional>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ #include <memory>
+--- a/include/cuco/static_set.cuh
++++ b/include/cuco/static_set.cuh
+@@ -18,7 +18,7 @@
+ 
+ #include <cuda/atomic>
+ #include <cuda/std/functional>
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #if defined(CUCO_HAS_CUDA_BARRIER)
+ #include <cuda/barrier>
+--- a/include/cuco/utility/allocator.hpp
++++ b/include/cuco/utility/allocator.hpp
+@@ -7,7 +7,7 @@
+ 
+ #include <cuco/detail/error.hpp>
+ 
+-#include <cuda/stream_ref>
++#include <cuda/stream>
+ 
+ #include <cstddef>
+ 
