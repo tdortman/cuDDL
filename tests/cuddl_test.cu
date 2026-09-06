@@ -3001,6 +3001,57 @@ TEST(FastaTest, HeaderAtEndOfFileWithoutNewline) {
     std::remove(path.c_str());
 }
 
+TEST(FastaTest, FastqMatchesFastaIncludingWrappedRecordsAndQualities) {
+    auto const fasta = write_tmp_fasta(">a\r\nACGTN\r\nAC\r\n>b\r\nGTAC\r\n");
+    auto const fastq = write_tmp_fasta(
+        "\r\n@a\r\nACGTN\r\nAC\r\n+a\r\nACG\r\nT@+!\r\n"
+        "@b\r\nGTAC\r\n+\r\n>>>>"
+    );
+    auto const expected = cuddl::parse_fasta_file(fasta, 3);
+    auto const actual = cuddl::parse_fasta_file(fastq, 3);
+    std::remove(fasta.c_str());
+    std::remove(fastq.c_str());
+    ASSERT_TRUE(expected.has_value());
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->kmers, expected->kmers);
+    EXPECT_EQ(actual->bases, expected->bases);
+    EXPECT_EQ(actual->valid_kmers, expected->valid_kmers);
+    EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+}
+
+TEST(FastaTest, RejectsMalformedFastq) {
+    for (auto const* content : {
+             "@a\nACGT\n", "@a\nACGT\n+\n!!!", "@a\nACGT\n+\n!!!!!",
+             "@a\nACGT\n+\n!!!!\n>b\nACGT\n",
+         }) {
+        auto const path = write_tmp_fasta(content);
+        auto const parsed = cuddl::parse_fasta_file(path, 3);
+        std::remove(path.c_str());
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_EQ(parsed.error().category(), cuddl::ErrorCategory::invalid_argument);
+    }
+}
+
+TEST(FastaTest, ParallelFastqMatchesSerialFasta) {
+    std::string sequence;
+    for (size_t i = 0; i < 70000; ++i) {
+        sequence += "ACGTACGTACGTACGTACGTACGTACGTACGTN";
+    }
+    auto const fasta = write_tmp_fasta(">a\n" + sequence + "\n");
+    auto const fastq = write_tmp_fasta(
+        "@a\n" + sequence + "\n+\n" + std::string(sequence.size(), 'A') + "\n"
+    );
+    auto const expected = cuddl::parse_fasta_file(fasta, 25, 1);
+    auto const actual = cuddl::parse_fasta_file(fastq, 25, 4);
+    std::remove(fasta.c_str());
+    std::remove(fastq.c_str());
+    ASSERT_TRUE(expected.has_value());
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->kmers, expected->kmers);
+    EXPECT_EQ(actual->bases, expected->bases);
+    EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+}
+
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {
     auto const path = write_tmp_fasta("");
     auto const res = cuddl::parse_fasta_file(path, 3);

@@ -4,10 +4,12 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <cusbf/detail/fastx_buffer_reader.hpp>
 #include <cusbf/detail/fastx_file_buffer.hpp>
 #include <cusbf/detail/fastx_sequence_scan.hpp>
 
@@ -15,7 +17,7 @@
 
 namespace cuddl::detail {
 
-/// @brief Result of parsing one FASTA file into packed canonical k-mers.
+/// @brief Result of parsing one FASTA/FASTQ file into packed canonical k-mers.
 struct fasta_parse_result {
     /// Packed canonical k-mers from all records, treated as one combined genome.
     std::vector<uint64_t> kmers;
@@ -112,9 +114,9 @@ inline void consume_byte(
 }  // namespace
 
 /**
- * @brief Parses a FASTA file's sequence bases into packed canonical k-mers of length @p k.
+ * @brief Parses a FASTA/FASTQ file's sequence bases into packed canonical k-mers of length @p k.
  *
- * Record header lines are excluded, and every record's sequence is fed through the DDL
+ * Record headers and FASTQ qualities are excluded, and every record's sequence is fed through the DDL
  * rolling-window extraction as one combined genome. An invalid or ambiguous base breaks the
  * rolling window, and no k-mer spanning it is emitted. Each k-mer is canonicalised to the larger
  * packed orientation. Files above 1 MiB are parsed in parallel: cuSBF splits the sequence stream
@@ -127,19 +129,35 @@ inline void consume_byte(
  *        regardless.
  *
  * @return A `fasta_parse_result`, or an error if the file cannot be opened, mapped, or contains
- *         bytes but no FASTA records.
+ *         bytes but no FASTA records, or malformed FASTQ records.
  */
 inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t k, unsigned threads = 0) {
     auto file = cusbf::detail::FastxFileBuffer::load(path);
     if (!file) {
-        return Err(Error::invalid_argument("cannot open FASTA file: " + path));
+        return Err(Error::invalid_argument("cannot open FASTX file: " + path));
     }
     auto const data = (*file)->data();
 
-    auto const extents = cusbf::detail::fastx_fasta_extents(data);
+    std::string sequence;
+    std::vector<cusbf::detail::fastx_sequence_extent> extents;
+    auto const first = data.find_first_not_of("\r\n");
+    if (first != std::string_view::npos && data[first] == '@') {
+        cusbf::detail::FastxBufferReader reader{data, path};
+        cusbf::detail::FastxRecord record;
+        std::string_view external;
+        while (true) {
+            auto next = reader.appendNextRecord(record, sequence, external);
+            if (!next) return Err(Error::invalid_argument(next.error().message()));
+            if (!*next) break;
+        }
+        if (sequence.empty()) return fasta_parse_result{};
+        extents.push_back({sequence.data(), sequence.data() + sequence.size()});
+    } else {
+        extents = cusbf::detail::fastx_fasta_extents(data);
+    }
     if (extents.empty()) {
         if (data.size() > 0) {
-            return Err(Error::invalid_argument("FASTA parse error near: " + path));
+            return Err(Error::invalid_argument("FASTX parse error near: " + path));
         }
         return fasta_parse_result{};
     }
