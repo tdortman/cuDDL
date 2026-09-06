@@ -119,6 +119,13 @@ def analyze(frame: pd.DataFrame):
     return best, near, lookup, evaluation
 
 
+def size_label(n: int) -> str:
+    for unit, scale in (("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)):
+        if n >= scale:
+            return f"{n / scale:.3g}{unit}"
+    return str(n)
+
+
 def figures(frame, best, lookup, evaluation, directory):
     labels_path = directory / "floor-sweep-labels.json"
     input_labels = json.loads(labels_path.read_text()) if labels_path.exists() else {}
@@ -155,7 +162,15 @@ def figures(frame, best, lookup, evaluation, directory):
         fig, axes = plt.subplots(
             len(inputs),
             len(buckets),
-            figsize=(7 * len(buckets), 5 * len(inputs)),
+            figsize=(
+                10 * len(buckets),
+                max(
+                    5,
+                    1.5
+                    + 0.22 * frame.groupby(["Input", "Buckets"]).Items.nunique().max(),
+                )
+                * len(inputs),
+            ),
             layout="constrained",
             squeeze=False,
         )
@@ -167,7 +182,7 @@ def figures(frame, best, lookup, evaluation, directory):
                         (frame.Input == input_name) & (frame.Buckets == bucket)
                     ].Items.unique()
                 )
-                size_labels = [f"{n / 1048576:g}" for n in sizes]
+                size_labels = [size_label(n) for n in sizes]
                 label = (
                     Path(input_name[6:]).name
                     if input_name.startswith("fasta=")
@@ -198,7 +213,7 @@ def figures(frame, best, lookup, evaluation, directory):
                 pu.format_axis(
                     ax,
                     "Floor warmup rounds",
-                    "Input size [Mi k-mers]",
+                    "Input size [k-mers]",
                     xscale="linear",
                     grid=False,
                 )
@@ -226,7 +241,7 @@ def figures(frame, best, lookup, evaluation, directory):
             fig, axes = plt.subplots(
                 len(inputs),
                 len(buckets),
-                figsize=(7 * len(buckets), 5 * len(inputs)),
+                figsize=(10 * len(buckets), 5 * len(inputs)),
                 layout="constrained",
                 squeeze=False,
             )
@@ -238,7 +253,7 @@ def figures(frame, best, lookup, evaluation, directory):
                             (frame.Input == input_name) & (frame.Buckets == bucket)
                         ].Items.unique()
                     )
-                    size_labels = [f"{n / 1048576:g}" for n in sizes]
+                    size_labels = [size_label(n) for n in sizes]
                     label = (
                         Path(input_name[6:]).name
                         if input_name.startswith("fasta=")
@@ -320,7 +335,7 @@ def figures(frame, best, lookup, evaluation, directory):
                         ax.set_ylim(0.8, max(2, evaluation.Speedup.max() * 1.05))
                     pu.format_axis(
                         ax,
-                        "Input size [Mi k-mers]",
+                        "Input size [k-mers]",
                         ax.get_ylabel(),
                         xscale="linear",
                     )
@@ -331,7 +346,13 @@ def figures(frame, best, lookup, evaluation, directory):
                         fontsize=pu.TITLE_FONT_SIZE,
                         fontweight="bold",
                     )
-                    ax.set_xticks(np.arange(len(sizes)), size_labels, rotation=45)
+                    ax.set_xticks(
+                        np.arange(len(sizes)),
+                        size_labels,
+                        rotation=45,
+                        ha="right",
+                        rotation_mode="anchor",
+                    )
             handles, labels = axes[0, 0].get_legend_handles_labels()
             fig.legend(
                 handles,
@@ -349,6 +370,13 @@ def figures(frame, best, lookup, evaluation, directory):
 
 
 def self_check():
+    assert [size_label(n) for n in (1, 1024, 65536, 1048576, 1 << 30)] == [
+        "1",
+        "1Ki",
+        "64Ki",
+        "1Mi",
+        "1Gi",
+    ]
     frame = pd.DataFrame(
         [
             {
