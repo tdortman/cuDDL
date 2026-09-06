@@ -30,6 +30,7 @@
         "search_decision",
         "refseq_parity",
         "indexed_search",
+        "pipeline",
         "fasta_pairwise"
       ]
     },

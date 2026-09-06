@@ -50,6 +50,15 @@ executable(
     install: false,
 )
 
+# FASTA-to-results pipeline and isolated public-operation stages, all timed by NVBench.
+executable(
+    'cuddl-pipeline-benchmark',
+    'cuddl_pipeline_benchmark.cu',
+    dependencies: [cuddl_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 executable(
     'cuddl-compact-search-benchmark',
     'cuddl_compact_search_benchmark.cu',
