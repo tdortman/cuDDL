@@ -207,7 +207,11 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
         __syncthreads();
         floor = shared_floor;
     }
-    for (auto offset = index + stride * FloorRounds; offset < input_size; offset += stride) {
+    // Keep a partial final warp together; individual loads remain bounds-checked.
+    auto const lane_offset = FloorRounds != 0U ? (threadIdx.x % warpSize) * 4U : 0U;
+    for (auto offset = index + stride * FloorRounds; offset - lane_offset < input_size; offset += stride) {
+        // Reconverge after score filtering before issuing the next global load.
+        if constexpr (FloorRounds != 0U) __syncwarp();
         if (vector_input && offset + 4U <= input_size) {
             uint64_t values[4];
             load_256_global_nc(input + offset, values);
