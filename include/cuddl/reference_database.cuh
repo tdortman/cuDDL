@@ -1539,6 +1539,9 @@ class reference_database {
     reference_database(reference_database const&) = delete;
     reference_database& operator=(reference_database const&) = delete;
 
+    // An explicit body keeps NVCC from inferring device-side buffer destruction.
+    __host__ ~reference_database() {}  // NOLINT(modernize-use-equals-default)
+
     reference_database(reference_database&& other) noexcept
         : rows_(std::move(other.rows_)),
           saturation_states_(std::move(other.saturation_states_)),
