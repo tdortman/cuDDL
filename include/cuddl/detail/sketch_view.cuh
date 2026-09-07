@@ -67,7 +67,7 @@ class sketch_view {
         });
     }
 
-    /// @brief Constructs the sketch from packed k-mers in @p input.
+    /// @brief Accumulates packed device k-mers into the existing sketch without clearing it.
     ///
     /// The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void>

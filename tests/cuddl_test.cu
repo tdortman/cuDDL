@@ -278,8 +278,9 @@ TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
     EXPECT_EQ(restore<layout>(std::numeric_limits<uint16_t>::max()), 1ULL << 32U);
 
     auto const inputs = make_inputs(50000);
+    auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
     cuddl::sketch<k_default, b_default, layout> gpu(stream);
-    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}, stream).has_value());
+    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
 
     scalar_sketch<b_default, layout> oracle;
     oracle.add(inputs);
@@ -307,8 +308,9 @@ TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
 TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
     cuda::stream stream{cuda::devices[0]};
     auto const inputs = make_inputs(50000);
+    auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
     cuddl::sketch<k_default, b_default> gpu(stream);
-    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}, stream).has_value());
+    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
 
     scalar_sketch<b_default> oracle;
     oracle.add(inputs);
@@ -324,6 +326,37 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
         stream.sync();
     }()));
     EXPECT_EQ(gpu_regs, oracle.registers);
+}
+
+TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t chunk_size = 4093;
+    auto chunk = cuda::make_device_buffer<uint64_t>(
+        stream, stream.device(), chunk_size, cuda::no_init
+    );
+    for (auto const& inputs : {make_inputs(50000), std::vector<uint64_t>(65537, 12345)}) {
+        auto full_input = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
+        cuddl::sketch<k_default, b_default> full(stream), incremental(stream);
+        ASSERT_TRUE(full.add(full_input, stream));
+        auto* const allocation = incremental.data().data();
+        for (size_t offset = 0; offset < inputs.size(); offset += chunk_size) {
+            auto const size = std::min(chunk_size, inputs.size() - offset);
+            cuda::copy_bytes(
+                stream, cuda::std::span{inputs.data() + offset, size},
+                cuddl::device_span<uint64_t>{chunk.data(), size}
+            );
+            ASSERT_TRUE(incremental.add_async({chunk.data(), size}, stream));
+            ASSERT_TRUE(incremental.add({}, stream));  // Empty add preserves state and waits.
+        }
+        EXPECT_EQ(incremental.data().data(), allocation);
+        std::vector<uint32_t> expected(b_default), actual(b_default);
+        cuda::copy_bytes(stream, full.data(), expected);
+        cuda::copy_bytes(stream, incremental.data(), actual);
+        stream.sync();
+        EXPECT_EQ(actual, expected);
+        EXPECT_EQ(CUDDL_UNWRAP(incremental.winner_counts(stream)),
+                  CUDDL_UNWRAP(full.winner_counts(stream)));
+    }
 }
 
 // Sequential aggregation isolates the block histogram/reduction from the estimator formulas.
@@ -478,10 +511,12 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
     std::vector<uint64_t> b_joined = shared;
     b_joined.insert(b_joined.end(), b.begin(), b.end());
 
+    auto device_a = cuda::make_device_buffer<uint64_t>(stream, stream.device(), a);
+    auto device_b = cuda::make_device_buffer<uint64_t>(stream, stream.device(), b_joined);
     cuddl::sketch<k_default, b_default> gpu_a(stream);
     cuddl::sketch<k_default, b_default> gpu_b(stream);
-    ASSERT_TRUE(gpu_a.add({a.data(), a.size()}, stream).has_value());
-    ASSERT_TRUE(gpu_b.add({b_joined.data(), b_joined.size()}, stream).has_value());
+    ASSERT_TRUE(gpu_a.add(device_a, stream).has_value());
+    ASSERT_TRUE(gpu_b.add(device_b, stream).has_value());
 
     auto const gpu_summary = gpu_a.compare(gpu_b, stream);
     ASSERT_TRUE(gpu_summary.has_value());
@@ -2836,8 +2871,9 @@ TEST(SketchTest, WinnerCountsAndSaturationMatchScalarOracle) {
     auto const repeat = 65536U;
     inputs.assign(repeat, packed_kmer);
 
+    auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
     cuddl::sketch<k_default, b_default> gpu(stream);
-    ASSERT_TRUE(gpu.add({inputs.data(), inputs.size()}, stream).has_value());
+    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
     auto const gpu_wc = gpu.winner_counts(stream);
     ASSERT_TRUE(gpu_wc.has_value());
 
@@ -2858,14 +2894,16 @@ TEST(SketchTest, SaturationFlagSetAtCounterOverflow) {
 
     cuddl::sketch<k_default, b_default> under(stream);
     std::vector<uint64_t> few(1000, packed_kmer);
-    ASSERT_TRUE(under.add({few.data(), few.size()}, stream).has_value());
+    auto device_few = cuda::make_device_buffer<uint64_t>(stream, stream.device(), few);
+    ASSERT_TRUE(under.add(device_few, stream).has_value());
     auto const under_wc = under.winner_counts(stream);
     ASSERT_TRUE(under_wc.has_value());
     EXPECT_FALSE(under_wc->second);
 
     cuddl::sketch<k_default, b_default> over(stream);
     std::vector<uint64_t> many(65536, packed_kmer);
-    ASSERT_TRUE(over.add({many.data(), many.size()}, stream).has_value());
+    auto device_many = cuda::make_device_buffer<uint64_t>(stream, stream.device(), many);
+    ASSERT_TRUE(over.add(device_many, stream).has_value());
     auto const over_wc = over.winner_counts(stream);
     ASSERT_TRUE(over_wc.has_value());
     EXPECT_TRUE(over_wc->second);
@@ -2876,12 +2914,14 @@ TEST(SketchTest, HostMetricsOnRawPair) {
     auto const a = make_inputs(40000, 0x4444'4444'4444'4444ULL);
     auto const c = make_inputs(40000, 0x5555'5555'5555'5555ULL);
 
+    auto device_a = cuda::make_device_buffer<uint64_t>(stream, stream.device(), a);
+    auto device_c = cuda::make_device_buffer<uint64_t>(stream, stream.device(), c);
     cuddl::sketch<k_default, b_default> sa(stream);
     cuddl::sketch<k_default, b_default> sb(stream);
     cuddl::sketch<k_default, b_default> sc(stream);
-    ASSERT_TRUE(sa.add({a.data(), a.size()}, stream).has_value());
-    ASSERT_TRUE(sb.add({a.data(), a.size()}, stream).has_value());
-    ASSERT_TRUE(sc.add({c.data(), c.size()}, stream).has_value());
+    ASSERT_TRUE(sa.add(device_a, stream).has_value());
+    ASSERT_TRUE(sb.add(device_a, stream).has_value());
+    ASSERT_TRUE(sc.add(device_c, stream).has_value());
 
     auto const same_result = sa.compare(sb, stream);
     ASSERT_TRUE(same_result.has_value());

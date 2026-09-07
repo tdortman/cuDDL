@@ -112,11 +112,19 @@ class sketch {
         return cuda_try([&] { stream.sync(); });
     }
 
+    /// @brief Adds packed device k-mers to the existing sketch without clearing it.
+    ///
+    /// Call repeatedly on the same stream to accumulate successive chunks. Empty input is a
+    /// no-op. Keep input alive and unchanged until the stream completes. Use clear() to reset.
+    /// When chunking raw sequence before packing, preserve the K-1 boundary bases and emit
+    /// each k-mer window exactly once; this API receives already-packed k-mers.
     [[nodiscard]] Result<void>
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
         return view().add_async(input, stream);
     }
 
+    /// @brief Adds packed device k-mers without clearing, then synchronizes the stream.
+    /// The caller can reuse the input buffer for the next chunk after this returns successfully.
     [[nodiscard]] Result<void>
     add(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
         if (auto const result = add_async(input, stream); !result) {
