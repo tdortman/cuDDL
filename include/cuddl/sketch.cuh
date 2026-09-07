@@ -114,7 +114,7 @@ class sketch {
 
     /// @brief Adds packed device k-mers to the existing sketch without clearing it.
     ///
-    /// Call repeatedly on the same stream to accumulate successive chunks. Empty input is a
+    /// Call repeatedly to accumulate successive chunks. Empty input is a
     /// no-op. Keep input alive and unchanged until the stream completes. Use clear() to reset.
     /// When chunking raw sequence before packing, preserve the K-1 boundary bases and emit
     /// each k-mer window exactly once; this API receives already-packed k-mers.
