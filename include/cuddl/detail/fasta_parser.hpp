@@ -9,9 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include <cusbf/detail/fastx_buffer_reader.hpp>
-#include <cusbf/detail/fastx_file_buffer.hpp>
-#include <cusbf/detail/fastx_sequence_scan.hpp>
+#include <cuddl/detail/fastx_sequence_file.hpp>
 
 #include <cuddl/error.hpp>
 
@@ -132,34 +130,22 @@ inline void consume_byte(
  *         bytes but no FASTA records, or malformed FASTQ records.
  */
 inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t k, unsigned threads = 0) {
-    auto file = cusbf::detail::FastxFileBuffer::load(path);
-    if (!file) {
-        return Err(Error::invalid_argument("cannot open FASTX file: " + path));
-    }
-    auto const data = (*file)->data();
+    auto source = CUDDL_TRY(load_fastx_sequence_file(path));
+    auto& extents = source->extents;
+    if (extents.empty()) return fasta_parse_result{};
 
-    std::string sequence;
-    std::vector<cusbf::detail::fastx_sequence_extent> extents;
-    auto const first = data.find_first_not_of("\r\n");
-    if (first != std::string_view::npos && data[first] == '@') {
-        cusbf::detail::FastxBufferReader reader{data, path};
-        cusbf::detail::FastxRecord record;
-        std::string_view external;
-        while (true) {
-            auto next = reader.appendNextRecord(record, sequence, external);
-            if (!next) return Err(Error::invalid_argument(next.error().message()));
-            if (!*next) break;
+    // cuSBF's span splitter otherwise joins extents and seeds windows across record headers.
+    // A separate invalid-base extent stops prefix replay. Workers recognize its address and
+    // reset without counting the synthetic separator as an invalid input window.
+    static constexpr char record_boundary = 'N';
+    if (extents.size() > 1) {
+        std::vector<cusbf::detail::fastx_sequence_extent> separated;
+        separated.reserve(extents.size() * 2 - 1);
+        for (auto const& extent : extents) {
+            if (!separated.empty()) separated.push_back({&record_boundary, &record_boundary + 1});
+            separated.push_back(extent);
         }
-        if (sequence.empty()) return fasta_parse_result{};
-        extents.push_back({sequence.data(), sequence.data() + sequence.size()});
-    } else {
-        extents = cusbf::detail::fastx_fasta_extents(data);
-    }
-    if (extents.empty()) {
-        if (data.size() > 0) {
-            return Err(Error::invalid_argument("FASTX parse error near: " + path));
-        }
-        return fasta_parse_result{};
+        extents = std::move(separated);
     }
 
     uint64_t total = 0;
@@ -169,8 +155,7 @@ inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t 
 
     unsigned worker_count = 1;
     if (total >= (uint64_t{1} << 20)) {
-        auto const available =
-            threads > 0 ? threads : std::thread::hardware_concurrency();
+        auto const available = threads > 0 ? threads : std::thread::hardware_concurrency();
         worker_count = available > 0 ? available : 1U;
     }
 
@@ -195,6 +180,11 @@ inline Result<fasta_parse_result> parse_fasta(std::string const& path, uint32_t 
                 consume_byte(ch, k, mask, sink, window, window_len);
             }
             for (auto const& segment : spans[t].segments) {
+                if (segment.data() == &record_boundary) {
+                    window = 0;
+                    window_len = 0;
+                    continue;
+                }
                 for (char ch : segment) {
                     consume_byte(ch, k, mask, partials[t], window, window_len);
                 }

@@ -1,6 +1,7 @@
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
+#include <cuddl/reference_database_file.cuh>
 #include <cuddl/refseq_parity.hpp>
 
 #include <gtest/gtest.h>
@@ -2987,6 +2988,245 @@ TEST(FastaTest, ParsesSimpleSeedIntoExpectedKmers) {
     std::remove(path.c_str());
 }
 
+TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    // The two short records must not form an AAA k-mer across the record boundary.
+    std::vector<std::filesystem::path> paths{
+        write_tmp_fasta(">first contig\nAA\n>second contig\nA\n"),
+        write_tmp_fasta("@first\nACGTNACGT\n+\nIIIIIIIII\n@second\nTTT\n+\nIII\n"),
+        write_tmp_fasta(">repeats\n" + std::string(70000, 'A') + "\n"),
+        write_tmp_fasta(""),
+    };
+    auto built = cuddl::reference_database_file::build<3, buckets>(paths, stream);
+    ASSERT_TRUE(built) << built.error().message();
+    auto const file = paths.front().string() + ".cuddl";
+    auto saved = built->save(file);
+    ASSERT_TRUE(saved) << saved.error().message();
+    auto loaded = cuddl::reference_database_file::load(file);
+    ASSERT_TRUE(loaded) << loaded.error().message();
+    EXPECT_EQ(loaded->metadata(), built->metadata());
+    ASSERT_EQ(loaded->names().size(), paths.size());
+    for (size_t i = 0; i < paths.size(); ++i) {
+        EXPECT_EQ(loaded->names()[i], paths[i].string());
+    }
+    EXPECT_FALSE((loaded->upload<4, buckets>(stream)));
+    EXPECT_FALSE((loaded->upload<3, 4096>(stream)));
+    EXPECT_FALSE((loaded->upload<3, buckets, cuddl::register_layout<5, 11>>(stream)));
+    auto uploaded = loaded->upload<3, buckets>(stream);
+    ASSERT_TRUE(uploaded) << uploaded.error().message();
+    auto& database = *uploaded;
+    EXPECT_TRUE(database.has_index());
+    EXPECT_TRUE(database.preserves_multiplicity());
+    std::vector<uint32_t> rows(paths.size() * buckets), saturation(paths.size());
+    cuda::copy_bytes(stream, database.packed_data(), rows);
+    cuda::copy_bytes(stream, database.saturation_states(), saturation);
+    stream.sync();
+    EXPECT_EQ(saturation, (std::vector<uint32_t>{0, 0, 1, 0}));
+
+    std::vector<scalar_sketch<buckets>> expected(paths.size());
+    for (size_t i = 0; i < paths.size(); ++i) {
+        auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[i].string(), 3));
+        expected[i].add(parsed.kmers);
+        expected[i].pack_registers();
+        EXPECT_TRUE(
+            std::equal(
+                expected[i].registers.begin(),
+                expected[i].registers.end(),
+                rows.begin() + i * buckets
+            )
+        );
+        std::filesystem::remove(paths[i]);
+    }
+    EXPECT_TRUE(std::all_of(rows.begin(), rows.begin() + buckets, [](auto r) { return r == 0; }));
+    auto query = cuda::make_device_buffer<uint16_t>(stream, stream.device(), expected[1].winners);
+    auto output = cuda::make_device_buffer<cuddl::reference_search_result>(
+        stream, stream.device(), paths.size(), cuda::no_init
+    );
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream,
+        stream.device(),
+        CUDDL_UNWRAP(database.indexed_single_query_workspace_bytes(stream)),
+        cuda::no_init
+    );
+    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
+    ASSERT_TRUE(database.search_indexed_async(
+        {query.data(), query.size()},
+        loaded->metadata().compatibility,
+        {workspace.data(), workspace.size()},
+        {output.data(), output.size()},
+        {count.data(), count.size()},
+        {.minimum_matches = 0},
+        stream
+    ));
+    std::vector<cuddl::reference_search_result> hits;
+    ASSERT_TRUE(copy_device_buffer(output, hits));
+    std::vector<uint32_t> returned;
+    ASSERT_TRUE(copy_device_buffer(count, returned));
+    ASSERT_EQ(returned.front(), paths.size());
+    for (size_t i = 0; i < hits.size(); ++i) {
+        EXPECT_EQ(hits[i].reference_id, i);
+        EXPECT_EQ(hits[i].summary.counts, expected[1].compare(expected[i]));
+    }
+    // Loaded archives are self-contained after the input files disappear; replacing a file works.
+    ASSERT_TRUE(loaded->save(file));
+    ASSERT_TRUE(cuddl::reference_database_file::load(file));
+    EXPECT_FALSE(loaded->save(file + "/missing/output"));
+    ASSERT_TRUE(cuddl::reference_database_file::load(file));
+    auto directory = file + ".directory";
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    // A rename failure must clean up the temporary file and preserve the destination.
+    EXPECT_FALSE(loaded->save(directory));
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+    for (auto const& entry :
+         std::filesystem::directory_iterator(std::filesystem::path(file).parent_path())) {
+        EXPECT_FALSE(entry.path().string().starts_with(directory + ".tmp."));
+    }
+    std::filesystem::remove(directory);
+    std::filesystem::remove(file);
+}
+
+TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
+    cuda::stream stream{cuda::devices[0]};
+    std::vector<std::filesystem::path> paths{write_tmp_fasta(">genome\nACGTACGT\n")};
+    auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<3, 2048>(paths, stream)));
+    auto file = paths.front().string() + ".cuddl";
+    ASSERT_TRUE(archive.save(file));
+    std::ifstream input(file, std::ios::binary);
+    std::string bytes{std::istreambuf_iterator<char>(input), {}};
+    ASSERT_GT(bytes.size(), 70U);
+    EXPECT_EQ(bytes.substr(0, 8), std::string("CUDDLDB\0", 8));
+    EXPECT_EQ(static_cast<unsigned char>(bytes[8]), 1U);   // little-endian format version
+    EXPECT_EQ(static_cast<unsigned char>(bytes[12]), 3U);  // k-mer length
+    auto reject = [&](std::string const& corrupted) {
+        {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out.write(corrupted.data(), corrupted.size());
+        }
+        EXPECT_FALSE(cuddl::reference_database_file::load(file));
+    };
+    reject("");
+    reject(bytes.substr(0, 65));
+    reject(bytes.substr(0, bytes.size() - 1));
+    reject(bytes + "trailing data");
+    for (size_t offset :
+         {size_t{0}, size_t{8}, size_t{12}, size_t{16}, size_t{68}, bytes.size() - 10}) {
+        auto corrupted = bytes;
+        corrupted[offset] ^= 0x40;
+        reject(corrupted);
+    }
+    auto oversized = bytes;
+    oversized.replace(62, 4, 4, '\xff');  // reference count, checked before allocation
+    reject(oversized);
+    oversized = bytes;
+    oversized.replace(66, 4, 4, '\xff');  // first label length, checked before allocation
+    reject(oversized);
+    // Check structural validation independently of CRC failure.
+    auto invalid_flag = bytes;
+    invalid_flag[invalid_flag.size() - 8] = 2;
+    auto checksum = static_cast<uint32_t>(crc32_z(
+        crc32(0, nullptr, 0),
+        reinterpret_cast<Bytef const*>(invalid_flag.data()),
+        invalid_flag.size() - 4
+    ));
+    for (size_t i = 0; i < 4; ++i) {
+        invalid_flag[invalid_flag.size() - 4 + i] = static_cast<char>(checksum >> (8 * i));
+    }
+    reject(invalid_flag);
+    {
+        std::ofstream out(paths.front());
+        out << "@broken\nACGT\n+\nII\n";
+    }
+    EXPECT_FALSE((cuddl::reference_database_file::build<3, 2048>(paths, stream)));
+    std::filesystem::remove(paths.front());
+    EXPECT_FALSE((cuddl::reference_database_file::build<3, 2048>(paths, stream)));
+    std::filesystem::remove(file);
+    EXPECT_FALSE(cuddl::reference_database_file::load(file));
+}
+
+TEST(ReferenceDatabaseFileTest, GenomeLargerThanUploadBufferMatchesScalar) {
+    cuda::stream stream{cuda::devices[0]};
+    // More than 64 MiB of packed k-mers, including a partial final upload.
+    std::string sequence((size_t{1} << 23) + 113, 'A');
+    for (size_t i = 0; i < sequence.size(); ++i) {
+        sequence[i] = "ACGT"[cuddl::detail::splitmix64(i) & 3U];
+    }
+    std::vector<std::filesystem::path> paths{write_tmp_fasta(">genome\n" + sequence + "\n")};
+    auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths.front().string(), 25));
+    scalar_sketch<2048> expected;
+    expected.add(parsed.kmers);
+    expected.pack_registers();
+    auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(paths, stream)));
+    auto database = CUDDL_UNWRAP((archive.upload<25, 2048>(stream)));
+    std::vector<uint32_t> rows(2048);
+    cuda::copy_bytes(stream, database.packed_data(), rows);
+    stream.sync();
+    EXPECT_TRUE(std::equal(rows.begin(), rows.end(), expected.registers.begin()));
+    std::filesystem::remove(paths.front());
+}
+
+TEST(ReferenceDatabaseFileTest, GpuTilesMatchCpuAcrossTinyChunkBoundaries) {
+    cuda::stream stream{cuda::devices[0]};
+    cuddl::detail::fastx_device_builder packer(stream);
+    ASSERT_TRUE(packer.prepare(stream));
+    auto path = write_tmp_fasta(
+        ">short\nAA\n>genome\nacGTACGT N\tACGTACGTACGTACGTACGTACGTACGTACGTACGT\r\n"
+        "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>last\nTT\n"
+    );
+    auto sequence = CUDDL_UNWRAP(cuddl::detail::load_fastx_sequence_file(path));
+    auto check = [&]<size_t buckets>() {
+        for (uint32_t k = 1; k <= 31; ++k) {
+            auto expected = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k, 1));
+            for (size_t chunk : {size_t{1}, size_t{7}, size_t{31}, size_t{80}}) {
+                auto registers =
+                    cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets + 1, 0U);
+                scalar_sketch<buckets> oracle;
+                oracle.add(expected.kmers);
+                oracle.pack_registers();
+                for (auto const& extent : sequence->extents) {
+                    packer.reset();
+                    std::string_view const record{extent.begin, extent.end};
+                    for (size_t offset = 0; offset < record.size(); offset += chunk) {
+                        CUDDL_UNWRAP((packer.add<buckets>(
+                            record.substr(offset, chunk),
+                            k,
+                            registers.data(),
+                            registers.data()[buckets],
+                            stream
+                        )));
+                    }
+                }
+                std::vector<uint32_t> actual(buckets + 1);
+                cuda::copy_bytes(stream, registers, actual);
+                stream.sync();
+                EXPECT_EQ(actual[buckets], oracle.saturated);
+                EXPECT_TRUE(
+                    std::equal(oracle.registers.begin(), oracle.registers.end(), actual.begin())
+                ) << "k="
+                  << k << " chunk=" << chunk;
+            }
+        }
+    };
+    check.template operator()<2048>();
+    check.template operator()<16384>();
+    std::filesystem::remove(path);
+}
+
+TEST(ReferenceDatabaseFileTest, EmptyCollectionRoundTrip) {
+    cuda::stream stream{cuda::devices[0]};
+    auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<3, 2048>({}, stream)));
+    auto file = write_tmp_fasta("");
+    ASSERT_TRUE(archive.save(file));
+    auto loaded = CUDDL_UNWRAP(cuddl::reference_database_file::load(file));
+    EXPECT_EQ(loaded.metadata().reference_count, 0U);
+    EXPECT_TRUE(loaded.names().empty());
+    auto database = loaded.upload<3, 2048>(stream);
+    ASSERT_TRUE(database) << database.error().message();
+    EXPECT_EQ(database->reference_count(), 0U);
+    EXPECT_TRUE(database->has_index());
+    std::filesystem::remove(file);
+}
+
 TEST(FastaTest, InvalidBaseBreaksRollingWindow) {
     // ACGTNACGT with k=3: the N follows a full window, so it breaks the run but not a partial
     // window. No k-mer ever spans the N.
@@ -3095,6 +3335,73 @@ TEST(FastaTest, ParallelFastqMatchesSerialFasta) {
     EXPECT_EQ(actual->kmers, expected->kmers);
     EXPECT_EQ(actual->bases, expected->bases);
     EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+}
+
+TEST(FastaTest, RecordBoundariesResetSerialAndParallelWindows) {
+    for (auto length : {size_t{2}, size_t{600000}}) {
+        std::string const sequence(length, 'A');
+        auto const fasta = write_tmp_fasta(">a\n" + sequence + "\n>b\n" + sequence + "\n");
+        auto const fastq = write_tmp_fasta(
+            "@a\n" + sequence + "\n+\n" + std::string(length, 'I') + "\n@b\n" + sequence + "\n+\n" +
+            std::string(length, 'I') + "\n"
+        );
+        for (auto const& path : {fasta, fastq}) {
+            for (auto threads : {1U, 4U}) {
+                auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, 3, threads));
+                EXPECT_EQ(parsed.bases, 2 * length);
+                EXPECT_EQ(parsed.valid_kmers, 2 * (length - 2));
+                EXPECT_EQ(parsed.kmers.size(), parsed.valid_kmers);
+                EXPECT_EQ(parsed.invalid_windows, 0U);
+                EXPECT_TRUE(std::all_of(parsed.kmers.begin(), parsed.kmers.end(), [](auto kmer) {
+                    return kmer == 42;  // canonical AAA is TTT with cuDDL's 2-bit alphabet
+                }));
+            }
+            std::filesystem::remove(path);
+        }
+    }
+}
+
+TEST(FastaTest, ParallelFastaExtentsMatchSerial) {
+    std::vector<std::string> cases{
+        ">a\nACGT\n>b\nTGCA\n",
+        ">a>with>gt\nAC>GT\n>\n\n>b\r\nACGT\r\n",
+        ">\nACGT",
+        ">only-header-no-seq\n",
+        "\n\n>a\nACGT\n",
+        ">a\n",
+        "ACGT\n",
+        ">a\nACGT\n>mid\nline>with>gt\n>b\nTT\n",
+    };
+    std::string big;
+    for (int i = 0; i < 2000; ++i) {
+        big += ">r" + std::to_string(i) + " x>y\nACGTACGT\n";
+    }
+    cases.push_back(big);
+    auto check = [](std::string_view data) {
+        auto const expected = cusbf::detail::fastx_fasta_extents(data);
+        std::vector<size_t> candidates;
+        constexpr size_t shards = 3;
+        auto const span = (data.size() + shards - 1) / shards;
+        for (size_t shard = 0; shard < shards; ++shard) {
+            auto const begin = std::min(shard * span, data.size());
+            cuddl::detail::gather_header_candidates(
+                data, begin, std::min(begin + span, data.size()), candidates
+            );
+        }
+        auto const actual = cuddl::detail::walk_header_candidates(data, candidates);
+        ASSERT_EQ(actual.size(), expected.size());
+        for (size_t i = 0; i < actual.size(); ++i) {
+            EXPECT_EQ(actual[i].begin, expected[i].begin);
+            EXPECT_EQ(actual[i].end, expected[i].end);
+        }
+        auto const dispatched = cuddl::detail::parallel_fastx_fasta_extents(data);
+        ASSERT_EQ(dispatched.size(), expected.size());
+        for (size_t i = 0; i < dispatched.size(); ++i) {
+            EXPECT_EQ(dispatched[i].begin, expected[i].begin);
+            EXPECT_EQ(dispatched[i].end, expected[i].end);
+        }
+    };
+    for (auto const& text : cases) check(std::string_view{text});
 }
 
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {

@@ -17,10 +17,12 @@ using fasta_parse_result = detail::fasta_parse_result;
 /**
  * @brief Parses a FASTA/FASTQ file's sequence bases into packed canonical k-mers of length @p k.
  *
+ * Gzip/BGZF is detected by magic bytes and decompressed before parsing.
  * Format is detected from the first record header; FASTQ qualities are validated and ignored.
  * This is the FASTX entry point. It reads every record as one combined genome and emits a
  * packed canonical k-mer per contiguous run of `k` valid bases; an invalid or ambiguous base
- * breaks the rolling window, and no k-mer spanning it is emitted. See @ref detail::parse_fasta.
+ * breaks the rolling window, and no k-mer spanning it is emitted. Record boundaries also reset
+ * the window, without contributing to `invalid_windows`. See @ref detail::parse_fasta.
  *
  * @param threads Worker count for parallel files (0 selects
  *        `std::thread::hardware_concurrency()`); files at or below 1 MiB parse serially.

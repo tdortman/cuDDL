@@ -1,4 +1,7 @@
 examples = {
+    'cuddl-build-reference-db': {
+        'src': 'build_reference_database.cu',
+    },
     'cuddl-main': {
         'src': 'main.cu',
     },

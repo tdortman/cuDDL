@@ -1,6 +1,14 @@
 cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
 
 executable(
+    'cuddl-reference-build-benchmark',
+    'cuddl_reference_build_benchmark.cu',
+    dependencies: [cuddl_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
+
+executable(
     'cuddl-hll-comparison',
     'cuddl_vs_cuco_hll.cu',
     dependencies: [cuddl_dep, cuco_bench_dep, nvbench_dep, nvbench_main],
