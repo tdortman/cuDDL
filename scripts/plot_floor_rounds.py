@@ -124,7 +124,25 @@ def size_label(n: int) -> str:
     return str(n)
 
 
-def figures(frame, best, lookup, evaluation, directory):
+def panel_grid(panels, width: float = 6, height: float = 4.5):
+    """Two panels per row; a lone trailing panel sits centered on its own row."""
+    rows = math.ceil(len(panels) / 2)
+    fig = plt.figure(
+        figsize=(width * min(len(panels), 2), height * rows), layout="constrained"
+    )
+    grid = fig.add_gridspec(rows, 4)
+    axes = []
+    for index in range(len(panels)):
+        span = (
+            slice(1, 3)
+            if index == len(panels) - 1 and len(panels) % 2
+            else slice(2 * (index % 2), 2 * (index % 2) + 2)
+        )
+        axes.append(fig.add_subplot(grid[index // 2, span]))
+    return fig, axes
+
+
+def figures(frame, evaluation, directory):
     labels_path = directory / "floor-sweep-labels.json"
     input_labels = json.loads(labels_path.read_text()) if labels_path.exists() else {}
     inputs, buckets = list(frame.Input.unique()), sorted(frame.Buckets.unique())
@@ -157,214 +175,165 @@ def figures(frame, best, lookup, evaluation, directory):
         norm = TwoSlopeNorm(
             vmin=min(0.99, medians.min()), vcenter=1, vmax=max(1.01, medians.max())
         )
+        panels = [(name, bucket) for name in inputs for bucket in buckets]
         fig, axes = plt.subplots(
-            len(inputs),
-            len(buckets),
+            1,
+            len(panels),
             figsize=(
-                10 * len(buckets),
+                4.5 * len(panels),
                 max(
-                    5,
-                    1.5
-                    + 0.22 * frame.groupby(["Input", "Buckets"]).Items.nunique().max(),
-                )
-                * len(inputs),
+                    6,
+                    1.5 + 0.22 * frame.groupby(["Input", "Buckets"]).Items.nunique().max(),
+                ),
             ),
             layout="constrained",
             squeeze=False,
         )
-        for row, input_name in enumerate(inputs):
-            for col, bucket in enumerate(buckets):
-                ax = axes[row, col]
-                sizes = sorted(
-                    frame[
-                        (frame.Input == input_name) & (frame.Buckets == bucket)
-                    ].Items.unique()
-                )
-                size_labels = [size_label(n) for n in sizes]
-                label = (
-                    Path(input_name[6:]).name
-                    if input_name.startswith("fasta=")
-                    else input_name
-                )
-                values = (
-                    medians.loc[(input_name, bucket)]
-                    .unstack("FloorRounds")
-                    .reindex(index=sizes, columns=ROUNDS)
-                )
-                image = ax.imshow(
-                    values,
-                    origin="lower",
-                    aspect="auto",
-                    interpolation="nearest",
-                    cmap="RdBu",
-                    norm=norm,
-                )
-                ax.scatter(
-                    np.argmax(values.to_numpy(), axis=1),
-                    np.arange(len(sizes)),
-                    marker="o",
-                    s=40,
-                    facecolors="none",
-                    edgecolors="black",
-                    linewidths=1.5,
-                )
-                pu.format_axis(
-                    ax,
-                    "Floor warmup rounds",
-                    "Input size [k-mers]",
-                    xscale="linear",
-                    grid=False,
-                )
-                ax.set_title(
-                    f"{fill(input_labels.get(input_name, label), width=32)}\n{bucket} buckets",
-                    usetex=False,
-                    parse_math=False,
-                    fontsize=pu.TITLE_FONT_SIZE,
-                    fontweight="bold",
-                )
-                ax.set_xticks(range(len(ROUNDS)), ROUNDS, rotation=45)
-                ax.set_yticks(range(len(sizes)), size_labels)
+        for ax, (input_name, bucket) in zip(axes[0], panels):
+            sizes = sorted(
+                frame[
+                    (frame.Input == input_name) & (frame.Buckets == bucket)
+                ].Items.unique()
+            )
+            size_labels = [size_label(n) for n in sizes]
+            label = (
+                Path(input_name[6:]).name
+                if input_name.startswith("fasta=")
+                else input_name
+            )
+            values = (
+                medians.loc[(input_name, bucket)]
+                .unstack("FloorRounds")
+                .reindex(index=sizes, columns=ROUNDS)
+            )
+            image = ax.imshow(
+                values,
+                origin="lower",
+                aspect="auto",
+                interpolation="nearest",
+                cmap="RdBu",
+                norm=norm,
+            )
+            ax.scatter(
+                np.argmax(values.to_numpy(), axis=1),
+                np.arange(len(sizes)),
+                marker="o",
+                s=40,
+                facecolors="none",
+                edgecolors="black",
+                linewidths=1.5,
+            )
+            pu.format_axis(
+                ax,
+                "Floor warmup rounds",
+                "Input size [k-mers]",
+                xscale="linear",
+                grid=False,
+            )
+            ax.set_title(
+                f"{fill(input_labels.get(input_name, label), width=32)}\n{bucket} buckets",
+                usetex=False,
+                parse_math=False,
+                fontsize=pu.TITLE_FONT_SIZE,
+                fontweight="bold",
+            )
+            step = 2 if len(ROUNDS) > 8 else 1  # thin labels so they stay apart
+            ax.set_xticks(
+                range(0, len(ROUNDS), step),
+                ROUNDS[::step],
+                rotation=45,
+                ha="right",
+                rotation_mode="anchor",
+            )
+            ax.set_yticks(range(len(sizes)), size_labels)
         fig.colorbar(
             image,
             ax=axes,
+            location="bottom",
+            shrink=0.6,
+            aspect=40,
             label="Median speedup over zero rounds",
-            shrink=0.7,
         )
         fig.suptitle(
             "Input size and floor rounds\nMedians over two sweep orders and genome windows\nCircles mark row maxima"
         )
         save(fig, "floor-rounds-heatmap")
 
-        for kind in ("rounds", "speedup"):
-            fig, axes = plt.subplots(
-                len(inputs),
-                len(buckets),
-                figsize=(10 * len(buckets), 5 * len(inputs)),
-                layout="constrained",
-                squeeze=False,
+        fig, axes = panel_grid(panels, width=7.5)
+        for ax, (input_name, bucket) in zip(axes, panels):
+            sizes = sorted(
+                frame[
+                    (frame.Input == input_name) & (frame.Buckets == bucket)
+                ].Items.unique()
             )
-            for row, input_name in enumerate(inputs):
-                for col, bucket in enumerate(buckets):
-                    ax = axes[row, col]
-                    sizes = sorted(
-                        frame[
-                            (frame.Input == input_name) & (frame.Buckets == bucket)
-                        ].Items.unique()
-                    )
-                    size_labels = [size_label(n) for n in sizes]
-                    label = (
-                        Path(input_name[6:]).name
-                        if input_name.startswith("fasta=")
-                        else input_name
-                    )
-                    if kind == "rounds":
-                        data = best[
-                            (best.Input == input_name) & (best.Buckets == bucket)
-                        ]
-                        spread = (
-                            data.groupby("Items")
-                            .FloorRounds.agg(["median", "min", "max"])
-                            .reindex(sizes)
-                        )
-                        x = np.arange(len(sizes))
-                        ax.errorbar(
-                            x,
-                            spread["median"],
-                            yerr=[
-                                spread["median"] - spread["min"],
-                                spread["max"] - spread["median"],
-                            ],
-                            fmt="o-",
-                            color=pu.FILTER_COLORS["cuddl"],
-                            capsize=3,
-                            label="Fastest tested: median + range",
-                        )
-                        rule = (
-                            lookup[lookup.Buckets == bucket]
-                            .set_index("Items")
-                            .reindex(sizes)
-                        )
-                        ax.plot(
-                            x,
-                            rule.FloorRounds,
-                            "v--",
-                            color=pu.FILTER_COLORS["cuddl_paper"],
-                            label="Forward-trained size lookup",
-                        )
-                        ax.plot(
-                            x,
-                            np.ones(len(sizes)),
-                            "D:",
-                            color=pu.FILTER_COLORS["cuddl_bbtools"],
-                            label="Current rule",
-                        )
-                        ax.set_ylabel("Floor warmup rounds")
-                        ax.set_ylim(-2, best.FloorRounds.max() + 4)
-                    else:
-                        data = evaluation[
-                            (evaluation.Input == input_name)
-                            & (evaluation.Buckets == bucket)
-                        ]
-                        for policy, style, color in [
-                            ("Fastest tested", "o-", pu.FILTER_COLORS["cuddl"]),
-                            ("Size lookup", "v--", pu.FILTER_COLORS["cuddl_paper"]),
-                            ("Current rule", "D:", pu.FILTER_COLORS["cuddl_bbtools"]),
-                        ]:
-                            spread = (
-                                data[data.Policy == policy]
-                                .groupby("Items")
-                                .Speedup.agg(["median", "min", "max"])
-                                .reindex(sizes)
-                            )
-                            ax.errorbar(
-                                np.arange(len(sizes)),
-                                spread["median"],
-                                yerr=[
-                                    spread["median"] - spread["min"],
-                                    spread["max"] - spread["median"],
-                                ],
-                                fmt=style,
-                                color=color,
-                                capsize=3,
-                                label=policy,
-                            )
-                        ax.axhline(1, color="grey", linewidth=pu.REFERENCE_LINE_WIDTH)
-                        ax.set_ylabel("Speedup over zero rounds")
-                        ax.set_ylim(0.8, max(2, evaluation.Speedup.max() * 1.05))
-                    pu.format_axis(
-                        ax,
-                        "Input size [k-mers]",
-                        ax.get_ylabel(),
-                        xscale="linear",
-                    )
-                    ax.set_title(
-                        f"{fill(input_labels.get(input_name, label), width=32)}\n{bucket} buckets",
-                        usetex=False,
-                        parse_math=False,
-                        fontsize=pu.TITLE_FONT_SIZE,
-                        fontweight="bold",
-                    )
-                    ax.set_xticks(
-                        np.arange(len(sizes)),
-                        size_labels,
-                        rotation=45,
-                        ha="right",
-                        rotation_mode="anchor",
-                    )
-            handles, labels = axes[0, 0].get_legend_handles_labels()
-            fig.legend(
-                handles,
-                labels,
-                loc="outside lower center",
-                ncol=1 if len(buckets) == 1 else 3,
+            size_labels = [size_label(n) for n in sizes]
+            label = (
+                Path(input_name[6:]).name
+                if input_name.startswith("fasta=")
+                else input_name
             )
-            detail = (
-                "Both orders: fastest-round ranges across runs/windows"
-                if kind == "rounds"
-                else "Reverse order only: median and min/max across genome windows\nNot confidence intervals"
+            data = evaluation[
+                (evaluation.Input == input_name) & (evaluation.Buckets == bucket)
+            ]
+            for policy, style, color in [
+                ("Fastest tested", "o-", pu.FILTER_COLORS["cuddl"]),
+                ("Size lookup", "v--", pu.FILTER_COLORS["cuddl_paper"]),
+                ("Current rule", "D:", pu.FILTER_COLORS["cuddl_bbtools"]),
+            ]:
+                spread = (
+                    data[data.Policy == policy]
+                    .groupby("Items")
+                    .Speedup.agg(["median", "min", "max"])
+                    .reindex(sizes)
+                )
+                ax.errorbar(
+                    np.arange(len(sizes)),
+                    spread["median"],
+                    yerr=[
+                        spread["median"] - spread["min"],
+                        spread["max"] - spread["median"],
+                    ],
+                    fmt=style,
+                    color=color,
+                    capsize=3,
+                    label=policy,
+                )
+            ax.axhline(1, color="grey", linewidth=pu.REFERENCE_LINE_WIDTH)
+            ax.set_ylabel("Speedup over zero rounds")
+            ax.set_ylim(0.8, max(2, evaluation.Speedup.max() * 1.05))
+            pu.format_axis(
+                ax,
+                "Input size [k-mers]",
+                ax.get_ylabel(),
+                xscale="linear",
             )
-            fig.suptitle(f"{kind.capitalize()} versus input size\n{detail}")
-            save(fig, f"floor-rounds-{kind}")
+            ax.set_title(
+                f"{fill(input_labels.get(input_name, label), width=32)}\n{bucket} buckets",
+                usetex=False,
+                parse_math=False,
+                fontsize=pu.TITLE_FONT_SIZE,
+                fontweight="bold",
+            )
+            ax.set_xticks(
+                np.arange(len(sizes)),
+                size_labels,
+                rotation=45,
+                ha="right",
+                rotation_mode="anchor",
+            )
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="outside lower center",
+            ncol=1 if len(buckets) == 1 else 3,
+        )
+        fig.suptitle(
+            "Speedup versus input size\n"
+            "Reverse order only: median and min/max across genome windows\n"
+            "Not confidence intervals"
+        )
+        save(fig, "floor-rounds-speedup")
 
 
 def self_check():
@@ -549,7 +518,7 @@ def main(
         cases="size",
     )
     summary.to_csv(directory / "floor-rounds-holdout.csv")
-    figures(frame, best, lookup, evaluation, directory)
+    figures(frame, evaluation, directory)
     print(
         f"Validated {len(frame)} states; {len(best)} paired configurations; {len(lookup)} lookup entries"
     )
