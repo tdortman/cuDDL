@@ -48,6 +48,7 @@
 
           cudaToolkit = pkgs.symlinkJoin {
             name = "cuda-toolkit";
+
             paths = with cudaPkgs; [
               cuda_nvcc
               cuda_crt
@@ -61,15 +62,15 @@
               nsight_compute
               cudaSanitizer
 
-              # NVML and CUPTI are required by nvbench (benchmark GPU monitoring).
-              cuda_nvml_dev.include # nvml.h
-              cuda_nvml_dev.stubs # libnvidia-ml.so stub
-              cuda_cupti.lib # libcupti.so
-              cuda_cupti.include # cupti.h
+              # NVML and CUPTI are required by nvbench
+              # (benchmark GPU monitoring).
+              cuda_nvml_dev.include
+              cuda_nvml_dev.stubs
+              cuda_cupti.lib
+              cuda_cupti.include
 
-              # I do not know why cuRAND headers are necessary
-              # for clangd to not freak out about STL headers when cuda_crt is
-              # also present but at least it's a somewhat cheap dependency...
+              # Required for clangd to correctly understand some of the
+              # CUDA/STL headers when cuda_crt is present.
               libcurand.include
             ];
           };
@@ -78,6 +79,7 @@
             arch = "1200";
             smTarget = "sm_120";
             path = cudaToolkit;
+
             version = {
               complete = cudaPkgs.cudaMajorMinorVersion;
               major = cudaPkgs.cudaMajorVersion;
@@ -88,11 +90,16 @@
           buildInputs = [
             cudaToolkit
             pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+
+            # OpenMP headers + libomp runtime.
+            llvmPkgs.openmp
           ];
 
           nativeBuildInputs = with pkgs; [
             llvmPkgs.clang-tools
             llvmPkgs.clang
+
             meson
             uv
             pkg-config
@@ -105,8 +112,8 @@
             texliveFull
             tex-fmt
 
-            # BBTools is vendored as a Meson subproject (pure Java, no Nix store
-            # path needed); only its JRE runtime belongs in the dev shell.
+            # BBTools is vendored as a Meson subproject (pure Java, no Nix
+            # store path needed); only its JRE runtime belongs in the shell.
             jre_headless
           ];
         in
@@ -115,7 +122,11 @@
             inherit buildInputs nativeBuildInputs;
 
             env = {
-              CPATH = lib.makeIncludePath [ cuda.path ];
+              CPATH = lib.makeIncludePath [
+                cuda.path
+                llvmPkgs.openmp
+              ];
+
               CUDA_HOME = cuda.path;
 
               LD_LIBRARY_PATH = "${
@@ -124,35 +135,33 @@
             };
 
             shellHook = ''
-                  export PATH="${cuda.path}/compute-sanitizer:$PATH"
-                  export PYTHONPATH=$(pwd)/scripts:$PYTHONPATH
-                  if [ ! -e .clangd ]; then
-                    cat > .clangd <<EOF
+              # Local CPU benchmarks use RabbitSketch's native-ISA build.
+              unset NIX_ENFORCE_NO_NATIVE
+
+              export PATH="${cuda.path}/compute-sanitizer:$PATH"
+              export PYTHONPATH="$(pwd)/scripts''${PYTHONPATH:+:$PYTHONPATH}"
+
+              if [ ! -e .clangd ]; then
+                cat > .clangd <<EOF
               CompileFlags:
-                Compiler: ${cuda.path}/bin/nvcc
+                Compiler: ${llvmPkgs.clang}/bin/clang++
                 Add:
                   - -std=c++20
-                  - -xcuda
-                  - --cuda-path=${cuda.path}
+                  - -fopenmp
                   - -D__INTELLISENSE__
                   - -D__CLANGD__
                   - -I$(pwd)/subprojects/cccl/libcudacxx/include
                   - -I$(pwd)/subprojects/cccl/cub
                   - -I$(pwd)/subprojects/cccl/thrust
                   - -I${cuda.path}/include
+                  - -I${llvmPkgs.openmp}/include
                   - -I$(pwd)/include
                   - -I$(pwd)/subprojects/nvbench
                   - -I$(pwd)/subprojects/cuco/include
                   - -I$(pwd)/subprojects/cusbf/include
                   - -I$(pwd)/subprojects/zlib-1.3.1
                   - -I$(pwd)/subprojects/googletest-1.17.0/googletest/include
-                  - -D__LIBCUDAXX__STD_VER=${cuda.version.major}
-                  - -D__CUDACC_VER_MAJOR__=${cuda.version.major}
-                  - -D__CUDACC_VER_MINOR__=${cuda.version.minor}
-                  - -D__CUDA_ARCH__=${cuda.arch}
-                  - --cuda-gpu-arch=${cuda.smTarget}
-                  - -D__CUDACC_EXTENDED_LAMBDA__
-                  - -DPARAM_SWEEP_GROUP
+
                 Remove:
                   - -Xcompiler=*
                   - -G
@@ -170,6 +179,24 @@
 
               Diagnostics:
                 UnusedIncludes: None
+
+              ---
+
+              If:
+                PathMatch: .*\.(cu|cuh)$
+
+              CompileFlags:
+                Add:
+                  - -xcuda
+                  - --cuda-path=${cuda.path}
+                  - --cuda-gpu-arch=${cuda.smTarget}
+                  - -D__LIBCUDACXX__STD_VER=${cuda.version.major}
+                  - -D__CUDACC_VER_MAJOR__=${cuda.version.major}
+                  - -D__CUDACC_VER_MINOR__=${cuda.version.minor}
+                  - -D__CUDA_ARCH__=${cuda.arch}
+                  - -D__CUDACC_EXTENDED_LAMBDA__
+
+              Diagnostics:
                 Suppress:
                   - variadic_device_fn
                   - attributes_not_allowed
@@ -178,8 +205,9 @@
                   - expected_expression
                   - deduction_guide_target_attr
               EOF
-                    echo ".clangd created by flake shellHook"
-                  fi
+
+                echo ".clangd created by flake shellHook"
+              fi
             '';
           };
         }
