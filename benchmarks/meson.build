@@ -78,7 +78,7 @@ executable(
     install: false,
 )
 
-# FASTA-to-results pipeline and isolated public-operation stages, all timed by NVBench.
+# FASTA application and packed resident pipeline; GPU stages use NVBench.
 executable(
     'cuddl-pipeline-benchmark',
     'cuddl_pipeline_benchmark.cu',

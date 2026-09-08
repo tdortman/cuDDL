@@ -5,6 +5,9 @@
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
 #include <nvbench/nvbench.cuh>
+#include <thrust/for_each.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +18,6 @@
 #include <map>
 #include <optional>
 #include <string>
-#include <utility>
 #include <utility>
 #include <vector>
 
@@ -36,32 +38,6 @@ struct options {
     int samples = 20, warmups = 3;
 };
 
-// Provenance is collected outside every timing interval.
-std::string command_output(std::string const& command) {
-    auto* pipe = popen(command.c_str(), "r");
-    if (pipe == nullptr) {
-        throw std::runtime_error("cannot start provenance command");
-    }
-    std::string output;
-    char buffer[4096];
-    while (std::fgets(buffer, sizeof(buffer), pipe)) {
-        output += buffer;
-    }
-    if (pclose(pipe) != 0) {
-        throw std::runtime_error("provenance command failed: " + command);
-    }
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-        output.pop_back();
-    }
-    return output;
-}
-std::string quote(std::string const& value) {
-    std::string output = "'";
-    for (char c : value) {
-        output += c == '\'' ? "'\\''" : std::string(1, c);
-    }
-    return output + "'";
-}
 struct winner_score {
     __device__ uint16_t operator()(uint32_t reg) const {
         return cuddl::detail::winner(reg);
@@ -74,7 +50,8 @@ json measure(
     bool host,
     std::function<void(cuda::stream_ref)> function,
     std::function<void(cuda::stream_ref)> prepare = {},
-    json* wall = nullptr
+    json* wall = nullptr,
+    std::function<void()> finish = {}
 ) {
     // CPU-only NVBench timing supplies wall time for host work and synchronized E2E runs.
     auto run = [&](nvbench::state& state, nvbench::type_list<>) {
@@ -98,6 +75,8 @@ json measure(
                 }
             );
         }
+        // NVBench destroys the state stream when this kernel-generator returns.
+        if (finish) finish();
     };
     nvbench::benchmark<decltype(run)> benchmark(run);
     benchmark.set_name(name)
@@ -359,11 +338,13 @@ void search(
     cuda::stream_ref stream,
     bool indexed,
     bool all,
-    host_results* output = nullptr
+    host_results* output = nullptr,
+    std::function<void(uint32_t)> device_consume = {}
 ) {
-    auto consume = [&](uint32_t) {
+    auto consume = [&](uint32_t capacity) {
+        if (device_consume) device_consume(capacity);
         if (!output) {
-            return;  // Isolated compute timing. The E2E path consumes every tile.
+            return;  // A device consumer can retain results without host downloads.
         }
         auto count = download(buffers.count, stream).front();
         if (!(count <= buffers.results.size())) {
@@ -550,10 +531,97 @@ json collection_metrics(collection const& group, cuda::stream_ref stream) {
     return output;
 }
 
+json resident_timings(
+    options opts, parsed_files const& reference_files, parsed_files const& query_files,
+    std::vector<uint16_t> const& ref_scores, std::vector<uint16_t> const& query_scores
+) {
+    opts.minimum_matches = 0;
+    bool const all = opts.topology == "all-to-all";
+    cuda::stream setup{cuda::devices[0]};
+    collection refs(reference_files, setup, opts.rows == "compact", opts.rows == "packed");
+    collection queries(all ? parsed_files{} : query_files, setup, true, false);
+    refs.add(setup);
+    queries.add(setup);
+    refs.extract(setup);
+    queries.extract(setup);
+    std::optional<database> db{build(refs, opts, setup, true)};
+    search_buffers buffers(*db, static_cast<uint32_t>(queries.sketches.size()), setup, opts.topology);
+    auto const n = reference_files.size();
+    auto const q = all ? n : query_files.size();
+    if (n && q > std::numeric_limits<size_t>::max() / n) {
+        throw std::runtime_error("resident result size overflow");
+    }
+    auto retained = cuda::make_device_buffer<cuddl::batch_search_result>(setup, setup.device(), n * q, cuda::no_init);
+    auto retained_matches = cuda::make_device_buffer<uint32_t>(setup, setup.device(), n * q, cuda::no_init);
+    setup.sync();
+    auto reset = [&](cuda::stream_ref s) { refs.clear(s); queries.clear(s); };
+    auto construct = [&](cuda::stream_ref s) { refs.add(s); queries.add(s); };
+    auto statistics = [&](cuda::stream_ref s) {
+        refs.cardinality(s); queries.cardinality(s);
+        refs.winner_counts(s); queries.winner_counts(s);
+    };
+    auto rows = [&](cuda::stream_ref s) {
+        if (opts.rows == "compact") { refs.extract_scores(s); }
+        else { refs.extract_packed(s); }
+        queries.extract_scores(s);
+    };
+    auto index = [&](cuda::stream_ref s) { db.emplace(build(refs, opts, s, true)); };
+    auto query = [&](cuda::stream_ref s) {
+        auto consume = [&](uint32_t capacity) {
+            auto const* source = buffers.results.data();
+            auto const* source_matches = buffers.matches.data();
+            auto const* count = buffers.count.data();
+            auto* target = retained.data();
+            auto* matches = retained_matches.data();
+            thrust::for_each_n(
+                thrust::cuda::par_nosync.on(s.get()), thrust::counting_iterator<size_t>{0},
+                capacity, [=] __device__ (size_t i) {
+                    if (i < *count) {
+                        auto const row = source[i];
+                        auto const position = static_cast<size_t>(row.query_id) * n + row.reference_id;
+                        target[position] = row;
+                        matches[position] = source_matches[i];
+                    }
+                });
+        };
+        search(*db, queries, buffers, opts, s, true, all, nullptr, consume);
+    };
+    json timings;
+    auto gpu = [&](char const* name, auto function, std::function<void(cuda::stream_ref)> prepare = {}) {
+        json wall;
+        timings[name] = measure(opts, name, false, function, prepare, &wall, [&] { db.reset(); });
+        timings[std::string(name) + "_wall"] = std::move(wall);
+    };
+    gpu("resident_total", [&](cuda::stream_ref s) {
+        reset(s); construct(s); statistics(s); rows(s); index(s); query(s);
+    }, [&](cuda::stream_ref) { db.reset(); });
+    // Download only after measurement; every pair must survive device tile reuse.
+    auto output = download(retained, setup);
+    auto match_counts = download(retained_matches, setup);
+    host_results observed;
+    for (size_t i = 0; i < q; ++i) {
+        for (size_t j = all ? i + 1 : 0; j < n; ++j) {
+            observed.rows.push_back(output[i * n + j]);
+            observed.matches.push_back(match_counts[i * n + j]);
+        }
+    }
+    validate(observed, ref_scores, query_scores, opts, true, all);
+    gpu("resident_reset", reset);
+    gpu("resident_construct", construct, reset);
+    gpu("resident_statistics", statistics);
+    gpu("resident_rows", rows);
+    gpu("resident_index", index, [&](cuda::stream_ref) { db.reset(); });
+    db.emplace(build(refs, opts, setup, true));
+    setup.sync();
+    gpu("resident_search", query);
+    return timings;
+}
+
 // A complete application run: parse, allocate/upload, sketch, analytics, database/index,
 // selected search topology, consume all results, derive metrics, serialize in memory, teardown.
 // CUDA context initialization and writing the benchmark report itself are outside the timer.
-std::string end_to_end(options const& opts, cuda::stream_ref stream) {
+template <typename Mark>
+void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     auto reference_files = parse(opts.references);
     auto query_files = opts.topology == "batch" ? parse(opts.queries) : parsed_files{};
     collection refs(reference_files, stream, opts.rows == "compact", opts.rows == "packed");
@@ -567,6 +635,8 @@ std::string end_to_end(options const& opts, cuda::stream_ref stream) {
         db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
     );
     host_results output;
+    stream.sync();
+    mark();
     search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
     json result = {
         {"references", collection_metrics(refs, stream)},
@@ -581,15 +651,15 @@ std::string end_to_end(options const& opts, cuda::stream_ref stream) {
         );
     }
     stream.sync();
-    return result.dump();
+    auto serialized = result.dump();
+    do_not_optimise(serialized);
+    mark();
 }
 
 json run(options const& opts) {
     cuda::stream stream{cuda::devices[0]};
-    json timings = json::object();
-    timings["end_to_end_wall"] = measure(opts, "end_to_end_wall", true, [&](cuda::stream_ref) {
-        auto output = end_to_end(opts, stream);
-        do_not_optimise(output);
+    json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
+        end_to_end(opts, stream, mark);
         stream.sync();
     });
     auto reference_files = parse(opts.references), query_files = parse(opts.queries);
@@ -917,6 +987,7 @@ json run(options const& opts) {
             kmers += f.valid_kmers;
         }
     }
+    timings.update(resident_timings(opts, reference_files, query_files, ref_scores, query_scores));
     measurements.insert(
         measurements.begin(),
         json{
@@ -949,6 +1020,9 @@ json run(options const& opts) {
               {"warmups", opts.warmups},
               {"input_cache", "warm_os_cache"},
               {"end_to_end_output", "host_metrics_and_in_memory_json"},
+              {"resident_input", "packed_u64_actg_max"},
+              {"resident_output", "device_cardinalities_winners_and_pair_summaries"},
+              {"resident_minimum_matches", 0},
               {"worktree_dirty",
                !command_output("git status --porcelain --untracked-files=no").empty()}}},
             {"metrics",
@@ -1007,6 +1081,7 @@ int main(int argc, char** argv) try {
     app.add_option("--key-bits", opts.key_bits)->check(CLI::IsMember({15, 16}));
     app.add_option("--samples", opts.samples)->check(CLI::Range(2, 10000));
     app.add_option("--warmups", opts.warmups)->check(CLI::Range(0, 1000));
+    app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
     if (!(opts.topology != "all-to-all" || opts.references.size() >= 2)) {
         throw std::runtime_error("all-to-all E2E needs at least two reference genomes");

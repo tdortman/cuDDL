@@ -107,6 +107,26 @@ def main(
             data = load_result(report, "pipeline")
             pipeline = data["measurements"][0]
             assert required_stages <= pipeline["timings"].keys()
+            assert pipeline["case"]["resident_input"] == "packed_u64_actg_max"
+            for key in (
+                "resident_total",
+                "resident_reset",
+                "resident_construct",
+                "resident_statistics",
+                "resident_rows",
+                "resident_index",
+                "resident_search",
+            ):
+                value = pipeline["timings"][key]
+                assert value["source"] == "nvbench_gpu_events"
+                assert 0 <= value["min_ms"] <= value["median_ms"] <= value["max_ms"]
+            phases = [
+                pipeline["timings"][key]
+                for key in ("prepare_wall", "query_output_wall", "teardown_wall")
+            ]
+            total = pipeline["timings"]["end_to_end_wall"]
+            assert sum(p["min_ms"] for p in phases) <= total["min_ms"] + 1e-9
+            assert total["max_ms"] <= sum(p["max_ms"] for p in phases) + 1e-9
             assert pipeline["metrics"]["oracle_passed"]
             assert pipeline["case"]["references"] == 3
             assert pipeline["case"]["queries"] == 3
