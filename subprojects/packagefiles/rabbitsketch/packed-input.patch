@@ -1,0 +1,131 @@
+--- a/src/fastkmv.h
++++ b/src/fastkmv.h
+@@ -45,6 +45,15 @@
+     FastKMV& operator=(FastKMV&&) = default;
+ 
+     void update(const char* seq, uint64_t length);
++
++    /** Ingest caller-prepared packed values without encoding or canonicalization.
++     * Hashing, SIMD filtering and bottom-k insertion match sequence update.
++     * Callers must use the same packing and orientation policy across sketches.
++     */
++    void updatePacked(const uint64_t* packed, uint64_t length);
++
++    /** Reset to an empty mutable sketch while retaining allocated storage. */
++    void clear() noexcept;
+ 
+     /** Seal the sketch.  Query operations remain valid; later updates fail. */
+     void finalize();
+@@ -124,6 +133,8 @@
+     void printSketch() const;
+ 
+ private:
++    template <bool Packed>
++    void updateImpl(const char* seq, uint64_t length, const uint64_t* packed);
+     void addHash(uint64_t h);
+     void insertKey(uint64_t key);
+     void compactify() const;
+--- a/src/fastkmv.cpp
++++ b/src/fastkmv.cpp
+@@ -246,14 +246,30 @@
+ }
+ 
+ void FastKMV::update(const char* seq, uint64_t length) {
++    updateImpl<false>(seq, length, nullptr);
++}
++
++void FastKMV::clear() noexcept {
++    size_ = 0;
++    threshold_ = UINT64_MAX;
++    sorted_ = false;
++    sealed_ = false;
++}
++
++void FastKMV::updatePacked(const uint64_t* packed, uint64_t length) {
++    updateImpl<true>(nullptr, length, packed);
++}
++
++template <bool Packed>
++void FastKMV::updateImpl(const char* seq, uint64_t length, const uint64_t* packed) {
+     if (sealed_) {
+         throw std::logic_error("FastKMV::update called after finalize");
+     }
+-    if (seq == nullptr && length != 0) {
+-        throw std::invalid_argument("FastKMV::update sequence must not be null");
++    if ((Packed ? packed == nullptr : seq == nullptr) && length != 0) {
++        throw std::invalid_argument("FastKMV::update input must not be null");
+     }
+     const int K = kmer_size_;
+-    if (length < static_cast<uint64_t>(K)) return;
++    if (length < static_cast<uint64_t>(Packed ? 1 : K)) return;
+ 
+     const uint64_t loc_seed = seed_;
+ 
+@@ -263,7 +279,7 @@
+                                           : ((1ULL << (2 * K)) - 1);
+     uint64_t fwd_h = 0, rc_h = 0;
+     int inv = 0;
+-    for (int k = 0; k < K; ++k) {
++    for (int k = 0; k < (Packed ? 0 : K); ++k) {
+         uint8_t ef = FKMV_ENC(seq[k]);
+         if (!FKMV_VALID(ef)) ++inv;
+         fwd_h = ((fwd_h << 2) | (FKMV_VALID(ef) ? (ef & 3u) : 0u)) & kmer_mask;
+@@ -272,7 +288,7 @@
+     }
+ 
+     const int      lanes   = 8;
+-    const uint64_t N_body  = length - static_cast<uint64_t>(K);
++    const uint64_t N_body  = length - static_cast<uint64_t>(Packed ? 1 : K);
+     const uint64_t N_batch = (N_body >= 1) ? (N_body / lanes) * lanes : 0;
+ 
+ #if defined(__AVX512F__) && defined(__AVX512DQ__) && !defined(FASTKMV_NO_FMUX)
+@@ -299,16 +315,21 @@
+         for (int j = 0; j < lanes; ++j) {
+             const uint64_t pos = i + j;
+ 
+-            lane_valid[j] = (inv == 0);
+-            resv[j] = lane_valid[j] ? (fwd_h < rc_h ? fwd_h : rc_h) : 0;
+-
+-            uint8_t ef_out = FKMV_ENC(seq[pos]);
+-            uint8_t ef_in  = FKMV_ENC(seq[pos + K]);
+-            if (!FKMV_VALID(ef_out)) --inv;
+-            if (!FKMV_VALID(ef_in))  ++inv;
+-            fwd_h = ((fwd_h << 2) | (FKMV_VALID(ef_in) ? (ef_in & 3u) : 0u)) & kmer_mask;
+-            uint8_t er_in = FKMV_VALID(ef_in) ? (FKMV_COMP(ef_in) & 3u) : 0u;
+-            rc_h  = (rc_h >> 2) | (static_cast<uint64_t>(er_in) << (2 * (K - 1)));
++            if constexpr (Packed) {
++                lane_valid[j] = true;
++                resv[j] = packed[pos];
++            } else {
++                lane_valid[j] = (inv == 0);
++                resv[j] = lane_valid[j] ? (fwd_h < rc_h ? fwd_h : rc_h) : 0;
++
++                uint8_t ef_out = FKMV_ENC(seq[pos]);
++                uint8_t ef_in  = FKMV_ENC(seq[pos + K]);
++                if (!FKMV_VALID(ef_out)) --inv;
++                if (!FKMV_VALID(ef_in))  ++inv;
++                fwd_h = ((fwd_h << 2) | (FKMV_VALID(ef_in) ? (ef_in & 3u) : 0u)) & kmer_mask;
++                uint8_t er_in = FKMV_VALID(ef_in) ? (FKMV_COMP(ef_in) & 3u) : 0u;
++                rc_h  = (rc_h >> 2) | (static_cast<uint64_t>(er_in) << (2 * (K - 1)));
++            }
+         }
+ 
+ #if defined(__AVX512F__) && defined(__AVX512DQ__)
+@@ -434,7 +455,7 @@
+     // ── Remainder loop ──────────────────────────────────────────────────
+     for (uint64_t i = N_batch; i <= N_body; ++i) {
+         if (inv == 0) {
+-            uint64_t canon = (fwd_h < rc_h) ? fwd_h : rc_h;
++            uint64_t canon = Packed ? packed[i] : ((fwd_h < rc_h) ? fwd_h : rc_h);
+ #ifdef FASTKMV_NO_FMUX
+             uint64_t key = canon >> 11;
+ #else
+@@ -449,7 +470,7 @@
+             if (key < threshold_)
+                 insertKey(key);
+         }
+-        if (i < N_body) {
++        if (!Packed && i < N_body) {
+             uint8_t ef_out = FKMV_ENC(seq[i]);
+             uint8_t ef_in  = FKMV_ENC(seq[i + K]);
+             if (!FKMV_VALID(ef_out)) --inv;

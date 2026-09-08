@@ -1,3 +1,23 @@
+cmake = import('cmake')
+rabbitsketch_opts = cmake.subproject_options()
+rabbitsketch_opts.add_cmake_defines(
+    {
+        'CXXAPI': true,
+        'RABBITSKETCH_BUILD_TESTS': false,
+        'RABBITSKETCH_NATIVE_ARCH': true,
+    },
+)
+rabbitsketch_project = cmake.subproject('rabbitsketch', options: rabbitsketch_opts)
+rabbitsketch_dep = rabbitsketch_project.dependency('rabbitsketch_static')
+rabbitsketch_revision = import('fs').read('../subprojects/rabbitsketch.wrap').split('revision = ')[1].split('\n')[0]
+executable(
+    'rabbitsketch-pipeline-benchmark',
+    'rabbitsketch_pipeline_benchmark.cpp',
+    cpp_args: ['-DRABBITSKETCH_REVISION="' + rabbitsketch_revision + '"'],
+    dependencies: [rabbitsketch_dep, cli11_dep, nlohmann_json_dep, cuddl_dep, nvbench_dep, dependency('openmp')],
+    install: false,
+)
+
 cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
 
 executable(

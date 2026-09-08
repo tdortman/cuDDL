@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/RabbitBio/RabbitSketch.git
+revision = 8db783ea75f597068b72705272ae207c94194e83
+depth = 1
+diff_files = rabbitsketch/packed-input.patch
