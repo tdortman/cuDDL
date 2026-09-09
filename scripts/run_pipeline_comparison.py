@@ -21,6 +21,20 @@ from typer.core import TyperCommand
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def read_plan_cap(plan: Path) -> int:
+    """Read a probed resident cap from a --resident-plan JSON document."""
+    try:
+        payload = json.loads(plan.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(f"unreadable resident plan {plan}: {error}") from error
+    cap = payload.get("resident_batch_bytes") if isinstance(payload, dict) else None
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        raise typer.BadParameter(
+            f"resident plan {plan} returned invalid resident_batch_bytes: {cap!r}"
+        )
+    return cap
+
+
 def run(command: list[str]) -> None:
     typer.echo("+ " + shlex.join(command), err=True)
     subprocess.run(command, cwd=ROOT, check=True)
@@ -139,6 +153,14 @@ def main(
             help="cuDDL file loading workers for --ingest sequence; default: eight",
         ),
     ] = None,
+    resident_bytes: Annotated[
+        int,
+        typer.Option(
+            "--resident-bytes",
+            min=0,
+            help="Bounded resident staging payload in bytes; 0 probes GPU free memory for --ingest sequence",
+        ),
+    ] = 0,
 ) -> None:
     """Build and run both implementations at k=25 and 4,096 buckets/entries."""
     inputs = inputs or []
@@ -227,43 +249,11 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     # GPU isolated-stage coverage requires a query even when the resident all-to-all path ignores it.
     gpu_queries = queries or references[:1]
-    commands = [
-        (
-            f"cuddl-{rows}-{index}.json",
-            [
-                str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
-                *common,
-                "--ingest",
-                ingest,
-                *(["--workers", str(workers)] if workers is not None else []),
-                "--rows",
-                rows,
-                "--index",
-                index,
-                "--minimum-matches",
-                "0",
-            ],
-        )
-        for rows, index in itertools.product(("compact", "packed"), ("sparse", "dense"))
+    cuddl_variants = (
+        list(itertools.product(("compact", "packed"), ("sparse", "dense")))
         if "cuddl" in selected
-    ]
-    if "rabbitsketch" in selected:
-        commands.append(
-            (
-                "rabbitsketch.json",
-                [
-                    str(build_dir / "benchmarks/rabbitsketch-pipeline-benchmark"),
-                    *common,
-                    "--k",
-                    "25",
-                    "--ingest",
-                    ingest,
-                    "--sketch-size",
-                    "4096",
-                    *(["--threads", str(threads)] if threads is not None else []),
-                ],
-            )
-        )
+        else []
+    )
     with tempfile.TemporaryDirectory(prefix=".pipeline-", dir=output_dir) as temporary:
         configs = {}
         for implementation, query_files in (
@@ -289,6 +279,85 @@ def main(
                 encoding="utf-8",
             )
             configs[implementation] = config
+        effective_resident_bytes = resident_bytes
+        if ingest == "sequence" and resident_bytes == 0:
+            if "cuddl" not in selected:
+                raise typer.BadParameter(
+                    "sequence runs with the default --resident-bytes 0 need the GPU "
+                    "probe; pass explicit --resident-bytes for CPU-only runs"
+                )
+            caps = []
+            for rows, index in cuddl_variants:
+                plan = Path(temporary) / f"plan-{rows}-{index}.json"
+                run(
+                    [
+                        str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
+                        "--topology",
+                        topology,
+                        "--ingest",
+                        "sequence",
+                        "--resident-bytes",
+                        "0",
+                        "--resident-plan",
+                        *(["--workers", str(workers)] if workers is not None else []),
+                        "--rows",
+                        rows,
+                        "--index",
+                        index,
+                        "--minimum-matches",
+                        "0",
+                        "--config",
+                        str(configs["cuddl"]),
+                        "--output",
+                        str(plan),
+                    ]
+                )
+                caps.append(read_plan_cap(plan))
+            effective_resident_bytes = min(caps)
+            typer.echo(
+                f"Probed resident cap {effective_resident_bytes} bytes "
+                f"(min over {len(caps)} cuDDL variants)"
+            )
+        commands = [
+            (
+                f"cuddl-{rows}-{index}.json",
+                [
+                    str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
+                    *common,
+                    "--ingest",
+                    ingest,
+                    "--resident-bytes",
+                    str(effective_resident_bytes),
+                    *(["--workers", str(workers)] if workers is not None else []),
+                    "--rows",
+                    rows,
+                    "--index",
+                    index,
+                    "--minimum-matches",
+                    "0",
+                ],
+            )
+            for rows, index in cuddl_variants
+        ]
+        if "rabbitsketch" in selected:
+            commands.append(
+                (
+                    "rabbitsketch.json",
+                    [
+                        str(build_dir / "benchmarks/rabbitsketch-pipeline-benchmark"),
+                        *common,
+                        "--k",
+                        "25",
+                        "--ingest",
+                        ingest,
+                        "--resident-bytes",
+                        str(effective_resident_bytes),
+                        "--sketch-size",
+                        "4096",
+                        *(["--threads", str(threads)] if threads is not None else []),
+                    ],
+                )
+            )
         for name, command in commands:
             report = Path(temporary) / name
             implementation = "rabbitsketch" if name == "rabbitsketch.json" else "cuddl"
