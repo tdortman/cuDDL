@@ -131,6 +131,14 @@ def main(
         str,
         typer.Option(help="cuDDL ingestion: packed, or sequence for a large corpus"),
     ] = "packed",
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            min=0,
+            max=64,
+            help="cuDDL file loading workers for --ingest sequence; default: eight",
+        ),
+    ] = None,
 ) -> None:
     """Build and run both implementations at k=25 and 4,096 buckets/entries."""
     inputs = inputs or []
@@ -227,6 +235,7 @@ def main(
                 *common,
                 "--ingest",
                 ingest,
+                *(["--workers", str(workers)] if workers is not None else []),
                 "--rows",
                 rows,
                 "--index",
