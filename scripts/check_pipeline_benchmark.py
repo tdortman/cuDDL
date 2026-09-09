@@ -33,7 +33,10 @@ def main(
         fixtures = {
             "genome": f">genome\n{sequence}\n",
             "partial": f">partial\n{sequence[:4096]}NNNN{sequence[5000:]}\n",
-            "saturated": f">repeats\n{'A' * 70050}\n",
+            # Several records of one genome share each batch and saturate a common winner.
+            "saturated": "".join(
+                f">repeats{i}\n{'A' * 1024}\n" for i in range(70)
+            ),
             "empty": ">short\nACGTNN\n>another\nACGT\n",
             "reverse": f">reverse\n{sequence.translate(str.maketrans('ACGT', 'TGCA'))[::-1]}\n",
         }
@@ -163,6 +166,8 @@ def main(
             (
                 "--ingest",
                 "sequence",
+                "--resident-bytes",
+                "4096",
                 "--rows",
                 "compact",
                 "--index",
@@ -187,21 +192,106 @@ def main(
         data = load_result(streamed, "pipeline")
         pipeline = data["measurements"][0]
         assert pipeline["case"]["ingest"] == "sequence"
-        assert pipeline["case"]["resident_input"] == "sequence_tiles"
-        assert pipeline["memory_bytes"]["input_kmers"] == 0
+        assert pipeline["case"]["resident_input"] == "sequence_ascii"
+        assert pipeline["case"]["resident_batch_bytes"] == 4096
+        assert pipeline["case"]["resident_batches"] > 1
+        # Actual largest-batch device allocation stays bounded by the cap; the cap
+        # itself is reported in the case, the allocation in memory_bytes.
+        assert 0 < pipeline["memory_bytes"]["resident_input"] <= 4096
+        assert 0 <= pipeline["memory_bytes"]["resident_input_metadata"] <= 4096
         assert pipeline["metrics"]["oracle_passed"]
         assert (
             pipeline["metrics"]["oracle_pairs_checked"]
             == pipeline["metrics"]["oracle_pairs_total"]
         )
-        for key in ("resident_total", "host_to_device", "construct_resident", "clear_and_construct"):
-            assert key not in pipeline["timings"], f"packed-input stage {key} ran in streamed mode"
+        for key in ("host_to_device", "construct_resident", "clear_and_construct"):
+            assert key not in pipeline["timings"], (
+                f"packed-input stage {key} ran in streamed mode"
+            )
+        for key in (
+            "resident_total",
+            "resident_reset",
+            "resident_construct",
+            "resident_statistics",
+            "resident_rows",
+            "resident_index",
+            "resident_search",
+        ):
+            for suffix, source in (
+                ("", "nvbench_gpu_events"),
+                ("_wall", "nvbench_cpu_wall"),
+            ):
+                value = pipeline["timings"][key + suffix]
+                assert value["source"] == source
+                assert value["samples"] == 2
+                assert 0 <= value["min_ms"] <= value["median_ms"] <= value["max_ms"]
         # Streamed rows must reproduce the packed-input sketches, pair metrics, and match rows.
         packed = load_result(root / "compact-sparse-batch.json", "pipeline")
         assert data["measurements"][1:] == packed["measurements"][1:], (
             "streamed ingestion differs from packed-input construction"
         )
         typer.echo("PASS streamed sequence ingestion")
+        automatic = root / "streamed-auto.json"
+        command[command.index("--resident-bytes") + 1] = "0"
+        command[command.index("--output") + 1] = str(automatic)
+        subprocess.run(command, check=True)
+        auto_data = load_result(automatic, "pipeline")
+        auto_pipeline = auto_data["measurements"][0]
+        assert auto_pipeline["case"]["resident_batch_bytes"] >= 25
+        assert auto_pipeline["case"]["resident_batches"] >= 1
+        assert 0 < auto_pipeline["memory_bytes"]["resident_input"] <= auto_pipeline["case"]["resident_batch_bytes"]
+        assert 0 <= auto_pipeline["memory_bytes"]["resident_input_metadata"] <= auto_pipeline["case"]["resident_batch_bytes"]
+        assert auto_data["measurements"][1:] == packed["measurements"][1:], (
+            "automatic GPU memory sizing changed sketches or pair results"
+        )
+        typer.echo("PASS automatic GPU memory sizing and same-genome batch merging")
+        # Single-batch corpus (empty + saturated fixtures included) must keep the cap
+        # in the case but report the smaller actual allocation: no cap-sized upload.
+        single_path = root / "streamed-single.json"
+        single_command = [str(binary.resolve())]
+        for name in ("genome", "partial", "saturated"):
+            single_command.extend(("--reference", str(paths[name])))
+        for name in ("reverse", "empty", "saturated"):
+            single_command.extend(("--query", str(paths[name])))
+        single_command.extend(
+            (
+                "--ingest",
+                "sequence",
+                "--resident-bytes",
+                "1048576",
+                "--rows",
+                "compact",
+                "--index",
+                "sparse",
+                "--topology",
+                "batch",
+                "--indexed-buckets",
+                "2048",
+                "--key-bits",
+                "15",
+                "--minimum-matches",
+                "5",
+                "--samples",
+                "2",
+                "--warmups",
+                "0",
+                "--output",
+                str(single_path),
+            )
+        )
+        subprocess.run(single_command, check=True)
+        single_data = load_result(single_path, "pipeline")
+        single_pipeline = single_data["measurements"][0]
+        assert single_pipeline["case"]["resident_batch_bytes"] == 1048576
+        assert single_pipeline["case"]["resident_batches"] == 1
+        assert 0 < single_pipeline["memory_bytes"]["resident_input"] < 1048576
+        assert 0 <= single_pipeline["memory_bytes"]["resident_input_metadata"] <= 1048576
+        assert single_pipeline["memory_bytes"]["input_kmers"] == 0
+        assert single_pipeline["metrics"]["oracle_passed"]
+        assert single_data["measurements"][1:] == packed["measurements"][1:], (
+            "single-batch streamed ingestion differs from packed-input construction"
+        )
+        typer.echo("PASS single-batch resident allocation without cap-sized upload")
         typer.echo(
             "All 8 pipeline configurations and streamed ingestion passed. "
             "Timing samples are smoke checks, not performance evidence."

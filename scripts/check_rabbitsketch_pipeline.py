@@ -153,23 +153,45 @@ def main(
                 assert timing["samples"] == 2
                 assert 0 <= timing["min_ms"] <= timing["median_ms"] <= timing["max_ms"]
             if topology == "batch":
-                # Streamed ingestion uses RabbitSketch file ingest and drops the record and
-                # packed-input stages.
+                # Bounded resident replay must preserve record and chunk boundaries.
                 streamed_report = root / "streamed.json"
                 subprocess.run(
-                    [*command, "--ingest", "sequence", "--output", str(streamed_report)],
+                    [
+                        *command,
+                        "--ingest",
+                        "sequence",
+                        "--resident-bytes",
+                        "256",
+                        "--output",
+                        str(streamed_report),
+                    ],
                     check=True,
                 )
                 streamed = load_result(streamed_report, "pipeline")
                 streamed_pipeline = streamed["measurements"][0]
                 assert streamed_pipeline["case"]["ingest"] == "sequence"
-                assert streamed_pipeline["case"]["resident_input"] == "fastx_files"
+                assert streamed_pipeline["case"]["resident_input"] == "sequence_ascii"
+                assert streamed_pipeline["case"]["resident_batch_bytes"] == 256
+                assert streamed_pipeline["case"]["resident_batches"] > 1
                 assert (
-                    streamed_pipeline["metrics"]["resident_streaming_scope"]
-                    == "first_file_per_role"
+                    streamed_pipeline["case"]["resident_timing_scope"]
+                    == "batched_resident_segments"
                 )
-                for key in ("parse_fastx", "construct_resident", "resident_total_wall"):
+                assert streamed_pipeline["metrics"]["resident_streaming_equal"]
+                for key in ("parse_fastx", "construct_resident"):
                     assert key not in streamed_pipeline["timings"]
+                for key in (
+                    "resident_total_wall",
+                    "resident_reset_wall",
+                    "resident_construct_wall",
+                    "resident_finalize_wall",
+                    "resident_cardinality_wall",
+                    "resident_search_wall",
+                ):
+                    value = streamed_pipeline["timings"][key]
+                    assert value["source"] == "nvbench_cpu_wall"
+                    assert value["samples"] == 2
+                    assert 0 <= value["min_ms"] <= value["median_ms"] <= value["max_ms"]
                 assert streamed["measurements"][1:] == data["measurements"][1:]
                 typer.echo(
                     "PASS streamed file ingest: identical sketches and pair metrics"
