@@ -37,7 +37,7 @@ struct options {
     int k = 25, sketch_size = 4096, samples = 20, warmups = 3;
     uint64_t seed = 42;
     int threads = omp_get_num_procs();
-    size_t match_rows = 20000, dataset_hashes = 8, all_to_all_pairs = 50000000;
+    size_t match_rows = 20000, dataset_hashes = 8;
     size_t resident_bytes = 64ULL << 20;
 };
 
@@ -182,20 +182,15 @@ struct search_result {
 
 // @p retain_limit bounds retained results (0 keeps every pair). All pairs are still queried, so
 // the pair count and the timing stay complete while a large all-to-all matrix stays bounded.
-search_result search(
-    collection const& refs,
-    collection const& queries,
-    bool all,
-    size_t retain_limit
-) {
+search_result
+search(collection const& refs, collection const& queries, bool all, size_t retain_limit) {
     auto const& left = all ? refs : queries;
-    auto const pair_count = all ? uint64_t{refs.size()} * (refs.size() - 1) / 2
-                                : uint64_t{left.size()} * refs.size();
+    auto const pair_count =
+        all ? uint64_t{refs.size()} * (refs.size() - 1) / 2 : uint64_t{left.size()} * refs.size();
     size_t const limit = retain_limit ? retain_limit : (pair_count ? pair_count : 1);
     size_t const stride = pair_count > limit ? (pair_count + limit - 1) / limit : 1;
     bool const extra_last = pair_count > 0 && (pair_count - 1) % stride != 0;
-    size_t const slots =
-        pair_count == 0 ? 0 : (pair_count - 1) / stride + 1 + (extra_last ? 1 : 0);
+    size_t const slots = pair_count == 0 ? 0 : (pair_count - 1) / stride + 1 + (extra_last ? 1 : 0);
     std::vector<match> retained(slots);
     parallel_for(left.size(), [&](size_t q) {
         for (size_t r = all ? q + 1 : 0; r < refs.size(); ++r) {
@@ -819,14 +814,7 @@ json run(options const& opts) {
     auto const reference_count = opts.references.size();
     uint64_t const all_to_all_pairs =
         reference_count > 1 ? uint64_t{reference_count} * (reference_count - 1) / 2 : 0;
-    if (all && opts.all_to_all_pairs && all_to_all_pairs > opts.all_to_all_pairs) {
-        throw std::runtime_error(
-            "all-to-all over " + std::to_string(reference_count) + " references retains " +
-            std::to_string(all_to_all_pairs) + " pair results, above --all-to-all-pairs (" +
-            std::to_string(opts.all_to_all_pairs) +
-            "); use --topology batch with a small --query set"
-        );
-    }
+
     auto build_queries = [&] {
         return build_files(opts.queries, cfg);
     };
@@ -873,9 +861,8 @@ json run(options const& opts) {
     if (!streamed) {
         auto reference_records = parse(opts.references);
         auto query_records = parse(opts.queries);
-        timings["parse_fastx"] = measure(opts, [&] {
-            consumed_size = reference_records.size() + query_records.size();
-        });
+        timings["parse_fastx"] =
+            measure(opts, [&] { consumed_size = reference_records.size() + query_records.size(); });
         timings["construct_resident"] = measure(opts, [&] {
             auto r = construct(reference_records, cfg);
             auto q = construct(query_records, cfg);
@@ -1006,12 +993,6 @@ int main(int argc, char** argv) try {
         ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
         ->check(CLI::Range(size_t{0}, size_t{1} << 20));
-    app.add_option(
-           "--all-to-all-pairs",
-           opts.all_to_all_pairs,
-           "Reference pairs above which all-to-all is refused"
-    )
-        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--output", opts.output, "Shared-schema JSON output, stdout if omitted");
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
