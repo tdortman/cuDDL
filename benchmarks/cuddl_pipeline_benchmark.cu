@@ -1,3 +1,6 @@
+#include <thrust/for_each.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/system/cuda/execution_policy.h>
 #include <CLI/CLI.hpp>
 #include <cub/device/device_transform.cuh>
 #include <cuda/buffer>
@@ -6,9 +9,6 @@
 #include <cuddl/fastx.hpp>
 #include <cuddl/reference_database_file.cuh>
 #include <nvbench/nvbench.cuh>
-#include <thrust/for_each.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/system/cuda/execution_policy.h>
 
 #include <algorithm>
 #include <cmath>
@@ -40,7 +40,8 @@ struct options {
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
     unsigned workers = 0;
     int samples = 20, warmups = 3;
-    size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8, all_to_all_pairs = 50000000;
+    size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8,
+           all_to_all_pairs = 50000000;
 };
 
 struct winner_score {
@@ -142,7 +143,9 @@ struct genome_rows {
 };
 
 genome_rows stream_genomes(
-    std::vector<std::string> const& paths, options const& opts, cuda::stream_ref stream
+    std::vector<std::string> const& paths,
+    options const& opts,
+    cuda::stream_ref stream
 ) {
     std::vector<std::filesystem::path> files{paths.begin(), paths.end()};
     auto file = CUDDL_UNWRAP(
@@ -190,7 +193,10 @@ struct collection {
           ),
           counts(
               cuda::make_device_buffer<uint16_t>(
-                  stream, stream.device(), genomes * buckets, cuda::no_init
+                  stream,
+                  stream.device(),
+                  genomes * buckets,
+                  cuda::no_init
               )
           ),
           packed(
@@ -204,13 +210,14 @@ struct collection {
           saturated(
               cuda::make_device_buffer<uint32_t>(stream, stream.device(), genomes, cuda::no_init)
           ),
-          empty(cuda::make_device_buffer<uint64_t>(stream, stream.device(), genomes, cuda::no_init)),
+          empty(
+              cuda::make_device_buffer<uint64_t>(stream, stream.device(), genomes, cuda::no_init)
+          ),
           cardinalities(
               cuda::make_device_buffer<double>(stream, stream.device(), genomes, cuda::no_init)
           ),
-          registers(
-              cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init)
-          ) {}
+          registers(cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init)) {
+    }
 
     collection(
         parsed_files const& files,
@@ -241,9 +248,11 @@ struct collection {
         registers = cuda::make_device_buffer<uint32_t>(stream, stream.device(), rows.registers);
         for (size_t i = 0; i < rows.saturation.size(); ++i) {
             sketches.emplace_back(stream);
-            CUDDL_UNWRAP(sketches[i].assign_async(
-                {registers.data() + i * (buckets + 1), buckets + 1}, stream
-            ));
+            CUDDL_UNWRAP(
+                sketches[i].assign_async(
+                    {registers.data() + i * (buckets + 1), buckets + 1}, stream
+                )
+            );
         }
     }
     void clear(cuda::stream_ref stream) {
@@ -522,9 +531,8 @@ validation validate(
     auto const& left = all ? refs : queries;
     auto const reference_count = refs.size() / buckets;
     auto const query_count = left.size() / buckets;
-    size_t const pair_space = all
-        ? (query_count > 1 ? query_count * (query_count - 1) / 2 : 0)
-        : query_count * reference_count;
+    size_t const pair_space = all ? (query_count > 1 ? query_count * (query_count - 1) / 2 : 0)
+                                  : query_count * reference_count;
     size_t const limit = oracle_limit ? oracle_limit : std::numeric_limits<size_t>::max();
     size_t const stride = pair_space > limit ? (pair_space + limit - 1) / limit : 1;
     validation result;
@@ -622,8 +630,11 @@ json collection_metrics(collection const& group, cuda::stream_ref stream) {
 }
 
 json resident_timings(
-    options opts, parsed_files const& reference_files, parsed_files const& query_files,
-    std::vector<uint16_t> const& ref_scores, std::vector<uint16_t> const& query_scores
+    options opts,
+    parsed_files const& reference_files,
+    parsed_files const& query_files,
+    std::vector<uint16_t> const& ref_scores,
+    std::vector<uint16_t> const& query_scores
 ) {
     opts.minimum_matches = 0;
     bool const all = opts.topology == "all-to-all";
@@ -635,27 +646,45 @@ json resident_timings(
     refs.extract(setup);
     queries.extract(setup);
     std::optional<database> db{build(refs, opts, setup, true)};
-    search_buffers buffers(*db, static_cast<uint32_t>(queries.sketches.size()), setup, opts.topology);
+    search_buffers buffers(
+        *db, static_cast<uint32_t>(queries.sketches.size()), setup, opts.topology
+    );
     auto const n = reference_files.size();
     auto const q = all ? n : query_files.size();
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
-    auto retained = cuda::make_device_buffer<cuddl::batch_search_result>(setup, setup.device(), n * q, cuda::no_init);
-    auto retained_matches = cuda::make_device_buffer<uint32_t>(setup, setup.device(), n * q, cuda::no_init);
+    auto retained = cuda::make_device_buffer<cuddl::batch_search_result>(
+        setup, setup.device(), n * q, cuda::no_init
+    );
+    auto retained_matches =
+        cuda::make_device_buffer<uint32_t>(setup, setup.device(), n * q, cuda::no_init);
     setup.sync();
-    auto reset = [&](cuda::stream_ref s) { refs.clear(s); queries.clear(s); };
-    auto construct = [&](cuda::stream_ref s) { refs.add(s); queries.add(s); };
+    auto reset = [&](cuda::stream_ref s) {
+        refs.clear(s);
+        queries.clear(s);
+    };
+    auto construct = [&](cuda::stream_ref s) {
+        refs.add(s);
+        queries.add(s);
+    };
     auto statistics = [&](cuda::stream_ref s) {
-        refs.cardinality(s); queries.cardinality(s);
-        refs.winner_counts(s); queries.winner_counts(s);
+        refs.cardinality(s);
+        queries.cardinality(s);
+        refs.winner_counts(s);
+        queries.winner_counts(s);
     };
     auto rows = [&](cuda::stream_ref s) {
-        if (opts.rows == "compact") { refs.extract_scores(s); }
-        else { refs.extract_packed(s); }
+        if (opts.rows == "compact") {
+            refs.extract_scores(s);
+        } else {
+            refs.extract_packed(s);
+        }
         queries.extract_scores(s);
     };
-    auto index = [&](cuda::stream_ref s) { db.emplace(build(refs, opts, s, true)); };
+    auto index = [&](cuda::stream_ref s) {
+        db.emplace(build(refs, opts, s, true));
+    };
     auto query = [&](cuda::stream_ref s) {
         auto consume = [&](uint32_t capacity) {
             auto const* source = buffers.results.data();
@@ -664,27 +693,42 @@ json resident_timings(
             auto* target = retained.data();
             auto* matches = retained_matches.data();
             thrust::for_each_n(
-                thrust::cuda::par_nosync.on(s.get()), thrust::counting_iterator<size_t>{0},
-                capacity, [=] __device__ (size_t i) {
+                thrust::cuda::par_nosync.on(s.get()),
+                thrust::counting_iterator<size_t>{0},
+                capacity,
+                [=] __device__(size_t i) {
                     if (i < *count) {
                         auto const row = source[i];
-                        auto const position = static_cast<size_t>(row.query_id) * n + row.reference_id;
+                        auto const position =
+                            static_cast<size_t>(row.query_id) * n + row.reference_id;
                         target[position] = row;
                         matches[position] = source_matches[i];
                     }
-                });
+                }
+            );
         };
         search(*db, queries, buffers, opts, s, true, all, nullptr, consume);
     };
     json timings;
-    auto gpu = [&](char const* name, auto function, std::function<void(cuda::stream_ref)> prepare = {}) {
+    auto gpu = [&](char const* name,
+                   auto function,
+                   std::function<void(cuda::stream_ref)> prepare = {}) {
         json wall;
         timings[name] = measure(opts, name, false, function, prepare, &wall, [&] { db.reset(); });
         timings[std::string(name) + "_wall"] = std::move(wall);
     };
-    gpu("resident_total", [&](cuda::stream_ref s) {
-        reset(s); construct(s); statistics(s); rows(s); index(s); query(s);
-    }, [&](cuda::stream_ref) { db.reset(); });
+    gpu(
+        "resident_total",
+        [&](cuda::stream_ref s) {
+            reset(s);
+            construct(s);
+            statistics(s);
+            rows(s);
+            index(s);
+            query(s);
+        },
+        [&](cuda::stream_ref) { db.reset(); }
+    );
     // Download only after measurement; every pair must survive device tile reuse.
     auto output = download(retained, setup);
     auto match_counts = download(retained_matches, setup);
@@ -707,11 +751,11 @@ json resident_timings(
     return timings;
 }
 
-// A complete application run: parse, allocate/upload, sketch, analytics, database/index,
-// selected search topology, consume all results, derive metrics, serialize in memory, teardown.
-// CUDA context initialization and writing the benchmark report itself are outside the timer.
-// Per-genome metrics, in-memory JSON serialization, and result consumption: the output phase.
+// Per-genome metrics, a bounded match sample, and in-memory JSON serialization: the output
+// phase. Serializing one object per pair is not a realistic application output for a large
+// collection, and the DOM costs about 2 KiB per pair, so the sample follows --match-rows.
 void application_output(
+    options const& opts,
     collection const& refs,
     collection const& queries,
     host_results const& output,
@@ -720,15 +764,28 @@ void application_output(
     json result = {
         {"references", collection_metrics(refs, stream)},
         {"queries", collection_metrics(queries, stream)},
-        {"matches", json::array()}
+        {"matches", json::array()},
+        {"matches_total", output.rows.size()}
     };
-    for (auto const& row : output.rows) {
+    size_t const limit = opts.match_rows ? opts.match_rows : output.rows.size();
+    size_t const stride = output.rows.size() > limit ? (output.rows.size() + limit - 1) / limit : 1;
+    size_t emitted = 0;
+    auto add = [&](cuddl::batch_search_result const& row) {
         result["matches"].push_back(
             {{"query_id", row.query_id},
              {"reference_id", row.reference_id},
              {"metrics", metrics(row.summary)}}
         );
+        ++emitted;
+    };
+    // One evenly spread row sample, always including the last pair.
+    for (size_t i = 0; i < output.rows.size(); i += stride) {
+        add(output.rows[i]);
     }
+    if (output.rows.size() && (output.rows.size() - 1) % stride != 0) {
+        add(output.rows.back());
+    }
+    result["matches_emitted"] = emitted;
     stream.sync();
     auto serialized = result.dump();
     do_not_optimise(serialized);
@@ -752,7 +809,7 @@ void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     stream.sync();
     mark();
     search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
-    application_output(refs, queries, output, stream);
+    application_output(opts, refs, queries, output, stream);
     mark();
 }
 
@@ -761,8 +818,8 @@ void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
 template <typename Mark>
 void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     auto reference_rows = stream_genomes(opts.references, opts, stream);
-    auto query_rows = opts.topology == "batch" ? stream_genomes(opts.queries, opts, stream)
-                                               : genome_rows{};
+    auto query_rows =
+        opts.topology == "batch" ? stream_genomes(opts.queries, opts, stream) : genome_rows{};
     collection refs(reference_rows, stream, opts.rows == "compact", opts.rows == "packed");
     collection queries(query_rows, stream, true, false);
     refs.extract(stream);
@@ -775,24 +832,27 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     stream.sync();
     mark();
     search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
-    application_output(refs, queries, output, stream);
+    application_output(opts, refs, queries, output, stream);
     mark();
 }
 
 json run(options const& opts) {
     bool const streamed = opts.ingest == "sequence";
     cuda::stream stream{cuda::devices[0]};
-    // All-to-all retains one result row per unique reference pair on the host. Refuse a corpus
-    // whose pair count exceeds --all-to-all-pairs instead of failing inside the first sample.
+    // All-to-all result storage grows as N*(N-1)/2 rows. Refuse a corpus that cannot hold them
+    // instead of failing inside the first timed sample.
     if (opts.topology == "all-to-all") {
         auto const count = opts.references.size();
         uint64_t const pairs = count > 1 ? uint64_t{count} * (count - 1) / 2 : 0;
-        if (opts.all_to_all_pairs && pairs > opts.all_to_all_pairs) {
+        uint64_t const required = pairs * (sizeof(cuddl::batch_search_result) + sizeof(uint32_t));
+        size_t free_bytes = 0, total_bytes = 0;
+        CUDDL_CUDA_CALL(cudaMemGetInfo(&free_bytes, &total_bytes));
+        if (required > free_bytes / 2) {
             throw std::runtime_error(
-                "all-to-all over " + std::to_string(count) + " references retains " +
-                std::to_string(pairs) + " pair rows, above --all-to-all-pairs (" +
-                std::to_string(opts.all_to_all_pairs) +
-                "); use --topology batch with a small --query set"
+                "all-to-all over " + std::to_string(count) + " references needs " +
+                std::to_string(required >> 30) + " GiB of result rows, more than half of the " +
+                std::to_string(free_bytes >> 30) +
+                " GiB free; use --topology batch with a small --query set"
             );
         }
     }
@@ -837,9 +897,7 @@ json run(options const& opts) {
         refs.extract(stream);
         if (!(download(refs.packed, stream) == original_packed &&
               download(refs.saturated, stream) == original_saturation)) {
-            throw std::runtime_error(
-                "incremental construction differs from one-shot construction"
-            );
+            throw std::runtime_error("incremental construction differs from one-shot construction");
         }
     }
 
@@ -880,7 +938,8 @@ json run(options const& opts) {
                 throw std::runtime_error("A48 record count differs");
             }
             for (size_t r = 0; r < decoded.records.size(); ++r) {
-                if (!(decoded.records[r].ordinal == r && decoded.records[r].scores.size() == buckets &&
+                if (!(decoded.records[r].ordinal == r &&
+                      decoded.records[r].scores.size() == buckets &&
                       std::equal(
                           decoded.records[r].scores.begin(),
                           decoded.records[r].scores.end(),
@@ -1085,13 +1144,11 @@ json run(options const& opts) {
         gpu(indexed ? "search_single_indexed" : "search_single_exhaustive",
             [&](cuda::stream_ref s) { single(s, indexed); });
     }
-    // The all-to-all suite is coverage for small corpora: it retains one host result row per
-    // unique reference pair and validates them. Skip it when the pair count exceeds the cap.
-    auto const all_to_all_pairs = refs.sketches.size() > 1
-        ? uint64_t{refs.sketches.size()} * (refs.sketches.size() - 1) / 2
-        : 0;
-    bool const all_to_all_suite =
-        !opts.all_to_all_pairs || all_to_all_pairs <= opts.all_to_all_pairs;
+    // The all-to-all suite is coverage for small corpora. A large collection needs more pair
+    // rows than the buffers hold, so it runs the selected topology only.
+    auto const all_to_all_fits =
+        CUDDL_UNWRAP(db.all_to_all_search_requirements(stream)).maximum_pair_count <=
+        buffers.results.size();
     uint64_t selected = 0, exhaustive_pairs = 0, match_rows_emitted = 0, match_rows_total = 0;
     validation selected_validation;
     auto emit_match = [&](cuddl::batch_search_result const& row) {
@@ -1105,7 +1162,7 @@ json run(options const& opts) {
         );
     };
     for (bool all : {false, true}) {
-        if (all && !all_to_all_suite) {
+        if (all && !all_to_all_fits) {
             continue;
         }
         for (bool indexed : {false, true}) {
@@ -1129,12 +1186,9 @@ json run(options const& opts) {
                     selected_validation = observed;
                     match_rows_total = output.rows.size();
                     // One evenly spread row sample, always including the last pair.
-                    size_t const limit =
-                        opts.match_rows ? opts.match_rows : output.rows.size();
+                    size_t const limit = opts.match_rows ? opts.match_rows : output.rows.size();
                     size_t const stride =
-                        output.rows.size() > limit
-                        ? (output.rows.size() + limit - 1) / limit
-                        : 1;
+                        output.rows.size() > limit ? (output.rows.size() + limit - 1) / limit : 1;
                     for (size_t i = 0; i < output.rows.size(); i += stride) {
                         emit_match(output.rows[i]);
                         ++match_rows_emitted;
@@ -1224,7 +1278,7 @@ json run(options const& opts) {
               {"samples", opts.samples},
               {"warmups", opts.warmups},
               {"input_cache", "warm_os_cache"},
-              {"end_to_end_output", "host_metrics_and_in_memory_json"},
+              {"end_to_end_output", "host_metrics_and_bounded_json"},
               {"resident_input", streamed ? "sequence_tiles" : "packed_u64_actg_max"},
               {"resident_output", "device_cardinalities_winners_and_pair_summaries"},
               {"resident_minimum_matches", 0},
@@ -1238,8 +1292,7 @@ json run(options const& opts) {
               {"oracle_pairs_checked", selected_validation.checked},
               {"match_rows_total", match_rows_total},
               {"match_rows_emitted", match_rows_emitted},
-              {"all_to_all_suite", all_to_all_suite},
-              {"all_to_all_pairs", all_to_all_pairs},
+              {"all_to_all_suite", all_to_all_fits},
               {"all_to_all_nonempty", refs.sketches.size() > 1},
               {"corresponding_pairs", pair_count},
               {"preserves_multiplicity", db.preserves_multiplicity()}}},
@@ -1303,12 +1356,6 @@ int main(int argc, char** argv) try {
         ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
         ->check(CLI::Range(size_t{0}, size_t{1} << 20));
-    app.add_option(
-           "--all-to-all-pairs",
-           opts.all_to_all_pairs,
-           "Reference pairs above which the all-to-all stage suite is skipped"
-    )
-        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
     if (!(opts.topology != "all-to-all" || opts.references.size() >= 2)) {
