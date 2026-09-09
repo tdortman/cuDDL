@@ -170,13 +170,29 @@ struct match {
     Sketch::Query::Result result;
 };
 
-std::vector<match> search(collection const& refs, collection const& queries, bool all) {
-    std::vector<match> result;
+struct search_result {
+    // One evenly spread pair sample, always including the last pair.
+    std::vector<match> matches;
+    uint64_t pairs = 0;
+};
+
+// @p retain_limit bounds retained results (0 keeps every pair). All pairs are still queried, so
+// the pair count and the timing stay complete while a large all-to-all matrix stays bounded.
+search_result search(
+    collection const& refs,
+    collection const& queries,
+    bool all,
+    size_t retain_limit
+) {
     auto const& left = all ? refs : queries;
-    if (!refs.empty() && left.size() > result.max_size() / refs.size()) {
-        throw std::length_error("pair results exceed addressable storage");
-    }
-    result.resize(all ? refs.size() * (refs.size() - 1) / 2 : left.size() * refs.size());
+    auto const pair_count = all ? uint64_t{refs.size()} * (refs.size() - 1) / 2
+                                : uint64_t{left.size()} * refs.size();
+    size_t const limit = retain_limit ? retain_limit : (pair_count ? pair_count : 1);
+    size_t const stride = pair_count > limit ? (pair_count + limit - 1) / limit : 1;
+    bool const extra_last = pair_count > 0 && (pair_count - 1) % stride != 0;
+    size_t const slots =
+        pair_count == 0 ? 0 : (pair_count - 1) / stride + 1 + (extra_last ? 1 : 0);
+    std::vector<match> retained(slots);
     parallel_for(left.size(), [&](size_t q) {
         for (size_t r = all ? q + 1 : 0; r < refs.size(); ++r) {
             auto value = left[q].sketch.query(refs[r].sketch);
@@ -185,10 +201,14 @@ std::vector<match> search(collection const& refs, collection const& queries, boo
             }
             auto const position =
                 all ? q * (2 * refs.size() - q - 1) / 2 + r - q - 1 : q * refs.size() + r;
-            result[position] = {q, r, std::move(value)};
+            if (position % stride == 0) {
+                retained[position / stride] = {q, r, std::move(value)};
+            } else if (extra_last && position + 1 == pair_count) {
+                retained[slots - 1] = {q, r, std::move(value)};
+            }
         }
     });
-    return result;
+    return {std::move(retained), pair_count};
 }
 
 json query_metrics(Sketch::Query::Result const& value) {
@@ -387,9 +407,10 @@ json run(options const& opts) {
     // The untimed run warms input caches and checks file ingest against record construction.
     auto refs = build_files(opts.references, cfg);
     auto queries = build_queries();
-    auto matches = search(refs, queries, all);
-    size_t match_rows_emitted = 0;
-    auto rows = measurements(refs, queries, matches, opts.match_rows, &match_rows_emitted);
+    auto const searched = search(refs, queries, all, opts.match_rows);
+    auto const& matches = searched.matches;
+    size_t const match_rows_emitted = matches.size();
+    auto rows = measurements(refs, queries, matches);
     std::string resident_scope = "all_files";
     if (streamed) {
         // Bounded check: build one genome per role both ways and compare sketch and parse
@@ -412,12 +433,9 @@ json run(options const& opts) {
         auto query_records = parse(opts.queries);
         auto resident_refs = construct(reference_records, cfg);
         auto resident_queries = construct(query_records, cfg);
-        if (measurements(
-                resident_refs,
-                resident_queries,
-                search(resident_refs, resident_queries, all),
-                opts.match_rows
-            ) != rows) {
+        auto const resident = search(resident_refs, resident_queries, all, opts.match_rows);
+        if (resident.pairs != searched.pairs ||
+            measurements(resident_refs, resident_queries, resident.matches) != rows) {
             throw std::runtime_error("resident and streaming RabbitSketch results differ");
         }
     }
@@ -426,8 +444,8 @@ json run(options const& opts) {
         auto r = build_files(opts.references, cfg);
         auto q = build_queries();
         mark();
-        auto hits = search(r, q, all);
-        auto output = measurements(r, q, hits, opts.match_rows).dump();
+        auto hits = search(r, q, all, opts.match_rows);
+        auto output = measurements(r, q, hits.matches).dump();
         consumed_size = output.size();
         mark();
     });
@@ -446,11 +464,11 @@ json run(options const& opts) {
         });
     }
     timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"] = measure(opts, [&] {
-        auto hits = search(refs, queries, all);
-        consumed_size = hits.size();
+        auto hits = search(refs, queries, all, opts.match_rows);
+        consumed_size = hits.matches.size();
     });
     timings["metrics_and_serialize"] = measure(opts, [&] {
-        auto output = measurements(refs, queries, matches, opts.match_rows).dump();
+        auto output = measurements(refs, queries, matches).dump();
         consumed_size = output.size();
     });
 
@@ -496,8 +514,8 @@ json run(options const& opts) {
               {"simd_override", runtime.environment_override},
               {"simd_override_honored", runtime.environment_override_honored}}},
             {"metrics",
-             {{"exhaustive_pairs", matches.size()},
-              {"match_rows_total", matches.size()},
+             {{"exhaustive_pairs", searched.pairs},
+              {"match_rows_total", searched.pairs},
               {"match_rows_emitted", match_rows_emitted},
               {"resident_streaming_equal", true},
               {"resident_streaming_scope", resident_scope},
