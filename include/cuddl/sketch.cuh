@@ -112,6 +112,30 @@ class sketch {
         return cuda_try([&] { stream.sync(); });
     }
 
+    /// @brief Overwrites packed registers and the saturation flag from stored words.
+    ///
+    /// Loads a sketch from registers produced elsewhere, for example a saved reference database or
+    /// a streamed tile build. @p registers holds c BucketCount packed registers followed by the
+    /// saturation word, so one copy replaces both. Nothing is cleared or merged; the sketch's
+    /// contents become exactly @p registers.
+    [[nodiscard]] Result<void> assign_async(
+        device_span<register_type const> registers, cuda::stream_ref stream
+    ) const noexcept {
+        if (registers.size() != BucketCount + 1U) {
+            return Err(
+                Error::invalid_argument("sketch assign needs one register per bucket plus a flag")
+            );
+        }
+        auto* const destination = storage_.data();
+        return cuda_try([&] {
+            cuda::copy_bytes(
+                stream,
+                cuda::std::span{registers.data(), registers.size()},
+                cuda::std::span{destination, BucketCount + 1U}
+            );
+        });
+    }
+
     /// @brief Adds packed device k-mers to the existing sketch without clearing it.
     ///
     /// Call repeatedly to accumulate successive chunks. Empty input is a

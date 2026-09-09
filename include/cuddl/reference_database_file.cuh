@@ -224,6 +224,14 @@ class reference_database_file {
     [[nodiscard]] std::span<std::string const> names() const noexcept {
         return names_;
     }
+    /// @brief Packed winner/count registers in reference-ID order, one bucket row per genome.
+    [[nodiscard]] std::span<uint32_t const> rows() const noexcept {
+        return rows_;
+    }
+    /// @brief Saturation flags in reference-ID order.
+    [[nodiscard]] std::span<uint32_t const> saturation() const noexcept {
+        return saturation_;
+    }
 
     /**
      * @brief Builds one sketch per plain or gzip/BGZF FASTA/FASTQ file on the GPU.

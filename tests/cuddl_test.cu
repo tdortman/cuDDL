@@ -222,6 +222,40 @@ TEST(SketchTest, BufferMovesAndResultsAcrossNonblockingStreams) {
     producer.sync();
 }
 
+TEST(SketchTest, AssignLoadsStoredRowsAndSaturation) {
+    cuda::stream stream{cuda::devices[0]};
+    using sketch_type = cuddl::sketch<k_default, b_default>;
+    auto const host = make_inputs(65536);
+    auto input = cuda::make_device_buffer<uint64_t>(stream, stream.device(), host);
+    sketch_type original(stream);
+    ASSERT_TRUE(original.add_async({input.data(), input.size()}, stream));
+
+    // Round-trip the registers and flag through host storage, exactly as a saved database would.
+    auto expected = original.winner_counts(stream);
+    ASSERT_TRUE(expected);
+    std::vector<uint32_t> words(b_default + 1U);
+    cuda::copy_bytes(stream, original.data(), words);
+    stream.sync();
+    words[b_default] = expected->second ? 1U : 0U;
+    auto device_words = cuda::make_device_buffer<uint32_t>(stream, stream.device(), words);
+
+    sketch_type assigned(stream);
+    ASSERT_TRUE(assigned.assign_async({device_words.data(), words.size()}, stream));
+    auto counts = assigned.winner_counts(stream);
+    ASSERT_TRUE(counts);
+    EXPECT_EQ(counts->first, expected->first);
+    EXPECT_EQ(counts->second, expected->second);
+    auto const cardinality = assigned.cardinality(stream);
+    ASSERT_TRUE(cardinality);
+    auto const original_cardinality = original.cardinality(stream);
+    ASSERT_TRUE(original_cardinality);
+    EXPECT_DOUBLE_EQ(*cardinality, *original_cardinality);
+
+    // A span without the trailing saturation word is rejected without touching the sketch.
+    EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default}, stream));
+    stream.sync();
+}
+
 TEST_F(ReferenceDatabaseTest, BufferMoveAssignmentRetainsRowsAndMetadata) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
