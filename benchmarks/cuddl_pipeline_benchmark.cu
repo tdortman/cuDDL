@@ -2,8 +2,12 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <CLI/CLI.hpp>
+#include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_sort.cuh>
 #include <cub/device/device_transform.cuh>
 #include <cuda/buffer>
+#include <cuda/iterator>
+#include <cuda/memory_pool>
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
@@ -24,6 +28,7 @@
 #include <vector>
 
 #include "common.cuh"
+#include "resident_sequence_batches.hpp"
 #include "result_json.hpp"
 
 namespace {
@@ -39,6 +44,8 @@ struct options {
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
     unsigned workers = 0;
+    size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
+    bool resident_plan = false;
     int samples = 20, warmups = 3;
     size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8,
            all_to_all_pairs = 50000000;
@@ -57,10 +64,16 @@ json measure(
     std::function<void(cuda::stream_ref)> function,
     std::function<void(cuda::stream_ref)> prepare = {},
     json* wall = nullptr,
-    std::function<void()> finish = {}
+    std::function<void()> finish = {},
+    cuda::stream_ref const* external_stream = nullptr
 ) {
     // CPU-only NVBench timing supplies wall time for host work and synchronized E2E runs.
     auto run = [&](nvbench::state& state, nvbench::type_list<>) {
+        if (external_stream) {
+            state.set_cuda_stream(nvbench::make_cuda_stream_view(external_stream->get()));
+        }
+        // Stateful segments must execute exactly once; corpus replays provide their warmups.
+        state.set_run_once(opts.samples == 1 && opts.warmups == 0);
         if (host) {
             state.exec(nvbench::exec_tag::timer, [&](nvbench::launch&, auto& timer) {
                 timer.start();
@@ -629,28 +642,245 @@ json collection_metrics(collection const& group, cuda::stream_ref stream) {
     return output;
 }
 
+// Counts FASTX record extents one file at a time for the descriptor bound. No base
+// bytes are copied; only the current file's parser storage is alive at a time.
+size_t count_sequence_records(std::vector<std::string> const& paths) {
+    size_t records = 0;
+    for (auto const& path : paths) {
+        auto loaded = cuddl::detail::load_fastx_sequence_file(path);
+        if (!loaded) {
+            throw std::runtime_error("cannot load FASTX file: " + path);
+        }
+        records += (*loaded)->extents.size();
+    }
+    return records;
+}
+
+struct resident_budget {
+    size_t cap = 0;  // Effective ASCII staging bytes per batch.
+    size_t free_bytes = 0;
+    size_t reusable_pool_bytes = 0;
+    size_t available_bytes = 0;
+    size_t future_peak_bytes = 0;  // Index-rebuild transients incl. exact CUB scratch.
+    size_t reserve_bytes = 0;      // Automatic sizing keeps 10% availability headroom.
+    size_t total_bytes = 0;
+    size_t total_records = 0;
+    size_t metadata_bytes = 0;  // 24-byte chunk descriptors bound at the resolved cap.
+};
+
+// Chunk-descriptor bound at @p cap: every staged piece holds at least k bytes, and
+// split pieces beyond record starts are bounded by the header's per-chunk UINT32
+// window cap, so the staged count never exceeds either term.
+size_t batch_metadata_bound(size_t cap, size_t records) {
+    size_t const dense = cap / k;
+    if (records >= dense) {
+        return dense;  // Records alone exceed the per-byte bound; sums below stay safe.
+    }
+    // records < dense <= SIZE_MAX/k here, so records + 2 + splits cannot wrap.
+    size_t const splits = cap / (static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - k + 1);
+    return std::min(dense, records + 2 + splits);
+}
+
+// Exact CUB scratch for the index-rebuild transients, queried without launching.
+size_t index_rebuild_scratch(
+    options const& opts,
+    uint64_t postings,
+    uint64_t cells,
+    uint32_t references,
+    uint32_t indexed_buckets,
+    cuda::stream_ref stream
+) {
+    if (opts.index == "sparse") {
+        size_t bytes = 0;
+        auto const segment_offsets = cuda::make_transform_iterator(
+            cuda::make_counting_iterator(uint32_t{0}),
+            cuddl::detail::sparse_segment_offset{references}
+        );
+        CUDDL_CUDA_CALL(
+            cub::DeviceSegmentedSort::SortPairs(
+                nullptr,
+                bytes,
+                static_cast<uint16_t const*>(nullptr),
+                static_cast<uint16_t*>(nullptr),
+                static_cast<uint32_t const*>(nullptr),
+                static_cast<uint32_t*>(nullptr),
+                static_cast<int64_t>(postings),
+                static_cast<int64_t>(indexed_buckets),
+                segment_offsets,
+                segment_offsets + 1,
+                stream.get()
+            )
+        );
+        return bytes;
+    }
+    size_t bytes = 0;
+    CUDDL_CUDA_CALL(
+        cub::DeviceScan::ExclusiveSum(
+            nullptr,
+            bytes,
+            static_cast<uint32_t const*>(nullptr),
+            static_cast<uint32_t*>(nullptr),
+            static_cast<int64_t>(cells + 1),
+            stream.get()
+        )
+    );
+    return bytes;
+}
+
+// Device bytes a fresh index generation needs while the resident generation is
+// still alive: new rows, the new index, build temporaries, and exact CUB scratch.
+size_t index_generation_peak(options const& opts, uint32_t references, cuda::stream_ref stream) {
+    auto const compat = compatibility(opts);
+    uint64_t const postings = cuddl::detail::indexed_posting_count(references, compat);
+    // Build arguments evaluate before optional::emplace destroys the old generation,
+    // so a rebuild holds old and new rows plus the new index and temporaries.
+    // Counting the full new generation is conservative but safe against pool reuse.
+    size_t const rows = (opts.rows == "packed") ? database::persistent_packed_row_bytes(references)
+                                                : database::persistent_row_bytes(references);
+    size_t const row_size = (opts.rows == "packed") ? sizeof(uint32_t) : sizeof(uint16_t);
+    size_t index = 0;
+    size_t transients = static_cast<size_t>(postings) * row_size;
+    if (opts.index == "sparse") {
+        index = static_cast<size_t>(postings) * sizeof(uint16_t) +
+                static_cast<size_t>(postings) * sizeof(uint32_t);
+        transients += static_cast<size_t>(postings) * sizeof(uint16_t);
+        transients += static_cast<size_t>(postings) * sizeof(uint32_t);
+    } else {
+        uint64_t const cells = cuddl::detail::indexed_cell_count(compat);
+        index = static_cast<size_t>(cells + 1U) * sizeof(uint32_t) +
+                static_cast<size_t>(postings) * sizeof(uint32_t);
+    }
+    uint64_t const cells = cuddl::detail::indexed_cell_count(compat);
+    return rows + index + transients +
+           index_rebuild_scratch(
+               opts, postings, cells, references, compat.indexed_bucket_count, stream
+           );
+}
+
+// Resolves the staging cap against actual remaining GPU memory: pool-aware
+// available bytes minus a 10% reserve and the future rebuild peak fund cap input
+// bytes plus 24-byte descriptors per staged chunk. Explicit caps are honored when
+// affordable, otherwise rejected before any staging allocation.
+resident_budget resolve_resident_budget(
+    options const& opts,
+    size_t references,
+    size_t records,
+    cuda::stream_ref setup
+) {
+    size_t free_bytes = 0, total_bytes = 0;
+    CUDDL_CUDA_CALL(cudaMemGetInfo(&free_bytes, &total_bytes));
+    auto const& pool = cuda::device_default_memory_pool(setup.device());
+    auto const reserved = pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
+    auto const used = pool.attribute(cuda::memory_pool_attributes::used_mem_current);
+    // cudaMemGetInfo excludes cached pool storage, which the next allocation reuses.
+    size_t const reusable = reserved - std::min(reserved, used);
+    size_t const available = free_bytes + reusable;
+    if (references > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("resident reference count exceeds 32-bit index capacity");
+    }
+    size_t const peak = index_generation_peak(opts, static_cast<uint32_t>(references), setup);
+    // A resolved cap already includes headroom; allow it to absorb probe-to-run changes.
+    size_t const reserve = opts.resident_bytes == 0 ? available / 10U : 0;
+    // Staging fits when the input bytes plus bounded descriptors fit the funded base.
+    // Both comparisons avoid forming the overflowing sum for huge explicit caps, and
+    // the predicate is monotone so binary search finds the largest affordable cap.
+    auto const fits = [&](size_t cap, size_t base) {
+        return cap <= base && size_t{24} * batch_metadata_bound(cap, records) <= base - cap;
+    };
+    auto const insufficient = [&](char const* what) {
+        throw std::runtime_error(
+            std::string("insufficient free device memory for resident sequence ") + what +
+            " (free " + std::to_string(free_bytes >> 20) + " MiB, peak " +
+            std::to_string(peak >> 20) + " MiB)"
+        );
+    };
+    if (reserve + peak >= available) {
+        insufficient("staging budget");
+    }
+    size_t const base = available - reserve - peak;
+    size_t cap = 0;
+    if (opts.resident_bytes != 0) {
+        cap = opts.resident_bytes;
+        if (!fits(cap, base)) {
+            insufficient("staging budget");
+        }
+    } else {
+        size_t lo = 0, hi = base;
+        while (lo < hi) {
+            size_t const mid = lo + (hi - lo + 1) / 2;
+            if (fits(mid, base)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        cap = lo;
+        if (cap < k) {
+            insufficient("staging budget");
+        }
+    }
+    return {
+        cap,
+        free_bytes,
+        reusable,
+        available,
+        peak,
+        reserve,
+        total_bytes,
+        records,
+        size_t{24} * batch_metadata_bound(cap, records)
+    };
+}
+
 json resident_timings(
     options opts,
     parsed_files const& reference_files,
     parsed_files const& query_files,
     std::vector<uint16_t> const& ref_scores,
-    std::vector<uint16_t> const& query_scores
+    std::vector<uint16_t> const& query_scores,
+    size_t* resident_batches = nullptr,
+    genome_rows const* expected_references = nullptr,
+    genome_rows const* expected_queries = nullptr,
+    size_t* resolved_bytes = nullptr,
+    json* plan = nullptr,
+    json* memory = nullptr
 ) {
     opts.minimum_matches = 0;
     bool const all = opts.topology == "all-to-all";
+    bool const sequence = opts.ingest == "sequence";
     cuda::stream setup{cuda::devices[0]};
-    collection refs(reference_files, setup, opts.rows == "compact", opts.rows == "packed");
-    collection queries(all ? parsed_files{} : query_files, setup, true, false);
-    refs.add(setup);
-    queries.add(setup);
+    collection refs =
+        sequence
+            ? collection(
+                  opts.references.size(), setup, opts.rows == "compact", opts.rows == "packed"
+              )
+            : collection(reference_files, setup, opts.rows == "compact", opts.rows == "packed");
+    collection queries = sequence
+                             ? collection(all ? 0 : opts.queries.size(), setup, true, false)
+                             : collection(all ? parsed_files{} : query_files, setup, true, false);
+    if (sequence) {
+        for (size_t i = 0; i < opts.references.size(); ++i) {
+            refs.sketches.emplace_back(setup);
+        }
+        if (!all) {
+            for (size_t i = 0; i < opts.queries.size(); ++i) {
+                queries.sketches.emplace_back(setup);
+            }
+        }
+        refs.clear(setup);
+        queries.clear(setup);
+    } else {
+        refs.add(setup);
+        queries.add(setup);
+    }
     refs.extract(setup);
     queries.extract(setup);
     std::optional<database> db{build(refs, opts, setup, true)};
     search_buffers buffers(
         *db, static_cast<uint32_t>(queries.sketches.size()), setup, opts.topology
     );
-    auto const n = reference_files.size();
-    auto const q = all ? n : query_files.size();
+    auto const n = refs.sketches.size();
+    auto const q = all ? n : queries.sketches.size();
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
@@ -709,6 +939,227 @@ json resident_timings(
         };
         search(*db, queries, buffers, opts, s, true, all, nullptr, consume);
     };
+    if (sequence) {
+        auto paths = opts.references;
+        if (!all) paths.insert(paths.end(), opts.queries.begin(), opts.queries.end());
+        auto registers = cuda::make_device_buffer<uint32_t>(
+            setup, setup.device(), paths.size() * (buckets + 1), cuda::no_init
+        );
+        auto single = opts;
+        single.samples = 1;
+        single.warmups = 0;
+        cuda::stream_ref const stream = setup;
+        auto const device = setup.device();
+        auto const per_chunk_blocks =
+            static_cast<size_t>(device.attribute(cuda::device_attributes::multiprocessor_count)) *
+            2U;
+        auto const max_grid =
+            static_cast<size_t>(device.attribute(cuda::device_attributes::max_grid_dim_x));
+        // Budget against actual remaining memory now that every persistent allocation
+        // above is resident. The untimed record count tightens the 24-byte descriptor
+        // bound for long-record corpora.
+        setup.sync();
+        size_t const records = count_sequence_records(paths);
+        // Only references are indexed; queries never enter the database peak.
+        size_t const indexed = all ? paths.size() : opts.references.size();
+        resident_budget const budget = resolve_resident_budget(opts, indexed, records, setup);
+        size_t const cap = budget.cap;
+        if (resolved_bytes) {
+            *resolved_bytes = cap;
+        }
+        if (plan) {
+            // Probe mode: same persistent allocations as a regular run, then report the
+            // effective budget without staging input, streaming batches, or running
+            // timings. Batch counts come from real runs at the probed budget.
+            *plan = json{
+                {"resident_batch_bytes", cap},
+                {"requested_bytes", opts.resident_bytes},
+                {"free_bytes", budget.free_bytes},
+                {"reusable_pool_bytes", budget.reusable_pool_bytes},
+                {"available_bytes", budget.available_bytes},
+                {"future_peak_bytes", budget.future_peak_bytes},
+                {"reserve_bytes", budget.reserve_bytes},
+                {"metadata_bytes", budget.metadata_bytes},
+                {"total_records", records},
+                {"total_bytes", budget.total_bytes},
+            };
+            return json{};
+        }
+        using batch_chunk = cuddl::detail::sequence_batch_chunk;
+        std::optional<cuda::device_buffer<char>> input;
+        std::optional<cuda::device_buffer<batch_chunk>> staged;
+        std::vector<batch_chunk> host;
+        size_t block_end = 0;
+        auto construct_sequence = [&](cuda::stream_ref s) {
+            auto const grid = static_cast<uint32_t>(std::min(block_end, max_grid));
+            cuddl::detail::add_sequence_batch_kernel<buckets, cuddl::default_register_layout>
+                <<<grid, 256, 0, s.get()>>>(
+                    input->data(), staged->data(), host.size(), block_end, k, registers.data()
+                );
+            CUDDL_CUDA_CALL(cudaGetLastError());
+        };
+        std::map<std::string, std::vector<double>> samples;
+        for (int sample = -opts.warmups; sample < opts.samples; ++sample) {
+            std::map<std::string, double> elapsed;
+            auto segment = [&](std::string const& name, auto function) {
+                json wall;
+                json gpu = measure(single, name, false, function, {}, &wall, {}, &stream);
+                if (gpu["samples"] != 1 || wall["samples"] != 1) {
+                    throw std::runtime_error(
+                        "resident segment requires exactly one NVBench sample"
+                    );
+                }
+                elapsed[name] += gpu["median_ms"].get<double>();
+                elapsed[name + "_wall"] += wall["median_ms"].get<double>();
+            };
+            db.reset();
+            setup.sync();
+            segment("resident_reset", [&](cuda::stream_ref s) {
+                reset(s);
+                cuda::fill_bytes(s, registers, 0);
+            });
+            elapsed["resident_construct"] = 0;
+            elapsed["resident_construct_wall"] = 0;
+            size_t count = 0;
+            if (sample != -opts.warmups && *resident_batches <= 1) {
+                count = *resident_batches;
+                if (count) segment("resident_construct", construct_sequence);
+            } else {
+                count = resident_sequence::for_each_batch(
+                    paths, k, cap, [&](resident_sequence::batch const& batch) {
+                        // Host windows arithmetic stays size_t; the header caps chunk windows
+                        // at UINT32_MAX so the narrowing cast below cannot wrap.
+                        host.clear();
+                        host.reserve(batch.chunks.size());
+                        block_end = 0;
+                        for (auto const& chunk : batch.chunks) {
+                            if (chunk.size < k) {
+                                continue;  // No complete window; the header omits these.
+                            }
+                            size_t const windows = chunk.size - k + 1;
+                            if (windows > std::numeric_limits<uint32_t>::max() ||
+                                chunk.genome > std::numeric_limits<uint32_t>::max()) {
+                                throw std::runtime_error(
+                                    "resident chunk exceeds batch kernel range"
+                                );
+                            }
+                            block_end +=
+                                std::min(per_chunk_blocks, (windows + size_t{2047}) / size_t{2048});
+                            host.push_back({
+                                chunk.offset,
+                                block_end,
+                                static_cast<uint32_t>(chunk.genome),
+                                static_cast<uint32_t>(windows),
+                            });
+                        }
+                        if (!input || input->size() < batch.bases.size()) {
+                            // Free before growing so two near-capacity allocations cannot overlap.
+                            input.reset();
+                            setup.sync();
+                            input.emplace(
+                                cuda::make_device_buffer<char>(
+                                    setup, setup.device(), batch.bases.size(), cuda::no_init
+                                )
+                            );
+                        }
+                        if (!staged || staged->size() < host.size()) {
+                            staged.reset();
+                            setup.sync();
+                            staged.emplace(
+                                cuda::make_device_buffer<batch_chunk>(
+                                    setup, setup.device(), host.size(), cuda::no_init
+                                )
+                            );
+                        }
+                        cuda::copy_bytes(
+                            setup,
+                            cuda::std::span{batch.bases.data(), batch.bases.size()},
+                            cuddl::device_span<char>{input->data(), batch.bases.size()}
+                        );
+                        cuda::copy_bytes(
+                            setup,
+                            cuda::std::span{host.data(), host.size()},
+                            cuddl::device_span<batch_chunk>{staged->data(), host.size()}
+                        );
+                        setup.sync();
+                        segment("resident_construct", construct_sequence);
+                    }
+                );
+            }
+            if (sample == -opts.warmups) *resident_batches = count;
+            if (*resident_batches != count) {
+                throw std::runtime_error("resident input changed between replays");
+            }
+            segment("resident_construct", [&](cuda::stream_ref s) {
+                for (size_t i = 0; i < paths.size(); ++i) {
+                    auto& target = i < n ? refs.sketches[i] : queries.sketches[i - n];
+                    CUDDL_UNWRAP(
+                        target.assign_async({registers.data() + i * (buckets + 1), buckets + 1}, s)
+                    );
+                }
+            });
+            segment("resident_statistics", statistics);
+            segment("resident_rows", rows);
+            segment("resident_index", index);
+            segment("resident_search", query);
+            // Validate the timed resident construction, including multiplicities and saturation.
+            auto const observed_registers = download(registers, setup);
+            for (size_t i = 0; i < observed_registers.size(); ++i) {
+                auto const expected =
+                    i < expected_references->registers.size()
+                        ? expected_references->registers[i]
+                        : expected_queries->registers[i - expected_references->registers.size()];
+                if (observed_registers[i] != expected) {
+                    throw std::runtime_error(
+                        "resident sequence register " + std::to_string(i) + " expected " +
+                        std::to_string(expected) + ", observed " +
+                        std::to_string(observed_registers[i])
+                    );
+                }
+            }
+            double total_gpu = 0, total_wall = 0;
+            for (auto const& [name, value] : elapsed) {
+                (name.ends_with("_wall") ? total_wall : total_gpu) += value;
+            }
+            elapsed["resident_total"] = total_gpu;
+            elapsed["resident_total_wall"] = total_wall;
+            if (sample >= 0) {
+                for (auto const& [name, value] : elapsed) {
+                    samples[name].push_back(value);
+                }
+            }
+        }
+        auto output = download(retained, setup);
+        auto matches = download(retained_matches, setup);
+        host_results observed;
+        for (size_t i = 0; i < q; ++i) {
+            for (size_t j = all ? i + 1 : 0; j < n; ++j) {
+                observed.rows.push_back(output[i * n + j]);
+                observed.matches.push_back(matches[i * n + j]);
+            }
+        }
+        validate(observed, ref_scores, query_scores, opts, true, all, opts.oracle_pairs);
+        json result;
+        if (memory) {
+            *memory = {
+                {"resident_input", input ? input->size() : 0},
+                {"resident_input_metadata", staged ? staged->size() * sizeof(batch_chunk) : 0},
+            };
+        }
+        for (auto& [name, values] : samples) {
+            std::sort(values.begin(), values.end());
+            auto const middle = values.size() / 2;
+            result[name] = {
+                {"samples", values.size()},
+                {"min_ms", values.front()},
+                {"max_ms", values.back()},
+                {"median_ms",
+                 values.size() % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2},
+                {"source", name.ends_with("_wall") ? "nvbench_cpu_wall" : "nvbench_gpu_events"},
+            };
+        }
+        return result;
+    }
     json timings;
     auto gpu = [&](char const* name,
                    auto function,
@@ -856,14 +1307,21 @@ json run(options const& opts) {
             );
         }
     }
-    json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
-        if (streamed) {
-            end_to_end_streamed(opts, stream, mark);
-        } else {
-            end_to_end(opts, stream, mark);
-        }
-        stream.sync();
-    });
+    if (opts.resident_plan && !streamed) {
+        throw std::runtime_error("--resident-plan requires --ingest sequence");
+    }
+    // Probe mode skips the end-to-end run; the outer setup below still stages the
+    // realistic memory state the batch budget is measured against.
+    json timings = opts.resident_plan
+                       ? json::object()
+                       : measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
+                             if (streamed) {
+                                 end_to_end_streamed(opts, stream, mark);
+                             } else {
+                                 end_to_end(opts, stream, mark);
+                             }
+                             stream.sync();
+                         });
     // Streamed rows must outlive their collections: register copies are stream-ordered.
     parsed_files reference_files, query_files;
     genome_rows reference_rows, query_rows;
@@ -899,6 +1357,27 @@ json run(options const& opts) {
               download(refs.saturated, stream) == original_saturation)) {
             throw std::runtime_error("incremental construction differs from one-shot construction");
         }
+    }
+
+    if (opts.resident_plan) {
+        // The outer database and buffers above stage the realistic memory state;
+        // the probe reuses them only as resident pressure, then reports the flat
+        // batch plan without running any timing.
+        json plan;
+        size_t plan_batches = 0, plan_bytes = 0;
+        resident_timings(
+            opts,
+            parsed_files{},
+            parsed_files{},
+            {},
+            {},
+            &plan_batches,
+            nullptr,
+            nullptr,
+            &plan_bytes,
+            &plan
+        );
+        return plan;
     }
 
     auto db = build(refs, opts, stream, true);
@@ -1241,11 +1720,21 @@ json run(options const& opts) {
             }
         }
     }
-    if (!streamed) {
-        timings.update(
-            resident_timings(opts, reference_files, query_files, ref_scores, query_scores)
-        );
-    }
+    size_t resident_batches = 0, resident_resolved = 0;
+    json resident_memory = json::object();
+    timings.update(resident_timings(
+        opts,
+        reference_files,
+        query_files,
+        ref_scores,
+        query_scores,
+        &resident_batches,
+        &reference_rows,
+        &query_rows,
+        &resident_resolved,
+        nullptr,
+        &resident_memory
+    ));
     measurements.insert(
         measurements.begin(),
         json{
@@ -1279,7 +1768,11 @@ json run(options const& opts) {
               {"warmups", opts.warmups},
               {"input_cache", "warm_os_cache"},
               {"end_to_end_output", "host_metrics_and_bounded_json"},
-              {"resident_input", streamed ? "sequence_tiles" : "packed_u64_actg_max"},
+              {"resident_input", streamed ? "sequence_ascii" : "packed_u64_actg_max"},
+              {"resident_batch_bytes", streamed ? resident_resolved : 0},
+              {"resident_batches", resident_batches},
+              {"resident_timing_scope",
+               streamed ? "batched_resident_segments" : "resident_pipeline"},
               {"resident_output", "device_cardinalities_winners_and_pair_summaries"},
               {"resident_minimum_matches", 0},
               {"worktree_dirty",
@@ -1308,6 +1801,7 @@ json run(options const& opts) {
               {"search_match_capacity", buffers.matches.size() * sizeof(uint32_t)}}},
         }
     );
+    measurements.front()["memory_bytes"].update(resident_memory);
     json datasets = json::object();
     for (auto const& [role, paths] : std::vector<std::pair<std::string, std::vector<std::string>>>{
              {"reference", opts.references}, {"query", opts.queries}
@@ -1350,6 +1844,34 @@ int main(int argc, char** argv) try {
         ->check(CLI::IsMember({"packed", "sequence"}));
     app.add_option("--workers", opts.workers, "File loading workers for --ingest sequence")
         ->check(CLI::Range(0u, 64u));
+    app.add_option(
+           "--resident-bytes",
+           opts.resident_bytes,
+           "Resident ASCII input batch byte budget for --ingest sequence "
+           "(0 selects automatically from free GPU memory)"
+    )
+        ->check(
+            CLI::Validator(
+                [](std::string& value) {
+                    size_t parsed = 0;
+                    try {
+                        parsed = std::stoull(value);
+                    } catch (std::exception const&) {
+                        return std::string{"must be a byte count"};
+                    }
+                    if (parsed != 0 && parsed < size_t{k}) {
+                        return std::string{"must be 0 (auto) or at least k bytes"};
+                    }
+                    return std::string{};
+                },
+                "0 or >= k"
+            )
+        );
+    app.add_flag(
+        "--resident-plan",
+        opts.resident_plan,
+        "Sequence-only: print the resident batch plan as flat JSON without timings"
+    );
     app.add_option("--oracle-pairs", opts.oracle_pairs, "Scalar-oracle pair comparisons per suite")
         ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--match-rows", opts.match_rows, "Match measurement rows emitted")
