@@ -247,6 +247,8 @@ def main(
                     *common,
                     "--k",
                     "25",
+                    "--ingest",
+                    ingest,
                     "--sketch-size",
                     "4096",
                     *(["--threads", str(threads)] if threads is not None else []),

@@ -152,6 +152,28 @@ def main(
             for timing in pipeline["timings"].values():
                 assert timing["samples"] == 2
                 assert 0 <= timing["min_ms"] <= timing["median_ms"] <= timing["max_ms"]
+            if topology == "batch":
+                # Streamed ingestion uses RabbitSketch file ingest and drops the record and
+                # packed-input stages.
+                streamed_report = root / "streamed.json"
+                subprocess.run(
+                    [*command, "--ingest", "sequence", "--output", str(streamed_report)],
+                    check=True,
+                )
+                streamed = load_result(streamed_report, "pipeline")
+                streamed_pipeline = streamed["measurements"][0]
+                assert streamed_pipeline["case"]["ingest"] == "sequence"
+                assert streamed_pipeline["case"]["resident_input"] == "fastx_files"
+                assert (
+                    streamed_pipeline["metrics"]["resident_streaming_scope"]
+                    == "first_file_per_role"
+                )
+                for key in ("parse_fastx", "construct_resident", "resident_total_wall"):
+                    assert key not in streamed_pipeline["timings"]
+                assert streamed["measurements"][1:] == data["measurements"][1:]
+                typer.echo(
+                    "PASS streamed file ingest: identical sketches and pair metrics"
+                )
             typer.echo(
                 f"PASS {topology}: {len(matches)} exact pair results, identical with 1, 3 and default threads; SIMD {pipeline['case']['simd_u64_path']}"
             )

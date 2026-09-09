@@ -30,9 +30,11 @@ using json = nlohmann::json;
 struct options {
     std::vector<std::string> references, queries;
     std::string output, name = "RabbitSketch CPU pipeline", topology = "batch";
+    std::string ingest = "packed";
     int k = 25, sketch_size = 4096, samples = 20, warmups = 3;
     uint64_t seed = 42;
     int threads = omp_get_num_procs();
+    size_t match_rows = 20000, dataset_hashes = 8, all_to_all_pairs = 50000000;
 };
 
 template <typename Function>
@@ -225,10 +227,13 @@ json query_metrics(Sketch::Query::Result const& value) {
 json measurements(
     collection const& refs,
     collection const& queries,
-    std::vector<match> const& matches
+    std::vector<match> const& matches,
+    size_t match_limit = 0,
+    size_t* emitted = nullptr
 ) {
     json result = json::array();
-    for (auto const& row : matches) {
+    size_t count = 0;
+    auto add_match = [&](match const& row) {
         result.push_back({
             {"implementation", {{"name", "rabbitsketch"}}},
             {"case",
@@ -237,6 +242,19 @@ json measurements(
               {"reference_id", row.reference_id}}},
             {"metrics", query_metrics(row.result)},
         });
+        ++count;
+    };
+    // One evenly spread row sample, always including the last pair.
+    size_t const limit = match_limit ? match_limit : matches.size();
+    size_t const stride = matches.size() > limit ? (matches.size() + limit - 1) / limit : 1;
+    for (size_t i = 0; i < matches.size(); i += stride) {
+        add_match(matches[i]);
+    }
+    if (matches.size() && (matches.size() - 1) % stride != 0) {
+        add_match(matches.back());
+    }
+    if (emitted != nullptr) {
+        *emitted = count;
     }
     for (auto const& [role, group] : std::vector<std::pair<std::string, collection const*>>{
              {"reference", &refs}, {"query", &queries}
@@ -351,22 +369,57 @@ json resident_timings(options const& opts) {
 json run(options const& opts) {
     auto const cfg = config(opts);
     auto const all = opts.topology == "all-to-all";
+    bool const streamed = opts.ingest == "sequence";
+    auto const reference_count = opts.references.size();
+    uint64_t const all_to_all_pairs =
+        reference_count > 1 ? uint64_t{reference_count} * (reference_count - 1) / 2 : 0;
+    if (all && opts.all_to_all_pairs && all_to_all_pairs > opts.all_to_all_pairs) {
+        throw std::runtime_error(
+            "all-to-all over " + std::to_string(reference_count) + " references retains " +
+            std::to_string(all_to_all_pairs) + " pair results, above --all-to-all-pairs (" +
+            std::to_string(opts.all_to_all_pairs) +
+            "); use --topology batch with a small --query set"
+        );
+    }
     auto build_queries = [&] {
         return build_files(opts.queries, cfg);
     };
-    // The untimed run warms input caches and checks resident and streaming construction agree.
+    // The untimed run warms input caches and checks file ingest against record construction.
     auto refs = build_files(opts.references, cfg);
     auto queries = build_queries();
     auto matches = search(refs, queries, all);
-    auto rows = measurements(refs, queries, matches);
-    auto reference_records = parse(opts.references);
-    auto query_records = parse(opts.queries);
-    auto resident_refs = construct(reference_records, cfg);
-    auto resident_queries = construct(query_records, cfg);
-    if (measurements(
-            resident_refs, resident_queries, search(resident_refs, resident_queries, all)
-        ) != rows) {
-        throw std::runtime_error("resident and streaming RabbitSketch results differ");
+    size_t match_rows_emitted = 0;
+    auto rows = measurements(refs, queries, matches, opts.match_rows, &match_rows_emitted);
+    std::string resident_scope = "all_files";
+    if (streamed) {
+        // Bounded check: build one genome per role both ways and compare sketch and parse
+        // metrics. The type-erased BuiltSketch exposes no registers.
+        resident_scope = "first_file_per_role";
+        for (auto const* paths : {&opts.references, &opts.queries}) {
+            if (paths->empty()) {
+                continue;
+            }
+            auto const resident = construct(parse({paths->front()}), cfg);
+            auto const ingested = build_files({paths->front()}, cfg);
+            if (measurements(resident, {}, {}, 0) != measurements(ingested, {}, {}, 0)) {
+                throw std::runtime_error(
+                    "file ingest differs from record construction: " + paths->front()
+                );
+            }
+        }
+    } else {
+        auto reference_records = parse(opts.references);
+        auto query_records = parse(opts.queries);
+        auto resident_refs = construct(reference_records, cfg);
+        auto resident_queries = construct(query_records, cfg);
+        if (measurements(
+                resident_refs,
+                resident_queries,
+                search(resident_refs, resident_queries, all),
+                opts.match_rows
+            ) != rows) {
+            throw std::runtime_error("resident and streaming RabbitSketch results differ");
+        }
     }
 
     json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
@@ -374,31 +427,37 @@ json run(options const& opts) {
         auto q = build_queries();
         mark();
         auto hits = search(r, q, all);
-        auto output = measurements(r, q, hits).dump();
+        auto output = measurements(r, q, hits, opts.match_rows).dump();
         consumed_size = output.size();
         mark();
     });
-    timings["parse_fastx"] = measure(opts, [&] {
-        auto r = parse(opts.references);
-        auto q = parse(opts.queries);
-        consumed_size = r.size() + q.size();
-    });
-    timings["construct_resident"] = measure(opts, [&] {
-        auto r = construct(reference_records, cfg);
-        auto q = construct(query_records, cfg);
-        consumed_size = r.size() + q.size();
-    });
+    // The record and packed-input stages materialize the whole corpus, so a streamed run skips
+    // them. RabbitSketch's own file ingest is the bounded path.
+    if (!streamed) {
+        auto reference_records = parse(opts.references);
+        auto query_records = parse(opts.queries);
+        timings["parse_fastx"] = measure(opts, [&] {
+            consumed_size = reference_records.size() + query_records.size();
+        });
+        timings["construct_resident"] = measure(opts, [&] {
+            auto r = construct(reference_records, cfg);
+            auto q = construct(query_records, cfg);
+            consumed_size = r.size() + q.size();
+        });
+    }
     timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"] = measure(opts, [&] {
         auto hits = search(refs, queries, all);
         consumed_size = hits.size();
     });
     timings["metrics_and_serialize"] = measure(opts, [&] {
-        auto output = measurements(refs, queries, matches).dump();
+        auto output = measurements(refs, queries, matches, opts.match_rows).dump();
         consumed_size = output.size();
     });
 
     auto const& runtime = Sketch::Runtime::runtimeInfo();
-    timings.update(resident_timings(opts));
+    if (!streamed) {
+        timings.update(resident_timings(opts));
+    }
     rows.insert(
         rows.begin(),
         json{
@@ -425,7 +484,8 @@ json run(options const& opts) {
               {"orchestration_threads", opts.threads},
               {"resident_parallelism", "independent_sketches_and_pairs"},
               {"end_to_end_output", "host_metrics_and_in_memory_json"},
-              {"resident_input", "packed_u64_actg_max"},
+              {"ingest", opts.ingest},
+              {"resident_input", streamed ? "fastx_files" : "packed_u64_actg_max"},
               {"resident_output", "host_cardinalities_and_jaccard_matrix"},
               {"resident_minimum_matches", 0},
               {"packed_input_patch", "FastKMV::updatePacked+clear"},
@@ -435,7 +495,13 @@ json run(options const& opts) {
               {"simd_rank_path", runtime.selected_rank_path},
               {"simd_override", runtime.environment_override},
               {"simd_override_honored", runtime.environment_override_honored}}},
-            {"metrics", {{"exhaustive_pairs", matches.size()}, {"resident_streaming_equal", true}}},
+            {"metrics",
+             {{"exhaustive_pairs", matches.size()},
+              {"match_rows_total", matches.size()},
+              {"match_rows_emitted", match_rows_emitted},
+              {"resident_streaming_equal", true},
+              {"resident_streaming_scope", resident_scope},
+              {"all_to_all_pairs", all_to_all_pairs}}},
             {"timings", timings},
         }
     );
@@ -444,12 +510,7 @@ json run(options const& opts) {
          std::vector<std::pair<std::string, std::vector<std::string> const*>>{
              {"reference", &opts.references}, {"query", &opts.queries}
          }) {
-        for (size_t i = 0; i < paths->size(); ++i) {
-            datasets[role + "_" + std::to_string(i)] = {
-                {"path", paths->at(i)},
-                {"sha256", command_output("sha256sum < " + quote(paths->at(i))).substr(0, 64)},
-            };
-        }
+        datasets.update(dataset_entries(role, *paths, opts.dataset_hashes));
     }
     return {
         {"schema", "cuddl-benchmark/v1"},
@@ -481,6 +542,23 @@ int main(int argc, char** argv) try {
         ->check(CLI::PositiveNumber);
     app.add_option("--samples", opts.samples)->check(CLI::Range(2, 10000));
     app.add_option("--warmups", opts.warmups)->check(CLI::Range(0, 1000));
+    app.add_option(
+           "--ingest",
+           opts.ingest,
+           "packed: add the record and packed-input stages. sequence: RabbitSketch file ingest "
+           "only, required for a large corpus"
+    )
+        ->check(CLI::IsMember({"packed", "sequence"}));
+    app.add_option("--match-rows", opts.match_rows, "Match measurement rows emitted")
+        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
+    app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
+        ->check(CLI::Range(size_t{0}, size_t{1} << 20));
+    app.add_option(
+           "--all-to-all-pairs",
+           opts.all_to_all_pairs,
+           "Reference pairs above which all-to-all is refused"
+    )
+        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--output", opts.output, "Shared-schema JSON output, stdout if omitted");
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
