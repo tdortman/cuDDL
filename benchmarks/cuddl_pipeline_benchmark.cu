@@ -884,11 +884,14 @@ json resident_timings(
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
+    // All-to-all keeps the strict upper triangle in row-major order; batch stays rectangular.
+    size_t const pairs =
+        all ? (n < 2 ? 0 : (n % 2 == 0 ? (n / 2) * (n - 1) : n * ((n - 1) / 2))) : n * q;
     auto retained = cuda::make_device_buffer<cuddl::batch_search_result>(
-        setup, setup.device(), n * q, cuda::no_init
+        setup, setup.device(), pairs, cuda::no_init
     );
     auto retained_matches =
-        cuda::make_device_buffer<uint32_t>(setup, setup.device(), n * q, cuda::no_init);
+        cuda::make_device_buffer<uint32_t>(setup, setup.device(), pairs, cuda::no_init);
     setup.sync();
     auto reset = [&](cuda::stream_ref s) {
         refs.clear(s);
@@ -929,8 +932,10 @@ json resident_timings(
                 [=] __device__(size_t i) {
                     if (i < *count) {
                         auto const row = source[i];
+                        auto const qid = static_cast<size_t>(row.query_id);
+                        auto const rid = static_cast<size_t>(row.reference_id);
                         auto const position =
-                            static_cast<size_t>(row.query_id) * n + row.reference_id;
+                            all ? qid * (2 * n - qid - 1) / 2 + rid - qid - 1 : qid * n + rid;
                         target[position] = row;
                         matches[position] = source_matches[i];
                     }
@@ -1129,15 +1134,8 @@ json resident_timings(
                 }
             }
         }
-        auto output = download(retained, setup);
-        auto matches = download(retained_matches, setup);
-        host_results observed;
-        for (size_t i = 0; i < q; ++i) {
-            for (size_t j = all ? i + 1 : 0; j < n; ++j) {
-                observed.rows.push_back(output[i * n + j]);
-                observed.matches.push_back(matches[i * n + j]);
-            }
-        }
+        // Compact downloads already arrive in validation row order.
+        host_results observed{download(retained, setup), download(retained_matches, setup)};
         validate(observed, ref_scores, query_scores, opts, true, all, opts.oracle_pairs);
         json result;
         if (memory) {
@@ -1181,15 +1179,8 @@ json resident_timings(
         [&](cuda::stream_ref) { db.reset(); }
     );
     // Download only after measurement; every pair must survive device tile reuse.
-    auto output = download(retained, setup);
-    auto match_counts = download(retained_matches, setup);
-    host_results observed;
-    for (size_t i = 0; i < q; ++i) {
-        for (size_t j = all ? i + 1 : 0; j < n; ++j) {
-            observed.rows.push_back(output[i * n + j]);
-            observed.matches.push_back(match_counts[i * n + j]);
-        }
-    }
+    // Compact downloads already arrive in validation row order.
+    host_results observed{download(retained, setup), download(retained_matches, setup)};
     validate(observed, ref_scores, query_scores, opts, true, all, opts.oracle_pairs);
     gpu("resident_reset", reset);
     gpu("resident_construct", construct, reset);

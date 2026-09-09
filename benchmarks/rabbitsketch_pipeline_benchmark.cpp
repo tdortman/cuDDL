@@ -582,20 +582,30 @@ sequence_timings sequence_resident_timings(
             );
         }
     }
-    std::vector<double> expected(n * q);
-    parallel_for(expected.size(), [&](size_t position) {
-        auto const i = position / n, j = position % n;
-        if (all && j <= i) {
-            return;
-        }
-        expected[position] = staged[all ? i : n + i].jaccard(staged[j]);
-    });
+    // Compact strict-upper-triangle layout for all-to-all (row-major q<r); batch stays n*q.
+    // The n*q guard above keeps n*n representable, so divide-before-multiply below is safe.
+    size_t const pair_count =
+        all ? (n < 2 ? 0 : (n % 2 == 0 ? (n / 2) * (n - 1) : n * ((n - 1) / 2))) : n * q;
+    std::vector<double> expected(pair_count);
+    if (all) {
+        parallel_for(n, [&](size_t i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                auto const position = i * (2 * n - i - 1) / 2 + j - i - 1;
+                expected[position] = staged[i].jaccard(staged[j]);
+            }
+        });
+    } else {
+        parallel_for(expected.size(), [&](size_t position) {
+            auto const i = position / n, j = position % n;
+            expected[position] = staged[n + i].jaccard(staged[j]);
+        });
+    }
     std::vector<Sketch::FastKMV> sketches;
     sketches.reserve(genome_paths.size());
     for (size_t i = 0; i < genome_paths.size(); ++i) {
         sketches.emplace_back(opts.sketch_size, opts.k, opts.seed);
     }
-    std::vector<double> cardinalities(genome_paths.size()), similarities(n * q);
+    std::vector<double> cardinalities(genome_paths.size()), similarities(pair_count);
     auto reset = [&] {
         parallel_for(sketches.size(), [&](size_t i) { sketches[i].clear(); });
     };
@@ -608,13 +618,19 @@ sequence_timings sequence_resident_timings(
         });
     };
     auto compare = [&] {
-        parallel_for(similarities.size(), [&](size_t position) {
-            auto const i = position / n, j = position % n;
-            if (all && j <= i) {
-                return;
-            }
-            similarities[position] = sketches[all ? i : n + i].jaccard(sketches[j]);
-        });
+        if (all) {
+            parallel_for(n, [&](size_t i) {
+                for (size_t j = i + 1; j < n; ++j) {
+                    auto const position = i * (2 * n - i - 1) / 2 + j - i - 1;
+                    similarities[position] = sketches[i].jaccard(sketches[j]);
+                }
+            });
+        } else {
+            parallel_for(similarities.size(), [&](size_t position) {
+                auto const i = position / n, j = position % n;
+                similarities[position] = sketches[n + i].jaccard(sketches[j]);
+            });
+        }
         consumed_size = similarities.size();
     };
     // Timed replays sum the per-replay batch segments (each a single raw NVBench observation),
@@ -719,7 +735,11 @@ json resident_timings(options const& opts) {
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
-    std::vector<double> cardinalities(inputs.size()), similarities(n * q);
+    // Compact strict-upper-triangle layout for all-to-all (row-major q<r); batch stays n*q.
+    // The n*q guard above keeps n*n representable, so divide-before-multiply below is safe.
+    size_t const pair_count =
+        all ? (n < 2 ? 0 : (n % 2 == 0 ? (n / 2) * (n - 1) : n * ((n - 1) / 2))) : n * q;
+    std::vector<double> cardinalities(inputs.size()), similarities(pair_count);
     auto reset = [&] {
         parallel_for(sketches.size(), [&](size_t i) { sketches[i].clear(); });
     };
@@ -737,11 +757,19 @@ json resident_timings(options const& opts) {
         });
     };
     auto compare = [&] {
-        parallel_for(similarities.size(), [&](size_t position) {
-            auto const i = position / n, j = position % n;
-            if (all && j <= i) return;
-            similarities[position] = sketches[all ? i : n + i].jaccard(sketches[j]);
-        });
+        if (all) {
+            parallel_for(n, [&](size_t i) {
+                for (size_t j = i + 1; j < n; ++j) {
+                    auto const position = i * (2 * n - i - 1) / 2 + j - i - 1;
+                    similarities[position] = sketches[i].jaccard(sketches[j]);
+                }
+            });
+        } else {
+            parallel_for(similarities.size(), [&](size_t position) {
+                auto const i = position / n, j = position % n;
+                similarities[position] = sketches[n + i].jaccard(sketches[j]);
+            });
+        }
         consumed_size = similarities.size();
     };
     auto pipeline = [&] {
