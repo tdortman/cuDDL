@@ -779,41 +779,6 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     mark();
 }
 
-// Per-file digests are bounded so a large corpus does not pay one hash per genome. When the
-// list is truncated, one digest covers the corpus manifest of file sizes and paths.
-json dataset_entries(
-    std::string const& role, std::vector<std::string> const& paths, size_t limit
-) {
-    json entries = json::object();
-    size_t const hashed = limit ? std::min(limit, paths.size()) : paths.size();
-    for (size_t i = 0; i < hashed; ++i) {
-        entries[role + "_" + std::to_string(i)] = {
-            {"path", paths[i]},
-            {"sha256", command_output("sha256sum < " + quote(paths[i])).substr(0, 64)}
-        };
-    }
-    if (hashed < paths.size()) {
-        auto const manifest =
-            std::filesystem::temp_directory_path() / ("cuddl-pipeline-" + role + "-manifest.txt");
-        std::ofstream output(manifest);
-        if (!output) {
-            throw std::runtime_error("cannot write dataset manifest");
-        }
-        for (auto const& path : paths) {
-            std::error_code error;
-            auto const size = std::filesystem::file_size(path, error);
-            output << (error ? 0 : size) << '\t' << path << '\n';
-        }
-        output.close();
-        entries[role + "_manifest"] = {
-            {"path", paths.front() + " and " + std::to_string(paths.size() - 1) + " more"},
-            {"sha256", command_output("sha256sum < " + quote(manifest.string())).substr(0, 64)}
-        };
-        std::filesystem::remove(manifest);
-    }
-    return entries;
-}
-
 json run(options const& opts) {
     bool const streamed = opts.ingest == "sequence";
     cuda::stream stream{cuda::devices[0]};
