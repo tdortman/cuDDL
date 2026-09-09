@@ -4,9 +4,7 @@
 #include <cuda/algorithm>
 #include <cuda/buffer>
 #include <cuda/memory_pool>
-#include <cuda/std/bit>
 #include <cuda/stream>
-#include <cusbf/Alphabet.cuh>
 
 #include <algorithm>
 #include <condition_variable>
@@ -17,6 +15,7 @@
 #include <vector>
 #include <cuda/devices>
 #include <cuddl/detail/register.cuh>
+#include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
 
@@ -27,137 +26,6 @@ struct sequence_byte {
         return c != '\n' && c != '\r' && c != ' ' && c != '\t';
     }
 };
-
-// A tile encodes each ASCII base once; each thread rolls eight adjacent windows.
-// cuSBF's symbol-tile helpers require compile-time Bloom-filter Config; this path
-// accepts runtime k and feeds cuDDL's existing register update/merge operations.
-template <size_t BucketCount, typename Layout>
-__device__ __forceinline__ void add_sequence_windows(
-    char const* sequence,
-    uint32_t windows,
-    size_t first_tile,
-    size_t tile_stride,
-    uint32_t k,
-    uint32_t* registers,
-    uint32_t& saturation
-) {
-    if (windows == 0) return;
-    constexpr uint32_t tile_size = 256 * 8;
-    constexpr bool shared_sketch = BucketCount <= 8192;
-    __shared__ uint8_t bases[tile_size + 30];
-    __shared__ uint32_t local[shared_sketch ? BucketCount : 1];
-    if constexpr (shared_sketch) {
-        for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
-            local[i] = 0;
-        }
-    }
-    auto* target = shared_sketch ? local : registers;
-    auto const mask = (uint64_t{1} << (2 * k)) - 1;
-    for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
-        auto const count = min(tile_size, windows - static_cast<uint32_t>(tile));
-        for (uint32_t i = threadIdx.x; i < count + k - 1; i += blockDim.x) {
-            bases[i] = cusbf::DnaAlphabet::encode(sequence + tile + i);
-        }
-        __syncthreads();
-        auto const start = threadIdx.x * 8;
-        if (start < count) {
-            uint64_t forward = 0;
-            uint32_t valid = 0;
-            auto const end = min(start + 8, count) + k - 1;
-            for (uint32_t i = start; i < end; ++i) {
-                auto const symbol = bases[i];
-                forward = ((forward << 2) | (symbol & 3U)) & mask;
-                valid = symbol == cusbf::DnaAlphabet::invalidSymbol ? 0 : valid + 1;
-                if (valid >= k) {
-                    auto const bits = cuda::std::bit_reverse(forward);
-                    auto const pairs = ((bits & 0xAAAAAAAAAAAAAAAAULL) >> 1) |
-                                       ((bits & 0x5555555555555555ULL) << 1);
-                    auto const reverse = (pairs ^ 0xAAAAAAAAAAAAAAAAULL) >> (64 - 2 * k);
-                    auto const hash = hash_kmer(forward > reverse ? forward : reverse);
-                    update(&target[bucket_of<BucketCount>(hash)], score<Layout>(hash), saturation);
-                }
-            }
-        }
-        __syncthreads();
-    }
-    if constexpr (shared_sketch) {
-        for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
-            merge_register(&registers[i], local[i], saturation);
-        }
-    }
-}
-
-template <size_t BucketCount, typename Layout>
-__global__ void add_sequence_tile_kernel(
-    char const* sequence,
-    uint32_t const* window_count,
-    char* carry,
-    uint32_t k,
-    uint32_t* registers,
-    uint32_t& saturation
-) {
-    auto const windows = *window_count;
-    if (blockIdx.x == 0 && threadIdx.x < k - 1) {
-        carry[threadIdx.x] = sequence[windows + threadIdx.x];
-    }
-    add_sequence_windows<BucketCount, Layout>(
-        sequence,
-        windows,
-        size_t{blockIdx.x} * 2048,
-        size_t{gridDim.x} * 2048,
-        k,
-        registers,
-        saturation
-    );
-}
-
-struct sequence_batch_chunk {
-    size_t offset;
-    size_t block_end;
-    uint32_t genome;
-    uint32_t windows;
-};
-
-// Logical blocks cover every chunk in one launch, including independent short records.
-template <size_t BucketCount, typename Layout>
-__global__ void add_sequence_batch_kernel(
-    char const* sequence,
-    sequence_batch_chunk const* chunks,
-    size_t chunk_count,
-    size_t block_count,
-    uint32_t k,
-    uint32_t* registers
-) {
-    __shared__ sequence_batch_chunk chunk;
-    __shared__ size_t first_block;
-    for (size_t block = blockIdx.x; block < block_count; block += gridDim.x) {
-        if (threadIdx.x == 0) {
-            size_t low = 0, high = chunk_count;
-            while (low < high) {
-                auto const middle = low + (high - low) / 2;
-                if (chunks[middle].block_end <= block) {
-                    low = middle + 1;
-                } else {
-                    high = middle;
-                }
-            }
-            chunk = chunks[low];
-            first_block = low ? chunks[low - 1].block_end : 0;
-        }
-        __syncthreads();
-        auto* target = registers + size_t{chunk.genome} * (BucketCount + 1);
-        add_sequence_windows<BucketCount, Layout>(
-            sequence + chunk.offset,
-            chunk.windows,
-            (block - first_block) * 2048,
-            (chunk.block_end - first_block) * 2048,
-            k,
-            target,
-            target[BucketCount]
-        );
-        __syncthreads();
-    }
-}
 
 // Persistent stripe-copy workers for host staging. Single-thread copies from
 // file-backed mappings stall the GPU feed (measured ~4.7 GB/s alone versus ~13 GB/s

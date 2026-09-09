@@ -158,8 +158,7 @@
                   - -I$(pwd)/include
                   - -I$(pwd)/subprojects/nvbench
                   - -I$(pwd)/subprojects/cuco/include
-                  - -I$(pwd)/subprojects/cusbf/include
-                  - -I$(pwd)/subprojects/zlib-1.3.1
+                  - -I$(pwd)/subprojects/zlib-1.3.2
                   - -I$(pwd)/subprojects/googletest-1.17.0/googletest/include
 
                 Remove:

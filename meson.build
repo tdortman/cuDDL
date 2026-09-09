@@ -23,13 +23,11 @@ cuda_args = [
     '--generate-line-info',
 ] + cuda_arch_args
 
-# The FASTA parser reuses cuSBF's FASTX reader, pulled in as a pinned Meson subproject. cuSBF's
-# exported `cusbf_dep` carries its headers and propagates its own zlib dependency, so no direct
-# sibling include path or zlib wiring is needed here.
 cccl_dep = subproject('cccl').get_variable('cccl_dep')
+zlib_dep = subproject('zlib').get_variable('zlib_dep')
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [cccl_dep, subproject('cusbf').get_variable('cusbf_dep')],
+    dependencies: [cccl_dep, zlib_dep],
 )
 
 build_examples = (

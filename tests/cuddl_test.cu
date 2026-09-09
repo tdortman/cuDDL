@@ -9,6 +9,7 @@
 #include <cuda/buffer>
 #include <cuda/stream>
 
+#include <zlib.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -3395,47 +3396,72 @@ TEST(FastaTest, RecordBoundariesResetSerialAndParallelWindows) {
     }
 }
 
-TEST(FastaTest, ParallelFastaExtentsMatchSerial) {
-    std::vector<std::string> cases{
-        ">a\nACGT\n>b\nTGCA\n",
-        ">a>with>gt\nAC>GT\n>\n\n>b\r\nACGT\r\n",
-        ">\nACGT",
-        ">only-header-no-seq\n",
-        "\n\n>a\nACGT\n",
-        ">a\n",
-        "ACGT\n",
-        ">a\nACGT\n>mid\nline>with>gt\n>b\nTT\n",
-    };
-    std::string big;
-    for (int i = 0; i < 2000; ++i) {
-        big += ">r" + std::to_string(i) + " x>y\nACGTACGT\n";
+std::string write_tmp_gzip(std::string const& content) {
+    static int counter = 0;
+    auto const path = std::string("/tmp/cuddl_gzip_test_") + std::to_string(++counter) + ".fa.gz";
+    std::unique_ptr<gzFile_s, decltype(&gzclose)> out{gzopen(path.c_str(), "wb"), &gzclose};
+    if (out && !content.empty()) {
+        (void)gzwrite(out.get(), content.data(), static_cast<unsigned>(content.size()));
     }
-    cases.push_back(big);
-    auto check = [](std::string_view data) {
-        auto const expected = cusbf::detail::fastx_fasta_extents(data);
-        std::vector<size_t> candidates;
-        constexpr size_t shards = 3;
-        auto const span = (data.size() + shards - 1) / shards;
-        for (size_t shard = 0; shard < shards; ++shard) {
-            auto const begin = std::min(shard * span, data.size());
-            cuddl::detail::gather_header_candidates(
-                data, begin, std::min(begin + span, data.size()), candidates
-            );
-        }
-        auto const actual = cuddl::detail::walk_header_candidates(data, candidates);
-        ASSERT_EQ(actual.size(), expected.size());
-        for (size_t i = 0; i < actual.size(); ++i) {
-            EXPECT_EQ(actual[i].begin, expected[i].begin);
-            EXPECT_EQ(actual[i].end, expected[i].end);
-        }
-        auto const dispatched = cuddl::detail::parallel_fastx_fasta_extents(data);
-        ASSERT_EQ(dispatched.size(), expected.size());
-        for (size_t i = 0; i < dispatched.size(); ++i) {
-            EXPECT_EQ(dispatched[i].begin, expected[i].begin);
-            EXPECT_EQ(dispatched[i].end, expected[i].end);
-        }
-    };
-    for (auto const& text : cases) check(std::string_view{text});
+    return path;
+}
+
+TEST(FastaTest, HeaderEdgeCasesParseThroughPublicApi) {
+    // A '>' only opens a record at the start of a line; inside a sequence line it is an
+    // invalid base that breaks the rolling window without emitting a spanning k-mer.
+    auto const embedded = write_tmp_fasta(">a\nAC>GT\n");
+    auto const broken = cuddl::parse_fasta_file(embedded, 3);
+    std::remove(embedded.c_str());
+    ASSERT_TRUE(broken.has_value());
+    EXPECT_EQ(broken->bases, 4u);
+    EXPECT_EQ(broken->valid_kmers, 0u);
+    EXPECT_EQ(broken->invalid_windows, 1u);
+
+    // Adjacent records split at the header; no k-mer spans the boundary.
+    auto const split = write_tmp_fasta(">a\nACGT\n>b\nTGCA\n");
+    auto const both = cuddl::parse_fasta_file(split, 3);
+    std::remove(split.c_str());
+    ASSERT_TRUE(both.has_value());
+    EXPECT_EQ(both->bases, 8u);
+    EXPECT_EQ(both->valid_kmers, 4u);
+    EXPECT_EQ(both->invalid_windows, 0u);
+
+    // Leading blank lines are tolerated, while a file with bytes but no record is rejected.
+    auto const leading = write_tmp_fasta("\n\n>a\nACGT\n");
+    auto const tolerated = cuddl::parse_fasta_file(leading, 3);
+    std::remove(leading.c_str());
+    ASSERT_TRUE(tolerated.has_value());
+    EXPECT_EQ(tolerated->bases, 4u);
+    EXPECT_EQ(tolerated->valid_kmers, 2u);
+
+    auto const headerless = write_tmp_fasta("ACGT\n");
+    auto const rejected = cuddl::parse_fasta_file(headerless, 3);
+    std::remove(headerless.c_str());
+    EXPECT_FALSE(rejected.has_value());
+}
+
+TEST(FastaTest, GzipMatchesPlainAndRejectsTruncated) {
+    std::string const content = ">a\nACGTNACGT\n>b\nTTGGCCAA\n";
+    auto const plain = write_tmp_fasta(content);
+    auto const zipped = write_tmp_gzip(content);
+    auto const expected = cuddl::parse_fasta_file(plain, 3);
+    auto const actual = cuddl::parse_fasta_file(zipped, 3);
+    std::remove(plain.c_str());
+    std::remove(zipped.c_str());
+    ASSERT_TRUE(expected.has_value());
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->kmers, expected->kmers);
+    EXPECT_EQ(actual->bases, expected->bases);
+    EXPECT_EQ(actual->valid_kmers, expected->valid_kmers);
+    EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+
+    // A truncated stream must fail loudly, never parse as a partial genome.
+    auto const truncated = write_tmp_gzip(content);
+    auto const full_size = std::filesystem::file_size(truncated);
+    ASSERT_GT(full_size, 10u);
+    std::filesystem::resize_file(truncated, full_size - 10);
+    EXPECT_FALSE(cuddl::parse_fasta_file(truncated, 3).has_value());
+    std::remove(truncated.c_str());
 }
 
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {

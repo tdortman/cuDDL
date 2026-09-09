@@ -1,7 +1,0 @@
-[wrap-git]
-url = https://github.com/tdortman/cuSBF.git
-revision = ec678b0750b0067d4fc66e066c8cd7a67cc5e792
-depth = 1
-
-[provide]
-dependency_names = cusbf_dep, cusbf
