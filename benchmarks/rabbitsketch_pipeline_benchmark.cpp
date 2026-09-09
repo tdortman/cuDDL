@@ -3,6 +3,7 @@
 #include <api/Version.h>
 #include <fastkmv.h>
 #include <omp.h>
+#include <rank/CanonicalKmer.h>
 #include <rank/RankStream.h>
 #include <CLI/CLI.hpp>
 #include <cuddl/fastx.hpp>
@@ -16,10 +17,12 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <vector>
 
 #include "host_result_json.hpp"
+#include "resident_sequence_batches.hpp"
 
 namespace {
 namespace api = Sketch::API;
@@ -35,6 +38,7 @@ struct options {
     uint64_t seed = 42;
     int threads = omp_get_num_procs();
     size_t match_rows = 20000, dataset_hashes = 8, all_to_all_pairs = 50000000;
+    size_t resident_bytes = 64ULL << 20;
 };
 
 template <typename Function>
@@ -299,6 +303,400 @@ json measurements(
     return result;
 }
 
+// Bounded resident ASCII-sequence path. Staging (parse, whitespace strip, chunking) uses the
+// shared resident_sequence batch rule and stays outside every timed region; only staged batch
+// bytes are consumed inside NVBench. Sketches and pair results stay corpus-sized, and every
+// nonempty record with at least k bases contributes its windows exactly once.
+char normalize_sequence_base(char base) {
+    switch (base) {
+        case 'A':
+        case 'a':
+            return 'A';
+        case 'C':
+        case 'c':
+            return 'C';
+        case 'G':
+        case 'g':
+            return 'G';
+        case 'T':
+        case 't':
+            return 'T';
+        default:
+            return 'N';
+    }
+}
+
+bool is_staged_whitespace(char base) {
+    return base == '\n' || base == '\r' || base == ' ' || base == '\t';
+}
+
+// Groups one staged batch's chunks by genome so chunks sharing a sketch run serially while
+// distinct genomes run on the existing OpenMP workers.
+struct sequence_batch_groups {
+    std::vector<size_t> genomes;
+    std::vector<std::vector<std::pair<size_t, size_t>>> ranges;
+};
+
+sequence_batch_groups group_sequence_batch(resident_sequence::batch const& staged) {
+    sequence_batch_groups result;
+    for (auto const& piece : staged.chunks) {
+        size_t slot = result.genomes.size();
+        for (size_t i = 0; i < result.genomes.size(); ++i) {
+            if (result.genomes[i] == piece.genome) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == result.genomes.size()) {
+            result.genomes.push_back(piece.genome);
+            result.ranges.emplace_back();
+        }
+        result.ranges[slot].emplace_back(piece.offset, piece.size);
+    }
+    return result;
+}
+
+void update_sequence_groups(
+    std::vector<Sketch::FastKMV>& sketches,
+    resident_sequence::batch const& staged,
+    sequence_batch_groups const& groups
+) {
+    parallel_for(groups.genomes.size(), [&](size_t slot) {
+        auto& sketch = sketches[groups.genomes[slot]];
+        for (auto const& [offset, size] : groups.ranges[slot]) {
+            std::string sequence;
+            sequence.resize(size);
+            for (size_t i = 0; i < size; ++i) {
+                sequence[i] = normalize_sequence_base(staged.bases[offset + i]);
+            }
+            sketch.update(sequence.data(), sequence.size());
+        }
+    });
+    consumed_size = staged.bases.size();
+}
+
+// One NVBench observation: with a single sample the summary median is the raw time, so
+// per-replay batch segments sum to an aligned raw total without a raw-sample export.
+double measure_single_ms(options const& opts, const std::function<void()>& function) {
+    options single = opts;
+    single.samples = 1;
+    single.warmups = 0;
+    return measure(single, function).at("median_ms").get<double>();
+}
+
+json summarize_replays(std::vector<double> values) {
+    if (values.empty()) {
+        throw std::runtime_error("no resident replay samples to summarize");
+    }
+    std::sort(values.begin(), values.end());
+    size_t const middle = values.size() / 2;
+    json result = {
+        {"samples", values.size()},
+        {"median_ms",
+         values.size() % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2},
+        {"min_ms", values.front()},
+        {"max_ms", values.back()},
+        {"source", "nvbench_cpu_wall"},
+    };
+    if (values.size() > 1) {
+        double mean = 0;
+        for (auto value : values) {
+            mean += value;
+        }
+        mean /= static_cast<double>(values.size());
+        double variance = 0;
+        for (auto value : values) {
+            variance += (value - mean) * (value - mean);
+        }
+        variance /= static_cast<double>(values.size());
+        double const noise = mean != 0 ? std::sqrt(variance) / std::abs(mean) : 0;
+        if (std::isfinite(noise)) {
+            result["relative_stddev_percent"] = noise * 100;
+        }
+    }
+    return result;
+}
+
+// Validates staged ASCII against the native FastxReader, rebuilds per-genome stats, and
+// checks whole-record sketches against the scalar hash/sort bottom-k oracle. One file at a
+// time: parser storage never spans the corpus.
+struct sequence_reference {
+    std::vector<api::BuildStats> stats;
+    std::vector<std::vector<uint64_t>> registers;
+};
+
+sequence_reference
+check_sequence_reference(std::vector<std::string> const& genome_paths, options const& opts) {
+    sequence_reference result;
+    result.stats.resize(genome_paths.size());
+    result.registers.resize(genome_paths.size());
+    size_t const k = static_cast<size_t>(opts.k);
+    for (size_t genome = 0; genome < genome_paths.size(); ++genome) {
+        auto const& path = genome_paths[genome];
+        auto loaded = cuddl::detail::load_fastx_sequence_file(path);
+        if (!loaded) {
+            throw std::runtime_error(path + ": " + loaded.error().message());
+        }
+        std::vector<std::string> parsed;
+        {
+            Sketch::IO::FastxReader reader(path);
+            Sketch::IO::FastxRecord record;
+            while (reader.next(record)) {
+                parsed.push_back(record.sequence);
+            }
+        }
+        auto const& extents = (*loaded)->extents;
+        if (extents.size() != parsed.size()) {
+            throw std::runtime_error("staged record count differs from FastxReader for " + path);
+        }
+        Sketch::FastKMV sketch(opts.sketch_size, opts.k, opts.seed);
+        auto& stats = result.stats[genome];
+        std::vector<uint64_t> keys;
+        for (size_t record = 0; record < extents.size(); ++record) {
+            std::string sequence;
+            for (auto cursor = extents[record].begin; cursor != extents[record].end; ++cursor) {
+                if (is_staged_whitespace(*cursor)) {
+                    continue;
+                }
+                sequence.push_back(normalize_sequence_base(*cursor));
+            }
+            std::string expected;
+            for (char base : parsed[record]) {
+                if (is_staged_whitespace(base)) {
+                    continue;
+                }
+                expected.push_back(normalize_sequence_base(base));
+            }
+            if (sequence != expected) {
+                throw std::runtime_error("staged ASCII differs from FastxReader for " + path);
+            }
+            ++stats.records;
+            stats.input_bases += parsed[record].size();
+            if (!sequence.empty()) {
+                sketch.update(sequence.data(), sequence.size());
+            }
+            if (sequence.size() < k) {
+                continue;
+            }
+            stats.candidate_kmers += sequence.size() - k + 1;
+            size_t ambiguous = 0;
+            for (size_t i = 0; i < k; ++i) {
+                ambiguous += sequence[i] == 'N';
+            }
+            for (size_t start = 0; start + k <= sequence.size(); ++start) {
+                if (ambiguous != 0) {
+                    ++stats.skipped_ambiguous_kmers;
+                } else {
+                    ++stats.accepted_kmers;
+                }
+                if (start + k < sequence.size()) {
+                    ambiguous -= sequence[start] == 'N';
+                    ambiguous += sequence[start + k] == 'N';
+                }
+            }
+            Sketch::Rank::CanonicalKmerIterator windows(
+                sequence.data(), sequence.size(), static_cast<uint8_t>(opts.k)
+            );
+            uint64_t code = 0;
+            while (windows.next(code)) {
+                keys.push_back(Sketch::Rank::RankStream::fmix64(code, opts.seed) >> 11);
+            }
+        }
+        sketch.finalize();
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        keys.resize(std::min(keys.size(), static_cast<size_t>(opts.sketch_size)));
+        auto const* registers = sketch.getRegisters();
+        if (sketch.size() != keys.size() || !std::equal(keys.begin(), keys.end(), registers)) {
+            throw std::runtime_error(
+                "sequence FastKMV differs from scalar bottom-k oracle: " + path
+            );
+        }
+        result.registers[genome].assign(registers, registers + sketch.size());
+    }
+    return result;
+}
+
+struct sequence_timings {
+    json timings;
+    size_t batches = 0;
+};
+
+sequence_timings sequence_resident_timings(
+    options const& opts,
+    api::SketchConfig const& cfg,
+    uint64_t expected_pairs,
+    json const& rows
+) {
+    bool const all = opts.topology == "all-to-all";
+    if (opts.resident_bytes < static_cast<size_t>(opts.k)) {
+        throw std::runtime_error("--resident-bytes must be at least k to stage overlapping chunks");
+    }
+    std::vector<std::string> genome_paths = opts.references;
+    if (!all) {
+        genome_paths.insert(genome_paths.end(), opts.queries.begin(), opts.queries.end());
+    }
+    auto const reference_size = opts.references.size();
+    auto const n = reference_size;
+    auto const q = all ? n : opts.queries.size();
+    if (n && q > std::numeric_limits<size_t>::max() / n) {
+        throw std::runtime_error("resident result size overflow");
+    }
+    auto const reference = check_sequence_reference(genome_paths, opts);
+    uint32_t const k = static_cast<uint32_t>(opts.k);
+    std::vector<Sketch::FastKMV> staged;
+    staged.reserve(genome_paths.size());
+    for (size_t i = 0; i < genome_paths.size(); ++i) {
+        staged.emplace_back(opts.sketch_size, opts.k, opts.seed);
+    }
+    // Untimed chunked build over the shared batch stream; register equality against the
+    // whole-record reference proves the k-1 overlap loses and duplicates no window.
+    // A one-batch corpus keeps its staged batch for the timed replays below; a
+    // multi-batch corpus keeps streaming so staging stays bounded by the cap.
+    resident_sequence::batch retained;
+    size_t seen = 0;
+    size_t const batches = resident_sequence::for_each_batch(
+        genome_paths, k, opts.resident_bytes, [&](resident_sequence::batch& batch) {
+            update_sequence_groups(staged, batch, group_sequence_batch(batch));
+            // consume() passes a nonconst batch; move the first one into retained
+            // storage. flush() clears the moved-from vectors safely.
+            if (seen++ == 0) {
+                retained = std::move(batch);
+            }
+        }
+    );
+    if (batches != 1) {
+        retained = resident_sequence::batch{};
+    }
+    sequence_batch_groups retained_groups;
+    if (batches == 1) {
+        retained_groups = group_sequence_batch(retained);
+    }
+    for (size_t i = 0; i < staged.size(); ++i) {
+        staged[i].finalize();
+        auto const* registers = staged[i].getRegisters();
+        if (staged[i].size() != reference.registers[i].size() ||
+            !std::equal(reference.registers[i].begin(), reference.registers[i].end(), registers)) {
+            throw std::runtime_error(
+                "batched ASCII chunks differ from whole-record sketch: " + genome_paths[i]
+            );
+        }
+    }
+    std::vector<double> expected(n * q);
+    parallel_for(expected.size(), [&](size_t position) {
+        auto const i = position / n, j = position % n;
+        if (all && j <= i) {
+            return;
+        }
+        expected[position] = staged[all ? i : n + i].jaccard(staged[j]);
+    });
+    std::vector<Sketch::FastKMV> sketches;
+    sketches.reserve(genome_paths.size());
+    for (size_t i = 0; i < genome_paths.size(); ++i) {
+        sketches.emplace_back(opts.sketch_size, opts.k, opts.seed);
+    }
+    std::vector<double> cardinalities(genome_paths.size()), similarities(n * q);
+    auto reset = [&] {
+        parallel_for(sketches.size(), [&](size_t i) { sketches[i].clear(); });
+    };
+    auto finalize = [&] {
+        parallel_for(sketches.size(), [&](size_t i) { sketches[i].finalize(); });
+    };
+    auto cardinality = [&] {
+        parallel_for(sketches.size(), [&](size_t i) {
+            cardinalities[i] = sketches[i].cardinality();
+        });
+    };
+    auto compare = [&] {
+        parallel_for(similarities.size(), [&](size_t position) {
+            auto const i = position / n, j = position % n;
+            if (all && j <= i) {
+                return;
+            }
+            similarities[position] = sketches[all ? i : n + i].jaccard(sketches[j]);
+        });
+        consumed_size = similarities.size();
+    };
+    // Timed replays sum the per-replay batch segments (each a single raw NVBench observation),
+    // then summarize across replays while warmup replays are discarded. A one-batch corpus
+    // reuses its retained staging; multi-batch corpora restage outside the timers per replay
+    // so staging stays bounded by the cap. Downstream stages stay whole-corpus singles.
+    std::vector<double> reset_ms, construct_ms, finalize_ms, cardinality_ms, search_ms, total_ms;
+    for (int replay = -opts.warmups; replay < opts.samples; ++replay) {
+        double const reset_time = measure_single_ms(opts, reset);
+        double construct_time = 0;
+        if (batches == 1) {
+            construct_time += measure_single_ms(opts, [&] {
+                update_sequence_groups(sketches, retained, retained_groups);
+            });
+        } else {
+            size_t const observed = resident_sequence::for_each_batch(
+                genome_paths, k, opts.resident_bytes, [&](resident_sequence::batch const& batch) {
+                    auto const groups = group_sequence_batch(batch);
+                    construct_time += measure_single_ms(opts, [&] {
+                        update_sequence_groups(sketches, batch, groups);
+                    });
+                }
+            );
+            if (observed != batches) {
+                throw std::runtime_error("resident batch plan changed between replays");
+            }
+        }
+        double const finalize_time = measure_single_ms(opts, finalize);
+        double const cardinality_time = measure_single_ms(opts, cardinality);
+        double const search_time = measure_single_ms(opts, compare);
+        if (similarities != expected) {
+            throw std::runtime_error("resident replay changed pair results");
+        }
+        if (replay >= 0) {
+            reset_ms.push_back(reset_time);
+            construct_ms.push_back(construct_time);
+            finalize_ms.push_back(finalize_time);
+            cardinality_ms.push_back(cardinality_time);
+            search_ms.push_back(search_time);
+            total_ms.push_back(
+                reset_time + construct_time + finalize_time + cardinality_time + search_time
+            );
+        }
+    }
+    for (size_t i = 0; i < sketches.size(); ++i) {
+        auto const* registers = sketches[i].getRegisters();
+        if (sketches[i].size() != reference.registers[i].size() ||
+            !std::equal(reference.registers[i].begin(), reference.registers[i].end(), registers)) {
+            throw std::runtime_error("timed resident replay differs from untimed chunks");
+        }
+    }
+    json timings;
+    timings["resident_total_wall"] = summarize_replays(total_ms);
+    timings["resident_reset_wall"] = summarize_replays(reset_ms);
+    timings["resident_construct_wall"] = summarize_replays(construct_ms);
+    timings["resident_finalize_wall"] = summarize_replays(finalize_ms);
+    timings["resident_cardinality_wall"] = summarize_replays(cardinality_ms);
+    timings["resident_search_wall"] = summarize_replays(search_ms);
+    collection resident_refs, resident_queries;
+    resident_refs.reserve(reference_size);
+    if (!all) {
+        resident_queries.reserve(opts.queries.size());
+    }
+    for (size_t i = 0; i < genome_paths.size(); ++i) {
+        api::BuiltSketch sketch = api::BuiltSketch::fromFastKMV(std::move(sketches[i]));
+        api::BuildResult built(
+            std::move(sketch), "genome", cfg, reference.stats[i], genome_paths[i], ""
+        );
+        if (i < reference_size) {
+            resident_refs.push_back(std::move(built));
+        } else {
+            resident_queries.push_back(std::move(built));
+        }
+    }
+    auto const resident = search(resident_refs, resident_queries, all, opts.match_rows);
+    if (resident.pairs != expected_pairs ||
+        measurements(resident_refs, resident_queries, resident.matches) != rows) {
+        throw std::runtime_error("resident sequence chunks differ from file ingest results");
+    }
+    return {std::move(timings), batches};
+}
+
 json resident_timings(options const& opts) {
     std::vector<std::vector<uint64_t>> inputs;
     for (auto const* paths : {&opts.references, &opts.queries}) {
@@ -412,22 +810,15 @@ json run(options const& opts) {
     size_t const match_rows_emitted = matches.size();
     auto rows = measurements(refs, queries, matches);
     std::string resident_scope = "all_files";
+    bool sequence_oracle_equal = false;
+    size_t resident_batches = 0;
+    json chunked_timings = json::object();
     if (streamed) {
-        // Bounded check: build one genome per role both ways and compare sketch and parse
-        // metrics. The type-erased BuiltSketch exposes no registers.
-        resident_scope = "first_file_per_role";
-        for (auto const* paths : {&opts.references, &opts.queries}) {
-            if (paths->empty()) {
-                continue;
-            }
-            auto const resident = construct(parse({paths->front()}), cfg);
-            auto const ingested = build_files({paths->front()}, cfg);
-            if (measurements(resident, {}, {}, 0) != measurements(ingested, {}, {}, 0)) {
-                throw std::runtime_error(
-                    "file ingest differs from record construction: " + paths->front()
-                );
-            }
-        }
+        // Full-corpus check: bounded chunked resident sketches must match file ingest exactly.
+        auto resident = sequence_resident_timings(opts, cfg, searched.pairs, rows);
+        chunked_timings = std::move(resident.timings);
+        resident_batches = resident.batches;
+        sequence_oracle_equal = true;
     } else {
         auto reference_records = parse(opts.references);
         auto query_records = parse(opts.queries);
@@ -475,6 +866,8 @@ json run(options const& opts) {
     auto const& runtime = Sketch::Runtime::runtimeInfo();
     if (!streamed) {
         timings.update(resident_timings(opts));
+    } else {
+        timings.update(chunked_timings);
     }
     rows.insert(
         rows.begin(),
@@ -503,9 +896,15 @@ json run(options const& opts) {
               {"resident_parallelism", "independent_sketches_and_pairs"},
               {"end_to_end_output", "host_metrics_and_in_memory_json"},
               {"ingest", opts.ingest},
-              {"resident_input", streamed ? "fastx_files" : "packed_u64_actg_max"},
+              {"resident_input", streamed ? "sequence_ascii" : "packed_u64_actg_max"},
               {"resident_output", "host_cardinalities_and_jaccard_matrix"},
               {"resident_minimum_matches", 0},
+              {"resident_batch_bytes", streamed ? opts.resident_bytes : 0},
+              {"resident_batches", resident_batches},
+              {"resident_timing_scope",
+               streamed ? "batched_resident_segments" : "resident_pipeline"},
+              {"resident_construct_path",
+               streamed ? "ascii_chunks+FastKMV-update" : "packed_u64+FastKMV-updatePacked"},
               {"packed_input_patch", "FastKMV::updatePacked+clear"},
               {"native_arch", !runtime.portable_baseline},
               {"simd_byte_path", runtime.selected_byte_path},
@@ -519,6 +918,7 @@ json run(options const& opts) {
               {"match_rows_emitted", match_rows_emitted},
               {"resident_streaming_equal", true},
               {"resident_streaming_scope", resident_scope},
+              {"resident_sequence_chunk_oracle_equal", sequence_oracle_equal},
               {"all_to_all_pairs", all_to_all_pairs}}},
             {"timings", timings},
         }
@@ -563,10 +963,17 @@ int main(int argc, char** argv) try {
     app.add_option(
            "--ingest",
            opts.ingest,
-           "packed: add the record and packed-input stages. sequence: RabbitSketch file ingest "
-           "only, required for a large corpus"
+           "packed: add the record and packed-input stages. sequence: bounded ASCII-chunk "
+           "resident path limited by --resident-bytes, required for a large corpus"
     )
         ->check(CLI::IsMember({"packed", "sequence"}));
+    app.add_option(
+           "--resident-bytes",
+           opts.resident_bytes,
+           "Staged ASCII byte cap for --ingest sequence, including k-1 overlap; must be at "
+           "least k. Sketches and pair results stay corpus-sized"
+    )
+        ->check(CLI::Range(size_t{0}, std::numeric_limits<size_t>::max()));
     app.add_option("--match-rows", opts.match_rows, "Match measurement rows emitted")
         ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
@@ -581,6 +988,9 @@ int main(int argc, char** argv) try {
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
+    if (opts.ingest == "sequence" && opts.resident_bytes < static_cast<size_t>(opts.k)) {
+        throw std::runtime_error("--resident-bytes must be at least k for --ingest sequence");
+    }
     omp_set_dynamic(0);
     omp_set_num_threads(opts.threads);
     if (opts.topology == "batch" && opts.queries.empty()) {
