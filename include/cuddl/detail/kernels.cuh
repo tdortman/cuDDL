@@ -804,12 +804,17 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
     }
 }
 
+/// @brief Cells one warp owns per iteration of @ref count_batch_index_matches_kernel.
+///
+/// The host divides the grid by this so every launched warp stays busy.
+constexpr uint32_t index_match_cells_per_warp = 8U;
+
 /// @brief Counts dense index matches for every query/reference pair in one tile.
 ///
-/// One warp owns each (query, bucket) cell. The cell's posting list is walked with a lane
-/// stride, so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
-/// postings at a time instead of serially by a single thread, and the two per-cell offset
-/// loads collapse into warp-uniform broadcasts.
+/// One warp owns @ref index_match_cells_per_warp (query, bucket) cells per iteration. Each
+/// cell's posting list is walked with a lane stride, so hot keys with long lists (the dominant
+/// cost on skewed rows) are consumed 32 postings at a time instead of serially by a single
+/// thread, and the two per-cell offset loads collapse into warp-uniform broadcasts.
 template <size_t BucketCount, typename QueryRow>
 __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     QueryRow const* queries,
@@ -827,27 +832,71 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     constexpr uint32_t warps_per_block = block_size / warp_width;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const cell_index = static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
-    auto const cell_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
     auto const total_cells = static_cast<uint64_t>(query_count) * indexed_bucket_count;
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-    for (auto cell = cell_index; cell < total_cells; cell += cell_stride) {
-        auto const query_index = static_cast<uint32_t>(cell / indexed_bucket_count);
-        auto const bucket = static_cast<uint32_t>(cell % indexed_bucket_count);
-        auto const score =
-            reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket]);
-        if (score == 0U) {
-            continue;
+    // The indexed bucket count is always a power of two (BucketCount or BucketCount / 2), so
+    // splitting the linear cell id costs a shift and a mask instead of a 64-bit division on
+    // every cell; the division dominated the mostly-empty-cell path.
+    auto const bucket_shift = static_cast<uint32_t>(cuda::std::countr_zero(indexed_bucket_count));
+    auto const bucket_mask = indexed_bucket_count - 1U;
+    // A few cells per warp: one cell's work is a short chain of dependent loads (score, then
+    // the posting range, then the postings), so issuing every cell's score load before consuming
+    // any of them multiplies the outstanding requests per warp instead of serializing on one
+    // cell. The host shrinks the grid by the same factor.
+    constexpr uint32_t cells_per_warp = index_match_cells_per_warp;
+    auto const first_cell =
+        (static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp) * cells_per_warp;
+    auto const warp_cell_stride =
+        static_cast<uint64_t>(gridDim.x) * warps_per_block * cells_per_warp;
+    for (auto cell_base = first_cell; cell_base < total_cells; cell_base += warp_cell_stride) {
+        uint32_t scores[cells_per_warp];
+        uint32_t query_indexes[cells_per_warp];
+        uint32_t buckets[cells_per_warp];
+        _Pragma("unroll")
+        for (uint32_t i = 0U; i < cells_per_warp; ++i) {
+            auto const cell = cell_base + static_cast<uint64_t>(i);
+            auto const in_range = cell < total_cells;
+            auto const bounded = in_range ? cell : uint64_t{0};
+            auto const query_index = static_cast<uint32_t>(bounded >> bucket_shift);
+            query_indexes[i] = query_index;
+            buckets[i] = static_cast<uint32_t>(bounded) & bucket_mask;
+            scores[i] =
+                in_range ? reference_score(
+                               queries[(query_row_offset + query_index) * BucketCount + buckets[i]]
+                           )
+                         : 0U;
         }
-        auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const range = index_posting_range(
-            offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
-        );
-        auto const begin = range.x;
-        auto const end = range.y;
-        auto* const counts = match_counts + static_cast<size_t>(query_index) * reference_count;
-        for (auto posting = begin + lane; posting < end; posting += warp_width) {
-            atomicAdd(&counts[postings[posting]], 1U);
+        _Pragma("unroll")
+        for (uint32_t i = 0U; i < cells_per_warp; ++i) {
+            auto const score = scores[i];
+            if (score == 0U) {
+                continue;
+            }
+            auto const key = static_cast<uint32_t>(score & key_mask);
+            auto const range = index_posting_range(
+                offsets, sorted_keys, reference_count, buckets[i], key, key_count
+            );
+            auto const begin = range.x;
+            auto const end = range.y;
+            auto* const counts =
+                match_counts + static_cast<size_t>(query_indexes[i]) * reference_count;
+            auto posting = begin + lane;
+            // Four independent posting loads in flight per lane keep the atomic stream fed
+            // while the following loads are still outstanding.
+            for (; posting + 3U * warp_width < end; posting += 4U * warp_width) {
+                uint32_t ids[4];
+                _Pragma("unroll")
+                for (uint32_t j = 0U; j < 4U; ++j) {
+                    ids[j] = postings[posting + j * warp_width];
+                }
+                _Pragma("unroll")
+                for (uint32_t j = 0U; j < 4U; ++j) {
+                    atomicAdd(&counts[ids[j]], 1U);
+                }
+            }
+            for (; posting < end; posting += warp_width) {
+                atomicAdd(&counts[postings[posting]], 1U);
+            }
         }
     }
 }

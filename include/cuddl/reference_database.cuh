@@ -1391,8 +1391,10 @@ class reference_database_view {
                 );
                 auto const query_buckets = static_cast<size_t>(tile_query_count) *
                                            metadata_.compatibility.indexed_bucket_count;
+                constexpr auto cells_per_warp = detail::index_match_cells_per_warp;
+                auto const cells_per_block = warps_per_block * cells_per_warp;
                 auto const required_bucket_blocks =
-                    (query_buckets + warps_per_block - 1U) / warps_per_block;
+                    (query_buckets + cells_per_block - 1U) / cells_per_block;
                 auto const bucket_blocks = static_cast<uint32_t>(
                     required_bucket_blocks < 65535U ? required_bucket_blocks : 65535U
                 );
