@@ -58,6 +58,22 @@ __device__ summary_payload combine_payloads(summary_payload a, summary_payload c
 
 }  // namespace
 
+/// @brief Buckets one contiguous chunk covers, for a query/reference score pair.
+///
+/// One wide load covers 16 buckets whenever either row stores 16-bit scores, and 8 buckets
+/// when both store packed 32-bit registers. The scalar fallback covers half as many.
+template <typename QueryScore, typename ReferenceScore>
+constexpr uint32_t wide_chunk_buckets =
+    (sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 16U : 8U;
+
+/// @brief Classifies one contiguous per-lane chunk of both rows (defined below).
+template <bool Use256, typename QueryScore, typename ReferenceScore>
+__device__ void classify_wide_chunk(
+    pairwise_counts& target,
+    QueryScore const* query,
+    ReferenceScore const* reference
+) noexcept;
+
 /**
  * @brief Constructs a sketch from packed k-mers using direct global packed CAS.
  *
@@ -389,9 +405,33 @@ __global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
     pairwise_counts local{};
     if (valid_reference) {
         auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
-        for (auto bucket = static_cast<size_t>(thread_in_reference); bucket < BucketCount;
-             bucket += threads_per_reference) {
-            classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
+        // Same wide chunk path as the batch kernel: every row stride is a multiple of the
+        // required alignment, so the two base pointers decide the load width.
+        auto const wide = wide_rows_aligned(query, rows);
+        if (wide) {
+            constexpr uint32_t chunk_buckets = wide_chunk_buckets<uint16_t, ReferenceRow>;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
+            for (auto chunk = thread_in_reference; chunk < chunks_per_row;
+                 chunk += threads_per_reference) {
+                classify_wide_chunk<true>(
+                    local,
+                    query + static_cast<size_t>(chunk) * chunk_buckets,
+                    rows + row_offset + static_cast<size_t>(chunk) * chunk_buckets
+                );
+            }
+        } else {
+            constexpr uint32_t chunk_buckets = wide_chunk_buckets<uint16_t, ReferenceRow> / 2U;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
+            for (auto chunk = thread_in_reference; chunk < chunks_per_row;
+                 chunk += threads_per_reference) {
+                classify_wide_chunk<false>(
+                    local,
+                    query + static_cast<size_t>(chunk) * chunk_buckets,
+                    rows + row_offset + static_cast<size_t>(chunk) * chunk_buckets
+                );
+            }
         }
     }
     auto const warp_total = reduce_warp(warp, local);
@@ -707,12 +747,42 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = block_size / warp_width;
     using count_reduce = cub::WarpReduce<pairwise_counts>;
-    using match_reduce = cub::WarpReduce<uint32_t>;
     __shared__ typename count_reduce::TempStorage count_storage[warps_per_block];
-    __shared__ typename match_reduce::TempStorage match_storage[warps_per_block];
 
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    // The wide path needs rows aligned to @ref load_256_alignment, which is 32 bytes on sm_100+
+    // and 16 bytes below. Every row stride here is a multiple of it, so checking the two base
+    // pointers covers every row the warp touches. Otherwise the chunking falls back to scalar
+    // loads.
+    auto const wide = wide_rows_aligned(queries, rows);
+    auto const classify_rows = [&](size_t query_offset, size_t reference_offset) {
+        pairwise_counts local{};
+        if (wide) {
+            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow>;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
+            for (uint32_t chunk = lane; chunk < chunks_per_row; chunk += warp_width) {
+                classify_wide_chunk<true>(
+                    local,
+                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
+                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
+                );
+            }
+        } else {
+            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow> / 2U;
+            static_assert(BucketCount % chunk_buckets == 0U);
+            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
+            for (uint32_t chunk = lane; chunk < chunks_per_row; chunk += warp_width) {
+                classify_wide_chunk<false>(
+                    local,
+                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
+                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
+                );
+            }
+        }
+        return local;
+    };
     if constexpr (!AllToAll) {
         // Reference-major traversal: each warp owns one reference and compares it against
         // every query in the tile, so each reference row is loaded once (and reused from L1
@@ -730,17 +800,8 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
                 auto const query_id = query_id_offset + query_index;
                 auto const query_offset =
                     (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
-                pairwise_counts local{};
-                uint32_t local_matches = 0U;
-                for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
-                     bucket += warp_width) {
-                    auto const query_score = reference_score(queries[query_offset + bucket]);
-                    auto const stored_score = reference_score(rows[reference_offset + bucket]);
-                    classify(local, query_score, stored_score);
-                    local_matches += query_score != 0U && query_score == stored_score;
-                }
+                auto const local = classify_rows(query_offset, reference_offset);
                 auto const total = count_reduce(count_storage[warp]).Sum(local);
-                auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
                 if (lane == 0U) {
                     auto const result_index =
                         static_cast<size_t>(query_index) * reference_count + reference_id;
@@ -749,7 +810,7 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
                     results[result_index].summary.counts = total;
                     results[result_index].summary.cardinality = 0.0;
                     if (result_match_counts != nullptr) {
-                        result_match_counts[result_index] = matches;
+                        result_match_counts[result_index] = total.equal;
                     }
                 }
                 __syncwarp();
@@ -776,18 +837,9 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
             auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
             for (; reference < reference_count; reference += reference_stride) {
                 auto const reference_id = static_cast<uint32_t>(reference);
-                pairwise_counts local{};
-                uint32_t local_matches = 0;
                 auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-                for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount;
-                     bucket += warp_width) {
-                    auto const query_score = reference_score(queries[query_offset + bucket]);
-                    auto const stored_score = reference_score(rows[reference_offset + bucket]);
-                    classify(local, query_score, stored_score);
-                    local_matches += query_score != 0U && query_score == stored_score;
-                }
+                auto const local = classify_rows(query_offset, reference_offset);
                 auto const total = count_reduce(count_storage[warp]).Sum(local);
-                auto const matches = match_reduce(match_storage[warp]).Sum(local_matches);
                 if (lane == 0U) {
                     auto const result_index = preceding_pairs + reference_id - first_reference;
                     results[result_index].query_id = query_id;
@@ -795,7 +847,7 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
                     results[result_index].summary.counts = total;
                     results[result_index].summary.cardinality = 0.0;
                     if (result_match_counts != nullptr) {
-                        result_match_counts[result_index] = matches;
+                        result_match_counts[result_index] = total.equal;
                     }
                 }
                 __syncwarp();
@@ -919,19 +971,19 @@ struct batch_minimum_match_predicate {
 
 /// @brief Classifies one contiguous per-lane chunk of both rows.
 ///
-/// With @p Use256 the chunk covers 16 buckets for 16-bit scores (one 256-bit load per row, via
-/// `ld.global.nc.v8.u32` on sm_100+) and 8 buckets for packed 32-bit registers; that path
-/// requires 32-byte-aligned rows. Without it the chunk covers 8 or 4 buckets with per-element
-/// scalar loads, which are safe for rows aligned only to their score type (2 or 4 bytes).
+/// With @p Use256 the chunk covers 16 buckets for 16-bit scores and 8 buckets for packed
+/// 32-bit registers, through @ref load_256_global_nc: one 256-bit load per row on sm_100+ and
+/// two 128-bit loads below, so it needs rows aligned to @ref load_256_alignment. Without it the
+/// chunk covers 8 or 4 buckets with per-element scalar loads, which are safe for rows aligned
+/// only to their score type (2 or 4 bytes).
 template <bool Use256, typename QueryScore, typename ReferenceScore>
 __device__ void classify_wide_chunk(
     pairwise_counts& target,
     QueryScore const* query,
     ReferenceScore const* reference
 ) noexcept {
-    constexpr uint32_t chunk_buckets =
-        Use256 ? ((sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 16U : 8U)
-               : ((sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 8U : 4U);
+    constexpr uint32_t chunk_buckets = Use256 ? wide_chunk_buckets<QueryScore, ReferenceScore>
+                                              : wide_chunk_buckets<QueryScore, ReferenceScore> / 2U;
     if constexpr (Use256) {
         if constexpr (sizeof(QueryScore) == 2U && sizeof(ReferenceScore) == 2U) {
             uint32_t q[8];
@@ -1053,10 +1105,9 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
     auto candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
     auto const candidate_stride = static_cast<uint32_t>(gridDim.x) * warps_per_block;
 
-    // The 256-bit load path needs 32-byte-aligned rows; callers may hand over spans whose base
-    // breaks that, in which case the same chunking falls back to 128-bit loads.
-    auto const wide256 = (reinterpret_cast<uintptr_t>(queries) & 31U) == 0U &&
-                         (reinterpret_cast<uintptr_t>(rows) & 31U) == 0U;
+    // The wide load path needs rows aligned to @ref load_256_alignment; callers may hand over
+    // spans whose base breaks that, in which case the same chunking falls back to scalar loads.
+    auto const wide256 = wide_rows_aligned(queries, rows);
     for (; candidate_index < *candidate_count; candidate_index += candidate_stride) {
         auto const pair_id = candidate_ids[candidate_index];
         auto const query_index = pair_id / reference_count;
@@ -1079,8 +1130,7 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
                 );
             }
         } else {
-            constexpr uint32_t chunk_buckets =
-                (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 8U : 4U;
+            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow> / 2U;
             static_assert(BucketCount % chunk_buckets == 0U);
             constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
             for (auto chunk = static_cast<uint32_t>(lane); chunk < chunks_per_row;

@@ -13,10 +13,34 @@
 namespace cuddl::detail {
 
 /**
+ * @brief Byte alignment @ref load_256_global_nc requires on the compiled architecture.
+ *
+ * sm_100 and later issue one 256-bit load per call, which needs 32-byte alignment. Earlier
+ * architectures issue two 128-bit loads, which need only 16 bytes, so a 16-byte-aligned row
+ * still takes the wide path there.
+ */
+__host__ __device__ constexpr uint32_t load_256_alignment() noexcept {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return 32U;
+#else
+    return 16U;
+#endif
+}
+
+/// @brief True when both row bases meet @ref load_256_alignment on the compiled architecture.
+template <typename QueryScore, typename ReferenceScore>
+__host__ __device__ inline bool
+wide_rows_aligned(QueryScore const* query, ReferenceScore const* reference) noexcept {
+    constexpr uintptr_t mask = load_256_alignment() - 1U;
+    return (reinterpret_cast<uintptr_t>(query) & mask) == 0U &&
+           (reinterpret_cast<uintptr_t>(reference) & mask) == 0U;
+}
+
+/**
  * @brief Loads 256 bits from global memory using the non-coherent cache path.
  *
  * @tparam T Element type (uint32_t or uint64_t)
- * @param ptr Source pointer (must be 32-byte aligned)
+ * @param ptr Source pointer (must be aligned to @ref load_256_alignment)
  * @param out Output array (4 elements for uint64_t, 8 for uint32_t)
  */
 template <typename T>
