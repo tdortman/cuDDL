@@ -32,18 +32,15 @@ struct sequence_byte {
 // cuSBF's symbol-tile helpers require compile-time Bloom-filter Config; this path
 // accepts runtime k and feeds cuDDL's existing register update/merge operations.
 template <size_t BucketCount, typename Layout>
-__global__ void add_sequence_tile_kernel(
+__device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
-    uint32_t const* window_count,
-    char* carry,
+    uint32_t windows,
+    size_t first_tile,
+    size_t tile_stride,
     uint32_t k,
     uint32_t* registers,
     uint32_t& saturation
 ) {
-    auto const windows = *window_count;
-    if (blockIdx.x == 0 && threadIdx.x < k - 1) {
-        carry[threadIdx.x] = sequence[windows + threadIdx.x];
-    }
     if (windows == 0) return;
     constexpr uint32_t tile_size = 256 * 8;
     constexpr bool shared_sketch = BucketCount <= 8192;
@@ -56,8 +53,8 @@ __global__ void add_sequence_tile_kernel(
     }
     auto* target = shared_sketch ? local : registers;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
-    for (uint32_t tile = blockIdx.x * tile_size; tile < windows; tile += gridDim.x * tile_size) {
-        auto const count = min(tile_size, windows - tile);
+    for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
+        auto const count = min(tile_size, windows - static_cast<uint32_t>(tile));
         for (uint32_t i = threadIdx.x; i < count + k - 1; i += blockDim.x) {
             bases[i] = cusbf::DnaAlphabet::encode(sequence + tile + i);
         }
@@ -87,6 +84,78 @@ __global__ void add_sequence_tile_kernel(
         for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
             merge_register(&registers[i], local[i], saturation);
         }
+    }
+}
+
+template <size_t BucketCount, typename Layout>
+__global__ void add_sequence_tile_kernel(
+    char const* sequence,
+    uint32_t const* window_count,
+    char* carry,
+    uint32_t k,
+    uint32_t* registers,
+    uint32_t& saturation
+) {
+    auto const windows = *window_count;
+    if (blockIdx.x == 0 && threadIdx.x < k - 1) {
+        carry[threadIdx.x] = sequence[windows + threadIdx.x];
+    }
+    add_sequence_windows<BucketCount, Layout>(
+        sequence,
+        windows,
+        size_t{blockIdx.x} * 2048,
+        size_t{gridDim.x} * 2048,
+        k,
+        registers,
+        saturation
+    );
+}
+
+struct sequence_batch_chunk {
+    size_t offset;
+    size_t block_end;
+    uint32_t genome;
+    uint32_t windows;
+};
+
+// Logical blocks cover every chunk in one launch, including independent short records.
+template <size_t BucketCount, typename Layout>
+__global__ void add_sequence_batch_kernel(
+    char const* sequence,
+    sequence_batch_chunk const* chunks,
+    size_t chunk_count,
+    size_t block_count,
+    uint32_t k,
+    uint32_t* registers
+) {
+    __shared__ sequence_batch_chunk chunk;
+    __shared__ size_t first_block;
+    for (size_t block = blockIdx.x; block < block_count; block += gridDim.x) {
+        if (threadIdx.x == 0) {
+            size_t low = 0, high = chunk_count;
+            while (low < high) {
+                auto const middle = low + (high - low) / 2;
+                if (chunks[middle].block_end <= block) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            chunk = chunks[low];
+            first_block = low ? chunks[low - 1].block_end : 0;
+        }
+        __syncthreads();
+        auto* target = registers + size_t{chunk.genome} * (BucketCount + 1);
+        add_sequence_windows<BucketCount, Layout>(
+            sequence + chunk.offset,
+            chunk.windows,
+            (block - first_block) * 2048,
+            (chunk.block_end - first_block) * 2048,
+            k,
+            target,
+            target[BucketCount]
+        );
+        __syncthreads();
     }
 }
 
