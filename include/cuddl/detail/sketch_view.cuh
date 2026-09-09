@@ -6,6 +6,7 @@
 
 #include <cuddl/detail/construction.cuh>
 #include <cuddl/detail/kernels.cuh>
+#include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
 #include <cuddl/hybrid_cardinality.cuh>
@@ -74,6 +75,21 @@ class sketch_view {
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
         return detail::launch_construction<BucketCount, Layout>(
             input, registers_, saturation_, stream
+        );
+    }
+
+    /// @brief Accumulates device-resident raw ASCII bases without clearing.
+    ///
+    /// Expects raw contiguous ASCII (no FASTA/newline stripping). Canonicalises
+    /// case-insensitively with the packed path; ambiguity breaks windows and emits no k-mer
+    /// across it. Accumulates without reset; short input below K is a no-op. Windows per call
+    /// are capped at UINT32_MAX, so size must not exceed UINT32_MAX + K - 1. No hidden carry:
+    /// callers supply the K-1 overlap within one record and no overlap between distinct
+    /// records. No host copies. The input must remain valid until @p stream completes.
+    [[nodiscard]] Result<void>
+    add_sequence_async(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
+        return detail::launch_sequence_add<BucketCount, Layout>(
+            sequence, K, registers_, saturation_, stream
         );
     }
 

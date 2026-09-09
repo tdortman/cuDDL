@@ -157,6 +157,33 @@ class sketch {
         return cuda_try([&] { stream.sync(); });
     }
 
+    /// @brief Adds device-resident raw ASCII bases without clearing.
+    ///
+    /// Expects raw contiguous ASCII (no FASTA/newline stripping). Canonicalises
+    /// case-insensitively with the packed path; ambiguity breaks windows and emits no k-mer
+    /// across it. Accumulates without reset; short input below K is a no-op. Windows per call
+    /// are capped at UINT32_MAX, so size must not exceed UINT32_MAX + K - 1. No hidden carry:
+    /// callers supply the K-1 overlap within one record and no overlap between distinct
+    /// records. No host copies. Keep input alive and unchanged until the stream completes. Use
+    /// clear() to reset.
+    [[nodiscard]] Result<void>
+    add_sequence_async(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
+        return view().add_sequence_async(sequence, stream);
+    }
+
+    /// @brief Adds device-resident raw ASCII bases without clearing, then synchronizes.
+    ///
+    /// Same input limits as add_sequence_async (raw ASCII, UINT32_MAX window cap, no
+    /// cross-record overlap). The caller can reuse the input buffer for the next chunk after
+    /// this returns successfully.
+    [[nodiscard]] Result<void>
+    add_sequence(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
+        if (auto const result = add_sequence_async(sequence, stream); !result) {
+            return result;
+        }
+        return cuda_try([&] { stream.sync(); });
+    }
+
     /// @brief Computes a fused pairwise summary into caller-owned device storage.
     template <bool IncludeCardinality = false>
     [[nodiscard]] Result<void> summary_async(

@@ -395,6 +395,313 @@ TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
     }
 }
 
+/// @brief Independent ASCII oracle for the raw-sequence sketch path.
+///
+/// Maps A/C/T/G case-insensitively to 0/1/2/3 with an explicit switch (not the
+/// bit-trick encoder) and canonicalises with an explicit loop, so agreement with the GPU
+/// guards the packed equivalence rather than repeating it. Any other byte breaks the window.
+int sequence_base_bits(char base) noexcept {
+    switch (base) {
+        case 'A':
+        case 'a':
+            return 0;
+        case 'C':
+        case 'c':
+            return 1;
+        case 'T':
+        case 't':
+            return 2;
+        case 'G':
+        case 'g':
+            return 3;
+        default:
+            return -1;
+    }
+}
+
+uint64_t sequence_reverse_complement(uint64_t forward, uint32_t k) noexcept {
+    uint64_t reverse = 0;
+    for (uint32_t i = 0; i < k; ++i) {
+        reverse = (reverse << 2U) | (((forward >> (2U * i)) & 3U) ^ 2U);
+    }
+    return reverse;
+}
+
+std::vector<uint64_t> encode_genome(std::string_view genome, uint32_t k) {
+    std::vector<uint64_t> packed;
+    if (k == 0 || genome.size() < k) {
+        return packed;
+    }
+    // Tests only use k <= 31, so the shift is safe.
+    auto const mask = (uint64_t{1} << (2U * k)) - 1U;
+    uint64_t forward = 0;
+    uint32_t valid = 0;
+    for (char base : genome) {
+        auto const bits = sequence_base_bits(base);
+        if (bits < 0) {
+            forward = 0;
+            valid = 0;
+            continue;
+        }
+        forward = ((forward << 2U) | static_cast<uint64_t>(bits)) & mask;
+        if (valid < k) {
+            ++valid;
+        }
+        if (valid == k) {
+            auto const reverse = sequence_reverse_complement(forward, k);
+            packed.push_back(forward > reverse ? forward : reverse);
+        }
+    }
+    return packed;
+}
+
+std::string make_genome(size_t size, uint64_t seed = 0x9e37'79b9'7f4a'7c15ULL) {
+    std::string genome;
+    genome.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
+        genome.push_back("ACGT"[cuddl::detail::splitmix64(seed + i) & 3U]);
+    }
+    return genome;
+}
+
+cuda::device_buffer<char> make_device_sequence(cuda::stream& stream, std::string_view genome) {
+    std::vector<char> bytes(genome.begin(), genome.end());
+    return cuda::make_device_buffer<char>(stream, stream.device(), bytes);
+}
+
+template <uint32_t K, size_t BucketCount, typename Layout = cuddl::default_register_layout>
+void expect_sketches_equal(
+    cuddl::sketch<K, BucketCount, Layout> const& actual,
+    cuddl::sketch<K, BucketCount, Layout> const& expected,
+    cuda::stream& stream
+) {
+    std::vector<uint32_t> actual_regs(BucketCount), expected_regs(BucketCount);
+    cuda::copy_bytes(stream, actual.data(), actual_regs);
+    cuda::copy_bytes(stream, expected.data(), expected_regs);
+    stream.sync();
+    EXPECT_EQ(actual_regs, expected_regs);
+    EXPECT_EQ(
+        CUDDL_UNWRAP(actual.winner_counts(stream)), CUDDL_UNWRAP(expected.winner_counts(stream))
+    );
+}
+
+TEST(SketchTest, SequenceWholeGenomeMatchesPackedOracle) {
+    cuda::stream stream{cuda::devices[0]};
+    auto const genome = make_genome(20000, 0x1234'5678ULL);
+    auto const packed = encode_genome(genome, k_default);
+    ASSERT_FALSE(packed.empty());
+
+    auto device_packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed);
+    cuddl::sketch<k_default, b_default> expected(stream);
+    ASSERT_TRUE(expected.add(device_packed, stream).has_value());
+
+    auto device_sequence = make_device_sequence(stream, genome);
+    cuddl::sketch<k_default, b_default> via_sync(stream);
+    ASSERT_TRUE(via_sync.add_sequence(device_sequence, stream).has_value());
+    expect_sketches_equal(via_sync, expected, stream);
+
+    cuddl::sketch<k_default, b_default> via_async(stream);
+    ASSERT_TRUE(via_async
+                    .add_sequence_async({device_sequence.data(), device_sequence.size()}, stream)
+                    .has_value());
+    ASSERT_NO_THROW(stream.sync());
+    expect_sketches_equal(via_async, expected, stream);
+}
+
+TEST(SketchTest, SequenceChunkedWithOverlapMatchesWholeGenome) {
+    cuda::stream stream{cuda::devices[0]};
+    auto const genome = make_genome(8000, 0xabcd'ef01ULL);
+    auto const packed = encode_genome(genome, k_default);
+    auto device_packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed);
+    cuddl::sketch<k_default, b_default> expected(stream);
+    ASSERT_TRUE(expected.add(device_packed, stream).has_value());
+
+    auto device_whole = make_device_sequence(stream, genome);
+    cuddl::sketch<k_default, b_default> whole(stream);
+    ASSERT_TRUE(whole.add_sequence(device_whole, stream).has_value());
+    expect_sketches_equal(whole, expected, stream);
+
+    for (auto const fresh_size : {size_t{7}, size_t{521}, size_t{4093}}) {
+        SCOPED_TRACE(fresh_size);
+        cuddl::sketch<k_default, b_default> chunked(stream);
+        for (size_t offset = 0; offset < genome.size();) {
+            auto const fresh = std::min(fresh_size, genome.size() - offset);
+            auto len = fresh + (offset + fresh < genome.size() ? k_default - 1U : 0U);
+            len = std::min(len, genome.size() - offset);
+            std::string_view const piece(genome.data() + offset, len);
+            auto device_piece = make_device_sequence(stream, piece);
+            ASSERT_TRUE(chunked
+                            .add_sequence_async({device_piece.data(), device_piece.size()}, stream)
+                            .has_value());
+            ASSERT_NO_THROW(stream.sync());
+            offset += fresh;
+        }
+        expect_sketches_equal(chunked, whole, stream);
+        expect_sketches_equal(chunked, expected, stream);
+    }
+}
+
+TEST(SketchTest, SequenceLowercaseAndAmbiguityMatchPackedOracle) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr uint32_t k = 5;
+    std::string const genome = "ACGTNacgtXACGTACGTNNacgtACGTnTGCAAGCTN";
+    std::string upper = genome;
+    for (char& c : upper) {
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - ('a' - 'A'));
+        }
+    }
+    auto const packed = encode_genome(genome, k);
+    auto const packed_upper = encode_genome(upper, k);
+    ASSERT_EQ(packed, packed_upper);
+    // Ambiguity must actually break windows or the test is vacuous.
+    ASSERT_LT(packed.size(), genome.size() - k + 1);
+    ASSERT_FALSE(packed.empty());
+
+    auto device_packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed);
+    cuddl::sketch<k, b_default> expected(stream);
+    ASSERT_TRUE(expected.add(device_packed, stream).has_value());
+
+    auto device_mixed = make_device_sequence(stream, genome);
+    cuddl::sketch<k, b_default> via_sync(stream);
+    ASSERT_TRUE(via_sync.add_sequence(device_mixed, stream).has_value());
+    expect_sketches_equal(via_sync, expected, stream);
+
+    auto device_upper = make_device_sequence(stream, upper);
+    cuddl::sketch<k, b_default> via_async(stream);
+    ASSERT_TRUE(
+        via_async.add_sequence_async({device_upper.data(), device_upper.size()}, stream).has_value()
+    );
+    ASSERT_NO_THROW(stream.sync());
+    expect_sketches_equal(via_async, expected, stream);
+}
+
+TEST(SketchTest, SequenceSeparateRecordsDoNotSpanBoundaries) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr uint32_t k = 5;
+    std::string const first = "AAAAA";
+    std::string const second = "CCCCC";
+    auto packed_separate = encode_genome(first, k);
+    auto const second_packed = encode_genome(second, k);
+    packed_separate.insert(packed_separate.end(), second_packed.begin(), second_packed.end());
+    auto const packed_joined = encode_genome(first + second, k);
+    ASSERT_EQ(packed_separate.size(), 2U);
+    ASSERT_EQ(packed_joined.size(), 6U);
+
+    cuddl::sketch<k, b_default> separate(stream);
+    auto device_first = make_device_sequence(stream, first);
+    ASSERT_TRUE(separate.add_sequence(device_first, stream).has_value());
+    auto device_second = make_device_sequence(stream, second);
+    ASSERT_TRUE(separate.add_sequence_async({device_second.data(), device_second.size()}, stream)
+                    .has_value());
+    ASSERT_NO_THROW(stream.sync());
+    auto device_separate_packed =
+        cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed_separate);
+    cuddl::sketch<k, b_default> expected_separate(stream);
+    ASSERT_TRUE(expected_separate.add(device_separate_packed, stream).has_value());
+    expect_sketches_equal(separate, expected_separate, stream);
+
+    auto device_joined = make_device_sequence(stream, first + second);
+    cuddl::sketch<k, b_default> joined(stream);
+    ASSERT_TRUE(joined.add_sequence(device_joined, stream).has_value());
+    auto device_joined_packed =
+        cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed_joined);
+    cuddl::sketch<k, b_default> expected_joined(stream);
+    ASSERT_TRUE(expected_joined.add(device_joined_packed, stream).has_value());
+    expect_sketches_equal(joined, expected_joined, stream);
+}
+
+TEST(SketchTest, SequenceShortAndEmptyInputsAreNoOps) {
+    cuda::stream stream{cuda::devices[0]};
+    cuddl::sketch<k_default, b_default> empty(stream);
+    ASSERT_TRUE(empty.add_sequence({}, stream).has_value());
+    auto device_empty = make_device_sequence(stream, "");
+    ASSERT_TRUE(
+        empty.add_sequence_async({device_empty.data(), device_empty.size()}, stream).has_value()
+    );
+    ASSERT_NO_THROW(stream.sync());
+    std::string const short_genome(k_default - 1U, 'A');
+    ASSERT_TRUE(encode_genome(short_genome, k_default).empty());
+    auto device_short = make_device_sequence(stream, short_genome);
+    ASSERT_TRUE(empty.add_sequence(device_short, stream).has_value());
+    std::vector<uint32_t> regs(b_default);
+    cuda::copy_bytes(stream, empty.data(), regs);
+    stream.sync();
+    EXPECT_EQ(regs, std::vector<uint32_t>(b_default, 0U));
+    auto const empty_wc = CUDDL_UNWRAP(empty.winner_counts(stream));
+    EXPECT_FALSE(empty_wc.second);
+    EXPECT_TRUE(std::all_of(empty_wc.first.begin(), empty_wc.first.end(), [](auto c) {
+        return c == 0U;
+    }));
+
+    auto const genome = make_genome(5000, 0x55aa'55aaULL);
+    auto device_genome = make_device_sequence(stream, genome);
+    cuddl::sketch<k_default, b_default> content(stream);
+    ASSERT_TRUE(content.add_sequence(device_genome, stream).has_value());
+    std::vector<uint32_t> before(b_default);
+    cuda::copy_bytes(stream, content.data(), before);
+    stream.sync();
+    auto const before_wc = CUDDL_UNWRAP(content.winner_counts(stream));
+    ASSERT_TRUE(content.add_sequence({}, stream).has_value());
+    ASSERT_TRUE(
+        content.add_sequence_async({device_short.data(), device_short.size()}, stream).has_value()
+    );
+    ASSERT_NO_THROW(stream.sync());
+    std::vector<uint32_t> after(b_default);
+    cuda::copy_bytes(stream, content.data(), after);
+    stream.sync();
+    EXPECT_EQ(after, before);
+    EXPECT_EQ(CUDDL_UNWRAP(content.winner_counts(stream)), before_wc);
+
+    std::string const one_window(k_default, 'C');
+    auto const packed_one = encode_genome(one_window, k_default);
+    ASSERT_EQ(packed_one.size(), 1U);
+    auto device_one = make_device_sequence(stream, one_window);
+    cuddl::sketch<k_default, b_default> one(stream);
+    ASSERT_TRUE(one.add_sequence(device_one, stream).has_value());
+    auto device_one_packed =
+        cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed_one);
+    cuddl::sketch<k_default, b_default> expected_one(stream);
+    ASSERT_TRUE(expected_one.add(device_one_packed, stream).has_value());
+    expect_sketches_equal(one, expected_one, stream);
+}
+
+TEST(SketchTest, SequenceKBoundariesMatchPackedOracle) {
+    cuda::stream stream{cuda::devices[0]};
+    {
+        constexpr uint32_t k = 1;
+        std::string const genome = "ACGTNacgtXACGT";
+        auto const packed = encode_genome(genome, k);
+        ASSERT_EQ(packed.size(), 12U);
+        auto device_packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed);
+        cuddl::sketch<k, b_default> expected(stream);
+        ASSERT_TRUE(expected.add(device_packed, stream).has_value());
+        auto device_sequence = make_device_sequence(stream, genome);
+        cuddl::sketch<k, b_default> actual(stream);
+        ASSERT_TRUE(actual.add_sequence(device_sequence, stream).has_value());
+        expect_sketches_equal(actual, expected, stream);
+    }
+    {
+        constexpr uint32_t k = 31;
+        auto genome = make_genome(2000, 0x1f2e'3d4cULL);
+        genome[1000] = 'N';
+        auto const packed = encode_genome(genome, k);
+        ASSERT_EQ(packed.size(), 1939U);
+        auto device_packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), packed);
+        cuddl::sketch<k, b_default> expected(stream);
+        ASSERT_TRUE(expected.add(device_packed, stream).has_value());
+        auto device_sequence = make_device_sequence(stream, genome);
+        cuddl::sketch<k, b_default> actual(stream);
+        ASSERT_TRUE(
+            actual.add_sequence_async({device_sequence.data(), device_sequence.size()}, stream)
+                .has_value()
+        );
+        ASSERT_NO_THROW(stream.sync());
+        expect_sketches_equal(actual, expected, stream);
+    }
+    // K is bounded by sketch_view to 1..31; K=32 has no runtime test by construction.
+}
+
 // Sequential aggregation isolates the block histogram/reduction from the estimator formulas.
 template <typename Layout>
 __global__ void scalar_hybrid_cardinality(
