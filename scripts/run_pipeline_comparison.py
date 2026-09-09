@@ -123,6 +123,14 @@ def main(
         int | None,
         typer.Option(min=1, help="RabbitSketch workers; default: available CPUs"),
     ] = None,
+    implementations: Annotated[
+        str,
+        typer.Option(help="Comma-separated implementations to run: cuddl, rabbitsketch"),
+    ] = "cuddl,rabbitsketch",
+    ingest: Annotated[
+        str,
+        typer.Option(help="cuDDL ingestion: packed, or sequence for a large corpus"),
+    ] = "packed",
 ) -> None:
     """Build and run both implementations at k=25 and 4,096 buckets/entries."""
     inputs = inputs or []
@@ -184,6 +192,12 @@ def main(
         raise typer.BadParameter(
             "output directory already contains JSON reports; use a new directory"
         )
+    selected = [name.strip() for name in implementations.split(",") if name.strip()]
+    unknown = [name for name in selected if name not in ("cuddl", "rabbitsketch")]
+    if unknown or not selected:
+        raise typer.BadParameter(f"unknown implementations: {', '.join(unknown) or 'none'}")
+    if ingest not in ("packed", "sequence"):
+        raise typer.BadParameter("ingest must be packed or sequence")
     build_dir = build_dir if build_dir.is_absolute() else ROOT / build_dir
     common = [
         "--topology",
@@ -193,16 +207,15 @@ def main(
         "--warmups",
         str(warmups),
     ]
-    run(
-        [
-            "meson",
-            "compile",
-            "-C",
-            str(build_dir),
-            "cuddl-pipeline-benchmark",
-            "rabbitsketch-pipeline-benchmark",
-        ]
-    )
+    targets = [
+        target
+        for implementation, target in (
+            ("cuddl", "cuddl-pipeline-benchmark"),
+            ("rabbitsketch", "rabbitsketch-pipeline-benchmark"),
+        )
+        if implementation in selected
+    ]
+    run(["meson", "compile", "-C", str(build_dir), *targets])
     output_dir.mkdir(parents=True, exist_ok=True)
     # GPU isolated-stage coverage requires a query even when the resident all-to-all path ignores it.
     gpu_queries = queries or references[:1]
@@ -212,6 +225,8 @@ def main(
             [
                 str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
                 *common,
+                "--ingest",
+                ingest,
                 "--rows",
                 rows,
                 "--index",
@@ -221,27 +236,31 @@ def main(
             ],
         )
         for rows, index in itertools.product(("compact", "packed"), ("sparse", "dense"))
+        if "cuddl" in selected
     ]
-    commands.append(
-        (
-            "rabbitsketch.json",
-            [
-                str(build_dir / "benchmarks/rabbitsketch-pipeline-benchmark"),
-                *common,
-                "--k",
-                "25",
-                "--sketch-size",
-                "4096",
-                *(["--threads", str(threads)] if threads is not None else []),
-            ],
+    if "rabbitsketch" in selected:
+        commands.append(
+            (
+                "rabbitsketch.json",
+                [
+                    str(build_dir / "benchmarks/rabbitsketch-pipeline-benchmark"),
+                    *common,
+                    "--k",
+                    "25",
+                    "--sketch-size",
+                    "4096",
+                    *(["--threads", str(threads)] if threads is not None else []),
+                ],
+            )
         )
-    )
     with tempfile.TemporaryDirectory(prefix=".pipeline-", dir=output_dir) as temporary:
         configs = {}
         for implementation, query_files in (
             ("cuddl", gpu_queries),
             ("rabbitsketch", queries),
         ):
+            if implementation not in selected:
+                continue
             config = Path(temporary) / f"{implementation}.toml"
             config.write_text(
                 "reference = "

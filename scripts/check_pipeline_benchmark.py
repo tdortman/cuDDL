@@ -152,8 +152,59 @@ def main(
                     if case["query_id"] == 0 and case["reference_id"] == 0:
                         assert values["wkid"] == 1 and values["ani"] == 1
             typer.echo(f"PASS {rows} / {index} / {topology}")
+        # Streamed ingestion replaces the host k-mer arrays with bounded per-genome GPU tiles.
+        streamed = root / "streamed.json"
+        command = [str(binary.resolve())]
+        for name in ("genome", "partial", "saturated"):
+            command.extend(("--reference", str(paths[name])))
+        for name in ("reverse", "empty", "saturated"):
+            command.extend(("--query", str(paths[name])))
+        command.extend(
+            (
+                "--ingest",
+                "sequence",
+                "--rows",
+                "compact",
+                "--index",
+                "sparse",
+                "--topology",
+                "batch",
+                "--indexed-buckets",
+                "2048",
+                "--key-bits",
+                "15",
+                "--minimum-matches",
+                "5",
+                "--samples",
+                "2",
+                "--warmups",
+                "0",
+                "--output",
+                str(streamed),
+            )
+        )
+        subprocess.run(command, check=True)
+        data = load_result(streamed, "pipeline")
+        pipeline = data["measurements"][0]
+        assert pipeline["case"]["ingest"] == "sequence"
+        assert pipeline["case"]["resident_input"] == "sequence_tiles"
+        assert pipeline["memory_bytes"]["input_kmers"] == 0
+        assert pipeline["metrics"]["oracle_passed"]
+        assert (
+            pipeline["metrics"]["oracle_pairs_checked"]
+            == pipeline["metrics"]["oracle_pairs_total"]
+        )
+        for key in ("resident_total", "host_to_device", "construct_resident", "clear_and_construct"):
+            assert key not in pipeline["timings"], f"packed-input stage {key} ran in streamed mode"
+        # Streamed rows must reproduce the packed-input sketches, pair metrics, and match rows.
+        packed = load_result(root / "compact-sparse-batch.json", "pipeline")
+        assert data["measurements"][1:] == packed["measurements"][1:], (
+            "streamed ingestion differs from packed-input construction"
+        )
+        typer.echo("PASS streamed sequence ingestion")
         typer.echo(
-            "All 8 pipeline configurations passed. Timing samples are smoke checks, not performance evidence."
+            "All 8 pipeline configurations and streamed ingestion passed. "
+            "Timing samples are smoke checks, not performance evidence."
         )
 
 

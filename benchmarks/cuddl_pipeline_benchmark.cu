@@ -4,6 +4,7 @@
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
+#include <cuddl/reference_database_file.cuh>
 #include <nvbench/nvbench.cuh>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -34,8 +36,11 @@ struct options {
     std::vector<std::string> references, queries;
     std::string output, name = "cuDDL pipeline";
     std::string rows = "compact", index = "sparse", topology = "batch";
+    std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
+    unsigned workers = 0;
     int samples = 20, warmups = 3;
+    size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8, all_to_all_pairs = 50000000;
 };
 
 struct winner_score {
@@ -126,14 +131,86 @@ parsed_files parse(std::vector<std::string> const& paths) {
     return files;
 }
 
+// One genome per input file, streamed through the tile builder: bases are encoded and rolled
+// on the GPU, so neither a host nor a device k-mer array is materialized. Footprint is rows
+// (genomes * buckets) instead of bases, which is what makes a full RefSeq collection fit.
+struct genome_rows {
+    // One contiguous run per genome: buckets registers followed by the saturation word.
+    std::vector<uint32_t> registers;
+    std::vector<uint32_t> saturation;
+    uint64_t input_bytes = 0;
+};
+
+genome_rows stream_genomes(
+    std::vector<std::string> const& paths, options const& opts, cuda::stream_ref stream
+) {
+    std::vector<std::filesystem::path> files{paths.begin(), paths.end()};
+    auto file = CUDDL_UNWRAP(
+        (cuddl::reference_database_file::build<k, buckets>(files, stream, opts.workers))
+    );
+    genome_rows result;
+    auto const count = file.saturation().size();
+    result.saturation.assign(file.saturation().begin(), file.saturation().end());
+    result.registers.resize(count * (buckets + 1));
+    for (size_t i = 0; i < count; ++i) {
+        std::copy_n(
+            file.rows().data() + i * buckets, buckets, result.registers.data() + i * (buckets + 1)
+        );
+        result.registers[i * (buckets + 1) + buckets] = file.saturation()[i];
+    }
+    for (auto const& path : paths) {
+        std::error_code error;
+        auto const size = std::filesystem::file_size(path, error);
+        if (!error) {
+            result.input_bytes += size;
+        }
+    }
+    return result;
+}
+
 // Each input file is a genome. Records within a file retain parser boundary semantics.
 struct collection {
     std::vector<cuda::device_buffer<uint64_t>> inputs;
+    // Streamed register source: (buckets + 1) words per genome, kept alive for the copies.
+    cuda::device_buffer<uint32_t> registers;
     std::vector<sketch> sketches;
     cuda::device_buffer<uint16_t> scores, counts;
     cuda::device_buffer<uint32_t> packed, saturated;
     cuda::device_buffer<uint64_t> empty;
     cuda::device_buffer<double> cardinalities;
+
+    collection(size_t genomes, cuda::stream_ref stream, bool compact_rows, bool packed_rows)
+        : scores(
+              cuda::make_device_buffer<uint16_t>(
+                  stream,
+                  stream.device(),
+                  compact_rows ? genomes * buckets : 0,
+                  cuda::no_init
+              )
+          ),
+          counts(
+              cuda::make_device_buffer<uint16_t>(
+                  stream, stream.device(), genomes * buckets, cuda::no_init
+              )
+          ),
+          packed(
+              cuda::make_device_buffer<uint32_t>(
+                  stream,
+                  stream.device(),
+                  packed_rows ? genomes * buckets : 0,
+                  cuda::no_init
+              )
+          ),
+          saturated(
+              cuda::make_device_buffer<uint32_t>(stream, stream.device(), genomes, cuda::no_init)
+          ),
+          empty(cuda::make_device_buffer<uint64_t>(stream, stream.device(), genomes, cuda::no_init)),
+          cardinalities(
+              cuda::make_device_buffer<double>(stream, stream.device(), genomes, cuda::no_init)
+          ),
+          registers(
+              cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init)
+          ) {}
 
     collection(
         parsed_files const& files,
@@ -141,54 +218,32 @@ struct collection {
         bool compact_rows = true,
         bool packed_rows = true
     )
-        : scores(
-              cuda::make_device_buffer<uint16_t>(
-                  stream,
-                  stream.device(),
-                  compact_rows ? files.size() * buckets : 0,
-                  cuda::no_init
-              )
-          ),
-          counts(
-              cuda::make_device_buffer<uint16_t>(
-                  stream,
-                  stream.device(),
-                  files.size() * buckets,
-                  cuda::no_init
-              )
-          ),
-          packed(
-              cuda::make_device_buffer<uint32_t>(
-                  stream,
-                  stream.device(),
-                  packed_rows ? files.size() * buckets : 0,
-                  cuda::no_init
-              )
-          ),
-          saturated(
-              cuda::make_device_buffer<uint32_t>(
-                  stream,
-                  stream.device(),
-                  files.size(),
-                  cuda::no_init
-              )
-          ),
-          empty(
-              cuda::make_device_buffer<uint64_t>(
-                  stream,
-                  stream.device(),
-                  files.size(),
-                  cuda::no_init
-              )
-          ),
-          cardinalities(
-              cuda::make_device_buffer<double>(stream, stream.device(), files.size(), cuda::no_init)
-          ) {
+        : collection(files.size(), stream, compact_rows, packed_rows) {
         for (auto const& file : files) {
             inputs.push_back(
                 cuda::make_device_buffer<uint64_t>(stream, stream.device(), file.kmers)
             );
             sketches.emplace_back(stream);
+        }
+    }
+
+    // Rows are copied into sketches; the caller keeps @p rows alive until the stream completes.
+    collection(
+        genome_rows const& rows,
+        cuda::stream_ref stream,
+        bool compact_rows = true,
+        bool packed_rows = true
+    )
+        : collection(rows.saturation.size(), stream, compact_rows, packed_rows) {
+        if (saturated.size()) {
+            cuda::copy_bytes(stream, rows.saturation, saturated);
+        }
+        registers = cuda::make_device_buffer<uint32_t>(stream, stream.device(), rows.registers);
+        for (size_t i = 0; i < rows.saturation.size(); ++i) {
+            sketches.emplace_back(stream);
+            CUDDL_UNWRAP(sketches[i].assign_async(
+                {registers.data() + i * (buckets + 1), buckets + 1}, stream
+            ));
         }
     }
     void clear(cuda::stream_ref stream) {
@@ -197,6 +252,9 @@ struct collection {
         }
     }
     void add(cuda::stream_ref stream, bool chunked = false) {
+        if (inputs.size() != sketches.size()) {
+            throw std::runtime_error("streamed collection has no k-mer input to add");
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             auto const n = inputs[i].size();
             if (chunked && n > 1) {
@@ -208,6 +266,9 @@ struct collection {
         }
     }
     void extract_scores(cuda::stream_ref stream) {
+        if (!scores.size()) {
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             CUDDL_CUDA_CALL(
                 cub::DeviceTransform::Transform(
@@ -221,6 +282,9 @@ struct collection {
         }
     }
     void extract_packed(cuda::stream_ref stream) {
+        if (!packed.size()) {
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             cuda::copy_bytes(
                 stream,
@@ -439,25 +503,46 @@ uint32_t hits(uint16_t const* left, uint16_t const* right, options const& opts) 
     return count;
 }
 
-// Checks all expected candidates, including missing results and nonzero-threshold empty output.
-void validate(
+struct validation {
+    size_t candidates = 0, expected = 0, checked = 0;
+};
+
+// Checks every expected candidate's presence and order, then compares a deterministic spread
+// against the scalar oracle. @p oracle_limit caps the expensive per-pair oracle work (0 checks
+// every pair); the first and last reference of each query are always compared.
+validation validate(
     host_results const& output,
     std::vector<uint16_t> const& refs,
     std::vector<uint16_t> const& queries,
     options const& opts,
     bool indexed,
-    bool all
+    bool all,
+    size_t oracle_limit
 ) {
     auto const& left = all ? refs : queries;
+    auto const reference_count = refs.size() / buckets;
+    auto const query_count = left.size() / buckets;
+    size_t const pair_space = all
+        ? (query_count > 1 ? query_count * (query_count - 1) / 2 : 0)
+        : query_count * reference_count;
+    size_t const limit = oracle_limit ? oracle_limit : std::numeric_limits<size_t>::max();
+    size_t const stride = pair_space > limit ? (pair_space + limit - 1) / limit : 1;
+    validation result;
     size_t cursor = 0;
-    for (size_t q = 0; q < left.size() / buckets; ++q) {
-        for (size_t r = all ? q + 1 : 0; r < refs.size() / buckets; ++r) {
+    for (size_t q = 0; q < query_count; ++q) {
+        for (size_t r = all ? q + 1 : 0; r < reference_count; ++r) {
             auto* a = left.data() + q * buckets;
             auto* b = refs.data() + r * buckets;
-            auto const match_count = hits(a, b, opts);
+            bool const sampled = result.candidates % stride == 0 || r + 1 == reference_count;
+            uint32_t match_count = 0;
+            if (opts.minimum_matches != 0 || sampled) {
+                match_count = hits(a, b, opts);
+            }
+            ++result.candidates;
             if (indexed && match_count < opts.minimum_matches) {
                 continue;
             }
+            ++result.expected;
             if (!(cursor < output.rows.size())) {
                 throw std::runtime_error("search omitted an expected pair");
             }
@@ -465,11 +550,15 @@ void validate(
             if (!(row.query_id == q && row.reference_id == r)) {
                 throw std::runtime_error("search IDs/order differ from oracle");
             }
-            if (!(row.summary.counts == oracle(a, b))) {
-                throw std::runtime_error("search counts differ from scalar oracle");
-            }
-            if (!(output.matches[cursor] == (indexed ? match_count : row.summary.counts.equal))) {
-                throw std::runtime_error("search match diagnostics differ from oracle");
+            if (sampled) {
+                if (!(row.summary.counts == oracle(a, b))) {
+                    throw std::runtime_error("search counts differ from scalar oracle");
+                }
+                if (!(output.matches[cursor] ==
+                      (indexed ? match_count : row.summary.counts.equal))) {
+                    throw std::runtime_error("search match diagnostics differ from oracle");
+                }
+                ++result.checked;
             }
             ++cursor;
         }
@@ -477,6 +566,7 @@ void validate(
     if (!(cursor == output.rows.size())) {
         throw std::runtime_error("search returned unexpected pairs");
     }
+    return result;
 }
 
 json metrics(cuddl::pairwise_summary const& summary) {
@@ -605,7 +695,7 @@ json resident_timings(
             observed.matches.push_back(match_counts[i * n + j]);
         }
     }
-    validate(observed, ref_scores, query_scores, opts, true, all);
+    validate(observed, ref_scores, query_scores, opts, true, all, opts.oracle_pairs);
     gpu("resident_reset", reset);
     gpu("resident_construct", construct, reset);
     gpu("resident_statistics", statistics);
@@ -620,6 +710,30 @@ json resident_timings(
 // A complete application run: parse, allocate/upload, sketch, analytics, database/index,
 // selected search topology, consume all results, derive metrics, serialize in memory, teardown.
 // CUDA context initialization and writing the benchmark report itself are outside the timer.
+// Per-genome metrics, in-memory JSON serialization, and result consumption: the output phase.
+void application_output(
+    collection const& refs,
+    collection const& queries,
+    host_results const& output,
+    cuda::stream_ref stream
+) {
+    json result = {
+        {"references", collection_metrics(refs, stream)},
+        {"queries", collection_metrics(queries, stream)},
+        {"matches", json::array()}
+    };
+    for (auto const& row : output.rows) {
+        result["matches"].push_back(
+            {{"query_id", row.query_id},
+             {"reference_id", row.reference_id},
+             {"metrics", metrics(row.summary)}}
+        );
+    }
+    stream.sync();
+    auto serialized = result.dump();
+    do_not_optimise(serialized);
+}
+
 template <typename Mark>
 void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     auto reference_files = parse(opts.references);
@@ -638,47 +752,130 @@ void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     stream.sync();
     mark();
     search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
-    json result = {
-        {"references", collection_metrics(refs, stream)},
-        {"queries", collection_metrics(queries, stream)},
-        {"matches", json::array()}
-    };
-    for (auto const& row : output.rows) {
-        result["matches"].push_back(
-            {{"query_id", row.query_id},
-             {"reference_id", row.reference_id},
-             {"metrics", metrics(row.summary)}}
-        );
-    }
-    stream.sync();
-    auto serialized = result.dump();
-    do_not_optimise(serialized);
+    application_output(refs, queries, output, stream);
     mark();
 }
 
+// Streamed application run: one bounded tile pass per genome replaces parse, host allocation,
+// and upload. Every other stage matches the packed-input path.
+template <typename Mark>
+void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& mark) {
+    auto reference_rows = stream_genomes(opts.references, opts, stream);
+    auto query_rows = opts.topology == "batch" ? stream_genomes(opts.queries, opts, stream)
+                                               : genome_rows{};
+    collection refs(reference_rows, stream, opts.rows == "compact", opts.rows == "packed");
+    collection queries(query_rows, stream, true, false);
+    refs.extract(stream);
+    queries.extract(stream);
+    auto db = build(refs, opts, stream, true);
+    search_buffers buffers(
+        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
+    );
+    host_results output;
+    stream.sync();
+    mark();
+    search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
+    application_output(refs, queries, output, stream);
+    mark();
+}
+
+// Per-file digests are bounded so a large corpus does not pay one hash per genome. When the
+// list is truncated, one digest covers the corpus manifest of file sizes and paths.
+json dataset_entries(
+    std::string const& role, std::vector<std::string> const& paths, size_t limit
+) {
+    json entries = json::object();
+    size_t const hashed = limit ? std::min(limit, paths.size()) : paths.size();
+    for (size_t i = 0; i < hashed; ++i) {
+        entries[role + "_" + std::to_string(i)] = {
+            {"path", paths[i]},
+            {"sha256", command_output("sha256sum < " + quote(paths[i])).substr(0, 64)}
+        };
+    }
+    if (hashed < paths.size()) {
+        auto const manifest =
+            std::filesystem::temp_directory_path() / ("cuddl-pipeline-" + role + "-manifest.txt");
+        std::ofstream output(manifest);
+        if (!output) {
+            throw std::runtime_error("cannot write dataset manifest");
+        }
+        for (auto const& path : paths) {
+            std::error_code error;
+            auto const size = std::filesystem::file_size(path, error);
+            output << (error ? 0 : size) << '\t' << path << '\n';
+        }
+        output.close();
+        entries[role + "_manifest"] = {
+            {"path", paths.front() + " and " + std::to_string(paths.size() - 1) + " more"},
+            {"sha256", command_output("sha256sum < " + quote(manifest.string())).substr(0, 64)}
+        };
+        std::filesystem::remove(manifest);
+    }
+    return entries;
+}
+
 json run(options const& opts) {
+    bool const streamed = opts.ingest == "sequence";
     cuda::stream stream{cuda::devices[0]};
+    // All-to-all retains one result row per unique reference pair on the host. Refuse a corpus
+    // whose pair count exceeds --all-to-all-pairs instead of failing inside the first sample.
+    if (opts.topology == "all-to-all") {
+        auto const count = opts.references.size();
+        uint64_t const pairs = count > 1 ? uint64_t{count} * (count - 1) / 2 : 0;
+        if (opts.all_to_all_pairs && pairs > opts.all_to_all_pairs) {
+            throw std::runtime_error(
+                "all-to-all over " + std::to_string(count) + " references retains " +
+                std::to_string(pairs) + " pair rows, above --all-to-all-pairs (" +
+                std::to_string(opts.all_to_all_pairs) +
+                "); use --topology batch with a small --query set"
+            );
+        }
+    }
     json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
-        end_to_end(opts, stream, mark);
+        if (streamed) {
+            end_to_end_streamed(opts, stream, mark);
+        } else {
+            end_to_end(opts, stream, mark);
+        }
         stream.sync();
     });
-    auto reference_files = parse(opts.references), query_files = parse(opts.queries);
-    collection refs(reference_files, stream), queries(query_files, stream);
-    refs.add(stream);
-    queries.add(stream);
+    // Streamed rows must outlive their collections: register copies are stream-ordered.
+    parsed_files reference_files, query_files;
+    genome_rows reference_rows, query_rows;
+    std::optional<collection> refs_holder, queries_holder;
+    if (streamed) {
+        reference_rows = stream_genomes(opts.references, opts, stream);
+        query_rows = stream_genomes(opts.queries, opts, stream);
+        // Both row formats are allocated so the stage suite matches the packed-input path.
+        refs_holder.emplace(reference_rows, stream);
+        queries_holder.emplace(query_rows, stream);
+    } else {
+        reference_files = parse(opts.references);
+        query_files = parse(opts.queries);
+        refs_holder.emplace(reference_files, stream);
+        queries_holder.emplace(query_files, stream);
+        refs_holder->add(stream);
+        queries_holder->add(stream);
+    }
+    auto& refs = *refs_holder;
+    auto& queries = *queries_holder;
     refs.extract(stream);
     queries.extract(stream);
     stream.sync();
     auto const ref_scores = download(refs.scores, stream),
                query_scores = download(queries.scores, stream);
-    auto const original_packed = download(refs.packed, stream);
-    auto const original_saturation = download(refs.saturated, stream);
-    refs.clear(stream);
-    refs.add(stream, true);
-    refs.extract(stream);
-    if (!(download(refs.packed, stream) == original_packed &&
-          download(refs.saturated, stream) == original_saturation)) {
-        throw std::runtime_error("incremental construction differs from one-shot construction");
+    if (!streamed) {
+        auto const original_packed = download(refs.packed, stream);
+        auto const original_saturation = download(refs.saturated, stream);
+        refs.clear(stream);
+        refs.add(stream, true);
+        refs.extract(stream);
+        if (!(download(refs.packed, stream) == original_packed &&
+              download(refs.saturated, stream) == original_saturation)) {
+            throw std::runtime_error(
+                "incremental construction differs from one-shot construction"
+            );
+        }
     }
 
     auto db = build(refs, opts, stream, true);
@@ -695,82 +892,85 @@ json run(options const& opts) {
     auto host = [&](std::string const& name, auto function) {
         timings[name] = measure(opts, name, true, function);
     };
-    std::string a48_text = "#k\t25\n#exponent\t6\n";
-    for (size_t r = 0; r < refs.sketches.size(); ++r) {
-        a48_text += "#id\t" + std::to_string(r) + "\n#len\t4096\n";
-        for (size_t b = 0; b < buckets; ++b) {
-            if (b != 0) {
-                a48_text += '\t';
+    // Packed-input stages need a materialized k-mer stream; a streamed corpus skips them.
+    if (!streamed) {
+        std::string a48_text = "#k\t25\n#exponent\t6\n";
+        for (size_t r = 0; r < refs.sketches.size(); ++r) {
+            a48_text += "#id\t" + std::to_string(r) + "\n#len\t4096\n";
+            for (size_t b = 0; b < buckets; ++b) {
+                if (b != 0) {
+                    a48_text += '\t';
+                }
+                a48_text += cuddl::a48::encode_a48_token(ref_scores[r * buckets + b]);
             }
-            a48_text += cuddl::a48::encode_a48_token(ref_scores[r * buckets + b]);
+            a48_text += '\n';
         }
-        a48_text += '\n';
-    }
-    for (bool parallel : {false, true}) {
-        auto decode = [&] {
-            return parallel ? CUDDL_UNWRAP(cuddl::a48::decode_a48_tsv_parallel(a48_text))
-                            : CUDDL_UNWRAP(cuddl::a48::decode_a48_tsv(a48_text));
-        };
-        auto decoded = decode();
-        if (!(decoded.records.size() == refs.sketches.size())) {
-            throw std::runtime_error("A48 record count differs");
-        }
-        for (size_t r = 0; r < decoded.records.size(); ++r) {
-            if (!(decoded.records[r].ordinal == r && decoded.records[r].scores.size() == buckets &&
-                  std::equal(
-                      decoded.records[r].scores.begin(),
-                      decoded.records[r].scores.end(),
-                      ref_scores.data() + r * buckets
-                  ))) {
-                throw std::runtime_error("A48 round trip differs");
+        for (bool parallel : {false, true}) {
+            auto decode = [&] {
+                return parallel ? CUDDL_UNWRAP(cuddl::a48::decode_a48_tsv_parallel(a48_text))
+                                : CUDDL_UNWRAP(cuddl::a48::decode_a48_tsv(a48_text));
+            };
+            auto decoded = decode();
+            if (!(decoded.records.size() == refs.sketches.size())) {
+                throw std::runtime_error("A48 record count differs");
             }
+            for (size_t r = 0; r < decoded.records.size(); ++r) {
+                if (!(decoded.records[r].ordinal == r && decoded.records[r].scores.size() == buckets &&
+                      std::equal(
+                          decoded.records[r].scores.begin(),
+                          decoded.records[r].scores.end(),
+                          ref_scores.data() + r * buckets
+                      ))) {
+                    throw std::runtime_error("A48 round trip differs");
+                }
+            }
+            host(parallel ? "a48_decode_parallel" : "a48_decode_serial", [&](cuda::stream_ref) {
+                auto value = decode();
+                do_not_optimise(value);
+            });
         }
-        host(parallel ? "a48_decode_parallel" : "a48_decode_serial", [&](cuda::stream_ref) {
-            auto value = decode();
-            do_not_optimise(value);
+        host("parse_and_canonicalize", [&](cuda::stream_ref) {
+            auto r = parse(opts.references), q = parse(opts.queries);
+            do_not_optimise(r);
+            do_not_optimise(q);
         });
-    }
-    host("parse_and_canonicalize", [&](cuda::stream_ref) {
-        auto r = parse(opts.references), q = parse(opts.queries);
-        do_not_optimise(r);
-        do_not_optimise(q);
-    });
-    gpu("host_to_device", [&](cuda::stream_ref s) {
-        for (size_t i = 0; i < refs.inputs.size(); ++i) {
-            cuda::copy_bytes(s, reference_files[i].kmers, refs.inputs[i]);
-        }
-        for (size_t i = 0; i < queries.inputs.size(); ++i) {
-            cuda::copy_bytes(s, query_files[i].kmers, queries.inputs[i]);
-        }
-    });
-    gpu("clear", [&](cuda::stream_ref s) {
-        refs.clear(s);
-        queries.clear(s);
-    });
-    gpu(
-        "construct_resident",
-        [&](cuda::stream_ref s) {
-            refs.add(s);
-            queries.add(s);
-        },
-        [&](cuda::stream_ref s) {
+        gpu("host_to_device", [&](cuda::stream_ref s) {
+            for (size_t i = 0; i < refs.inputs.size(); ++i) {
+                cuda::copy_bytes(s, reference_files[i].kmers, refs.inputs[i]);
+            }
+            for (size_t i = 0; i < queries.inputs.size(); ++i) {
+                cuda::copy_bytes(s, query_files[i].kmers, queries.inputs[i]);
+            }
+        });
+        gpu("clear", [&](cuda::stream_ref s) {
             refs.clear(s);
             queries.clear(s);
-        }
-    );
-    // Clear is included and labelled here: every NVBench replay starts with identical state.
-    gpu("clear_and_construct", [&](cuda::stream_ref s) {
-        refs.clear(s);
-        queries.clear(s);
-        refs.add(s);
-        queries.add(s);
-    });
-    gpu("clear_and_incremental_construct", [&](cuda::stream_ref s) {
-        refs.clear(s);
-        queries.clear(s);
-        refs.add(s, true);
-        queries.add(s, true);
-    });
+        });
+        gpu(
+            "construct_resident",
+            [&](cuda::stream_ref s) {
+                refs.add(s);
+                queries.add(s);
+            },
+            [&](cuda::stream_ref s) {
+                refs.clear(s);
+                queries.clear(s);
+            }
+        );
+        // Clear is included and labelled here: every NVBench replay starts with identical state.
+        gpu("clear_and_construct", [&](cuda::stream_ref s) {
+            refs.clear(s);
+            queries.clear(s);
+            refs.add(s);
+            queries.add(s);
+        });
+        gpu("clear_and_incremental_construct", [&](cuda::stream_ref s) {
+            refs.clear(s);
+            queries.clear(s);
+            refs.add(s, true);
+            queries.add(s, true);
+        });
+    }
     gpu("extract_compact_rows", [&](cuda::stream_ref s) {
         refs.extract_scores(s);
         queries.extract_scores(s);
@@ -920,12 +1120,34 @@ json run(options const& opts) {
         gpu(indexed ? "search_single_indexed" : "search_single_exhaustive",
             [&](cuda::stream_ref s) { single(s, indexed); });
     }
-    uint64_t selected = 0, exhaustive_pairs = 0;
+    // The all-to-all suite is coverage for small corpora: it retains one host result row per
+    // unique reference pair and validates them. Skip it when the pair count exceeds the cap.
+    auto const all_to_all_pairs = refs.sketches.size() > 1
+        ? uint64_t{refs.sketches.size()} * (refs.sketches.size() - 1) / 2
+        : 0;
+    bool const all_to_all_suite =
+        !opts.all_to_all_pairs || all_to_all_pairs <= opts.all_to_all_pairs;
+    uint64_t selected = 0, exhaustive_pairs = 0, match_rows_emitted = 0, match_rows_total = 0;
+    validation selected_validation;
+    auto emit_match = [&](cuddl::batch_search_result const& row) {
+        measurements.push_back(
+            {{"implementation", {{"name", "cuddl"}}},
+             {"case",
+              {{"measurement", "match"},
+               {"query_id", row.query_id},
+               {"reference_id", row.reference_id}}},
+             {"metrics", metrics(row.summary)}}
+        );
+    };
     for (bool all : {false, true}) {
+        if (all && !all_to_all_suite) {
+            continue;
+        }
         for (bool indexed : {false, true}) {
             host_results output;
             search(db, queries, buffers, opts, stream, indexed, all, &output);
-            validate(output, ref_scores, query_scores, opts, indexed, all);
+            auto const observed =
+                validate(output, ref_scores, query_scores, opts, indexed, all, opts.oracle_pairs);
             auto name = std::string(all ? "search_all_to_all_" : "search_batch_") +
                         (indexed ? "indexed" : "exhaustive");
             if (!all || refs.sketches.size() > 1) {
@@ -939,15 +1161,22 @@ json run(options const& opts) {
                     exhaustive_pairs = output.rows.size();
                 } else {
                     selected = output.rows.size();
-                    for (auto const& row : output.rows) {
-                        measurements.push_back(
-                            {{"implementation", {{"name", "cuddl"}}},
-                             {"case",
-                              {{"measurement", "match"},
-                               {"query_id", row.query_id},
-                               {"reference_id", row.reference_id}}},
-                             {"metrics", metrics(row.summary)}}
-                        );
+                    selected_validation = observed;
+                    match_rows_total = output.rows.size();
+                    // One evenly spread row sample, always including the last pair.
+                    size_t const limit =
+                        opts.match_rows ? opts.match_rows : output.rows.size();
+                    size_t const stride =
+                        output.rows.size() > limit
+                        ? (output.rows.size() + limit - 1) / limit
+                        : 1;
+                    for (size_t i = 0; i < output.rows.size(); i += stride) {
+                        emit_match(output.rows[i]);
+                        ++match_rows_emitted;
+                    }
+                    if (output.rows.size() && (output.rows.size() - 1) % stride != 0) {
+                        emit_match(output.rows.back());
+                        ++match_rows_emitted;
                     }
                 }
             }
@@ -958,7 +1187,9 @@ json run(options const& opts) {
                 zero.minimum_matches = 0;
                 host_results exhaustive_indexed;
                 search(db, queries, buffers, zero, stream, true, all, &exhaustive_indexed);
-                validate(exhaustive_indexed, ref_scores, query_scores, zero, true, all);
+                validate(
+                    exhaustive_indexed, ref_scores, query_scores, zero, true, all, zero.oracle_pairs
+                );
             }
         }
     }
@@ -979,15 +1210,23 @@ json run(options const& opts) {
             );
         }
     }
-    uint64_t input_bytes = 0, bases = 0, kmers = 0;
-    for (auto const* files : {&reference_files, &query_files}) {
-        for (auto const& f : *files) {
-            input_bytes += f.kmers.size() * sizeof(uint64_t);
-            bases += f.bases;
-            kmers += f.valid_kmers;
+    uint64_t input_bytes = 0, input_files = 0, bases = 0, kmers = 0;
+    if (streamed) {
+        input_files = reference_rows.input_bytes + query_rows.input_bytes;
+    } else {
+        for (auto const* files : {&reference_files, &query_files}) {
+            for (auto const& f : *files) {
+                input_bytes += f.kmers.size() * sizeof(uint64_t);
+                bases += f.bases;
+                kmers += f.valid_kmers;
+            }
         }
     }
-    timings.update(resident_timings(opts, reference_files, query_files, ref_scores, query_scores));
+    if (!streamed) {
+        timings.update(
+            resident_timings(opts, reference_files, query_files, ref_scores, query_scores)
+        );
+    }
     measurements.insert(
         measurements.begin(),
         json{
@@ -1002,6 +1241,7 @@ json run(options const& opts) {
               {"rows", opts.rows},
               {"index", opts.index},
               {"topology", opts.topology},
+              {"ingest", opts.ingest},
               {"indexed_buckets", opts.indexed_buckets},
               {"key_bits", opts.key_bits},
               {"minimum_matches", opts.minimum_matches},
@@ -1010,7 +1250,7 @@ json run(options const& opts) {
               {"canonicalisation_policy", compatibility(opts).canonicalisation_policy},
               {"exponent_bits", compatibility(opts).exponent_bits},
               {"mantissa_bits", compatibility(opts).mantissa_bits},
-              {"parser_threads", 0},
+              {"parser_threads", streamed ? static_cast<int>(opts.workers) : 0},
               {"application_queries", opts.topology == "batch" ? queries.sketches.size() : 0},
               {"references", refs.sketches.size()},
               {"queries", queries.sketches.size()},
@@ -1020,7 +1260,7 @@ json run(options const& opts) {
               {"warmups", opts.warmups},
               {"input_cache", "warm_os_cache"},
               {"end_to_end_output", "host_metrics_and_in_memory_json"},
-              {"resident_input", "packed_u64_actg_max"},
+              {"resident_input", streamed ? "sequence_tiles" : "packed_u64_actg_max"},
               {"resident_output", "device_cardinalities_winners_and_pair_summaries"},
               {"resident_minimum_matches", 0},
               {"worktree_dirty",
@@ -1029,12 +1269,19 @@ json run(options const& opts) {
              {{"oracle_passed", true},
               {"candidates", selected},
               {"exhaustive_pairs", exhaustive_pairs},
+              {"oracle_pairs_total", selected_validation.expected},
+              {"oracle_pairs_checked", selected_validation.checked},
+              {"match_rows_total", match_rows_total},
+              {"match_rows_emitted", match_rows_emitted},
+              {"all_to_all_suite", all_to_all_suite},
+              {"all_to_all_pairs", all_to_all_pairs},
               {"all_to_all_nonempty", refs.sketches.size() > 1},
               {"corresponding_pairs", pair_count},
               {"preserves_multiplicity", db.preserves_multiplicity()}}},
             {"timings", timings},
             {"memory_bytes",
              {{"input_kmers", input_bytes},
+              {"input_files", input_files},
               {"persistent_rows", db.persistent_row_bytes()},
               {"persistent_index", db.persistent_index_bytes()},
               {"search_workspace", buffers.workspace.size()},
@@ -1047,12 +1294,7 @@ json run(options const& opts) {
     for (auto const& [role, paths] : std::vector<std::pair<std::string, std::vector<std::string>>>{
              {"reference", opts.references}, {"query", opts.queries}
          }) {
-        for (size_t i = 0; i < paths.size(); ++i) {
-            datasets[role + "_" + std::to_string(i)] = {
-                {"path", paths[i]},
-                {"sha256", command_output("sha256sum < " + quote(paths[i])).substr(0, 64)}
-            };
-        }
+        datasets.update(dataset_entries(role, paths, opts.dataset_hashes));
     }
     return make_benchmark_result(opts.name, "pipeline", "end_to_end", measurements, datasets);
 }
@@ -1081,6 +1323,27 @@ int main(int argc, char** argv) try {
     app.add_option("--key-bits", opts.key_bits)->check(CLI::IsMember({15, 16}));
     app.add_option("--samples", opts.samples)->check(CLI::Range(2, 10000));
     app.add_option("--warmups", opts.warmups)->check(CLI::Range(0, 1000));
+    app.add_option(
+           "--ingest",
+           opts.ingest,
+           "packed: parse to host uint64 k-mer arrays. sequence: stream tiles per genome with "
+           "bounded memory, required for a large corpus"
+    )
+        ->check(CLI::IsMember({"packed", "sequence"}));
+    app.add_option("--workers", opts.workers, "File loading workers for --ingest sequence")
+        ->check(CLI::Range(0u, 64u));
+    app.add_option("--oracle-pairs", opts.oracle_pairs, "Scalar-oracle pair comparisons per suite")
+        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
+    app.add_option("--match-rows", opts.match_rows, "Match measurement rows emitted")
+        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
+    app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
+        ->check(CLI::Range(size_t{0}, size_t{1} << 20));
+    app.add_option(
+           "--all-to-all-pairs",
+           opts.all_to_all_pairs,
+           "Reference pairs above which the all-to-all stage suite is skipped"
+    )
+        ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
     if (!(opts.topology != "all-to-all" || opts.references.size() >= 2)) {
