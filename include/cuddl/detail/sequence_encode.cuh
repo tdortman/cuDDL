@@ -18,8 +18,8 @@
 
 namespace cuddl::detail {
 
-// A tile encodes each ASCII base once; each thread rolls eight adjacent windows
-// with runtime k and feeds the register update/merge operations.
+// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads
+// reuse neighboring words to construct eight overlapping windows on both strands.
 template <size_t BucketCount, typename Layout>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
@@ -32,7 +32,7 @@ __device__ __forceinline__ void add_sequence_windows(
 ) {
     constexpr uint32_t tile_size = 256 * 8;
     constexpr bool shared_sketch = BucketCount <= 8192;
-    __shared__ uint8_t bases[tile_size + 30];
+    __shared__ uint32_t cells[tile_size / 8 + 4];
     __shared__ uint32_t local[shared_sketch ? BucketCount : 1];
     if constexpr (shared_sketch) {
         for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
@@ -41,29 +41,81 @@ __device__ __forceinline__ void add_sequence_windows(
     }
     auto* target = shared_sketch ? local : registers;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
+    auto const valid_mask = (uint32_t{1} << k) - 1;
     for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
         auto const count = cuda::std::min(tile_size, windows - static_cast<uint32_t>(tile));
-        for (uint32_t i = threadIdx.x; i < count + k - 1; i += blockDim.x) {
-            bases[i] = encode_base(sequence[tile + i]);
+        // Four extra cells cover the k-1 halo, including the last partial cell.
+        auto const padded = (count + 7) / 8 + 4;
+        for (uint32_t cell = threadIdx.x; cell < padded; cell += blockDim.x) {
+            auto const pos = cell * 8;
+            uint32_t ascii[2] = {};
+            if ((reinterpret_cast<uintptr_t>(sequence + tile) & 7U) == 0 &&
+                pos + 7 < count + k - 1) {
+                auto const value = *reinterpret_cast<uint2 const*>(sequence + tile + pos);
+                ascii[0] = value.x;
+                ascii[1] = value.y;
+            } else {
+                _Pragma("unroll")
+                for (uint32_t j = 0; j < 8; ++j) {
+                    auto const byte = pos + j < count + k - 1
+                                          ? static_cast<uint8_t>(sequence[tile + pos + j])
+                                          : uint8_t{0xFF};
+                    ascii[j / 4] |= static_cast<uint32_t>(byte) << (8 * (j % 4));
+                }
+            }
+            uint32_t packed = 0, bad = 0;
+            _Pragma("unroll")
+            for (uint32_t j = 0; j < 8; ++j) {
+                auto const symbol = encode_base(static_cast<char>(ascii[j / 4] >> (8 * (j % 4))));
+                packed = (packed << 2) | (symbol & 3U);
+                bad |= static_cast<uint32_t>(symbol == 0xFFU) << j;
+            }
+            cells[cell] = packed | (bad << 16);
         }
         __syncthreads();
         auto const start = threadIdx.x * 8;
         if (start < count) {
-            uint64_t forward = 0;
-            uint32_t valid = 0;
-            auto const end = cuda::std::min(start + 8, count) + k - 1;
-            for (uint32_t i = start; i < end; ++i) {
-                auto const symbol = bases[i];
-                forward = ((forward << 2) | (symbol & 3U)) & mask;
-                valid = symbol == 0xFFu ? 0 : valid + 1;
-                if (valid >= k) {
-                    auto const bits = cuda::std::bit_reverse(forward);
-                    auto const pairs = ((bits & 0xAAAAAAAAAAAAAAAAULL) >> 1) |
-                                       ((bits & 0x5555555555555555ULL) << 1);
-                    auto const reverse = (pairs ^ 0xAAAAAAAAAAAAAAAAULL) >> (64 - 2 * k);
+            auto const cell = start / 8;
+            auto const a = cells[cell], b = cells[cell + 1];
+            auto const c = cells[cell + 2], d = cells[cell + 3];
+            auto high =
+                (uint64_t{a} << 48) | (uint64_t{b & 0xFFFFU} << 32) | (c << 16) | (d & 0xFFFFU);
+            uint64_t low = 0;
+            auto bad = uint64_t{a >> 16} | (uint64_t{b >> 16} << 8) | (uint64_t{c >> 16} << 16) |
+                       (uint64_t{d >> 16} << 24);
+            if (k > 25) {
+                auto const e = cells[cell + 4];
+                low = uint64_t{e & 0xFFFFU} << 48;
+                bad |= uint64_t{e >> 16} << 32;
+            }
+            // Reverse the span once, then slide both strands across its eight windows.
+            auto reverse_word = [](uint64_t word) {
+                auto const bits = cuda::std::bit_reverse(word);
+                return (((bits & 0xAAAAAAAAAAAAAAAAULL) >> 1) |
+                        ((bits & 0x5555555555555555ULL) << 1)) ^
+                       0xAAAAAAAAAAAAAAAAULL;
+            };
+            auto reverse_high = reverse_word(high);
+            auto reverse_low = reverse_word(low);
+            auto const end = cuda::std::min(8U, count - start);
+            for (uint32_t i = 0; i < end; ++i) {
+                if ((bad & valid_mask) == 0) {
+                    auto const forward = high >> (64 - 2 * k);
+                    auto const reverse = reverse_high & mask;
                     auto const hash = hash_kmer(forward > reverse ? forward : reverse);
                     update(&target[bucket_of<BucketCount>(hash)], score<Layout>(hash), saturation);
                 }
+                // Eight overlapping windows fit in one 32-base word when k <= 25.
+                if (k <= 25) {
+                    high <<= 2;
+                    reverse_high >>= 2;
+                } else {
+                    high = (high << 2) | (low >> 62);
+                    low <<= 2;
+                    reverse_high = (reverse_high >> 2) | (reverse_low << 62);
+                    reverse_low >>= 2;
+                }
+                bad >>= 1;
             }
         }
         __syncthreads();
@@ -196,8 +248,14 @@ __host__ inline Result<void> launch_sequence_add(
     return cuda_try([&] {
         auto const multiprocessors =
             stream.device().attribute(cuda::device_attributes::multiprocessor_count);
+        // Fill one resident wave, accounting for the GPU and this sketch's shared memory.
+        int blocks_per_sm = 0;
+        auto const occupancy = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, add_sequence_single_kernel<BucketCount, Layout>, 256, 0
+        );
+        if (occupancy != cudaSuccess) return occupancy;
         size_t const need = (static_cast<size_t>(windows) + 2047) / 2048;
-        size_t const capacity = static_cast<size_t>(multiprocessors) * 2U;
+        size_t const capacity = static_cast<size_t>(multiprocessors) * blocks_per_sm;
         size_t const blocks_size = capacity == 0 ? size_t{1} : (capacity < need ? capacity : need);
         auto const blocks = static_cast<uint32_t>(blocks_size);
         add_sequence_single_kernel<BucketCount, Layout><<<blocks, 256, 0, stream.get()>>>(

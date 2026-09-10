@@ -702,6 +702,65 @@ TEST(SketchTest, SequenceKBoundariesMatchPackedOracle) {
     // K is bounded by sketch_view to 1..31; K=32 has no runtime test by construction.
 }
 
+TEST(SketchTest, SequencePackedTilesMatchScalarOracle) {
+    cuda::stream stream{cuda::devices[0]};
+    auto verify = [&]<size_t B>(std::string const& genome, uint32_t k, size_t offset) {
+        SCOPED_TRACE(
+            ::testing::Message() << "k=" << k << " size=" << genome.size() << " offset=" << offset
+                                 << " buckets=" << B
+        );
+        auto const packed = encode_genome(genome, k);
+        scalar_sketch<B> oracle;
+        auto input = make_device_sequence(stream, std::string(offset, 'N') + genome);
+        auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1, 0U);
+        std::vector<uint32_t> observed(B + 1);
+        for (int append = 0; append < 2; ++append) {
+            oracle.add(packed);
+            oracle.pack_registers();
+            ASSERT_TRUE(
+                cuddl::detail::launch_sequence_add<B>(
+                    {input.data() + offset, genome.size()},
+                    k,
+                    {output.data(), B},
+                    output.data()[B],
+                    stream
+                )
+                    .has_value()
+            );
+            cuda::copy_bytes(stream, output, observed);
+            stream.sync();
+            EXPECT_EQ(observed.back(), static_cast<uint32_t>(oracle.saturated));
+            EXPECT_TRUE(
+                std::equal(oracle.registers.begin(), oracle.registers.end(), observed.begin())
+            );
+        }
+    };
+    for (uint32_t k = 1; k <= 31; ++k) {
+        for (size_t windows : {0U, 1U, 7U, 8U, 9U, 31U, 32U, 33U, 2047U, 2048U, 2049U, 4103U}) {
+            auto genome = make_genome(windows + k - 1);
+            verify.template operator()<b_default>(genome, k, 0);
+            for (size_t i = 7; i < genome.size(); i += 31) {
+                genome[i] = "NacgtX\xff"[(i / 31) % 7];
+            }
+            verify.template operator()<b_default>(genome, k, 3);
+        }
+    }
+    // Exercise multiple grid-stride tiles, the larger shared sketch, and global fallback.
+    auto const genome = make_genome(700003);
+    verify.template operator()<8192>(genome, 31, 1);
+    verify.template operator()<16384>(genome, 25, 7);
+    auto bytes = make_genome(256 * 8 * 32 + 31);
+    for (uint32_t byte = 0; byte < 256; ++byte) {
+        for (uint32_t position = 0; position < 8; ++position) {
+            bytes[(byte * 8 + position) * 32 + position] = static_cast<char>(byte);
+        }
+    }
+    verify.template operator()<b_default>(bytes, 25, 0);
+    verify.template operator()<b_default>(bytes, 31, 3);
+    // Preserve every observation of low-complexity DNA, including saturated counts.
+    verify.template operator()<b_default>(std::string(140000, 'A'), 25, 1);
+}
+
 // Sequential aggregation isolates the block histogram/reduction from the estimator formulas.
 template <typename Layout>
 __global__ void scalar_hybrid_cardinality(
