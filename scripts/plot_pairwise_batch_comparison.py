@@ -130,13 +130,24 @@ def main(
             "quality JSON is missing implementations: "
             + ", ".join(sorted(missing_implementations))
         )
-    positions = list(range(len(QUALITY_METRICS)))
-    width = 0.36
+    quality_metrics = list(QUALITY_METRICS)
+    if "cardinality_absolute_relative_error" in quality:
+        quality_metrics.insert(
+            0, ("cardinality_absolute_relative_error", "Cardinality")
+        )
+    implementations = [
+        ("cuddl", "cuDDL", CUDDL),
+        ("bbtools", "BBTools DDL", BBTOOLS),
+    ]
+    if "rabbitsketch" in set(quality["implementation"]):
+        implementations.append(
+            ("rabbitsketch", "RabbitSketch FastKMV", {"color": "#009E73"})
+        )
+    positions = list(range(len(quality_metrics)))
+    width = 0.8 / len(implementations)
     fig, quality_ax = pu.setup_figure()
-    for offset, implementation, label, style in (
-        (-0.5, "cuddl", "cuDDL", CUDDL),
-        (0.5, "bbtools", "BBTools DDL", BBTOOLS),
-    ):
+    for index, (implementation, label, style) in enumerate(implementations):
+        offset = index - (len(implementations) - 1) / 2
         selected = quality[quality["implementation"] == implementation]
         values = [
             (
@@ -145,7 +156,7 @@ def main(
                 else selected
             )[column].quantile(0.95)
             * 100
-            for column, _ in QUALITY_METRICS
+            for column, _ in quality_metrics
         ]
         bars = quality_ax.bar(
             [position + offset * width for position in positions],
@@ -165,20 +176,20 @@ def main(
         )
     quality_ax.set_xticks(
         positions,
-        [label for _, label in QUALITY_METRICS],
+        [label for _, label in quality_metrics],
     )
     quality_ax.set_ylim(0, quality_ax.get_ylim()[1] * 1.15)
     pu.format_axis(
         quality_ax,
         xlabel="",
-        ylabel="P95 absolute error (%)",
+        ylabel="P95 error (%)",
         title="Estimation quality",
         xscale=None,
         grid=False,
     )
     quality_ax.tick_params(axis="both", labelsize=pu.TICK_LABEL_FONT_SIZE)
     quality_ax.grid(axis="y", linestyle="--", alpha=pu.GRID_ALPHA)
-    add_top_legend(fig, quality_ax, ncol=2)
+    add_top_legend(fig, quality_ax, ncol=len(implementations))
     pu.save_figure(fig, output_dir / "estimation_quality.pdf")
 
     fig, throughput_ax = pu.setup_figure()
