@@ -143,6 +143,8 @@ def main(
         implementations.append(
             ("rabbitsketch", "RabbitSketch FastKMV", {"color": "#009E73"})
         )
+    if "cuco_hll" in set(quality["implementation"]):
+        implementations.append(("cuco_hll", "cuco HLL", {"color": "#E69F00"}))
     positions = list(range(len(quality_metrics)))
     width = 0.8 / len(implementations)
     fig, quality_ax = pu.setup_figure()
@@ -189,7 +191,9 @@ def main(
     )
     quality_ax.tick_params(axis="both", labelsize=pu.TICK_LABEL_FONT_SIZE)
     quality_ax.grid(axis="y", linestyle="--", alpha=pu.GRID_ALPHA)
-    add_top_legend(fig, quality_ax, ncol=len(implementations))
+    add_top_legend(
+        fig, quality_ax, ncol=2 if len(implementations) == 4 else len(implementations)
+    )
     pu.save_figure(fig, output_dir / "estimation_quality.pdf")
 
     fig, throughput_ax = pu.setup_figure()

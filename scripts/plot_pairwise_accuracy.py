@@ -28,6 +28,7 @@ def plot_comparison(data: pd.DataFrame, output_dir: Path) -> None:
         "cuddl": "cuDDL",
         "bbtools": "BBTools DDL",
         "rabbitsketch": "RabbitSketch FastKMV",
+        "cuco_hll": "cuco HLL",
     }
     unknown = set(data["implementation"]) - labels.keys()
     if unknown:
