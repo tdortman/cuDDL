@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "typer"]
 # ///
-"""Run cuDDL, BBTools, and RabbitSketch accuracy cases into one JSON result."""
+"""Run cuDDL, BBTools, RabbitSketch, and cuco HLL accuracy cases into one JSON result."""
 
 import csv
 import hashlib
@@ -160,7 +160,7 @@ FLOAT_FIELDS = {
 }
 COUNT_FIELDS = ("lower", "equal", "higher", "both_empty")
 app = typer.Typer(
-    help="Compare cuDDL, BBTools, and RabbitSketch on deterministic raw DNA.",
+    help="Compare cuDDL, BBTools, RabbitSketch, and cuco HLL on deterministic raw DNA.",
 )
 
 
@@ -381,7 +381,7 @@ def main(
     ] = 8,
     seed: Annotated[int, typer.Option(min=0, help="Root generator seed")] = 42,
 ) -> None:
-    """Build and run all three implementations, then publish one JSON result."""
+    """Build and run all four implementations, then publish one JSON result."""
     powers = powers or list(DEFAULT_POWERS)
     ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
     size_ratios = size_ratios or list(DEFAULT_SIZE_RATIOS)
@@ -441,11 +441,32 @@ def main(
                 str(cases_csv),
                 "--output",
                 str(cuddl_json),
+                "--cuco-hll",
             ]
         )
         cuddl_result = benchmark_schema.load_result(
             cuddl_json, operation="pairwise_accuracy"
         )
+        hll_measurements = [
+            row
+            for row in cuddl_result["measurements"]
+            if row["implementation"]["name"] == "cuco_hll"
+        ]
+        cuddl_result["measurements"] = [
+            row
+            for row in cuddl_result["measurements"]
+            if row["implementation"]["name"] == "cuddl"
+        ]
+        hll_rows = benchmark_schema.flatten_measurements(
+            {"measurements": hll_measurements}
+        )
+        original_rows = benchmark_schema.flatten_measurements(cuddl_result)
+        if len(hll_rows) != len(original_rows) or any(
+            any(hll[field] != original[field] for field in KEY_FIELDS)
+            for hll, original in zip(hll_rows, original_rows, strict=True)
+        ):
+            raise RuntimeError("cuco HLL case metadata differs from cuDDL")
+        benchmark_schema.write_result(cuddl_json, cuddl_result)
         rows = [
             {
                 field: (
@@ -554,6 +575,14 @@ def main(
     ):
         normalized["implementation"] = original["implementation"]
     result["measurements"].extend(rabbit_measurements)
+    normalized_hll = benchmark_schema.measurements_from_rows(
+        hll_rows,
+        case_fields=(*CASE_FIELDS, "hll_precision"),
+        omit_fields=PATH_FIELDS,
+    )
+    for normalized, original in zip(normalized_hll, hll_measurements, strict=True):
+        normalized["implementation"] = original["implementation"]
+    result["measurements"].extend(normalized_hll)
     benchmark_schema.write_result(output, result)
 
     typer.echo(f"Verified {len(rows)} matched raw-DNA pair rows")
