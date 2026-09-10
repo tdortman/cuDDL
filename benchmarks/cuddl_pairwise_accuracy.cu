@@ -1,4 +1,5 @@
 #include <CLI/CLI.hpp>
+#include <cuco/hyperloglog.cuh>
 #include <cuddl/cuddl.cuh>
 #include <cuddl/fastx.hpp>
 
@@ -85,6 +86,7 @@ struct prepared_sequence {
     uint64_t bases;
     std::vector<uint64_t> unique_kmers;
     sketch_type sketch;
+    std::optional<cuco::hyperloglog<uint64_t>> hll;
 };
 
 [[nodiscard]] std::vector<std::string> parse_csv_line(std::string const& input) {
@@ -215,6 +217,7 @@ void require_header(std::vector<std::string> const& fields) {
     std::string const& path,
     std::string const& sha256,
     uint64_t expected_bases,
+    bool with_hll,
     cuda::stream_ref stream
 ) {
     auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k_kmer_length));
@@ -232,6 +235,11 @@ void require_header(std::vector<std::string> const& fields) {
     sketch_type sketch(stream);
     CUDDL_UNWRAP(sketch.add(device, stream));
 
+    std::optional<cuco::hyperloglog<uint64_t>> hll;
+    if (with_hll) {
+        hll.emplace(cuco::hyperloglog<uint64_t>{cuco::precision{11}, {}, {}, stream});
+        hll->add(device.data(), device.data() + parsed.kmers.size(), stream);
+    }
     std::sort(parsed.kmers.begin(), parsed.kmers.end());
     parsed.kmers.erase(std::unique(parsed.kmers.begin(), parsed.kmers.end()), parsed.kmers.end());
     return {
@@ -240,6 +248,7 @@ void require_header(std::vector<std::string> const& fields) {
         .bases = parsed.bases,
         .unique_kmers = std::move(parsed.kmers),
         .sketch = std::move(sketch),
+        .hll = std::move(hll),
     };
 }
 
@@ -395,6 +404,41 @@ void emit_orientation(
     });
 }
 
+void emit_hll(json& measurements, json row, double left, double right, double union_size) {
+    auto& output = row["metrics"];
+    for (auto const* field : {"lower", "equal", "higher", "both_empty"}) {
+        output.erase(field);
+    }
+    // Inclusion-exclusion can leave the feasible interval because all three inputs are estimates.
+    double const raw_intersection = left + right - union_size;
+    double const intersection = std::clamp(raw_intersection, 0.0, std::min(left, right));
+    double const wkid = intersection / std::min(left, right);
+    auto add = [&](char const* name, double estimate) {
+        double const exact = output.at(std::string{"exact_"} + name);
+        output[std::string{"sketch_"} + name] = estimate;
+        output[std::string{name} + "_signed_error"] = estimate - exact;
+        output[std::string{name} + "_absolute_error"] = std::abs(estimate - exact);
+    };
+    add("cardinality", left);
+    add("containment", intersection / left);
+    add("completeness", std::min(1.0, left / right));
+    add("wkid", wkid);
+    add("ani", std::pow(wkid, 1.0 / k_kmer_length));
+    output["cardinality_relative_error"] = output["cardinality_signed_error"].get<double>() /
+                                           output["exact_cardinality"].get<double>();
+    output["cardinality_absolute_relative_error"] =
+        std::abs(output["cardinality_relative_error"].get<double>());
+    output["sketch_right_cardinality"] = right;
+    output["sketch_union"] = union_size;
+    output["sketch_intersection_raw"] = raw_intersection;
+    output["sketch_intersection"] = intersection;
+    output["pair_estimator"] = "clamp(A+B-union, 0, min(A,B))";
+    output["ani_estimator"] = "(intersection/min(A,B))^(1/k)";
+    row["implementation"] = {{"name", "cuco_hll"}, {"variant", "inclusion-exclusion"}};
+    row["case"]["hll_precision"] = 11;
+    measurements.push_back(std::move(row));
+}
+
 [[nodiscard]] double quantile(std::vector<double> const& sorted, double q) {
     auto const position = q * static_cast<double>(sorted.size() - 1U);
     auto const lower = static_cast<size_t>(position);
@@ -415,10 +459,12 @@ int main(int argc, char** argv) {
     try {
         CLI::App app{"cuDDL pairwise sketch accuracy on raw FASTA mutation cases"};
 
+        bool with_hll = false;
         std::string cases_path;
         std::string output_path;
         app.add_option("--cases", cases_path, "Input cases CSV path")->required();
         app.add_option("--output", output_path, "Output JSON path")->required();
+        app.add_flag("--cuco-hll", with_hll, "Include cuco HLL inclusion-exclusion estimates");
         CLI11_PARSE(app, argc, argv);
 
         std::ifstream cases(cases_path);
@@ -450,7 +496,11 @@ int main(int argc, char** argv) {
 
             if (!cached_reference || cached_reference->path != input.reference_path) {
                 cached_reference = prepare_sequence(
-                    input.reference_path, input.reference_sha256, input.reference_bases, stream
+                    input.reference_path,
+                    input.reference_sha256,
+                    input.reference_bases,
+                    with_hll,
+                    stream
                 );
             } else if (
                 cached_reference->sha256 != input.reference_sha256 ||
@@ -460,11 +510,13 @@ int main(int argc, char** argv) {
                     "reference metadata changed for cached path: " + input.reference_path
                 );
             }
-            auto query =
-                prepare_sequence(input.query_path, input.query_sha256, input.query_bases, stream);
+            auto query = prepare_sequence(
+                input.query_path, input.query_sha256, input.query_bases, with_hll, stream
+            );
             auto const intersection =
                 intersection_size(query.unique_kmers, cached_reference->unique_kmers);
 
+            auto const first_orientation = measurements.size();
             emit_orientation(
                 measurements,
                 input,
@@ -490,6 +542,33 @@ int main(int argc, char** argv) {
                     errors,
                     stream
                 );
+            }
+            if (with_hll) {
+                double const query_size = query.hll->estimate(stream);
+                double const reference_size = cached_reference->hll->estimate(stream);
+                if (query_size <= 0.0 || reference_size <= 0.0) {
+                    throw std::runtime_error("HLL estimated zero cardinality for nonempty input");
+                }
+                cuco::hyperloglog<uint64_t> combined(cuco::precision{11}, {}, {}, stream);
+                combined.merge(*query.hll, stream);
+                combined.merge(*cached_reference->hll, stream);
+                double const union_size = combined.estimate(stream);
+                emit_hll(
+                    measurements,
+                    measurements[first_orientation],
+                    query_size,
+                    reference_size,
+                    union_size
+                );
+                if (input.size_ratio != 1U) {
+                    emit_hll(
+                        measurements,
+                        measurements[first_orientation + 1],
+                        reference_size,
+                        query_size,
+                        union_size
+                    );
+                }
             }
             ++case_count;
         }

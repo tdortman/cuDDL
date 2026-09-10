@@ -54,7 +54,7 @@ executable(
 executable(
     'cuddl-pairwise-accuracy',
     'cuddl_pairwise_accuracy.cu',
-    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
+    dependencies: [cuddl_dep, cuco_bench_dep, cli11_dep, nlohmann_json_dep],
     cuda_args: cuda_args,
     install: false,
 )
