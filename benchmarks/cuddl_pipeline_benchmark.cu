@@ -660,22 +660,17 @@ json metrics(cuddl::pairwise_summary const& summary) {
     return result;
 }
 
-json collection_metrics(collection const& group, cuda::stream_ref stream) {
+json collection_metrics(collection& group, cuda::stream_ref stream) {
     json output = json::array();
+    // One async pass over the collection, then bulk downloads: no per-genome host synchronisation.
+    group.cardinality(stream);
     auto all_counts = download(group.counts, stream);
     auto saturation = download(group.saturated, stream);
-    for (size_t i = 0; i < group.sketches.size(); ++i) {
-        auto const& s = group.sketches[i];
-        auto estimates = CUDDL_UNWRAP(s.hybrid_cardinality(stream));
-        auto const saturated = saturation[i] != 0;
+    auto cardinalities = download(group.cardinalities, stream);
+    for (size_t i = 0; i < group.rows(); ++i) {
         auto value = json{
-            {"cardinality", CUDDL_UNWRAP(s.cardinality(stream))},
-            {"hybrid_bbtools", estimates.bbtools},
-            {"hybrid_paper", estimates.paper},
-            {"hybrid_lc", estimates.lc},
-            {"hybrid_dlc", estimates.dlc},
-            {"hybrid_mean_m_raw", estimates.mean_m_raw},
-            {"saturated", saturated}
+            {"cardinality", cardinalities[i]},
+            {"saturated", saturation[i] != 0},
         };
         std::map<uint16_t, uint32_t> histogram;
         for (size_t j = 0; j < buckets; ++j) {
@@ -1233,8 +1228,8 @@ json resident_timings(
 // collection, and the DOM costs about 2 KiB per pair, so the sample follows --match-rows.
 void application_output(
     options const& opts,
-    collection const& refs,
-    collection const& queries,
+    collection& refs,
+    collection& queries,
     host_results const& output,
     cuda::stream_ref stream
 ) {
@@ -1516,14 +1511,6 @@ json run(options const& opts) {
         refs.cardinality(s);
         queries.cardinality(s);
     });
-    host("hybrid_cardinality_host_result", [&](cuda::stream_ref) {
-        for (auto const& c : {&refs, &queries}) {
-            for (auto const& s : c->sketches) {
-                auto value = CUDDL_UNWRAP(s.hybrid_cardinality(stream));
-                do_not_optimise(value);
-            }
-        }
-    });
     auto pair_output = cuda::make_device_buffer<cuddl::pairwise_summary>(
         stream, stream.device(), 1, cuddl::pairwise_summary{}
     );
@@ -1722,7 +1709,7 @@ json run(options const& opts) {
         search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
         do_not_optimise(output);
     });
-    for (auto const& [label, group] : std::vector<std::pair<std::string, collection const*>>{
+    for (auto const& [label, group] : std::vector<std::pair<std::string, collection*>>{
              {"reference", &refs}, {"query", &queries}
          }) {
         auto values = collection_metrics(*group, stream);

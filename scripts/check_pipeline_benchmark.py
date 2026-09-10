@@ -58,7 +58,6 @@ def main(
             "extract_packed_rows",
             "winner_counts",
             "cardinality",
-            "hybrid_cardinality_host_result",
             "pairwise_summary",
             "pairwise_summary_with_cardinality",
             "compare_corresponding_rows",
