@@ -184,11 +184,18 @@ genome_rows stream_genomes(
     return result;
 }
 
+// Read-only rows of a streamed store, for the library's batch operations.
+cuddl::device_span<uint32_t const> stored_rows(cuddl::device_span<uint32_t> rows) noexcept {
+    return {rows.data(), rows.size()};
+}
+
 // Each input file is a genome. Records within a file retain parser boundary semantics.
 struct collection {
     std::vector<cuda::device_buffer<uint64_t>> inputs;
     // Streamed register source: (buckets + 1) words per genome, kept alive for the copies.
     cuda::device_buffer<uint32_t> registers;
+    // Rows this collection owns inside a shared streamed store; empty for per-file sketches.
+    cuddl::device_span<uint32_t> store;
     std::vector<sketch> sketches;
     cuda::device_buffer<uint16_t> scores, counts;
     cuda::device_buffer<uint32_t> packed, saturated;
@@ -268,7 +275,21 @@ struct collection {
             );
         }
     }
+    /// @brief Stored sketches this collection contributes: shared store rows or per-file sketches.
+    [[nodiscard]] size_t rows() const noexcept {
+        return store.size() ? store.size() / (buckets + 1) : sketches.size();
+    }
+
+    /// @brief Binds the shared store rows written by the streamed construct kernel.
+    void bind_store(cuddl::device_span<uint32_t> rows) noexcept {
+        store = rows;
+    }
+
     void clear(cuda::stream_ref stream) {
+        if (store.size()) {
+            cuda::fill_bytes(stream, cuda::std::span{store.data(), store.size()}, 0);
+            return;
+        }
         for (auto const& s : sketches) {
             CUDDL_UNWRAP(s.clear_async(stream));
         }
@@ -291,6 +312,12 @@ struct collection {
         if (!scores.size()) {
             return;
         }
+        if (store.size()) {
+            CUDDL_UNWRAP(
+                cuddl::extract_scores_batch_async<buckets>(stored_rows(store), scores, stream)
+            );
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             CUDDL_CUDA_CALL(
                 cub::DeviceTransform::Transform(
@@ -307,6 +334,12 @@ struct collection {
         if (!packed.size()) {
             return;
         }
+        if (store.size()) {
+            CUDDL_UNWRAP(
+                cuddl::extract_packed_rows_batch_async<buckets>(stored_rows(store), packed, stream)
+            );
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             cuda::copy_bytes(
                 stream,
@@ -316,6 +349,14 @@ struct collection {
         }
     }
     void winner_counts(cuda::stream_ref stream) {
+        if (store.size()) {
+            CUDDL_UNWRAP(
+                cuddl::winner_counts_batch_async<buckets>(
+                    stored_rows(store), counts, saturated, stream
+                )
+            );
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             CUDDL_UNWRAP(
                 sketches[i].winner_counts_async(
@@ -331,6 +372,14 @@ struct collection {
         winner_counts(stream);
     }
     void cardinality(cuda::stream_ref stream) {
+        if (store.size()) {
+            CUDDL_UNWRAP(
+                cuddl::cardinality_batch_async<buckets>(
+                    stored_rows(store), empty, cardinalities, stream
+                )
+            );
+            return;
+        }
         for (size_t i = 0; i < sketches.size(); ++i) {
             CUDDL_UNWRAP(
                 sketches[i].cardinality_async(empty.data() + i, cardinalities.data() + i, stream)
@@ -849,6 +898,15 @@ json resident_timings(
     bool const all = opts.topology == "all-to-all";
     bool const sequence = opts.ingest == "sequence";
     cuda::stream setup{cuda::devices[0]};
+    // Streamed rows are hashed straight into one store of (buckets + 1)-word sketches, shared by
+    // the reference and query collections.
+    auto paths = opts.references;
+    if (!all) {
+        paths.insert(paths.end(), opts.queries.begin(), opts.queries.end());
+    }
+    auto store = cuda::make_device_buffer<uint32_t>(
+        setup, setup.device(), sequence ? paths.size() * (buckets + 1) : 0, cuda::no_init
+    );
     collection refs =
         sequence
             ? collection(
@@ -859,14 +917,9 @@ json resident_timings(
                              ? collection(all ? 0 : opts.queries.size(), setup, true, false)
                              : collection(all ? parsed_files{} : query_files, setup, true, false);
     if (sequence) {
-        for (size_t i = 0; i < opts.references.size(); ++i) {
-            refs.sketches.emplace_back(setup);
-        }
-        if (!all) {
-            for (size_t i = 0; i < opts.queries.size(); ++i) {
-                queries.sketches.emplace_back(setup);
-            }
-        }
+        auto const reference_words = opts.references.size() * (buckets + 1);
+        refs.bind_store({store.data(), reference_words});
+        queries.bind_store({store.data() + reference_words, store.size() - reference_words});
         refs.clear(setup);
         queries.clear(setup);
     } else {
@@ -876,11 +929,9 @@ json resident_timings(
     refs.extract(setup);
     queries.extract(setup);
     std::optional<database> db{build(refs, opts, setup, true)};
-    search_buffers buffers(
-        *db, static_cast<uint32_t>(queries.sketches.size()), setup, opts.topology
-    );
-    auto const n = refs.sketches.size();
-    auto const q = all ? n : queries.sketches.size();
+    search_buffers buffers(*db, static_cast<uint32_t>(queries.rows()), setup, opts.topology);
+    auto const n = refs.rows();
+    auto const q = all ? n : queries.rows();
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
@@ -945,11 +996,6 @@ json resident_timings(
         search(*db, queries, buffers, opts, s, true, all, nullptr, consume);
     };
     if (sequence) {
-        auto paths = opts.references;
-        if (!all) paths.insert(paths.end(), opts.queries.begin(), opts.queries.end());
-        auto registers = cuda::make_device_buffer<uint32_t>(
-            setup, setup.device(), paths.size() * (buckets + 1), cuda::no_init
-        );
         auto single = opts;
         single.samples = 1;
         single.warmups = 0;
@@ -999,7 +1045,7 @@ json resident_timings(
             auto const grid = static_cast<uint32_t>(std::min(block_end, max_grid));
             cuddl::detail::add_sequence_batch_kernel<buckets, cuddl::default_register_layout>
                 <<<grid, 256, 0, s.get()>>>(
-                    input->data(), staged->data(), host.size(), block_end, k, registers.data()
+                    input->data(), staged->data(), host.size(), block_end, k, store.data()
                 );
             CUDDL_CUDA_CALL(cudaGetLastError());
         };
@@ -1019,10 +1065,7 @@ json resident_timings(
             };
             db.reset();
             setup.sync();
-            segment("resident_reset", [&](cuda::stream_ref s) {
-                reset(s);
-                cuda::fill_bytes(s, registers, 0);
-            });
+            segment("resident_reset", reset);
             elapsed["resident_construct"] = 0;
             elapsed["resident_construct_wall"] = 0;
             size_t count = 0;
@@ -1095,20 +1138,12 @@ json resident_timings(
             if (*resident_batches != count) {
                 throw std::runtime_error("resident input changed between replays");
             }
-            segment("resident_construct", [&](cuda::stream_ref s) {
-                for (size_t i = 0; i < paths.size(); ++i) {
-                    auto& target = i < n ? refs.sketches[i] : queries.sketches[i - n];
-                    CUDDL_UNWRAP(
-                        target.assign_async({registers.data() + i * (buckets + 1), buckets + 1}, s)
-                    );
-                }
-            });
             segment("resident_statistics", statistics);
             segment("resident_rows", rows);
             segment("resident_index", index);
             segment("resident_search", query);
             // Validate the timed resident construction, including multiplicities and saturation.
-            auto const observed_registers = download(registers, setup);
+            auto const observed_registers = download(store, setup);
             for (size_t i = 0; i < observed_registers.size(); ++i) {
                 auto const expected =
                     i < expected_references->registers.size()

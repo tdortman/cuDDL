@@ -959,6 +959,121 @@ TEST(SketchTest, BatchComparisonMatchesScalarOracle) {
     );
 }
 
+TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t row_count = 3;
+    constexpr size_t row_words = b_default + 1U;
+    std::vector<scalar_sketch<b_default>> oracles(row_count);
+    std::vector<uint32_t> store(row_count * row_words, 0U);
+    std::vector<uint32_t> flags(row_count);
+    for (size_t row = 0; row < row_count; ++row) {
+        oracles[row].add(make_inputs(1U << 12, 0x5eed'0000ULL + row));
+        oracles[row].pack_registers();
+        std::copy(
+            oracles[row].registers.begin(),
+            oracles[row].registers.end(),
+            store.begin() + static_cast<ptrdiff_t>(row * row_words)
+        );
+        flags[row] = static_cast<uint32_t>(row + 7U);
+        store[row * row_words + b_default] = flags[row];
+    }
+
+    auto device_store = cuda::make_device_buffer<uint32_t>(stream, stream.device(), store);
+    auto empty_out =
+        cuda::make_device_buffer<uint64_t>(stream, stream.device(), row_count, cuda::no_init);
+    auto estimates =
+        cuda::make_device_buffer<double>(stream, stream.device(), row_count, cuda::no_init);
+    auto counts = cuda::make_device_buffer<uint16_t>(
+        stream, stream.device(), row_count * b_default, cuda::no_init
+    );
+    auto saturation =
+        cuda::make_device_buffer<uint32_t>(stream, stream.device(), row_count, cuda::no_init);
+    auto scores = cuda::make_device_buffer<uint16_t>(
+        stream, stream.device(), row_count * b_default, cuda::no_init
+    );
+    auto packed = cuda::make_device_buffer<uint32_t>(
+        stream, stream.device(), row_count * b_default, cuda::no_init
+    );
+
+    cuddl::device_span<uint32_t const> const rows{device_store.data(), device_store.size()};
+    ASSERT_TRUE(
+        cuddl::cardinality_batch_async<b_default>(
+            rows, {empty_out.data(), empty_out.size()}, {estimates.data(), estimates.size()}, stream
+        )
+            .has_value()
+    );
+    ASSERT_TRUE(
+        cuddl::winner_counts_batch_async<b_default>(
+            rows, {counts.data(), counts.size()}, {saturation.data(), saturation.size()}, stream
+        )
+            .has_value()
+    );
+    ASSERT_TRUE(
+        cuddl::extract_scores_batch_async<b_default>(rows, {scores.data(), scores.size()}, stream)
+            .has_value()
+    );
+    ASSERT_TRUE(
+        cuddl::extract_packed_rows_batch_async<b_default>(
+            rows, {packed.data(), packed.size()}, stream
+        )
+            .has_value()
+    );
+    ASSERT_NO_THROW(stream.sync());
+
+    std::vector<uint64_t> empty_values;
+    std::vector<double> estimate_values;
+    std::vector<uint16_t> count_values, score_values;
+    std::vector<uint32_t> saturation_values, packed_values;
+    ASSERT_TRUE(copy_device_buffer(empty_out, empty_values));
+    ASSERT_TRUE(copy_device_buffer(estimates, estimate_values));
+    ASSERT_TRUE(copy_device_buffer(counts, count_values));
+    ASSERT_TRUE(copy_device_buffer(saturation, saturation_values));
+    ASSERT_TRUE(copy_device_buffer(scores, score_values));
+    ASSERT_TRUE(copy_device_buffer(packed, packed_values));
+
+    for (size_t row = 0; row < row_count; ++row) {
+        uint64_t expected_empty = 0;
+        float restored = 0.0F;
+        for (size_t bucket = 0; bucket < b_default; ++bucket) {
+            auto const value = oracles[row].registers[bucket];
+            EXPECT_EQ(count_values[row * b_default + bucket], cuddl::detail::count(value));
+            EXPECT_EQ(score_values[row * b_default + bucket], winner(value));
+            EXPECT_EQ(packed_values[row * b_default + bucket], value);
+            if (winner(value) == 0U) {
+                ++expected_empty;
+            } else {
+                restored += static_cast<float>(restore_midpoint(winner(value)));
+            }
+        }
+        EXPECT_EQ(empty_values[row], expected_empty);
+        EXPECT_EQ(saturation_values[row], flags[row]);
+        auto const expected = static_cast<double>(cuddl::detail::cardinality_f32(
+            static_cast<float>(b_default), static_cast<float>(expected_empty), restored
+        ));
+        EXPECT_NEAR(estimate_values[row], expected, 1e-6 * std::max(1.0, expected));
+    }
+
+    auto const partial_row = cuddl::cardinality_batch_async<b_default>(
+        {device_store.data(), device_store.size() - 1U},
+        {empty_out.data(), empty_out.size()},
+        {estimates.data(), estimates.size()},
+        stream
+    );
+    EXPECT_FALSE(partial_row.has_value());
+    EXPECT_EQ(partial_row.error().category(), cuddl::ErrorCategory::invalid_argument);
+    auto const undersized = cuddl::winner_counts_batch_async<b_default>(
+        rows, {counts.data(), counts.size() - 1U}, {saturation.data(), saturation.size()}, stream
+    );
+    EXPECT_FALSE(undersized.has_value());
+    EXPECT_EQ(undersized.error().category(), cuddl::ErrorCategory::invalid_argument);
+    EXPECT_TRUE(
+        cuddl::extract_scores_batch_async<b_default>(
+            cuddl::device_span<uint32_t const>{}, cuddl::device_span<uint16_t>{}, stream
+        )
+            .has_value()
+    );
+}
+
 TEST_F(ReferenceDatabaseTest, SparseAndDenseIndexesAgreeAcrossLayoutsAndKeyWidths) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;

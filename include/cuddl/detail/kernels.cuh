@@ -24,6 +24,9 @@ namespace cuddl::detail {
 /// @brief Threads per CTA for the single-pair and cardinality reduction kernels.
 constexpr uint32_t block_size = 256;
 
+/// @brief Stored sketches one batch launch may index, bounded by the CUDA grid dimension.
+constexpr size_t maximum_batch_rows = (size_t{1} << 31) - 1U;
+
 /// @brief Per-thread accumulator feeding a CUB block reduction for fused summaries.
 struct summary_payload {
     pairwise_counts counts{};
@@ -1294,6 +1297,108 @@ __global__ void winner_counts_kernel(
     }
     if (threadIdx.x == 0) {
         *saturation_out = *saturation_in;
+    }
+}
+
+/// @brief Words one stored sketch occupies: `BucketCount` registers then the saturation flag.
+template <size_t BucketCount>
+constexpr size_t stored_sketch_words = BucketCount + 1U;
+
+/// @brief Computes the cardinality of every stored sketch in one launch.
+///
+/// One block reduces one row of the row-major store, so the store's rows must hold
+/// `BucketCount` packed registers followed by the sketch's saturation word.
+template <size_t BucketCount, typename Layout = default_register_layout>
+__global__ void batch_cardinality_kernel(
+    uint32_t const* const registers,
+    uint32_t const row_count,
+    uint64_t* const empty_out,
+    double* const estimates_out
+) {
+    auto const row = static_cast<size_t>(blockIdx.x);
+    if (row >= row_count) {
+        return;
+    }
+    using block_reduce = cub::BlockReduce<cardinality_payload, block_size>;
+    __shared__ typename block_reduce::TempStorage storage;
+    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    cardinality_payload local{};
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        auto const stored = winner(__ldcs(&mine[bucket]));
+        if (stored == 0U) {
+            ++local.empty;
+        } else {
+            local.restored += static_cast<float>(restore_midpoint<Layout>(stored));
+        }
+    }
+    auto const total = block_reduce(storage).Sum(local);
+    if (threadIdx.x == 0) {
+        empty_out[row] = total.empty;
+        estimates_out[row] = static_cast<double>(cardinality_f32(
+            static_cast<float>(BucketCount), static_cast<float>(total.empty), total.restored
+        ));
+    }
+}
+
+/// @brief Extracts winner counts and saturation for every stored sketch in one launch.
+template <size_t BucketCount>
+__global__ void batch_winner_counts_kernel(
+    uint32_t const* const registers,
+    uint32_t const row_count,
+    uint16_t* const counts_out,
+    uint32_t* const saturation_out
+) {
+    auto const row = static_cast<size_t>(blockIdx.x);
+    if (row >= row_count) {
+        return;
+    }
+    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    auto* const counts = counts_out + row * BucketCount;
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        counts[bucket] = count(mine[bucket]);
+    }
+    if (threadIdx.x == 0) {
+        saturation_out[row] = mine[BucketCount];
+    }
+}
+
+/// @brief Copies the winning score of every register into compact row-major scores.
+template <size_t BucketCount>
+__global__ void batch_scores_kernel(
+    uint32_t const* const registers,
+    uint32_t const row_count,
+    uint16_t* const scores_out
+) {
+    auto const row = static_cast<size_t>(blockIdx.x);
+    if (row >= row_count) {
+        return;
+    }
+    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    auto* const scores = scores_out + row * BucketCount;
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        scores[bucket] = winner(__ldcs(&mine[bucket]));
+    }
+}
+
+/// @brief Copies every stored sketch's registers into compact row-major rows.
+template <size_t BucketCount>
+__global__ void batch_packed_rows_kernel(
+    uint32_t const* const registers,
+    uint32_t const row_count,
+    uint32_t* const packed_out
+) {
+    auto const row = static_cast<size_t>(blockIdx.x);
+    if (row >= row_count) {
+        return;
+    }
+    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    auto* const packed = packed_out + row * BucketCount;
+    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
+         bucket += blockDim.x) {
+        packed[bucket] = __ldcs(&mine[bucket]);
     }
 }
 
