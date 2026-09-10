@@ -22,6 +22,12 @@ public final class BBToolsPairwiseAccuracy {
         "reference_bases",
         "query_bases",
         "orientation",
+        "exact_cardinality",
+        "sketch_cardinality",
+        "cardinality_signed_error",
+        "cardinality_absolute_error",
+        "cardinality_relative_error",
+        "cardinality_absolute_relative_error",
         "lower",
         "equal",
         "higher",
@@ -185,6 +191,17 @@ public final class BBToolsPairwiseAccuracy {
         row.put("equal", Integer.toString(equal));
         row.put("higher", Integer.toString(higher));
         row.put("both_empty", Integer.toString(counts[3]));
+        setMetric(
+            row,
+            "exact_cardinality",
+            "sketch_cardinality",
+            "cardinality_signed_error",
+            "cardinality_absolute_error",
+            left.cardinality());
+        final double relativeError = Double.parseDouble(row.get("cardinality_signed_error"))
+            / Double.parseDouble(row.get("exact_cardinality"));
+        row.put("cardinality_relative_error", Double.toString(relativeError));
+        row.put("cardinality_absolute_relative_error", Double.toString(Math.abs(relativeError)));
         setMetric(
             row,
             "exact_containment",

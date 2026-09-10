@@ -72,6 +72,7 @@ struct exact_metrics {
 };
 
 struct error_samples {
+    std::vector<double> cardinality;
     std::vector<double> containment;
     std::vector<double> completeness;
     std::vector<double> wkid;
@@ -348,6 +349,17 @@ void emit_orientation(
         {"exact_set_derived_ani", exact.set_derived_ani},
     };
     emit_metric(
+        output,
+        "cardinality",
+        static_cast<double>(left_size),
+        CUDDL_UNWRAP(left.cardinality(stream)),
+        errors.cardinality
+    );
+    output["cardinality_relative_error"] =
+        output["cardinality_signed_error"].get<double>() / static_cast<double>(left_size);
+    output["cardinality_absolute_relative_error"] =
+        std::abs(output["cardinality_relative_error"].get<double>());
+    emit_metric(
         output, "containment", exact.values.containment, estimate.containment, errors.containment
     );
     emit_metric(
@@ -486,6 +498,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << std::setprecision(8);
+        print_summary("cardinality absolute error", std::move(errors.cardinality));
         print_summary("containment absolute error", std::move(errors.containment));
         print_summary("completeness absolute error", std::move(errors.completeness));
         print_summary("WKID absolute error", std::move(errors.wkid));
