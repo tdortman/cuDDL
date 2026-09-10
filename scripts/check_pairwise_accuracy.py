@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "typer"]
 # ///
-"""Check three-way accuracy output against exact sets and pair orientation."""
+"""Check four-way accuracy output against exact sets and pair orientation."""
 
 import math
 import subprocess
@@ -58,7 +58,7 @@ def main(
 
 def verify(output: Path) -> None:
     rows = flatten_measurements(load_result(output, "pairwise_accuracy"))
-    assert len(rows) == 180, len(rows)
+    assert len(rows) == 240, len(rows)
     cases = {}
     for row in rows:
         key = tuple(
@@ -86,6 +86,16 @@ def verify(output: Path) -> None:
         if row["size_ratio"] == 1 and row["actual_ani"] == 1:
             for metric in ("containment", "completeness", "wkid", "ani"):
                 assert row[f"sketch_{metric}"] == 1, (row["implementation"], metric)
+        if row["implementation"] == "cuco_hll":
+            assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
+            assert row["hll_precision"] == 11
+            left, right = row["sketch_cardinality"], row["sketch_right_cardinality"]
+            assert row["sketch_intersection_raw"] == left + right - row["sketch_union"]
+            assert 0 <= row["sketch_intersection"] <= min(left, right)
+            if row["actual_ani"] == 1 and row["orientation"] == "query_to_reference":
+                assert (
+                    row["sketch_union"] == right
+                )  # The query is a subset of the reference.
         if row["implementation"] == "rabbitsketch":
             assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
             assert row["sketch_size"] == row["buckets"] == 2048
@@ -100,7 +110,7 @@ def verify(output: Path) -> None:
                     row["sketch_ani"] < 1
                 )  # Native Jaccard ANI includes the size imbalance.
     for implementations in cases.values():
-        assert set(implementations) == {"cuddl", "bbtools", "rabbitsketch"}
+        assert set(implementations) == {"cuddl", "bbtools", "rabbitsketch", "cuco_hll"}
         for field in (
             "left_cardinality",
             "right_cardinality",
@@ -112,6 +122,16 @@ def verify(output: Path) -> None:
     for key, implementations in cases.items():
         if key[-1] != "query_to_reference" or key[2] == 1:
             continue
+        hll = implementations["cuco_hll"]
+        reversed_hll = cases[(*key[:-1], "reference_to_query")]["cuco_hll"]
+        for field in (
+            "sketch_union",
+            "sketch_intersection",
+            "sketch_wkid",
+            "sketch_ani",
+        ):
+            assert hll[field] == reversed_hll[field]
+        assert hll["sketch_cardinality"] == reversed_hll["sketch_right_cardinality"]
         forward = implementations["rabbitsketch"]
         reverse = cases[(*key[:-1], "reference_to_query")]["rabbitsketch"]
         assert math.isclose(
@@ -121,7 +141,7 @@ def verify(output: Path) -> None:
         )
         assert forward["sketch_ani"] == reverse["sketch_ani"]
     typer.echo(
-        "PASS: 180 accuracy rows, exact small sets, identical inputs, and both orientations"
+        "PASS: 240 accuracy rows, exact small sets, identical inputs, and both orientations"
     )
 
 
