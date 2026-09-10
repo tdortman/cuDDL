@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "typer"]
 # ///
-"""Run cuDDL and BBTools pairwise accuracy cases into one JSON result."""
+"""Run cuDDL, BBTools, and RabbitSketch accuracy cases into one JSON result."""
 
 import csv
 import hashlib
@@ -160,7 +160,7 @@ FLOAT_FIELDS = {
 }
 COUNT_FIELDS = ("lower", "equal", "higher", "both_empty")
 app = typer.Typer(
-    help="Run both pairwise accuracy implementations on deterministic raw DNA.",
+    help="Compare cuDDL, BBTools, and RabbitSketch on deterministic raw DNA.",
 )
 
 
@@ -381,7 +381,7 @@ def main(
     ] = 8,
     seed: Annotated[int, typer.Option(min=0, help="Root generator seed")] = 42,
 ) -> None:
-    """Build and run both implementations, then publish one JSON result."""
+    """Build and run all three implementations, then publish one JSON result."""
     powers = powers or list(DEFAULT_POWERS)
     ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
     size_ratios = size_ratios or list(DEFAULT_SIZE_RATIOS)
@@ -411,7 +411,16 @@ def main(
     if not bbtools_jar.is_file():
         raise typer.BadParameter(f"BBTools jar does not exist: {bbtools_jar}")
 
-    run(["meson", "compile", "-C", str(build_dir), "cuddl-pairwise-accuracy"])
+    run(
+        [
+            "meson",
+            "compile",
+            "-C",
+            str(build_dir),
+            "cuddl-pairwise-accuracy",
+            "rabbitsketch-pairwise-accuracy",
+        ]
+    )
     cuddl_benchmark = build_dir / "benchmarks/cuddl-pairwise-accuracy"
     if not cuddl_benchmark.is_file():
         raise typer.BadParameter(f"cuDDL benchmark was not built: {cuddl_benchmark}")
@@ -481,6 +490,28 @@ def main(
             capture=True,
         )
         reference_fields, reference = read_csv(io.StringIO(java.stdout))
+        rabbit_json = temporary_dir / "rabbitsketch.json"
+        run(
+            [
+                str(build_dir / "benchmarks/rabbitsketch-pairwise-accuracy"),
+                "--cases",
+                str(cuddl_json),
+                "--output",
+                str(rabbit_json),
+            ]
+        )
+        rabbit_result = benchmark_schema.load_result(rabbit_json, "pairwise_accuracy")
+        rabbit_rows = benchmark_schema.flatten_measurements(rabbit_result)
+        original_rows = benchmark_schema.flatten_measurements(cuddl_result)
+        if len(rabbit_rows) != len(original_rows):
+            raise RuntimeError("RabbitSketch emitted a different number of cases")
+        for index, (original, rabbit) in enumerate(
+            zip(original_rows, rabbit_rows, strict=True)
+        ):
+            if rabbit["implementation"] != "rabbitsketch" or any(
+                original[field] != rabbit[field] for field in KEY_FIELDS
+            ):
+                raise RuntimeError(f"RabbitSketch case metadata differs at row {index}")
 
     if reference_fields != list(CSV_FIELDS):
         raise RuntimeError("BBTools emitted a different CSV schema")
@@ -513,10 +544,20 @@ def main(
             omit_fields=PATH_FIELDS,
         ),
     )
+    rabbit_measurements = benchmark_schema.measurements_from_rows(
+        rabbit_rows,
+        case_fields=(*CASE_FIELDS, "hash_seed", "sketch_size"),
+        omit_fields=PATH_FIELDS,
+    )
+    for normalized, original in zip(
+        rabbit_measurements, rabbit_result["measurements"], strict=True
+    ):
+        normalized["implementation"] = original["implementation"]
+    result["measurements"].extend(rabbit_measurements)
     benchmark_schema.write_result(output, result)
 
     typer.echo(f"Verified {len(rows)} matched raw-DNA pair rows")
-    typer.echo(f"Saved {len(typed_rows)} measurements to {output}")
+    typer.echo(f"Saved {len(result['measurements'])} measurements to {output}")
 
 
 if __name__ == "__main__":
