@@ -282,6 +282,18 @@ def main(
         probe_per_pair_ms = 0.0
         subset_note = "all pairs"
         if need_cub and max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
+            # Probe only estimates per-pair cost. A size-spread handful keeps
+            # argv bounded on huge corpora instead of passing every file.
+            probe_refs = (
+                _spread_pick(references, sizes, 8)
+                if len(references) > 8
+                else references
+            )
+            probe_queries = (
+                _spread_pick(query_list, sizes, 8)
+                if topology == "batch" and len(query_list) > 8
+                else query_list
+            )
             probe_cmd = [
                 str(cub),
                 "--topology",
@@ -292,10 +304,10 @@ def main(
                 "0",
             ]
             if topology == "batch":
-                probe_cmd += ["--reference", *[str(p) for p in references]]
-                probe_cmd += ["--query", *[str(p) for p in query_list]]
+                probe_cmd += ["--reference", *[str(p) for p in probe_refs]]
+                probe_cmd += ["--query", *[str(p) for p in probe_queries]]
             else:
-                probe_cmd += ["--reference", *[str(p) for p in references]]
+                probe_cmd += ["--reference", *[str(p) for p in probe_refs]]
             probe_cmd += [
                 "--max-kmers",
                 str(max_kmers),
