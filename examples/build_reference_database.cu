@@ -61,7 +61,8 @@ int main(int argc, char** argv) {
     uint32_t buckets{};
     unsigned workers = 0;
     CLI::App app{
-        "Build one reference sketch per FASTA/FASTQ file directly in a folder. "
+        "Build one reference sketch per FASTA/FASTQ file in a folder, recursing into "
+        "subdirectories. "
         "Recognized extensions: .fa, .fna, .fasta, .ffn, .frn, .fq, .fastq (case-insensitive). "
         "Gzip/BGZF inputs may additionally end in .gz, .bgz, or .bgzf. "
         "Files are sorted by path to assign reference IDs."
@@ -83,7 +84,9 @@ int main(int argc, char** argv) {
 
     try {
         std::vector<std::filesystem::path> paths;
-        for (auto const& entry : std::filesystem::directory_iterator(folder)) {
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(
+                 folder, std::filesystem::directory_options::skip_permission_denied
+             )) {
             if (!entry.is_regular_file()) continue;
             auto filename = entry.path().filename().string();
             std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char c) {
