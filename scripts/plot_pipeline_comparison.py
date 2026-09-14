@@ -174,6 +174,8 @@ def main(
         rows = [read_pipeline(path) for path in paths]
         if len(rows) < 2:
             raise ValueError("provide at least two pipeline reports")
+        if "cuddl" not in {row["implementation"] for row in rows}:
+            raise ValueError("no cuDDL pipeline included, nothing to compare against")
         if any(workload(row) != workload(rows[0]) for row in rows[1:]):
             raise ValueError(
                 "reports must match inputs, k, topology, cache policy, ingest mode, resident input, batch contract and host hardware"

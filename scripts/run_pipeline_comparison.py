@@ -139,8 +139,16 @@ def main(
     ] = None,
     implementations: Annotated[
         str,
-        typer.Option(help="Comma-separated implementations to run: cuddl, rabbitsketch"),
+        typer.Option(help="Comma-separated implementations to run: cuddl, rabbitsketch, hypergen"),
     ] = "cuddl,rabbitsketch",
+    hypergen_bin: Annotated[
+        Path | None,
+        typer.Option(help="HyperGen binary; default: build/subprojects/hypergen/hyper-gen"),
+    ] = None,
+    hypergen_device: Annotated[
+        str,
+        typer.Option(help="HyperGen sketch device: cpu or gpu"),
+    ] = "cpu",
     ingest: Annotated[
         str,
         typer.Option(help="cuDDL ingestion: packed, or sequence for a large corpus"),
@@ -162,7 +170,7 @@ def main(
         ),
     ] = 0,
 ) -> None:
-    """Build and run both implementations at k=25 and 4,096 buckets/entries."""
+    """Build and run the selected implementations at k=25 and 4,096 buckets/entries."""
     inputs = inputs or []
     if inputs and (reference or query):
         raise typer.BadParameter(
@@ -223,7 +231,7 @@ def main(
             "output directory already contains JSON reports; use a new directory"
         )
     selected = [name.strip() for name in implementations.split(",") if name.strip()]
-    unknown = [name for name in selected if name not in ("cuddl", "rabbitsketch")]
+    unknown = [name for name in selected if name not in ("cuddl", "rabbitsketch", "hypergen")]
     if unknown or not selected:
         raise typer.BadParameter(f"unknown implementations: {', '.join(unknown) or 'none'}")
     if ingest not in ("packed", "sequence"):
@@ -259,6 +267,7 @@ def main(
         for implementation, query_files in (
             ("cuddl", gpu_queries),
             ("rabbitsketch", queries),
+            ("hypergen", queries),
         ):
             if implementation not in selected:
                 continue
@@ -358,9 +367,37 @@ def main(
                     ],
                 )
             )
+        if "hypergen" in selected:
+            if hypergen_device not in ("cpu", "gpu"):
+                raise typer.BadParameter("hypergen-device must be cpu or gpu")
+            commands.append(
+                (
+                    "hypergen.json",
+                    [
+                        "uv",
+                        "run",
+                        "--script",
+                        str(ROOT / "scripts/hypergen_pipeline.py"),
+                        "--topology",
+                        topology,
+                        "--samples",
+                        str(samples),
+                        "--warmups",
+                        str(warmups),
+                        "--k",
+                        "25",
+                        "--hv-dim",
+                        "4096",
+                        "--device",
+                        hypergen_device,
+                        *(["--threads", str(threads)] if threads is not None else []),
+                        *(["--hypergen-bin", str(hypergen_bin)] if hypergen_bin is not None else []),
+                    ],
+                )
+            )
         for name, command in commands:
             report = Path(temporary) / name
-            implementation = "rabbitsketch" if name == "rabbitsketch.json" else "cuddl"
+            implementation = "cuddl" if name.startswith("cuddl-") else name.removesuffix(".json")
             run(
                 [
                     *command,
