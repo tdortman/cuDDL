@@ -1,34 +1,50 @@
 cmake = import('cmake')
-rabbitsketch_opts = cmake.subproject_options()
-rabbitsketch_opts.add_cmake_defines(
-    {
-        'CXXAPI': true,
-        'RABBITSKETCH_BUILD_TESTS': false,
-        'RABBITSKETCH_NATIVE_ARCH': true,
-    },
-)
-rabbitsketch_project = cmake.subproject('rabbitsketch', options: rabbitsketch_opts)
-rabbitsketch_dep = rabbitsketch_project.dependency('rabbitsketch_static')
-rabbitsketch_revision = import('fs').read('../subprojects/rabbitsketch.wrap').split('revision = ')[1].split('\n')[0]
-executable(
-    'rabbitsketch-pairwise-accuracy',
-    'rabbitsketch_pairwise_accuracy.cpp',
-    cpp_args: ['-DRABBITSKETCH_REVISION="' + rabbitsketch_revision + '"'],
-    dependencies: [rabbitsketch_dep, cli11_dep, nlohmann_json_dep],
-    install: false,
-)
-executable(
-    'rabbitsketch-pipeline-benchmark',
-    'rabbitsketch_pipeline_benchmark.cpp',
-    cpp_args: ['-DRABBITSKETCH_REVISION="' + rabbitsketch_revision + '"'],
-    dependencies: [rabbitsketch_dep, cli11_dep, nlohmann_json_dep, cuddl_dep, nvbench_dep, dependency('openmp')],
-    install: false,
-)
+# RabbitSketch and Dashing2 are x86-only: unguarded x86 intrinsics and
+# hard `-mavx2`/`-msse` flags. Skip them on ARM hosts such as Grace
+# Hopper. Nothing links them at build time; scripts resolve the
+# binaries by path.
+build_x86_tools = host_machine.cpu_family() in ['x86', 'x86_64']
+if build_x86_tools
+    rabbitsketch_opts = cmake.subproject_options()
+    rabbitsketch_opts.add_cmake_defines(
+        {
+            'CXXAPI': true,
+            'RABBITSKETCH_BUILD_TESTS': false,
+            'RABBITSKETCH_NATIVE_ARCH': true,
+        },
+    )
+    rabbitsketch_project = cmake.subproject('rabbitsketch', options: rabbitsketch_opts)
+    rabbitsketch_dep = rabbitsketch_project.dependency('rabbitsketch_static')
+    rabbitsketch_revision = import('fs').read('../subprojects/rabbitsketch.wrap').split('revision = ')[1].split('\n')[0]
+    executable(
+        'rabbitsketch-pairwise-accuracy',
+        'rabbitsketch_pairwise_accuracy.cpp',
+        cpp_args: ['-DRABBITSKETCH_REVISION="' + rabbitsketch_revision + '"'],
+        dependencies: [rabbitsketch_dep, cli11_dep, nlohmann_json_dep],
+        install: false,
+    )
+    executable(
+        'rabbitsketch-pipeline-benchmark',
+        'rabbitsketch_pipeline_benchmark.cpp',
+        cpp_args: ['-DRABBITSKETCH_REVISION="' + rabbitsketch_revision + '"'],
+        dependencies: [
+            rabbitsketch_dep,
+            cli11_dep,
+            nlohmann_json_dep,
+            cuddl_dep,
+            nvbench_dep,
+            dependency('openmp'),
+        ],
+        install: false,
+    )
+endif
 
 cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
 hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
 skani_bin = subproject('skani').get_variable('skani_binary')
-dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
+if build_x86_tools
+    dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
+endif
 executable(
     'cub-exact-pairwise',
     'cub_exact_pairwise.cu',
