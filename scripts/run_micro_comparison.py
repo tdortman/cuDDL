@@ -308,19 +308,10 @@ def main(
         # Compare, truth, and search stay on the budget subset.
         sketch_references = list(references)
         sketch_queries = list(query_list)
-        if need_cub and max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
+
+        def cub_probe_rate(probe_refs, probe_queries) -> float:
             # Probe only estimates per-pair cost. A size-spread handful keeps
             # argv bounded on huge corpora instead of passing every file.
-            probe_refs = (
-                _spread_pick(references, sizes, 8)
-                if len(references) > 8
-                else references
-            )
-            probe_queries = (
-                _spread_pick(query_list, sizes, 8)
-                if topology == "batch" and len(query_list) > 8
-                else query_list
-            )
             probe_cmd = [
                 str(cub),
                 "--topology",
@@ -374,6 +365,57 @@ def main(
                 )
             if probe_per_pair_ms <= 0:
                 probe_per_pair_ms = probe_wall2_ms / max(probe_eval2, 1)
+            return probe_per_pair_ms
+
+        def skani_probe_rate() -> float:
+            # No cub oracle selected: rate the skani ANI truth over a
+            # size-spread slice so large corpora still subset. Self-pairs and
+            # unrefined rows make this overestimate the per-pair cost, which
+            # only tightens the subset.
+            slice_refs = (
+                _spread_pick(references, sizes, 16) if len(references) > 16 else references
+            )
+            slice_queries = (
+                _spread_pick(query_list, sizes, 16)
+                if topology == "batch" and len(query_list) > 16
+                else query_list
+            )
+            if topology == "batch":
+                pairs = len(slice_queries) * len(slice_refs)
+            else:
+                slice_queries = slice_refs
+                pairs = max(1, len(slice_refs) * (len(slice_refs) - 1) // 2)
+            tick = time.perf_counter()
+            run(
+                [
+                    str(skani),
+                    "dist",
+                    "-q",
+                    *[str(p) for p in slice_queries],
+                    "-r",
+                    *[str(p) for p in slice_refs],
+                    "-o",
+                    str(work / "skani-probe.tsv"),
+                    "-t",
+                    str(threads),
+                ]
+            )
+            return (time.perf_counter() - tick) * 1000 / pairs
+
+        if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
+            probe_refs = (
+                _spread_pick(references, sizes, 8) if len(references) > 8 else references
+            )
+            probe_queries = (
+                _spread_pick(query_list, sizes, 8)
+                if topology == "batch" and len(query_list) > 8
+                else query_list
+            )
+            probe_per_pair_ms = (
+                cub_probe_rate(probe_refs, probe_queries)
+                if need_cub
+                else skani_probe_rate()
+            )
             capacity = int(
                 budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
             )
@@ -441,7 +483,7 @@ def main(
         else:
             oracle = {}
         typer.echo(
-            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.1f} gpu={gpu_name}"
+            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} gpu={gpu_name}"
         )
         autoscale_case = {
             "threads": threads,
