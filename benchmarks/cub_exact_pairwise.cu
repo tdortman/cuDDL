@@ -1,11 +1,12 @@
 // cub-exact-pairwise: exact k-mer set baseline from CUB device primitives.
 //
 // Parses FASTA files with the cuDDL parser (k=25 canonical packed k-mers)
-// one genome at a time, so host memory stays bounded: only cardinalities
-// and k-mer counts are retained, never the packed arrays. Per genome:
-// upload, CUB radix sort, run-length encode; the run count is the exact
-// distinct cardinality. Per evaluated pair: re-parse both genomes,
-// concatenate on device, sort, run-length encode; the run count is the exact
+// one genome at a time. Genomes touched by evaluated pairs keep their
+// packed arrays; the rest stream through for distinct counts only, so
+// host memory stays bounded by the evaluated set. Per genome: upload,
+// CUB radix sort, run-length encode; the run count is the exact
+// distinct cardinality. Per evaluated pair: concatenate on device, sort,
+// run-length encode; the run count is the exact
 // union cardinality, so shared = |A| + |B| - union. No custom kernels:
 // sort and encode are CUB device-wide calls. The only downloads are one
 // integer per stage; pair metrics are host math.
@@ -31,6 +32,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -155,6 +157,15 @@ int run_main(
     if (!evaluated.empty() && evaluated.back() != total_pairs - 1) {
         evaluated.push_back(total_pairs - 1);
     }
+    // Genomes touched by evaluated pairs keep their packed arrays across the
+    // pair loop; the rest stream through for distinct counts only.
+    std::vector<char> needed(genomes, 0);
+    for (size_t ordinal : evaluated) {
+        auto const [qa, rb] = pair_at(ordinal);
+        needed[qa] = 1;
+        needed[rb] = 1;
+    }
+    std::vector<std::vector<uint64_t>> stashed(genomes);
 
     device_buffer work, uniques, run_counts, concat, pair_uniques, pair_counts, num_runs_dev, temp;
     size_t max_keys = 0, max_pair = 0, temp_bytes = 0;
@@ -212,6 +223,7 @@ int run_main(
             }
             CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
             distinct[g] = count ? fetch_runs() : 0;
+            if (needed[g]) stashed[g] = std::move(packed);
         }
         // Pair buffers sized from the largest evaluated pair actually measured.
         for (size_t ordinal : evaluated) {
@@ -229,10 +241,9 @@ int run_main(
         pair_rows = json::array();
         for (size_t ordinal : evaluated) {
             auto const [a, r] = pair_at(ordinal);
-            // Re-parse on demand; the OS page cache absorbs repeat reads and
-            // host RAM stays bounded by two genomes plus device buffers.
-            auto packed_a = parse_one(a);
-            auto packed_r = parse_one(r);
+            // Packed arrays were stashed during the sketch pass above.
+            auto const& packed_a = stashed[a];
+            auto const& packed_r = stashed[r];
             size_t shared = 0;
             if (distinct[a] && distinct[r]) {
                 auto* keys = static_cast<uint64_t*>(concat.data);
