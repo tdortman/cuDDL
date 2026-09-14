@@ -1,0 +1,5 @@
+# Vendored crate sources must stay byte-identical to the published `.crate`
+# archives: cargo verifies every file against `.cargo-checksum.json`, and any
+# line-ending normalisation makes the build fail with "listed checksum ... has
+# changed".
+subprojects/packagefiles/rust/vendor/** -text
