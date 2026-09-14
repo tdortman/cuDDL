@@ -29,6 +29,13 @@ cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
 hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
 skani_bin = subproject('skani').get_variable('skani_binary')
 dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
+executable(
+    'cub-exact-pairwise',
+    'cub_exact_pairwise.cu',
+    dependencies: [cuddl_dep, cli11_dep, nlohmann_json_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
 
 executable(
     'cuddl-reference-build-benchmark',
