@@ -92,6 +92,7 @@ _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
 _PROBE_PAIRS = 3  # stride-spread pairs timed to size the evaluated set
+_PROBE_PAIRS_HIGH = 12  # second probe size for the fixed-cost-canceling delta
 _PROBE_MIN_PAIRS = 12  # at or below this, skip the probe and run everything
 _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
 _CHUNK_BUDGET_BYTES = 256 << 20  # per-invocation truth output target
@@ -326,7 +327,27 @@ def main(
             probe_eval = jsonlib_probe.loads((work / "probe.json").read_text())["case"][
                 "pairs_evaluated"
             ]
-            probe_per_pair_ms = probe_wall_ms / max(probe_eval, 1)
+            # Second probe at more pairs on the same files. Fixed costs
+            # (startup, CUDA init, parsing) cancel in the delta, leaving
+            # the true per-pair rate. A single-point rate attributes all
+            # fixed cost to each pair and undersamples by orders.
+            probe_cmd2 = list(probe_cmd)
+            probe_cmd2[probe_cmd2.index("--max-pairs") + 1] = str(_PROBE_PAIRS_HIGH)
+            probe_cmd2[probe_cmd2.index("--match-rows") + 1] = "64"
+            probe_cmd2[probe_cmd2.index("--output") + 1] = str(work / "probe2.json")
+            tick2 = time.perf_counter()
+            run(probe_cmd2)
+            probe_wall2_ms = (time.perf_counter() - tick2) * 1000
+            probe_eval2 = jsonlib_probe.loads((work / "probe2.json").read_text())[
+                "case"
+            ]["pairs_evaluated"]
+            probe_per_pair_ms = 0.0
+            if probe_eval2 > probe_eval:
+                probe_per_pair_ms = (probe_wall2_ms - probe_wall_ms) / (
+                    probe_eval2 - probe_eval
+                )
+            if probe_per_pair_ms <= 0:
+                probe_per_pair_ms = probe_wall2_ms / max(probe_eval2, 1)
             capacity = int(
                 budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
             )
