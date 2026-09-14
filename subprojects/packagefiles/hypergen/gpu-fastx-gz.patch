@@ -1,0 +1,44 @@
+diff --git a/src/fastx_reader.rs b/src/fastx_reader.rs
+index e3736fb..8a25752 100644
+--- a/src/fastx_reader.rs
++++ b/src/fastx_reader.rs
+@@ -1,28 +1,19 @@
+-use std::fs::File;
+-use std::io::{BufRead, BufReader};
+ use std::path::PathBuf;
+ 
+-// Read merged sequences from a genome file into single u8 vector
++use needletail::{parse_fastx_file, Sequence};
++
++// Read merged sequences from a genome file into single u8 vector.
++// needletail sniffs compression by magic bytes, so gzipped FASTA works
++// transparently. Raw record bytes are kept unnormalized to match the
++// previous plain-text reader output exactly.
+ pub fn read_merge_seq(file_name: &PathBuf) -> Vec<u8> {
+     let mut fna_seqs = Vec::<u8>::new();
+ 
+-    let file = File::open(file_name).unwrap();
+-    let mut reader = BufReader::new(file);
+-
+-    let mut buf = String::new();
+-    while reader.read_line(&mut buf).unwrap() > 0 {
+-        if !buf.starts_with('>') {
+-            if buf.ends_with('\n') {
+-                buf.pop(); // remove \n character
+-            }
+-            if buf.ends_with('\r') {
+-                buf.pop();
+-            }
+-            fna_seqs.extend_from_slice(buf.as_bytes());
+-        } else {
+-            fna_seqs.push(b'N');
+-        }
+-        buf.clear();
++    let mut reader = parse_fastx_file(file_name).expect("genome file must open and parse");
++    while let Some(record) = reader.next() {
++        let seqrec = record.expect("invalid record in genome file");
++        fna_seqs.push(b'N');
++        fna_seqs.extend_from_slice(&seqrec.seq());
+     }
+ 
+     fna_seqs
