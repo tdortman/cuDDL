@@ -76,7 +76,7 @@ def discover(directory: Path) -> list[Path]:
     files = {
         path
         for ext in exts
-        for path in (*directory.glob(f"*{ext}"), *directory.glob(f"*{ext}.gz"))
+        for path in (*directory.rglob(f"*{ext}"), *directory.rglob(f"*{ext}.gz"))
         if path.is_file()
     }
     return sorted(files)
