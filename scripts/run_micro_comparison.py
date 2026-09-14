@@ -203,7 +203,18 @@ def main(
     cub = build / "benchmarks/cub-exact-pairwise"
     refbuild = build / "benchmarks/cuddl-reference-build-benchmark"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
-    for binary in (hypergen, skani, dashing2, cub, refbuild, rabbit):
+    required = [skani]  # ANI oracle runs for every selection
+    if "hypergen" in selected:
+        required.append(hypergen)
+    if "dashing2" in selected:
+        required.append(dashing2)
+    if "cub-exact" in selected:
+        required.append(cub)
+    if "cuddl" in selected:
+        required.append(refbuild)
+    if "rabbitsketch" in selected:
+        required.append(rabbit)
+    for binary in required:
         if not binary.exists():
             raise typer.BadParameter(f"missing binary, build first: {binary}")
 
