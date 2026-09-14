@@ -82,16 +82,10 @@ def discover(directory: Path) -> list[Path]:
     return sorted(files)
 
 
-def pairs_for(
-    references: list[Path], queries: list[Path], topology: str
-) -> list[tuple[Path, Path]]:
+def count_pairs(references: list[Path], queries: list[Path], topology: str) -> int:
     if topology == "all-to-all":
-        return [
-            (references[i], references[j])
-            for i in range(len(references))
-            for j in range(i + 1, len(references))
-        ]
-    return [(q, r) for q in queries for r in references]
+        return len(references) * (len(references) - 1) // 2
+    return len(queries) * len(references)
 
 
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
@@ -228,6 +222,7 @@ def main(
         sizes = {
             p: _est_genome_bases(p) for p in dict.fromkeys([*references, *query_list])
         }
+        typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
         auto_flags = {
             "threads": threads is None,
             "max_kmers": max_kmers is None,
@@ -261,7 +256,7 @@ def main(
                 gpu_name, _ = _gpu_free_bytes()
             except Exception:
                 pass
-        orig_pairs = len(pairs_for(references, query_list, topology))
+        orig_pairs = count_pairs(references, query_list, topology)
         probe_per_pair_ms = 0.0
         subset_note = "all pairs"
         if need_cub and max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
@@ -314,7 +309,7 @@ def main(
             max_pairs = 0
         elif max_pairs is None:
             max_pairs = 0
-        total_pairs = len(pairs_for(references, query_list, topology))
+        total_pairs = count_pairs(references, query_list, topology)
         if subset_note != "all pairs":
             subset_note = f"subset {total_pairs}/{orig_pairs}"
         if match_rows is None:
