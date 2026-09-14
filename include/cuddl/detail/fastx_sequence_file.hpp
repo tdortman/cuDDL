@@ -549,20 +549,38 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
         static_cast<unsigned char>(data[1]) == 0x8b) {
-        // zlib's gzread reports truncation as EOF. Check zlib errors here so
-        // truncated or corrupt genomes cannot silently produce a partial database.
+        // zlib reports Z_BUF_ERROR on the final partial read of valid
+        // streams too, so that status alone cannot end the loop. Other
+        // failures (Z_DATA_ERROR, Z_ERRNO, ...) still abort here; clean
+        // end and truncation are told apart by the gzip trailer below.
         std::unique_ptr<gzFile_s, decltype(&gzclose)> input{gzopen(path.c_str(), "rb"), &gzclose};
         if (!input) return Err(Error::resource("cannot open gzip FASTX file: " + path));
         char chunk[65536];
+        size_t total = 0;
         while (true) {
             auto const size = gzread(input.get(), chunk, sizeof(chunk));
             int status{};
             auto const message = gzerror(input.get(), &status);
-            if (size < 0 || (status != Z_OK && status != Z_STREAM_END)) {
+            if (size < 0 || (status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR)) {
                 return Err(Error::invalid_argument("gzip FASTX error: " + std::string(message)));
             }
             if (size == 0) break;
+            total += static_cast<size_t>(size);
             decompressed.append(chunk, static_cast<size_t>(size));
+        }
+        // ISIZE holds the uncompressed length mod 2^32 over all members.
+        // Truncated streams decompress short, which no zlib status reports.
+        if (data.size() < 8) {
+            return Err(Error::invalid_argument("gzip FASTX error: truncated stream: " + path));
+        }
+        size_t const tail = data.size() - 4;
+        auto const byte = [&](size_t i) {
+            return static_cast<uint32_t>(static_cast<unsigned char>(data[i]));
+        };
+        uint32_t const isize =
+            byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
+        if (static_cast<uint32_t>(total) != isize) {
+            return Err(Error::invalid_argument("gzip FASTX error: truncated stream: " + path));
         }
         data = decompressed;
     }
