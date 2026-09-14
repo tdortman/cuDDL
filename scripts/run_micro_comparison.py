@@ -236,27 +236,35 @@ def main(
             "skani_chunk": skani_chunk is None,
         }
         threads = threads or _cpu_count()
-        try:
-            gpu_name, gpu_free = _gpu_free_bytes()
-        except Exception as error:
-            raise typer.BadParameter(
-                f"auto caps need nvidia-smi ({error}); pass caps explicitly"
-            ) from error
-        if max_kmers is None:
-            # Worst pair holds two max-size genomes at ~32 device bytes/key.
-            max_kmers = int(_VRAM_FRACTION * gpu_free / (2 * _CUB_BYTES_PER_KEY))
-        for path, est in sizes.items():
-            if path.suffix == ".gz" and est > max_kmers // 3:
-                sizes[path] = est = _exact_gz_bases(path)
-        over = sorted(str(p) for p, est in sizes.items() if est > max_kmers)
-        if over:
-            raise typer.BadParameter(
-                f"genomes exceed VRAM-derived max-kmers={max_kmers}: {', '.join(over)}"
-            )
+        need_cub = "cub-exact" in selected
+        gpu_name = "none"
+        if need_cub:
+            try:
+                gpu_name, gpu_free = _gpu_free_bytes()
+            except Exception as error:
+                raise typer.BadParameter(
+                    f"auto caps need nvidia-smi ({error}); pass caps explicitly"
+                ) from error
+            if max_kmers is None:
+                # Worst pair holds two max-size genomes at ~32 device bytes/key.
+                max_kmers = int(_VRAM_FRACTION * gpu_free / (2 * _CUB_BYTES_PER_KEY))
+            for path, est in sizes.items():
+                if path.suffix == ".gz" and est > max_kmers // 3:
+                    sizes[path] = est = _exact_gz_bases(path)
+            over = sorted(str(p) for p, est in sizes.items() if est > max_kmers)
+            if over:
+                raise typer.BadParameter(
+                    f"genomes exceed VRAM-derived max-kmers={max_kmers}: {', '.join(over)}"
+                )
+        else:
+            try:
+                gpu_name, _ = _gpu_free_bytes()
+            except Exception:
+                pass
         orig_pairs = len(pairs_for(references, query_list, topology))
         probe_per_pair_ms = 0.0
         subset_note = "all pairs"
-        if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
+        if need_cub and max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_cmd = [
                 str(cub),
                 "--topology",
@@ -319,34 +327,37 @@ def main(
             str(p) for p in query_list if p not in references
         ]
 
-        cub_oracle = work / "oracle.json"
-        oracle_cmd = [str(cub), "--topology", topology, "--samples", "1"]
-        if topology == "batch":
-            oracle_cmd += ["--reference", *[str(p) for p in references]]
-            oracle_cmd += ["--query", *[str(p) for p in query_list]]
-        else:
-            oracle_cmd += ["--reference", *[str(p) for p in references]]
-        oracle_cmd += [
-            "--max-kmers",
-            str(max_kmers),
-            "--max-pairs",
-            str(max_pairs),
-            "--match-rows",
-            str(match_rows),
-            "--output",
-            str(cub_oracle),
-        ]
-        oracle_tick = time.perf_counter()
-        run(oracle_cmd)
-        oracle_wall_ms = (time.perf_counter() - oracle_tick) * 1000
-        import json as jsonlib
+        if need_cub:
+            cub_oracle = work / "oracle.json"
+            oracle_cmd = [str(cub), "--topology", topology, "--samples", "1"]
+            if topology == "batch":
+                oracle_cmd += ["--reference", *[str(p) for p in references]]
+                oracle_cmd += ["--query", *[str(p) for p in query_list]]
+            else:
+                oracle_cmd += ["--reference", *[str(p) for p in references]]
+            oracle_cmd += [
+                "--max-kmers",
+                str(max_kmers),
+                "--max-pairs",
+                str(max_pairs),
+                "--match-rows",
+                str(match_rows),
+                "--output",
+                str(cub_oracle),
+            ]
+            oracle_tick = time.perf_counter()
+            run(oracle_cmd)
+            oracle_wall_ms = (time.perf_counter() - oracle_tick) * 1000
+            import json as jsonlib
 
-        oracle = {
-            (row["query"], row["reference"]): row
-            for row in jsonlib.loads(cub_oracle.read_text())["pairs"]
-        }
-        if not probe_per_pair_ms:
-            probe_per_pair_ms = oracle_wall_ms / max(len(oracle), 1)
+            oracle = {
+                (row["query"], row["reference"]): row
+                for row in jsonlib.loads(cub_oracle.read_text())["pairs"]
+            }
+            if not probe_per_pair_ms:
+                probe_per_pair_ms = oracle_wall_ms / max(len(oracle), 1)
+        else:
+            oracle = {}
         typer.echo(
             f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.1f} gpu={gpu_name}"
         )
