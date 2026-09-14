@@ -174,12 +174,22 @@ def main(
     match_rows: Annotated[int | None, typer.Option(min=0)] = None,
     skani_chunk: Annotated[int | None, typer.Option(min=1)] = None,
     budget_secs: Annotated[float, typer.Option(min=1)] = 600,
+    sketch_all: Annotated[
+        bool, typer.Option(help="Sketch the full discovered corpus; compare stays on subset.")
+    ] = False,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if topology not in ("batch", "all-to-all"):
         raise typer.BadParameter("topology must be batch or all-to-all")
     references = discover(genomes)
-    query_list = sorted({q for paths in (queries or []) for q in paths if q.is_file()})
+    query_list = sorted(
+        {
+            q
+            for p in (queries or [])
+            for q in ([p] if p.is_file() else p.rglob("*"))
+            if q.is_file()
+        }
+    )
     if query_fraction is not None and topology != "batch":
         raise typer.BadParameter("query-fraction needs batch topology")
     if query_fraction is not None and not 0 < query_fraction <= 1:
@@ -282,6 +292,10 @@ def main(
         orig_pairs = count_pairs(references, query_list, topology)
         probe_per_pair_ms = 0.0
         subset_note = "all pairs"
+        # --sketch-all keeps the full discovered corpus for sketch lanes.
+        # Compare, truth, and search stay on the budget subset.
+        sketch_references = list(references)
+        sketch_queries = list(query_list)
         if need_cub and max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             # Probe only estimates per-pair cost. A size-spread handful keeps
             # argv bounded on huge corpora instead of passing every file.
@@ -376,6 +390,12 @@ def main(
         file_args = [str(p) for p in references] + [
             str(p) for p in query_list if p not in references
         ]
+        if not sketch_all:
+            sketch_references = references
+            sketch_queries = query_list
+        sketch_file_args = [str(p) for p in sketch_references] + [
+            str(p) for p in sketch_queries if p not in sketch_references
+        ]
 
         if need_cub:
             cub_oracle = work / "oracle.json"
@@ -466,13 +486,13 @@ def main(
                     "case": {
                         "measurement": "micro-sketch",
                         "topology": topology,
-                        "genomes": len(file_args),
+                        "genomes": len(sketch_file_args),
                         "k": sketch_k.get(tool, 0),
                         "threads": threads,
                     },
                     "timings": {"wall": summarize(marks)},
                     "metrics": {
-                        "per_genome_ms": statistics.median(marks) / len(file_args),
+                        "per_genome_ms": statistics.median(marks) / len(sketch_file_args),
                         **(extra or {}),
                     },
                 }
@@ -480,54 +500,68 @@ def main(
 
         if "hypergen" in selected:
             staged_to_real = {}
-            for role, files in (("hgrefs", references), ("hgqueries", query_list)):
-                role_dir = work / role
-                role_dir.mkdir(exist_ok=True)
-                for path in files:
-                    link = role_dir / path.name
-                    if link.is_symlink() or link.exists():
-                        link.unlink()
-                    link.symlink_to(path.resolve())
-                    staged_to_real[str(link)] = str(path)
-            sketch_cmds = [
-                [
-                    str(hypergen),
-                    "sketch",
-                    "-p",
-                    str(work / "hgrefs"),
-                    "-o",
-                    str(work / "hgr.sk"),
-                    "-t",
-                    str(threads),
-                    "-k",
-                    "25",
-                ]
-            ]
-            if topology == "batch":
-                sketch_cmds.append(
+            # (suffix, refs, queries): full-corpus sketch supplies timing in
+            # sketch-all mode while the subset sketch feeds dist.
+            hg_runs = [("", references, query_list)]
+            if sketch_all:
+                hg_runs.insert(0, ("-full", sketch_references, sketch_queries))
+            hg_marks = {}
+            for suffix, refs, queries in hg_runs:
+                for role, files in (
+                    (f"hgrefs{suffix}", refs),
+                    (f"hgqueries{suffix}", queries),
+                ):
+                    role_dir = work / role
+                    role_dir.mkdir(exist_ok=True)
+                    for n, path in enumerate(files):
+                        link = role_dir / f"{n}_{path.name}"
+                        if link.is_symlink() or link.exists():
+                            link.unlink()
+                        link.symlink_to(path.resolve())
+                        staged_to_real[str(link)] = str(path)
+                sketch_cmds = [
                     [
                         str(hypergen),
                         "sketch",
                         "-p",
-                        str(work / "hgqueries"),
+                        str(work / f"hgrefs{suffix}"),
                         "-o",
-                        str(work / "hgq.sk"),
+                        str(work / f"hgr{suffix}.sk"),
                         "-t",
                         str(threads),
                         "-k",
                         "25",
                     ]
-                )
-            marks = wall_of(sketch_cmds, samples, warmups)
+                ]
+                if topology == "batch":
+                    sketch_cmds.append(
+                        [
+                            str(hypergen),
+                            "sketch",
+                            "-p",
+                            str(work / f"hgqueries{suffix}"),
+                            "-o",
+                            str(work / f"hgq{suffix}.sk"),
+                            "-t",
+                            str(threads),
+                            "-k",
+                            "25",
+                        ]
+                    )
+                hg_marks[suffix] = wall_of(sketch_cmds, samples, warmups)
+            timed_suffix = "-full" if sketch_all else ""
+            marks = hg_marks[timed_suffix]
             sketch_times["hypergen"] = marks
-            sketch_bytes["hypergen"] = (work / "hgr.sk").stat().st_size
+            sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
             if topology == "batch":
-                sketch_bytes["hypergen"] += (work / "hgq.sk").stat().st_size
+                sketch_bytes["hypergen"] += (work / f"hgq{timed_suffix}.sk").stat().st_size
             record_sketch(
                 "hypergen", "cpu", marks, {"sketch_bytes": sketch_bytes["hypergen"]}
             )
         if "skani" in selected:
             marks = []
+            sketch_list = work / "skani-list.txt"
+            sketch_list.write_text("".join(p + "\n" for p in sketch_file_args))
             for rep in range(warmups + samples):
                 out_dir = work / f"skdb{rep}"
                 tick = time.perf_counter()
@@ -535,7 +569,8 @@ def main(
                     [
                         str(skani),
                         "sketch",
-                        *file_args,
+                        "-l",
+                        str(sketch_list),
                         "-o",
                         str(out_dir),
                         "-t",
@@ -556,31 +591,44 @@ def main(
             )
 
         if "dashing2" in selected:
-            marks = []
-            for rep in range(warmups + samples):
-                out_dir = work / f"d2_{rep}"
-                out_dir.mkdir(exist_ok=True)
-                tick = time.perf_counter()
-                run(
-                    [
-                        str(dashing2),
-                        "sketch",
-                        "-k25",
-                        "-S4096",
-                        f"-p{threads}",
-                        "--cache",
-                        "--outprefix",
-                        str(out_dir),
-                        *file_args,
-                    ]
-                )
-                done = time.perf_counter()
-                if rep >= warmups:
-                    marks.append((done - tick) * 1000)
+            # (suffix, args): full-corpus sketch supplies timing in sketch-all
+            # mode while the subset sketch feeds cmp.
+            d2_runs = [("", file_args)]
+            if sketch_all:
+                d2_runs.insert(0, ("-full", sketch_file_args))
+            d2_marks = {}
+            for suffix, args in d2_runs:
+                list_path = work / f"d2list{suffix}.txt"
+                list_path.write_text("".join(p + "\n" for p in args))
+                rep_marks = []
+                for rep in range(warmups + samples):
+                    out_dir = work / f"d2{suffix}_{rep}"
+                    out_dir.mkdir(exist_ok=True)
+                    tick = time.perf_counter()
+                    run(
+                        [
+                            str(dashing2),
+                            "sketch",
+                            "-k25",
+                            "-S4096",
+                            f"-p{threads}",
+                            "--cache",
+                            "--outprefix",
+                            str(out_dir),
+                            "-F",
+                            str(list_path),
+                        ]
+                    )
+                    done = time.perf_counter()
+                    if rep >= warmups:
+                        rep_marks.append((done - tick) * 1000)
+                d2_marks[suffix] = rep_marks
+            timed_suffix = "-full" if sketch_all else ""
+            marks = d2_marks[timed_suffix]
             sketch_times["dashing2"] = marks
             sketch_bytes["dashing2"] = sum(
                 p.stat().st_size
-                for p in (work / f"d2_{warmups + samples - 1}").rglob("*")
+                for p in (work / f"d2{timed_suffix}_{warmups + samples - 1}").rglob("*")
                 if p.is_file()
             )
             record_sketch(
@@ -592,11 +640,22 @@ def main(
 
         if "cuddl" in selected:
             db_out = work / "ref.cuddl"
+            # Full-corpus sketch-all runs pass paths by config file;
+            # argv cannot hold a hundred thousand genomes.
+            ref_cmd = [str(refbuild)]
+            if sketch_all:
+                import json as jsonlib_ref
+
+                ref_cfg = work / "refbuild.toml"
+                ref_cfg.write_text(
+                    "reference = " + jsonlib_ref.dumps([str(p) for p in sketch_file_args]) + "\n"
+                )
+                ref_cmd += ["--config", str(ref_cfg)]
+            else:
+                ref_cmd += ["--reference", *file_args]
             stdout = run(
-                [
-                    str(refbuild),
-                    "--reference",
-                    *file_args,
+                ref_cmd
+                + [
                     "--database",
                     str(db_out),
                     "--samples",
@@ -664,7 +723,42 @@ def main(
             rabbit_report, rabbit_rows = payload, pipe
 
         if "cub-exact" in selected:
+            import json as jsonlib4
+
             cub_rep = work / "cub.json"
+            if sketch_all:
+                # Full-corpus sketch supplies timing; the subset run below
+                # supplies compare rows. Full lists exceed argv, use config.
+                cub_cfg = work / "cub-sketch.toml"
+                cub_cfg.write_text(
+                    "reference = "
+                    + jsonlib4.dumps([str(p) for p in sketch_references])
+                    + "\n"
+                    + (
+                        "query = " + jsonlib4.dumps([str(p) for p in sketch_queries]) + "\n"
+                        if topology == "batch"
+                        else ""
+                    )
+                )
+                run(
+                    [
+                        str(cub),
+                        "--topology",
+                        topology,
+                        "--samples",
+                        str(samples),
+                        "--warmups",
+                        str(warmups),
+                        "--config",
+                        str(cub_cfg),
+                        "--max-kmers",
+                        str(max_kmers),
+                        "--sketch-only",
+                        "--output",
+                        str(work / "cub-sketch.json"),
+                    ]
+                )
+                sketch_payload = jsonlib4.loads((work / "cub-sketch.json").read_text())
             cub_cmd = [
                 str(cub),
                 "--topology",
@@ -690,9 +784,9 @@ def main(
                 str(cub_rep),
             ]
             run(cub_cmd)
-            import json as jsonlib4
-
             payload = jsonlib4.loads(cub_rep.read_text())
+            if sketch_all:
+                payload = sketch_payload
             sketch_times["cub-exact"] = [payload["phases_ms"]["sketch"]["median_ms"]]
             record_sketch(
                 "cub-exact",
@@ -705,7 +799,7 @@ def main(
                     .items()
                 },
             )
-            cub_phases = payload["phases_ms"]
+            cub_phases = jsonlib4.loads(cub_rep.read_text())["phases_ms"]
 
         # COMPARE op per tool; errors join cub-exact Jaccard and skani ANI.
         def record_compare(
@@ -1021,9 +1115,11 @@ def main(
             # The stage suite needs a query file even for all-to-all; match
             # rows stay triangular over references.
             search_queries = query_list or references[:1]
+            # Sketch-all searches the full-corpus index with subset queries.
+            search_references = sketch_references if sketch_all else references
             cfg.write_text(
                 "reference = "
-                + jsonlib6.dumps([str(path) for path in references])
+                + jsonlib6.dumps([str(path) for path in search_references])
                 + "\nquery = "
                 + jsonlib6.dumps([str(path) for path in search_queries])
                 + "\n"
@@ -1072,8 +1168,12 @@ def main(
                     search_scores[
                         (
                             "cuddl",
-                            str(query_set[m["case"]["query_id"]]),
-                            str(references[m["case"]["reference_id"]]),
+                            str(
+                                search_references[m["case"]["query_id"]]
+                                if topology != "batch"
+                                else query_set[m["case"]["query_id"]]
+                            ),
+                            str(search_references[m["case"]["reference_id"]]),
                         )
                     ] = metrics["wkid"]
 
