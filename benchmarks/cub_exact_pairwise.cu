@@ -13,7 +13,8 @@
 //
 // --max-pairs stride-samples the evaluated pair space (first and last pair
 // always measured) and --match-rows stride-samples the emitted rows the same
-// way; 0 disables either cap. Sketch wall is fused parse plus device work,
+// way; 0 disables either cap. --sketch-only skips pair intersection for
+// full-corpus parse timing; pair metrics come from the subset run instead.
 // matching the CLI tools, with the parse subtotal reported separately.
 // Allocation and temp-storage sizing stay outside timing; the report carries
 // buffer sizes instead.
@@ -106,6 +107,7 @@ int run_main(
     size_t max_kmers,
     size_t max_pairs,
     size_t match_rows,
+    bool sketch_only,
     json& report
 ) {
     cudaStream_t stream = nullptr;
@@ -240,6 +242,9 @@ int run_main(
         auto const compare_tick = clock_type::now();
         pair_rows = json::array();
         for (size_t ordinal : evaluated) {
+            // Sketch-only runs measure parsing plus per-genome device work;
+            // pair intersection is measured on the subset run instead.
+            if (sketch_only) break;
             auto const [a, r] = pair_at(ordinal);
             // Packed arrays were stashed during the sketch pass above.
             auto const& packed_a = stashed[a];
@@ -384,6 +389,9 @@ int main(int argc, char** argv) try {
     app.add_option("--max-pairs", max_pairs, "Evaluated pairs cap, even stride (0 disables)");
     app.add_option("--match-rows", match_rows, "Emitted pair rows cap, even stride (0 disables)");
     app.add_option("--output", output)->required();
+    app.set_config("--config", "TOML file with options, e.g. reference = [...]");
+    bool sketch_only = false;
+    app.add_flag("--sketch-only", sketch_only, "Parse plus per-genome device work only, no pairs");
     CLI11_PARSE(app, argc, argv);
     if (topology == "batch" && (references.empty() || queries.empty())) {
         throw std::runtime_error("batch needs nonempty --reference and --query");
@@ -401,6 +409,7 @@ int main(int argc, char** argv) try {
         max_kmers,
         max_pairs,
         match_rows,
+        sketch_only,
         report
     );
     FILE* stream = std::fopen(output.c_str(), "w");
