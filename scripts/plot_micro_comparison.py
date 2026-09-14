@@ -69,8 +69,6 @@ def read_micro(path: Path) -> list[dict]:
         )
     if not rows:
         raise ValueError(f"{path}: no micro measurements found")
-    if not any(r["tool"] == "cuddl" for r in rows):
-        raise ValueError(f"{path}: no cuDDL measurements, nothing to compare against")
     return rows
 
 
@@ -80,13 +78,21 @@ def label(row: dict) -> str:
 
 
 def main(
-    report: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    reports: Annotated[list[Path], typer.Argument(exists=True, dir_okay=False)],
     output_dir: Annotated[Path, typer.Option(file_okay=False)] = Path(
         "results/micro-comparison/plots"
     ),
 ) -> None:
     try:
-        rows = read_micro(report)
+        merged: dict[tuple[str, str], list[dict]] = {}
+        for path in reports:
+            by_impl: dict[tuple[str, str], list[dict]] = {}
+            for row in read_micro(path):
+                by_impl.setdefault((row["tool"], row["variant"]), []).append(row)
+            merged.update(by_impl)
+        rows = [row for impl_rows in merged.values() for row in impl_rows]
+        if not any(r["tool"] == "cuddl" for r in rows):
+            raise ValueError("no cuDDL measurements, nothing to compare against")
         key = lambda r: (r["tool"], r["variant"])
         sketch = sorted((r for r in rows if r["op"] == "sketch"), key=key)
         compare = sorted((r for r in rows if r["op"] == "compare"), key=key)
