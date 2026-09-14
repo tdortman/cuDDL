@@ -52,7 +52,16 @@ DEFAULT_TOOLS = "cuddl,rabbitsketch,hypergen,skani,dashing2,cub-exact"
 
 
 def run(cmd: list[str], capture: bool = False) -> str:
-    proc = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=capture, text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=capture, text=True)
+    except subprocess.CalledProcessError as error:
+        detail = "\n".join(
+            line
+            for chunk in (error.stdout, error.stderr)
+            if chunk
+            for line in chunk.splitlines()[-15:]
+        )
+        raise typer.BadParameter(f"command exited {error.returncode}: {cmd[0]}\n{detail}") from error
     return proc.stdout if capture else ""
 
 
