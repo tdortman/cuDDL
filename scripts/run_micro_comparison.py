@@ -177,10 +177,13 @@ def main(
     sketch_all: Annotated[
         bool, typer.Option(help="Sketch the full discovered corpus; compare stays on subset.")
     ] = False,
+    hypergen_device: Annotated[str, typer.Option()] = "cpu",
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if topology not in ("batch", "all-to-all"):
         raise typer.BadParameter("topology must be batch or all-to-all")
+    if hypergen_device not in ("cpu", "gpu"):
+        raise typer.BadParameter("hypergen-device must be cpu or gpu")
     references = discover(genomes)
     query_list = sorted(
         {
@@ -518,7 +521,6 @@ def main(
                         if link.is_symlink() or link.exists():
                             link.unlink()
                         link.symlink_to(path.resolve())
-                        staged_to_real[str(link)] = str(path)
                 sketch_cmds = [
                     [
                         str(hypergen),
@@ -531,6 +533,8 @@ def main(
                         str(threads),
                         "-k",
                         "25",
+                        "-D",
+                        hypergen_device,
                     ]
                 ]
                 if topology == "batch":
@@ -546,6 +550,8 @@ def main(
                             str(threads),
                             "-k",
                             "25",
+                            "-D",
+                            hypergen_device,
                         ]
                     )
                 hg_marks[suffix] = wall_of(sketch_cmds, samples, warmups)
@@ -556,7 +562,7 @@ def main(
             if topology == "batch":
                 sketch_bytes["hypergen"] += (work / f"hgq{timed_suffix}.sk").stat().st_size
             record_sketch(
-                "hypergen", "cpu", marks, {"sketch_bytes": sketch_bytes["hypergen"]}
+                "hypergen", hypergen_device, marks, {"sketch_bytes": sketch_bytes["hypergen"]}
             )
         if "skani" in selected:
             marks = []
@@ -942,7 +948,7 @@ def main(
                         )
                     except ValueError:
                         continue
-            record_compare("hypergen", "cpu", marks, rows)
+            record_compare("hypergen", hypergen_device, marks, rows)
         if "skani" in selected:
             dist_out = work / "skani-dist.tsv"
             marks = wall_of(
@@ -1303,7 +1309,7 @@ def main(
         variants = {
             "cuddl": "gpu-indexed",
             "skani": "cpu",
-            "hypergen": "cpu",
+            "hypergen": hypergen_device,
             "dashing2": "SetSketch",
             "rabbitsketch": "FastKMV",
             "cub-exact": "gpu-exact",
