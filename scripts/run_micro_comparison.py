@@ -158,6 +158,7 @@ def _spread_pick(paths: list[Path], sizes: dict[Path, int], count: int) -> list[
 def main(
     genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
     queries: Annotated[list[Path] | None, typer.Option("--query", exists=True)] = None,
+    query_fraction: Annotated[float | None, typer.Option(min=0, max=1)] = None,
     topology: Annotated[str, typer.Option()] = "all-to-all",
     tools: Annotated[str, typer.Option()] = DEFAULT_TOOLS,
     samples: Annotated[int, typer.Option(min=1)] = 3,
@@ -178,8 +179,14 @@ def main(
         raise typer.BadParameter("topology must be batch or all-to-all")
     references = discover(genomes)
     query_list = sorted({q for paths in (queries or []) for q in paths if q.is_file()})
-    if topology == "batch" and not query_list:
-        raise typer.BadParameter("batch needs --query files")
+    if query_fraction is not None and topology != "batch":
+        raise typer.BadParameter("query-fraction needs batch topology")
+    if query_fraction is not None and not 0 < query_fraction <= 1:
+        raise typer.BadParameter("query-fraction must be within (0, 1]")
+    if query_fraction is not None and query_list:
+        raise typer.BadParameter("query-fraction and --query exclude each other")
+    if topology == "batch" and not query_list and query_fraction is None:
+        raise typer.BadParameter("batch needs --query files or --query-fraction")
     if topology == "all-to-all" and len(references) < 2:
         raise typer.BadParameter("all-to-all needs at least two genomes")
     # No fixed corpus ceiling: the autoscale block below samples the pair
@@ -222,6 +229,10 @@ def main(
         sizes = {
             p: _est_genome_bases(p) for p in dict.fromkeys([*references, *query_list])
         }
+        if query_fraction is not None:
+            # Batch queries are a size-spread slice of the discovered files.
+            count = max(1, round(query_fraction * len(references)))
+            query_list = _spread_pick(references, sizes, count)
         typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
         auto_flags = {
             "threads": threads is None,
