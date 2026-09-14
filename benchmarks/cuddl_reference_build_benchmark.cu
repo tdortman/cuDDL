@@ -29,6 +29,7 @@ int main(int argc, char** argv) try {
     app.add_flag(
         "--parse-only", parse_only, "Time the serial CPU parser oracle, excluding GPU construction"
     );
+    app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     CLI11_PARSE(app, argc, argv);
     std::vector<std::filesystem::path> paths;
     uint64_t bytes = 0;
