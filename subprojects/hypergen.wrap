@@ -3,4 +3,4 @@ url = https://github.com/wh-xu/Hyper-Gen.git
 revision = 13d6512ebb9641e5211e58feab69f07684c7d653
 depth = 1
 patch_directory = hypergen
-diff_files = hypergen/blackwell-sm120.patch
+diff_files = hypergen/blackwell-sm120.patch,hypergen/aarch64-port.patch

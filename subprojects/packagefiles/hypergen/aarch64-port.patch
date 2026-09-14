@@ -1,0 +1,196 @@
+diff --git a/src/dist.rs b/src/dist.rs
+index d200b51..d63a929 100644
+--- a/src/dist.rs
++++ b/src/dist.rs
+@@ -6,6 +6,7 @@ use std::time::Instant;
+ use log::info;
+ use rayon::prelude::*;
+ 
++#[cfg(target_arch = "x86_64")]
+ use std::arch::x86_64::*;
+ 
+ pub fn dist(sketch_dist: &mut SketchDist) {
+@@ -160,6 +161,7 @@ pub fn compute_pairwise_ani(
+     }
+ }
+ 
++#[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+ pub unsafe fn compute_pairwise_ani_avx2(
+     r: Vec<i16>,
+diff --git a/src/hd.rs b/src/hd.rs
+index 5a529cd..a422632 100644
+--- a/src/hd.rs
++++ b/src/hd.rs
+@@ -1,4 +1,5 @@
+ use log::info;
++#[cfg(target_arch = "x86_64")]
+ use std::arch::x86_64::*;
+ use std::collections::HashSet;
+ 
+@@ -7,10 +8,12 @@ use rand::{RngCore, SeedableRng};
+ use wyhash::WyRng;
+ 
+ extern crate bitpacking;
++#[cfg(target_arch = "x86_64")]
+ use bitpacking::{BitPacker, BitPacker8x};
+ 
+ use rayon::prelude::*;
+ 
++#[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i16> {
+     let hv_d = sketch.hv_d;
+@@ -168,6 +171,41 @@ pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i16>) -> u8 {
+     quant_bit as u8
+ }
+ 
++// Scalar fallback for targets without x86 AVX2; mirrors the scalar branch above.
++#[cfg(not(target_arch = "x86_64"))]
++pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i16>) -> u8 {
++    let hv_d = sketch.hv_d;
++
++    // find the lossless quantization bit width
++    let min_hv = hv.iter().min().expect("hv holds hv_d entries, never empty").clone();
++    let max_hv = hv.iter().max().expect("hv holds hv_d entries, never empty").clone();
++
++    let mut quant_bit: i16 = 6;
++    loop {
++        let quant_min: i16 = -(1 << (quant_bit - 1));
++        let quant_max: i16 = (1 << (quant_bit - 1)) - 1;
++
++        if quant_min <= min_hv && quant_max >= max_hv {
++            break;
++        }
++
++        if quant_bit == 16 {
++            break;
++        }
++        quant_bit += 1;
++    }
++
++    let len_bit_vec_u16 = (quant_bit as usize * hv_d + 16) / 16;
++    let mut hv_compress_bits: Vec<i16> = vec![0; len_bit_vec_u16];
++    for i in 0..(quant_bit as usize * hv_d) {
++        hv_compress_bits[i / 16] |=
++            ((hv[i / quant_bit as usize] >> (i % quant_bit as usize)) & 1) << (i % 16);
++    }
++    sketch.hv.clone_from(&hv_compress_bits);
++
++    quant_bit as u8
++}
++
+ pub fn decompress_file_sketch(file_sketch: &mut Vec<FileSketch>) {
+     let hv_dim = file_sketch[0].hv_d;
+ 
+@@ -230,3 +268,30 @@ pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i16> {
+ 
+     hv_decompressed
+ }
++
++// Scalar fallback for targets without x86 AVX2; mirrors the scalar branch above.
++#[cfg(not(target_arch = "x86_64"))]
++pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i16> {
++    let hv_d = sketch.hv_d;
++    let quant_bit = sketch.hv_quant_bits;
++
++    let mut hv_decompressed: Vec<i16> = vec![0; hv_d];
++
++    // Scalar Bit Unpacking
++    for i in 0..(quant_bit as usize * hv_d) {
++        hv_decompressed[i / quant_bit as usize] |=
++            (((sketch.hv[i / 16] >> (i % 16)) & 1) << (i % quant_bit as usize)) as i16;
++
++        if (i + 1) % quant_bit as usize == 0 {
++            hv_decompressed[i / quant_bit as usize] = {
++                if hv_decompressed[i / quant_bit as usize] > (1 << (quant_bit - 1)) {
++                    hv_decompressed[i / quant_bit as usize] - (1 << quant_bit)
++                } else {
++                    hv_decompressed[i / quant_bit as usize]
++                }
++            };
++        }
++    }
++
++    hv_decompressed
++}
+diff --git a/src/sketch.rs b/src/sketch.rs
+index 143423f..2c94eae 100644
+--- a/src/sketch.rs
++++ b/src/sketch.rs
+@@ -8,7 +8,6 @@ use rayon::prelude::*;
+ use crate::types::*;
+ use crate::{dist, hd, utils};
+ 
+-#[cfg(target_arch = "x86_64")]
+ pub fn sketch(params: SketchParams) {
+     let files = utils::get_fasta_files(&params.path);
+     let n_file = files.len();
+@@ -37,11 +36,14 @@ pub fn sketch(params: SketchParams) {
+         let kmer_hash_set = extract_kmer_hash(&sketch);
+ 
+         // Encode extracted kmer hash into sketch HV
++        #[cfg(target_arch = "x86_64")]
+         let hv = if is_x86_feature_detected!("avx2") {
+             unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+         } else {
+             hd::encode_hash_hd(&kmer_hash_set, &sketch)
+         };
++        #[cfg(not(target_arch = "x86_64"))]
++        let hv = hd::encode_hash_hd(&kmer_hash_set, &sketch);
+ 
+         // Pre-compute HV's norm
+         sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
+diff --git a/src/types.rs b/src/types.rs
+index b8710c1..68afad7 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -1,3 +1,4 @@
++#[cfg(target_arch = "x86_64")]
+ use std::arch::x86_64::*;
+ use std::collections::HashSet;
+ use std::path::PathBuf;
+@@ -33,6 +34,7 @@ pub fn mm_hash64(kmer: u64) -> u64 {
+ 
+ // Use avx2 mmhash in https://github.com/bluenote-1577/skani/blob/main/src/avx2_seeding.rs
+ #[inline]
++#[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+ pub unsafe fn mm_hash64_avx2(kmer: __m256i) -> __m256i {
+     let mut key = kmer;
+@@ -205,6 +207,7 @@ impl Sketch {
+         }
+     }
+ 
++    #[cfg(target_arch = "x86_64")]
+     pub unsafe fn insert_kmer_u64_avx2(&mut self, kmer: __m256i) {
+         let hash_256 = mm_hash64_avx2(kmer);
+ 
+diff --git a/src/sketch_cuda.rs b/src/sketch_cuda.rs
+index d994a9b..cfaf14f 100644
+--- a/src/sketch_cuda.rs
++++ b/src/sketch_cuda.rs
+@@ -40,7 +40,7 @@ pub fn sketch_cuda(params: SketchParams) {
+ }
+ 
+ //  Sketch function to sketch all .fna files in folder path
+-#[cfg(all(target_arch = "x86_64", any(feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell", feature = "cuda-sketch-volta")))]
++#[cfg(any(feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell", feature = "cuda-sketch-volta"))]
+ pub fn sketch_cuda(params: SketchParams) {
+     let files = utils::get_fasta_files(&params.path);
+     let n_file = files.len();
+@@ -85,11 +85,14 @@ pub fn sketch_cuda(params: SketchParams) {
+         let kmer_hash_set = extract_kmer_t1ha2_cuda(&sketch, gpu);
+ 
+         // Encode extracted kmer hash into sketch HV
++        #[cfg(target_arch = "x86_64")]
+         let hv = if is_x86_feature_detected!("avx2") {
+             unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+         } else {
+             hd::encode_hash_hd(&kmer_hash_set, &sketch)
+         };
++        #[cfg(not(target_arch = "x86_64"))]
++        let hv = hd::encode_hash_hd(&kmer_hash_set, &sketch);
+ 
+         // Pre-compute HV's norm
+         sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);

@@ -1,8 +1,9 @@
 cmake = import('cmake')
-# RabbitSketch, HyperGen, and Dashing2 are x86-only: unguarded x86
-# intrinsics and hard `-mavx2`/`-msse` flags. Skip them on ARM hosts
-# such as Grace Hopper. Nothing links them at build time; scripts
-# resolve the binaries by path.
+# RabbitSketch and Dashing2 are x86-only: unguarded x86 intrinsics and
+# hard `-mavx2`/`-msse` flags. Skip them on ARM hosts such as Grace
+# Hopper. HyperGen carries its own `aarch64-port` patch with scalar
+# fallbacks, so it builds everywhere. Nothing links these tools at
+# build time; scripts resolve the binaries by path.
 build_x86_tools = host_machine.cpu_family() in ['x86', 'x86_64']
 if build_x86_tools
     rabbitsketch_opts = cmake.subproject_options()
@@ -40,10 +41,9 @@ if build_x86_tools
 endif
 
 cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
+hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
 skani_bin = subproject('skani').get_variable('skani_binary')
-
 if build_x86_tools
-    hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
     dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
 endif
 
