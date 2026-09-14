@@ -1,0 +1,19 @@
+language:
+    rust
+rust:
+  - stable
+  - beta
+  - nightly
+before_script:
+  rustup component add clippy-preview
+script:
+  - cargo build
+  - cargo test
+  - cargo build --all-features
+  - cargo test --all-features
+matrix:
+  allow_failures:
+    rust:
+      nightly
+  fast_finish:
+    true

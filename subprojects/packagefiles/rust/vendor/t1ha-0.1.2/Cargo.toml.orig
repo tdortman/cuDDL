@@ -1,0 +1,70 @@
+[package]
+name = "t1ha"
+version = "0.1.2"
+authors = ["Flier Lu <flier.lu@gmail.com>"]
+edition = "2018"
+license = "Zlib"
+readme = "README.md"
+repository = "https://github.com/flier/rust-t1ha"
+homepage = "https://github.com/flier/rust-t1ha"
+documentation = "http://doc.rust-lang.org/t1ha"
+keywords = ["hash", "t1ha"]
+categories = ["algorithms", "no-std"]
+build = "build.rs"
+exclude = ["/appveyor.yml"]
+description = "An implementation of the T1AH (Fast Positive Hash) hash function."
+
+[lib]
+bench = false
+
+[badges]
+travis-ci = { repository = "flier/rust-t1ha" }
+appveyor = { repository = "flier/rust-t1ha", project_name = "flier/rust-t1ha" }
+
+[features]
+default = ["std", "runtime_select"]
+std = []
+unaligned_access = []
+runtime_select = ["lazy_static"]
+
+[dependencies]
+cfg-if = "1.0"
+lazy_static = { version = "1.4", optional = true }
+
+[dependencies.num-traits]
+version = "0.2"
+default-features = false
+
+[dev-dependencies]
+ahash = "0.8"
+criterion = "0.5"
+farmhash = "1.1"
+fastmurmur3 = "0.2"
+fnv = "1.0"
+fxhash = "0.2"
+lazy_static = "1.4"
+meowhash = "0.3"
+metrohash = "1.0"
+murmur3 = "0.5"
+rustc-hash = "1.1"
+seahash = "4.1"
+twox-hash = "1.6"
+wyhash = "0.5"
+xxhash2 = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[build-dependencies]
+rustc_version = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+rustc-args = ["-C target-feature=aes,avx,avx2"]
+
+[[bench]]
+name = "t1ha"
+harness = false
+
+[[bench]]
+name = "hash"
+harness = false

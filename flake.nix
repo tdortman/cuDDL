@@ -3,10 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, rust-overlay, ... }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -20,8 +22,10 @@
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
+            overlays = [ rust-overlay.overlays.default ];
           };
 
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
           lib = pkgs.lib;
           cudaPkgs = pkgs.cudaPackages_13_3;
           llvmPkgs = pkgs.llvmPackages_22;
@@ -72,6 +76,11 @@
               # Required for clangd to correctly understand some of the
               # CUDA/STL headers when cuda_crt is present.
               libcurand.include
+
+              # cuBLAS (lib + headers); cudarc links cublasLt.
+              libcublas.lib
+              libcurand.lib
+              cuda_nvrtc.lib
             ];
           };
 
@@ -97,6 +106,7 @@
           ];
 
           nativeBuildInputs = with pkgs; [
+            rustToolchain
             llvmPkgs.clang-tools
             llvmPkgs.clang
 

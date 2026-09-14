@@ -1,0 +1,32 @@
+[package]
+name = "assert_cmd"
+version = "1.0.8"
+description = "Test CLI Applications."
+authors = ["Pascal Hertleif <killercup@gmail.com>", "Ed Page <eopage@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/assert-rs/assert_cmd.git"
+homepage = "https://github.com/assert-rs/assert_cmd"
+documentation = "http://docs.rs/assert_cmd/"
+readme = "README.md"
+categories = ["development-tools::testing"]
+keywords = ["cli", "test", "assert", "command", "duct"]
+edition = "2018"
+
+[badges]
+azure-devops = { project = "assert-rs", pipeline = "assert_cmd" }
+codecov = { repository = "assert-rs/assert_cmd" }
+maintenance = { status = "passively-maintained" }
+
+[[bin]]
+name = "bin_fixture"
+
+[dependencies]
+predicates = { version = "2.0", default-features = false, features = ["diff"] }
+predicates-core = "1.0"
+predicates-tree = "1.0"
+doc-comment = "0.3"
+wait-timeout = "0.2.0"
+bstr = "0.2.14"
+
+[dev-dependencies]
+escargot = "0.5"

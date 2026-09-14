@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/dnbaker/dashing2.git
+revision = 3906ebde218144eef2bf1455b15e2241f7b09f8c
+depth = 1
+patch_directory = dashing2

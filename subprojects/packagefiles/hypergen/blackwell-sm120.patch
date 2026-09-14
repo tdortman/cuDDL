@@ -1,0 +1,105 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c642dc0..70bbe4b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,8 @@ cuda-sketch-ampere = ["dep:cudarc"]
+ 
+ ## Hopper architecture for NIVIDA H100 series
+ cuda-sketch-hopper = ["dep:cudarc"]
++## Blackwell architecture, e.g. RTX 5070 Ti (sm_120)
++cuda-sketch-blackwell = ["dep:cudarc"]
+ 
+ [dependencies]
+ log = "0.4.20"
+diff --git a/build.rs b/build.rs
+index 0dbb918..ec50910 100644
+--- a/build.rs
++++ b/build.rs
+@@ -7,7 +7,7 @@ use bindgen::CargoCallbacks;
+ use regex::Regex;
+ 
+ fn main() {
+-    if cfg!(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper")) {
++    if cfg!(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell")) {
+         println!("cargo:rerun-if-changed={}", "cuda");
+ 
+         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+@@ -22,6 +22,8 @@ fn main() {
+             ("compute_80", "sm_80") // Ampere architecture for NIVIDA A100 series
+         } else if cfg!(feature = "cuda-sketch-hopper") {
+             ("compute_90", "sm_90") // // Hopper architecture for NIVIDA H100 series
++        } else if cfg!(feature = "cuda-sketch-blackwell") {
++            ("compute_120", "sm_120") // Blackwell architecture, e.g. RTX 5070 Ti
+         } else if cfg!(feature = "cuda-sketch-volta") {
+             ("compute_70", "sm_70") // Volta architecture for NIVIDA V100 series
+         } else {
+diff --git a/src/sketch_cuda.rs b/src/sketch_cuda.rs
+index d994a9b..6905aa8 100644
+--- a/src/sketch_cuda.rs
++++ b/src/sketch_cuda.rs
+@@ -1,6 +1,6 @@
+ use crate::types::*;
+ 
+-#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ use {
+     crate::{dist, fastx_reader, hd, utils},
+     cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig},
+@@ -16,10 +16,10 @@ use {
+     std::time::Instant,
+ };
+ 
+-#[cfg(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ const CUDA_KERNEL_MY_STRUCT: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
+ 
+-#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ const SEQ_NT4_TABLE: [u8; 256] = [
+     0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+@@ -32,7 +32,7 @@ const SEQ_NT4_TABLE: [u8; 256] = [
+ ];
+ 
+ #[allow(unused_variables)]
+-#[cfg(not(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper")))]
++#[cfg(not(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell")))]
+ pub fn sketch_cuda(params: SketchParams) {
+     use log::error;
+ 
+@@ -40,7 +40,7 @@ pub fn sketch_cuda(params: SketchParams) {
+ }
+ 
+ //  Sketch function to sketch all .fna files in folder path
+-#[cfg(all(target_arch = "x86_64", any(feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-volta")))]
++#[cfg(all(target_arch = "x86_64", any(feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell", feature = "cuda-sketch-volta")))]
+ pub fn sketch_cuda(params: SketchParams) {
+     let files = utils::get_fasta_files(&params.path);
+     let n_file = files.len();
+@@ -116,7 +116,7 @@ pub fn sketch_cuda(params: SketchParams) {
+     utils::dump_sketch(&all_filesketch, &params.out_file);
+ }
+ 
+-#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ fn extract_kmer_t1ha2_cuda(sketch: &FileSketch, gpu: &Arc<CudaDevice>) -> HashSet<u64> {
+     let fna_file = PathBuf::from(sketch.file_str.clone());
+     let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
+@@ -165,7 +165,7 @@ fn extract_kmer_t1ha2_cuda(sketch: &FileSketch, gpu: &Arc<CudaDevice>) -> HashSe
+     kmer_hash_set
+ }
+ 
+-#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ pub fn cuda_mmhash_bitpack_parallel(
+     path_fna: &String,
+     ksize: usize,
+@@ -250,7 +250,7 @@ pub fn cuda_mmhash_bitpack_parallel(
+     sketch_kmer_sets
+ }
+ 
+-#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper"))]
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ pub fn cuda_t1ha2_hash_parallel(
+     path_fna: &String,
+     ksize: usize,

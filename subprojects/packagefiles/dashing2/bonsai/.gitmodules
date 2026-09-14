@@ -1,0 +1,12 @@
+[submodule "hll"]
+	path = hll
+	url = https://github.com/dnbaker/sketch
+[submodule "zlib"]
+	path = zlib
+	url = https://github.com/madler/zlib
+[submodule "ntHash"]
+	path = ntHash
+	url = https://github.com/bcgsc/ntHash
+[submodule "zstd"]
+	path = zstd
+	url = https://github.com/facebook/zstd

@@ -26,6 +26,9 @@ executable(
 )
 
 cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
+hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
+skani_bin = subproject('skani').get_variable('skani_binary')
+dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
 
 executable(
     'cuddl-reference-build-benchmark',
