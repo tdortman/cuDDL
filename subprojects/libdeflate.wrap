@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/ebiggers/libdeflate.git
+revision = 92e6a0db9fa848d742f9eb286c92afc60f2c3dda
+depth = 1
+patch_directory = libdeflate
+
+[provide]
+libdeflate = libdeflate_dep

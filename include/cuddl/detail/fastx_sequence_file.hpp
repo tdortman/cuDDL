@@ -1,6 +1,6 @@
 #pragma once
 
-#include <zlib.h>
+#include <libdeflate.h>
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -536,6 +536,60 @@ struct fastx_sequence_file {
     std::vector<fastx_sequence_extent> extents;
 };
 
+/**
+ * @brief Decompresses gzip members from a mapped buffer into one string.
+ *
+ * Members are decompressed one at a time so concatenated streams (BGZF among them) work.
+ * libdeflate verifies each member's CRC32 and length trailer, so corrupt and truncated
+ * input both fail here instead of yielding partial sequence.
+ */
+[[nodiscard]] inline Result<std::string>
+gunzip_members(std::string_view input, std::string const& path) {
+    struct decompressor {
+        libdeflate_decompressor* handle{libdeflate_alloc_decompressor()};
+        decompressor() = default;
+        decompressor(decompressor const&) = delete;
+        decompressor& operator=(decompressor const&) = delete;
+        ~decompressor() {
+            libdeflate_free_decompressor(handle);
+        }
+    };
+    // libdeflate objects are single-threaded; loader pools call this from many threads.
+    static thread_local decompressor shared;
+    if (shared.handle == nullptr) {
+        return Err(Error::resource("cannot allocate gzip decompressor"));
+    }
+    // Genomes compress around 3x; guessing low costs a realloc per member, not correctness.
+    std::string output;
+    output.resize(std::max<size_t>(input.size() * 4, 1U << 16));
+    size_t consumed = 0;
+    size_t produced = 0;
+    while (consumed < input.size()) {
+        size_t member_in = 0;
+        size_t member_out = 0;
+        auto const status = libdeflate_gzip_decompress_ex(
+            shared.handle,
+            input.data() + consumed,
+            input.size() - consumed,
+            output.data() + produced,
+            output.size() - produced,
+            &member_in,
+            &member_out
+        );
+        if (status == LIBDEFLATE_INSUFFICIENT_SPACE) {
+            output.resize(output.size() * 2 + 1);
+            continue;
+        }
+        if (status != LIBDEFLATE_SUCCESS) {
+            return Err(Error::invalid_argument("gzip FASTX error: invalid stream: " + path));
+        }
+        consumed += member_in;
+        produced += member_out;
+    }
+    output.resize(produced);
+    return output;
+}
+
 inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     std::string const& path
 ) {
@@ -549,39 +603,9 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
         static_cast<unsigned char>(data[1]) == 0x8b) {
-        // zlib reports Z_BUF_ERROR on the final partial read of valid
-        // streams too, so that status alone cannot end the loop. Other
-        // failures (Z_DATA_ERROR, Z_ERRNO, ...) still abort here; clean
-        // end and truncation are told apart by the gzip trailer below.
-        std::unique_ptr<gzFile_s, decltype(&gzclose)> input{gzopen(path.c_str(), "rb"), &gzclose};
-        if (!input) return Err(Error::resource("cannot open gzip FASTX file: " + path));
-        char chunk[65536];
-        size_t total = 0;
-        while (true) {
-            auto const size = gzread(input.get(), chunk, sizeof(chunk));
-            int status{};
-            auto const message = gzerror(input.get(), &status);
-            if (size < 0 || (status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR)) {
-                return Err(Error::invalid_argument("gzip FASTX error: " + std::string(message)));
-            }
-            if (size == 0) break;
-            total += static_cast<size_t>(size);
-            decompressed.append(chunk, static_cast<size_t>(size));
-        }
-        // ISIZE holds the uncompressed length mod 2^32 over all members.
-        // Truncated streams decompress short, which no zlib status reports.
-        if (data.size() < 8) {
-            return Err(Error::invalid_argument("gzip FASTX error: truncated stream: " + path));
-        }
-        size_t const tail = data.size() - 4;
-        auto const byte = [&](size_t i) {
-            return static_cast<uint32_t>(static_cast<unsigned char>(data[i]));
-        };
-        uint32_t const isize =
-            byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
-        if (static_cast<uint32_t>(total) != isize) {
-            return Err(Error::invalid_argument("gzip FASTX error: truncated stream: " + path));
-        }
+        auto inflated = gunzip_members(data, path);
+        if (!inflated) return Err(inflated.error());
+        decompressed = std::move(*inflated);
         data = decompressed;
     }
 

@@ -25,9 +25,11 @@ cuda_args = [
 
 cccl_dep = subproject('cccl').get_variable('cccl_dep')
 zlib_dep = subproject('zlib').get_variable('zlib_dep')
+libdeflate_dep = subproject('libdeflate').get_variable('libdeflate_dep')
+
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [cccl_dep, zlib_dep],
+    dependencies: [cccl_dep, zlib_dep, libdeflate_dep],
 )
 
 build_examples = (
