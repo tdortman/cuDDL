@@ -154,10 +154,14 @@ int run_main(
         }
         return std::pair{query_base + ordinal / reference_count, ordinal % reference_count};
     };
+    // Sketch-only runs never evaluate a pair. Enumerating a full-corpus
+    // pair space here would materialize billions of ordinals.
     std::vector<size_t> evaluated;
-    for (size_t i = 0; i < total_pairs; i += pair_stride) evaluated.push_back(i);
-    if (!evaluated.empty() && evaluated.back() != total_pairs - 1) {
-        evaluated.push_back(total_pairs - 1);
+    if (!sketch_only) {
+        for (size_t i = 0; i < total_pairs; i += pair_stride) evaluated.push_back(i);
+        if (!evaluated.empty() && evaluated.back() != total_pairs - 1) {
+            evaluated.push_back(total_pairs - 1);
+        }
     }
     // Genomes touched by evaluated pairs keep their packed arrays across the
     // pair loop; the rest stream through for distinct counts only.
@@ -242,9 +246,6 @@ int run_main(
         auto const compare_tick = clock_type::now();
         pair_rows = json::array();
         for (size_t ordinal : evaluated) {
-            // Sketch-only runs measure parsing plus per-genome device work;
-            // pair intersection is measured on the subset run instead.
-            if (sketch_only) break;
             auto const [a, r] = pair_at(ordinal);
             // Packed arrays were stashed during the sketch pass above.
             auto const& packed_a = stashed[a];
