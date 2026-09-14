@@ -31,7 +31,8 @@
         "refseq_parity",
         "indexed_search",
         "pipeline",
-        "fasta_pairwise"
+        "fasta_pairwise",
+        "micro"
       ]
     },
     "scope": {
