@@ -5,6 +5,9 @@ add_compile_options(
   "-I${cccl_source}/libcudacxx/include"
   "-I${cccl_source}/cub"
   "-I${cccl_source}/thrust")
+# Same importer behavior drops the vendored nlohmann_json INTERFACE include
+# that CPM_nlohmann_json_SOURCE creates; re-add it for nvbench's own targets.
+add_compile_options("-I${NVBENCH_JSON_INCLUDE}")
 
 # Export the same precedence to Meson consumers after NVBench creates its targets.
 cmake_language(DEFER CALL target_compile_options nvbench INTERFACE

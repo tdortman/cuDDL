@@ -71,6 +71,8 @@ if build_benchmarks
         # versions, so a shared CPM_SOURCE_CACHE never hits across machines,
         # and the URL zip redirects to a host the site proxy blocks.
         'CPM_nlohmann_json_SOURCE': meson.project_source_root() / 'subprojects/nlohmann_json-3.12.0',
+        # Same vendored source, exposed for the nvbench shim below.
+        'NVBENCH_JSON_INCLUDE': meson.project_source_root() / 'subprojects/nlohmann_json-3.12.0/include',
     })
     # nvbench is imported as a CMake subproject; its `nvbench` and `nvbench.main` targets are
     # exposed through Meson's cmake module. NVML and CUPTI are provided by the dev shell's
