@@ -66,6 +66,11 @@ if build_benchmarks
         'CMAKE_CXX_STANDARD': '20',
         'CCCL_DIR': meson.project_source_root() / 'subprojects/cccl/lib/cmake/cccl',
         'CMAKE_PROJECT_NVBench_INCLUDE': meson.project_source_root() / 'subprojects/packagefiles/nvbench/cccl.cmake',
+        # nlohmann_json is already vendored as a Meson subproject; hand it to CPM
+        # directly. Its origin hash bakes in the patch command's toolchain
+        # versions, so a shared CPM_SOURCE_CACHE never hits across machines,
+        # and the URL zip redirects to a host the site proxy blocks.
+        'CPM_nlohmann_json_SOURCE': meson.project_source_root() / 'subprojects/nlohmann_json-3.12.0',
     })
     # nvbench is imported as a CMake subproject; its `nvbench` and `nvbench.main` targets are
     # exposed through Meson's cmake module. NVML and CUPTI are provided by the dev shell's
