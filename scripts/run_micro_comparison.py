@@ -717,6 +717,10 @@ def main(
                     str(db_out),
                     "--samples",
                     str(max(samples, 2)),
+                    # The benchmark defaults to one loader, which gunzips and
+                    # parses every genome on the calling thread.
+                    "--workers",
+                    str(threads),
                 ],
                 capture=True,
             )
