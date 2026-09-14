@@ -1,0 +1,15 @@
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -208,7 +208,13 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
+     let mut all_files = Vec::new();
+-    for t in ["*.fna", "*.fa", "*.fasta"] {
++    // Mirror the extensions honored by run_micro_comparison.py discovery,
++    // including gzip: RefSeq corpora ship as .fna.gz and needletail reads
++    // gzip transparently.
++    for t in [
++        "*.fna", "*.fa", "*.fasta", "*.ffn", "*.frn", "*.fna.gz", "*.fa.gz",
++        "*.fasta.gz", "*.ffn.gz", "*.frn.gz",
++    ] {
+         let mut files: Vec<_> = glob(path.join(t).to_str().unwrap())
+             .expect("Failed to read glob pattern")
+             .map(|f| f.unwrap())
