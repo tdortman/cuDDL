@@ -51,10 +51,29 @@ APP = typer.Typer()
 DEFAULT_TOOLS = "cuddl,rabbitsketch,hypergen,skani,dashing2,cub-exact"
 
 
-def run(cmd: list[str], capture: bool = False) -> str:
+def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
+    """Runs @p cmd and returns its output when @p capture is set.
+
+    @p quiet discards the command's stdout instead. A timed pass needs its time and nothing
+    else, and some tools print a whole similarity matrix or a per-sequence log to stdout, which
+    would otherwise bury the runner's own report. Stderr stays connected so a failure is still
+    readable.
+    """
+    if capture:
+        stdout: object = subprocess.PIPE
+        stderr: object = None
+    elif quiet:
+        # Some tools print a per-sequence log or a whole similarity matrix on stderr as well,
+        # and capturing those to report only on failure is not an option: the dashing2 matrix
+        # alone is quadratic in the corpus.
+        stdout = subprocess.DEVNULL
+        stderr = subprocess.DEVNULL
+    else:
+        stdout = None
+        stderr = None
     try:
         proc = subprocess.run(
-            cmd, cwd=ROOT, check=True, capture_output=capture, text=True
+            cmd, cwd=ROOT, check=True, stdout=stdout, stderr=stderr, text=True
         )
     except subprocess.CalledProcessError as error:
         detail = "\n".join(
@@ -108,7 +127,7 @@ def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
     """
     typer.echo(f"  {label}: running {Path(cmd[0]).name} ...")
     tick = time.perf_counter()
-    stdout = run(cmd, capture=capture)
+    stdout = run(cmd, capture=capture, quiet=not capture)
     typer.echo(f"  {label}: done in {time.perf_counter() - tick:.1f}s")
     return stdout
 
@@ -121,7 +140,7 @@ def wall_of(
     for rep in range(warmups + samples):
         tick = time.perf_counter()
         for item in groups:
-            run(item)
+            run(item, quiet=True)
         done = time.perf_counter()
         if rep >= warmups:
             marks.append((done - tick) * 1000)
@@ -505,7 +524,8 @@ def main(
                     str(work / "skani-probe.tsv"),
                     "-t",
                     str(threads),
-                ]
+                ],
+                quiet=True,
             )
             return (time.perf_counter() - tick) * 1000 / pairs
 
@@ -700,7 +720,8 @@ def main(
                     str(chunk_tsv),
                     "-t",
                     str(threads),
-                ]
+                ],
+                quiet=True,
             )
             for line in chunk_tsv.read_text().splitlines():
                 if not line or line.startswith("#"):
@@ -825,7 +846,8 @@ def main(
                         str(out_dir),
                         "-t",
                         str(threads),
-                    ]
+                    ],
+                    quiet=True,
                 )
                 done = time.perf_counter()
                 if rep >= warmups:
@@ -873,7 +895,8 @@ def main(
                             str(out_dir),
                             "-F",
                             str(list_path),
-                        ]
+                        ],
+                        quiet=True,
                     )
                     done = time.perf_counter()
                     if rep >= warmups:
@@ -985,7 +1008,8 @@ def main(
                     str(cfg),
                     "--output",
                     str(rep),
-                ]
+                ],
+                quiet=True,
             )
             payload = jsonlib3.loads(rep.read_text())
             pipe = next(
