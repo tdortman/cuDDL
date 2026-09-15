@@ -155,7 +155,8 @@ _PROBE_PAIRS = 30  # first probe size
 _PROBE_PAIRS_HIGH = 240  # second probe size; the gap has to dwarf probe-to-probe noise
 _PROBE_MIN_PAIRS = 12  # at or below this, skip the probe and run everything
 _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
-_CHUNK_BUDGET_BYTES = 256 << 20  # per-invocation truth output target
+_CHUNK_BUDGET_BYTES = 1 << 30  # per-invocation truth output target
+_CHUNK_MIN_ROWS = 8 << 20  # row floor, so loading the reference sketches amortises
 _PAIRS_TARGET_BYTES = 32 << 20  # stored-pairs output target
 _PAIR_ROW_BYTES = 160  # estimated stored bytes per pair row
 
@@ -539,9 +540,12 @@ def main(
         if match_rows is None:
             match_rows = _PAIRS_TARGET_BYTES // _PAIR_ROW_BYTES
         if skani_chunk is None:
-            skani_chunk = max(
-                1, _CHUNK_BUDGET_BYTES // (max(1, len(references)) * _CHUNK_ROW_BYTES)
-            )
+            # Every invocation reads the whole reference sketch set, so a chunk has to be big
+            # enough for that load to disappear into the work. Take the larger of a byte target
+            # and a row target: with a full-corpus reference set the byte target alone would
+            # shrink chunks to a handful of queries and multiply the fixed cost by hundreds.
+            target = max(_CHUNK_BUDGET_BYTES, _CHUNK_MIN_ROWS * _CHUNK_ROW_BYTES)
+            skani_chunk = max(1, target // (max(1, len(references)) * _CHUNK_ROW_BYTES))
         file_args = [str(p) for p in references] + [
             str(p) for p in query_list if p not in references
         ]
