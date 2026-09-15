@@ -413,8 +413,9 @@ json summarize_replays(std::vector<double> values) {
 }
 
 // Validates staged ASCII against the native FastxReader, rebuilds per-genome stats, and
-// checks whole-record sketches against the scalar hash/sort bottom-k oracle. One file at a
-// time: parser storage never spans the corpus.
+// checks whole-record sketches against the scalar hash/sort bottom-k oracle. Genomes are
+// independent, so the pass uses the OpenMP workers: parser storage is bounded by the worker
+// count instead of the corpus, and a full corpus no longer walks this on one core.
 struct sequence_reference {
     std::vector<api::BuildStats> stats;
     std::vector<std::vector<uint64_t>> registers;
@@ -426,7 +427,7 @@ check_sequence_reference(std::vector<std::string> const& genome_paths, options c
     result.stats.resize(genome_paths.size());
     result.registers.resize(genome_paths.size());
     size_t const k = static_cast<size_t>(opts.k);
-    for (size_t genome = 0; genome < genome_paths.size(); ++genome) {
+    parallel_for(genome_paths.size(), [&](size_t genome) {
         auto const& path = genome_paths[genome];
         auto loaded = cuddl::detail::load_fastx_sequence_file(path);
         if (!loaded) {
@@ -508,7 +509,7 @@ check_sequence_reference(std::vector<std::string> const& genome_paths, options c
             );
         }
         result.registers[genome].assign(registers, registers + sketch.size());
-    }
+    });
     return result;
 }
 
