@@ -147,6 +147,39 @@ def wall_of(
     return marks
 
 
+def read_dashing2_panel(
+    panel: Path, queries: list[Path], stride: int
+) -> tuple[list[dict], int]:
+    """Reads dashing2's rectangular panel: one row per reference, one column per query.
+
+    The file holds `len(queries)` values per reference, which at a full corpus is millions of
+    numbers, so it is read a line at a time and only a stride sample is kept. The returned count
+    is every pair the tool evaluated, which is what the per-pair rate divides by.
+    """
+    rows: list[dict] = []
+    evaluated = 0
+    with panel.open() as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.split()
+            reference = fields[0]
+            for index, value in enumerate(fields[1:]):
+                if index >= len(queries) or value == "-":
+                    continue
+                evaluated += 1
+                if evaluated % stride == 0:
+                    rows.append(
+                        {
+                            "query": str(queries[index]),
+                            "reference": reference,
+                            "jaccard": float(value),
+                            "ani": None,
+                        }
+                    )
+    return rows, evaluated
+
+
 def discover(directory: Path) -> list[Path]:
     exts = (".fa", ".fna", ".fasta", ".ffn", ".frn")
     files = {
@@ -1104,7 +1137,11 @@ def main(
 
         # COMPARE op per tool; errors join cub-exact Jaccard and skani ANI.
         def record_compare(
-            tool: str, variant: str, marks: list[float], rows: list[dict]
+            tool: str,
+            variant: str,
+            marks: list[float],
+            rows: list[dict],
+            evaluated: int | None = None,
         ) -> None:
             jaccard_errors, ani_errors, reported = [], [], 0
             stride = (
@@ -1126,10 +1163,13 @@ def main(
                     ani_errors.append(abs(row["ani"] - ani_truth))
                 if index % stride == 0 or index == len(rows) - 1:
                     pair_table.append({"tool": tool, **row})
+            # Rows may be a sample of what the tool evaluated, so the rate divides by the
+            # tool's own count when it reports one.
+            pairs = evaluated if evaluated is not None else len(rows)
             metrics: dict = {
-                "pairs": len(rows),
+                "pairs": pairs,
                 "pair_stride": stride,
-                "per_pair_ms": statistics.median(marks) / max(len(rows), 1),
+                "per_pair_ms": statistics.median(marks) / max(pairs, 1),
             }
             if jaccard_errors:
                 metrics["jaccard_mae_vs_exact"] = sum(jaccard_errors) / len(
@@ -1156,56 +1196,43 @@ def main(
             )
 
         if "dashing2" in selected:
-            listing = work / "d2list.txt"
-            # The subset sketch is the cmp input, and it runs once, so its last rep is fixed.
-            sketch_files = sorted((work / f"d2_{d2_subset_rep}").glob("*.opss"))
-            listing.write_text("".join(str(p) + "\n" for p in sketch_files))
+            # `cmp` writes a value per pair. A square matrix over a full corpus is about ten
+            # billion numbers, which no host can hold, so the queries go in by file: the
+            # rectangular panel holds one row per reference and one column per query, which is
+            # the same asymmetric comparison bounded by the query count. It reuses the sketch
+            # cache the sketch lane filled, so the timed passes compare only.
+            d2_dir = work / f"d2_{d2_subset_rep}"
+            d2_dir.mkdir(exist_ok=True)
+            panel_queries = query_list or references
+            reference_list = work / "d2refs.txt"
+            query_listing = work / "d2queries.txt"
+            reference_list.write_text("".join(f"{p}\n" for p in references))
+            query_listing.write_text("".join(f"{p}\n" for p in panel_queries))
+            panel = work / "d2panel.txt"
             cmp_cmd = [
                 str(dashing2),
                 "cmp",
                 "-k25",
                 "-S4096",
                 f"-p{threads}",
-                "--presketched",
+                "--cache",
+                "--outprefix",
+                str(d2_dir),
                 "-F",
-                str(listing),
+                str(reference_list),
+                "-Q",
+                str(query_listing),
+                "--cmpout",
+                str(panel),
             ]
             marks = wall_of([cmp_cmd], samples, warmups)
-            # One extra untimed run supplies parseable rows.
-            stdout = run(cmp_cmd, capture=True)
-            # Matrix rows list values in -F order; columns match rows.
-            table = [
-                line.split()
-                for line in stdout.splitlines()
-                if line and not line.startswith("#")
-            ]
-            # First column is the row label; value columns follow -F order,
-            # matching the sorted sketch file order.
-            rows = []
-            for i, row in enumerate(table):
-                for j in range(i + 1, len(sketch_files)):
-                    value = row[1 + j]
-                    if value == "-":
-                        continue
-                    left = next(
-                        p
-                        for p in references + query_list
-                        if p.name == sketch_files[i].name.split(".rc_canon")[0]
-                    )
-                    right = next(
-                        p
-                        for p in references + query_list
-                        if p.name == sketch_files[j].name.split(".rc_canon")[0]
-                    )
-                    rows.append(
-                        {
-                            "query": str(left),
-                            "reference": str(right),
-                            "jaccard": float(value),
-                            "ani": None,
-                        }
-                    )
-            record_compare("dashing2", "SetSketch", marks, rows)
+            # One sample row per `pair_stride` pairs, the same rule the other tools' rows use.
+            panel_stride = max(
+                1, (len(references) * len(panel_queries)) // max(match_rows or 1, 1)
+            )
+            rows, evaluated = read_dashing2_panel(panel, panel_queries, panel_stride)
+            record_compare("dashing2", "SetSketch", marks, rows, evaluated=evaluated)
+
         if "hypergen" in selected:
             dist_out = work / "hg.ani"
             query_sketch = (
