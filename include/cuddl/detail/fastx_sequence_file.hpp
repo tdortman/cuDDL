@@ -828,18 +828,25 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
 // rethrown by take, matching std::async propagation into the build error handlers.
 class fastx_load_pool {
    public:
+    /// @param workers Loader threads.
+    /// @param window  Files the loaders may hold ahead of the consumer, at least one per worker.
+    ///                Results are taken in order, so the window is what hides a slow file: with a
+    ///                window of one worker-worth there is no slack, and the consumer waits on the
+    ///                straggler while the other loaders sit idle.
     fastx_load_pool(
         std::span<std::filesystem::path const> paths,
-        size_t depth,
-        decompression_source source = {}
+        size_t workers,
+        decompression_source source = {},
+        size_t window = 0
     )
         : paths_(paths),
-          depth_(std::max(size_t{1}, depth)),
+          workers_(std::max(size_t{1}, workers)),
+          window_(std::max({size_t{1}, window, workers_})),
           source_(source),
           results_(paths.size()),
           errors_(paths.size()) {
-        workers_.reserve(depth_);
-        for (size_t i = 0; i < depth_; ++i) workers_.emplace_back([this] { work(); });
+        threads_.reserve(workers_);
+        for (size_t i = 0; i < workers_; ++i) threads_.emplace_back([this] { work(); });
     }
     ~fastx_load_pool() {
         {
@@ -847,7 +854,7 @@ class fastx_load_pool {
             stop_ = true;
         }
         assign_.notify_all();
-        for (auto& worker : workers_) worker.join();
+        for (auto& thread : threads_) thread.join();
     }
     fastx_load_pool(fastx_load_pool const&) = delete;
     fastx_load_pool& operator=(fastx_load_pool const&) = delete;
@@ -856,7 +863,9 @@ class fastx_load_pool {
         std::unique_lock lock(mutex_);
         filled_.wait(lock, [&] { return results_[id].has_value() || errors_[id] != nullptr; });
         ++taken_;
-        assign_.notify_all();
+        // One freed window slot needs one loader, not all of them: waking the rest is a syscall
+        // and a context switch each, once per genome, at 100,000 genomes.
+        assign_.notify_one();
         lock.unlock();
         if (errors_[id] != nullptr) std::rethrow_exception(errors_[id]);
         return std::move(*results_[id]);
@@ -869,10 +878,10 @@ class fastx_load_pool {
             {
                 std::unique_lock lock(mutex_);
                 assign_.wait(lock, [&] {
-                    return stop_ || next_ >= paths_.size() || next_ - taken_ < depth_;
+                    return stop_ || next_ >= paths_.size() || next_ - taken_ < window_;
                 });
                 if (stop_ || next_ >= paths_.size()) return;
-                if (next_ - taken_ >= depth_) continue;
+                if (next_ - taken_ >= window_) continue;
                 id = next_++;
             }
             try {
@@ -887,11 +896,12 @@ class fastx_load_pool {
         }
     }
     std::span<std::filesystem::path const> paths_;
-    size_t depth_;
+    size_t workers_;
+    size_t window_;
     decompression_source source_;
     std::vector<std::optional<Result<std::unique_ptr<fastx_sequence_file>>>> results_;
     std::vector<std::exception_ptr> errors_;
-    std::vector<std::thread> workers_;
+    std::vector<std::thread> threads_;
     std::mutex mutex_;
     std::condition_variable assign_, filled_;
     size_t next_ = 0, taken_ = 0;

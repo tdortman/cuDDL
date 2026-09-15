@@ -94,7 +94,7 @@ size_t for_each_batch(
             size_t{workers != 0 ? workers : std::max(1U, std::thread::hardware_concurrency())}
         )
     );
-    cuddl::detail::fastx_load_pool loader(file_paths, depth);
+    cuddl::detail::fastx_load_pool loader(file_paths, depth, {}, depth * 4);
     for (size_t genome = 0; genome < paths.size(); ++genome) {
         // Extents arrive compacted, so a piece is a straight copy of bases.
         auto sequence = loader.take(genome);

@@ -339,7 +339,12 @@ class reference_database_file {
                     ? detail::decompression_source{detail::acquire_pinned_target, pinned_pool}
                     : detail::decompression_source{};
             std::optional<detail::fastx_load_pool> loader;
-            if (workers > 1) loader.emplace(paths, workers, load_source);
+            if (workers > 1) {
+                // Loaders run a few files ahead of the consumer, which takes results in order.
+                // A window of one worker-worth leaves the consumer waiting on a straggler while
+                // every other loader sits idle.
+                loader.emplace(paths, workers, load_source, workers * 4);
+            }
             // Device budget: one arena of staged bases plus a store of register rows. The arena
             // is sized from what is actually free, so a batch is as large as the device allows
             // and one batch kernel covers every record staged into it, instead of a launch per
