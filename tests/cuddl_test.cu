@@ -3681,50 +3681,78 @@ TEST(ReferenceDatabaseFileTest, GenomeLargerThanUploadBufferMatchesScalar) {
     std::filesystem::remove(paths.front());
 }
 
-TEST(ReferenceDatabaseFileTest, GpuTilesMatchCpuAcrossTinyChunkBoundaries) {
+TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries) {
     cuda::stream stream{cuda::devices[0]};
-    cuddl::detail::fastx_device_builder packer(stream);
-    ASSERT_TRUE(packer.prepare(stream));
+    constexpr size_t buckets = 2048;
+    // A record far longer than the arena forces pieces to split inside a record and across
+    // batches. The short records, the wrapped lines and the FASTQ qualities force record
+    // boundaries and whitespace compaction to agree with the scalar parser.
+    std::string long_record;
+    long_record.reserve(4000);
+    for (size_t i = 0; i < 4000; ++i) {
+        long_record.push_back("ACGTN"[cuddl::detail::splitmix64(i) & 3U]);
+    }
+    std::vector<std::filesystem::path> paths{
+        write_tmp_fasta(">long contig\n" + long_record + "\n"),
+        write_tmp_fasta(">short\nAA\n>second\nACGTACGTACGT\n"),
+        write_tmp_fasta(">case and tabs\nacGTACGT \tN\nACGTacgt A\r\n>tail\nACGT\n"),
+        write_tmp_fasta("@fq1\nACGTNACGT\n+\nIIIIIIIII\n@fq2\nTTT\n+\nIII\n"),
+        write_tmp_fasta(""),
+    };
+    for (size_t const staging : {size_t{64}, size_t{512}, size_t{4096}}) {
+        auto built = cuddl::reference_database_file::build<25, buckets>(
+            paths, stream, 4, nullptr, true, staging
+        );
+        ASSERT_TRUE(built) << built.error().message() << " staging=" << staging;
+        ASSERT_EQ(built->rows().size(), paths.size() * buckets);
+        ASSERT_EQ(built->saturation().size(), paths.size());
+        for (size_t i = 0; i < paths.size(); ++i) {
+            auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[i].string(), 25));
+            scalar_sketch<buckets> expected;
+            expected.add(parsed.kmers);
+            expected.pack_registers();
+            EXPECT_TRUE(
+                std::equal(
+                    expected.registers.begin(),
+                    expected.registers.end(),
+                    built->rows().begin() + i * buckets
+                )
+            ) << "staging=" << staging << " genome=" << i;
+            EXPECT_EQ(expected.saturated, built->saturation()[i])
+                << "staging=" << staging << " genome=" << i;
+        }
+    }
+    for (auto const& path : paths) std::filesystem::remove(path);
+}
+
+TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
+    cuda::stream stream{cuda::devices[0]};
     auto path = write_tmp_fasta(
         ">short\nAA\n>genome\nacGTACGT N\tACGTACGTACGTACGTACGTACGTACGTACGTACGT\r\n"
         "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>last\nTT\n"
     );
-    auto sequence = CUDDL_UNWRAP(cuddl::detail::load_fastx_sequence_file(path));
-    auto check = [&]<size_t buckets>() {
-        for (uint32_t k = 1; k <= 31; ++k) {
-            auto expected = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k, 1));
-            for (size_t chunk : {size_t{1}, size_t{7}, size_t{31}, size_t{80}}) {
-                auto registers =
-                    cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets + 1, 0U);
-                scalar_sketch<buckets> oracle;
-                oracle.add(expected.kmers);
-                oracle.pack_registers();
-                for (auto const& extent : sequence->extents) {
-                    packer.reset();
-                    std::string_view const record{extent.begin, extent.end};
-                    for (size_t offset = 0; offset < record.size(); offset += chunk) {
-                        CUDDL_UNWRAP((packer.add<buckets>(
-                            record.substr(offset, chunk),
-                            k,
-                            registers.data(),
-                            registers.data()[buckets],
-                            stream
-                        )));
-                    }
-                }
-                std::vector<uint32_t> actual(buckets + 1);
-                cuda::copy_bytes(stream, registers, actual);
-                stream.sync();
-                EXPECT_EQ(actual[buckets], oracle.saturated);
-                EXPECT_TRUE(
-                    std::equal(oracle.registers.begin(), oracle.registers.end(), actual.begin())
-                ) << "k="
-                  << k << " chunk=" << chunk;
-            }
+    // k = 1 has no carry to re-stage, and k = 31 is the longest window the encoder takes.
+    auto check = [&]<uint32_t k>() {
+        auto expected = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k, 1));
+        scalar_sketch<2048> oracle;
+        oracle.add(expected.kmers);
+        oracle.pack_registers();
+        for (size_t const staging : {size_t{64}, size_t{128}}) {
+            auto built = cuddl::reference_database_file::build<k, 2048>(
+                std::vector<std::filesystem::path>{path}, stream, 1, nullptr, true, staging
+            );
+            ASSERT_TRUE(built) << built.error().message() << " k=" << k;
+            EXPECT_EQ(oracle.saturated, built->saturation().front()) << "k=" << k;
+            EXPECT_TRUE(
+                std::equal(oracle.registers.begin(), oracle.registers.end(), built->rows().begin())
+            ) << "k="
+              << k << " staging=" << staging;
         }
     };
-    check.template operator()<2048>();
-    check.template operator()<16384>();
+    check.template operator()<1>();
+    check.template operator()<3>();
+    check.template operator()<25>();
+    check.template operator()<31>();
     std::filesystem::remove(path);
 }
 

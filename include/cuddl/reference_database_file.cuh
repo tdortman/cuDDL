@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#include <cuddl/detail/fastx_device_builder.cuh>
+#include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/fastx.hpp>
 #include <cuddl/reference_database.cuh>
 #include <cuddl/sketch.cuh>
@@ -136,8 +136,9 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
 }
 
 // Page-locked sequence storage handed to loader threads. A lease returns to the pool when the
-// parsed file holding it dies, which is after the transfer engine has finished reading it, so a
-// buffer is never reused while a DMA may still be in flight.
+// parsed file holding it dies, which is after the caller enqueued every copy that reads it.
+// Releasing records that point on the stream; the next loader to take the slot waits for it
+// there, so a buffer is never rewritten under a DMA and the build never has to drain.
 class pinned_sequence_pool {
    public:
     /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
@@ -145,12 +146,38 @@ class pinned_sequence_pool {
         : stream_(stream), limit_(limit) {
         slots_.reserve(buffers);
         in_use_.reserve(buffers);
+        consumed_.reserve(buffers);
+    }
+
+    /// @brief Number of buffers the pool may grow to.
+    void set_capacity(size_t buffers) noexcept {
+        capacity_ = std::max<size_t>(1, buffers);
+    }
+
+    /// @brief Buffers allocated so far. Read once the loaders have stopped.
+    [[nodiscard]] size_t buffers() const noexcept {
+        return slots_.size();
     }
 
     /// @brief Returns page-locked bytes, or a null target when the pool cannot serve.
     [[nodiscard]] decompression_target acquire(size_t bytes) {
         if (bytes == 0 || bytes > limit_) return {};
-        std::lock_guard lock(mutex_);
+        size_t index = 0;
+        {
+            std::lock_guard lock(mutex_);
+            index = claim(bytes);
+            if (index == slots_.size()) return {};
+        }
+        // Wait on the loader thread rather than the build loop: the slot is already reserved,
+        // so this blocks only the genome that needs it. A failing wait throws out of the loader,
+        // which reports it through the pool's error slot like any other load failure.
+        consumed_[index].sync();
+        return lease(index);
+    }
+
+   private:
+    /// @brief Reserves a free slot holding at least @p bytes, or returns slots_.size().
+    [[nodiscard]] size_t claim(size_t bytes) {
         for (size_t i = 0; i < slots_.size(); ++i) {
             if (in_use_[i]) continue;
             if (slots_[i]->buffer.size() < bytes) {
@@ -167,9 +194,9 @@ class pinned_sequence_pool {
                 );
             }
             in_use_[i] = true;
-            return lease(i);
+            return i;
         }
-        if (slots_.size() >= capacity_) return {};
+        if (slots_.size() >= capacity_) return slots_.size();
         slots_.push_back(
             std::make_unique<slot>(
                 cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
@@ -178,17 +205,8 @@ class pinned_sequence_pool {
             )
         );
         in_use_.push_back(true);
-        return lease(slots_.size() - 1);
-    }
-
-    /// @brief Number of buffers the pool may grow to.
-    void set_capacity(size_t buffers) noexcept {
-        capacity_ = std::max<size_t>(1, buffers);
-    }
-
-    /// @brief Buffers allocated so far. Read once the loaders have stopped.
-    [[nodiscard]] size_t buffers() const noexcept {
-        return slots_.size();
+        consumed_.emplace_back(stream_);
+        return slots_.size() - 1;
     }
 
    private:
@@ -202,11 +220,12 @@ class pinned_sequence_pool {
         return {
             owner->buffer.data(),
             owner->buffer.size(),
-            std::shared_ptr<void>(owner, [pool](void* released) {
+            std::shared_ptr<void>(owner, [pool, index](void*) {
                 std::lock_guard lock(pool->mutex_);
-                for (size_t i = 0; i < pool->slots_.size(); ++i) {
-                    if (pool->slots_[i].get() == released) pool->in_use_[i] = false;
-                }
+                // Record before publishing the slot: a loader that takes it must see the
+                // event of every copy the previous lease fed.
+                pool->consumed_[index].record(pool->stream_);
+                pool->in_use_[index] = false;
             })
         };
     }
@@ -216,6 +235,7 @@ class pinned_sequence_pool {
     size_t capacity_{1};
     std::vector<std::unique_ptr<slot>> slots_;
     std::vector<bool> in_use_;
+    std::vector<cuda::event> consumed_;
     std::mutex mutex_;
 };
 
@@ -333,6 +353,9 @@ struct reference_build_statistics {
     size_t direct_chunks = 0;
     size_t staged_chunks = 0;
     size_t pinned_buffers = 0;
+    size_t staging_bytes = 0;
+    size_t batches = 0;
+    size_t pieces = 0;
 };
 
 /**
@@ -364,10 +387,13 @@ class reference_database_file {
      * @brief Builds one sketch per plain or gzip/BGZF FASTA/FASTQ file on the GPU.
      *
      * K-mers never cross record boundaries or ambiguous bases. FASTQ qualities are validated
-     * and ignored. A bounded queue loads sequences concurrently; GPU tiles encode bases
-     * in shared memory and update sketches without materializing a k-mer array. Zero workers
-     * selects up to eight. Use one worker to load only one genome at a time. Empty genomes retain
-     * their IDs and have zero rows.
+     * and ignored. Loader threads compact and stage records into a device arena sized from free
+     * device memory, and one batch kernel encodes every record in it, so the device is fed in
+     * large batches rather than slice by slice. Register rows stay on the device for a group of
+     * genomes and return to the host once, on the single drain at the end of the build.
+     * @p staging_bytes caps the arena explicitly; zero sizes it from free device memory.
+     * Zero workers selects up to eight. Use one worker to load only one genome at a time.
+     * Empty genomes retain their IDs and have zero rows.
      */
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     /// @p pinned transfers decompressed bytes straight from page-locked memory. Disabling it
@@ -378,7 +404,8 @@ class reference_database_file {
         cuda::stream_ref stream,
         unsigned parser_workers = 0,
         reference_build_statistics* statistics = nullptr,
-        bool pinned = default_pinned_transfer
+        bool pinned = default_pinned_transfer,
+        size_t staging_bytes = 0
     ) try {
         // NVCC 13.3 crashes on CUDDL_TRY directly inside a try block. Keep its GNU statement
         // expressions in a separate lambda scope, outside the exception-catching function.
@@ -397,6 +424,8 @@ class reference_database_file {
             result.rows_.resize(paths.size() * BucketCount);
             result.saturation_.resize(paths.size());
             result.names_.reserve(paths.size());
+            // No inputs means no staging budget to resolve and nothing to encode.
+            if (paths.empty()) return result;
             // Larger genomes keep the loader's own buffer rather than pinning that much RAM
             // per loader for the whole run.
             constexpr size_t pinned_limit = size_t{32} << 20;
@@ -417,121 +446,233 @@ class reference_database_file {
             auto* pinned_pool = pinned ? &pinned_buffers : nullptr;
             std::optional<detail::fastx_load_pool> loader;
             if (workers > 1) loader.emplace(paths, workers, pinned_pool);
-            auto registers = CUDDL_CUDA_TRY(
+            // Device budget: one arena of staged bases plus a store of register rows. The arena
+            // is sized from what is actually free, so a batch is as large as the device allows
+            // and one batch kernel covers every record staged into it, instead of a launch per
+            // slice with the host waiting on the device between them.
+            size_t free_bytes = 0, device_bytes = 0;
+            CUDDL_CUDA_TRY(cudaMemGetInfo(&free_bytes, &device_bytes));
+            auto const& device_pool = cuda::device_default_memory_pool(stream.device());
+            auto const pool_reserved =
+                device_pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
+            auto const pool_used =
+                device_pool.attribute(cuda::memory_pool_attributes::used_mem_current);
+            // Cached pool storage is reused by the next allocation, so it counts as available.
+            size_t const available = free_bytes + pool_reserved - std::min(pool_reserved, pool_used);
+            size_t const usable = available - available / 10;
+            // (BucketCount + 1) words hold one genome's registers plus its saturation flag.
+            size_t const row_words = BucketCount + 1;
+            size_t const row_bytes = row_words * sizeof(uint32_t);
+            // Rows are small next to the input, so the whole collection stays resident whenever
+            // that costs at most a quarter of what is affordable; otherwise rows stream back one
+            // group at a time as each group completes.
+            size_t const group = std::min(paths.size(), std::max<size_t>(1, usable / (4 * row_bytes)));
+            uint64_t input_bytes = 0;
+            for (auto const& path : paths) {
+                std::error_code error;
+                auto const size = std::filesystem::file_size(path, error);
+                if (!error) input_bytes += size;
+            }
+            // At most six staged bytes per input byte, so a small collection does not reserve an
+            // arena it could never fill.
+            size_t const arena_ceiling =
+                static_cast<size_t>(std::min<uint64_t>(input_bytes * 6, uint64_t{6} << 40));
+            size_t const row_store_bytes = group * row_bytes;
+            size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
+            size_t staging = staging_bytes;
+            if (staging == 0) {
+                staging = std::min(after_rows, arena_ceiling);
+            }
+            // One piece of at least k bases plus its k - 1 byte overlap has to fit.
+            if (staging < K + 1 || staging > after_rows) {
+                return Err(Error::resource(
+                    "insufficient free device memory for reference staging (free " +
+                    std::to_string(free_bytes >> 20) + " MiB)"
+                ));
+            }
+            // One descriptor per staged piece; the cap keeps a corpus of very short records from
+            // demanding a descriptor per record.
+            size_t const max_pieces =
+                std::min<size_t>(size_t{1} << 20, std::max<size_t>(64, staging / K));
+            // Pieces are a quarter of the arena at most, so a batch always holds several, and
+            // short enough that a piece's window count stays representable.
+            size_t const max_piece = std::min(
+                {std::max<size_t>(K, staging / 4),
+                 static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - K + 1}
+            );
+            auto rows = CUDDL_CUDA_TRY(
                 cuda::make_device_buffer<uint32_t>(
-                    stream, stream.device(), BucketCount + 1, cuda::no_init
+                    stream, stream.device(), group * row_words, cuda::no_init
                 )
             );
-            detail::fastx_device_builder packer(stream);
-            CUDDL_TRY(packer.prepare(stream));
-            std::string short_records;
-            for (size_t id = 0; id < paths.size(); ++id) {
-                auto sequence = CUDDL_TRY(
-                    workers == 1
-                        ? detail::load_fastx_sequence_file(
-                              paths[id].string(),
-                              pinned_pool != nullptr
-                                  ? detail::decompression_source{
-                                        detail::acquire_pinned_target, pinned_pool
-                                    }
-                                  : detail::decompression_source{}
-                          )
-                        : loader->take(id)
-                );
-                auto const* pinned_base = sequence->decompressed_target;
-                CUDDL_CUDA_TRY(cuda::fill_bytes(stream, registers, 0));
-                short_records.clear();
-                auto add_sequence = [&](std::string_view record) -> Result<void> {
-                    packer.reset();
-                    for (size_t offset = 0; offset < record.size(); offset += packer.capacity) {
-                        auto const slice = record.substr(offset, packer.capacity);
-                        // Decompressed bytes already sit in page-locked memory, so they go
-                        // straight to the device; heap-backed records still stage first.
-                        auto const pinned_span = pinned_base != nullptr &&
-                                                 slice.data() >= pinned_base &&
-                                                 slice.data() + slice.size() <=
-                                                     pinned_base + sequence->decompressed_size;
-                        if (pinned_span) {
-                            if (statistics != nullptr) {
-                                statistics->direct_bytes += slice.size();
-                                ++statistics->direct_chunks;
-                            }
-                            CUDDL_TRY((packer.add_direct<BucketCount, Layout>(
-                                slice.data(),
-                                slice.size(),
-                                K,
-                                registers.data(),
-                                registers.data()[BucketCount],
-                                stream
-                            )));
-                        } else {
-                            if (statistics != nullptr) {
-                                statistics->staged_bytes += slice.size();
-                                ++statistics->staged_chunks;
-                            }
-                            CUDDL_TRY((packer.add<BucketCount, Layout>(
-                                slice, K, registers.data(), registers.data()[BucketCount], stream
-                            )));
-                        }
-                    }
-                    return Ok();
-                };
-                for (auto const& extent : sequence->extents) {
-                    std::string_view const record{extent.begin, extent.end};
-                    auto const pinned_record = pinned_base != nullptr &&
-                                               record.data() >= pinned_base &&
-                                               record.data() + record.size() <=
-                                                   pinned_base + sequence->decompressed_size;
-                    if (pinned_record) {
-                        // Already page-locked, so this streams with no copy. Batching would move
-                        // it to the heap and lose that; batching exists only to spare fragmented
-                        // assemblies a launch per contig.
-                        if (!short_records.empty()) {
-                            CUDDL_TRY(add_sequence(short_records));
-                            short_records.clear();
-                        }
-                        CUDDL_TRY(add_sequence(record));
-                        continue;
-                    }
-                    if (record.size() >= packer.capacity ||
-                        short_records.size() + record.size() + 1 > packer.capacity) {
-                        CUDDL_TRY(add_sequence(short_records));
-                        short_records.clear();
-                    }
-                    if (record.size() >= packer.capacity) {
-                        CUDDL_TRY(add_sequence(record));
-                    } else {
-                        // Batch short contigs/reads to avoid a GPU launch per record.
-                        short_records.reserve(packer.capacity);
-                        short_records.append(record);
-                        short_records.push_back('N');
-                    }
-                }
-                if (!short_records.empty()) {
-                    CUDDL_TRY(add_sequence(short_records));
-                }
+            auto arena = CUDDL_CUDA_TRY(
+                cuda::make_device_buffer<char>(stream, stream.device(), staging, cuda::no_init)
+            );
+            auto descriptors = CUDDL_CUDA_TRY(
+                cuda::make_device_buffer<detail::sequence_batch_chunk>(
+                    stream, stream.device(), max_pieces, cuda::no_init
+                )
+            );
+            std::vector<detail::sequence_batch_chunk> staged_chunks;
+            staged_chunks.reserve(std::min<size_t>(max_pieces, size_t{1} << 16));
+            auto const sm = static_cast<size_t>(
+                stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+            );
+            auto const max_grid = static_cast<size_t>(
+                stream.device().attribute(cuda::device_attributes::max_grid_dim_x)
+            );
+            size_t arena_used = 0, block_end = 0, batches = 0, pieces = 0;
+
+            // Stages one span of bases and records its windows. A span that continues a record
+            // was widened by k - 1 bases on the host, so it holds one window per base it adds.
+            auto stage = [&](char const* source, size_t size, size_t genome, uint32_t windows
+                         ) -> Result<void> {
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
-                        device_span<uint32_t const>{registers.data(), BucketCount},
-                        cuda::std::span{result.rows_.data() + id * BucketCount, BucketCount}
+                        cuda::std::span{source, size},
+                        device_span<char>{arena.data() + arena_used, size}
                     )
                 );
+                auto const blocks =
+                    windows == 0
+                        ? size_t{0}
+                        : std::min(sm * 2, (static_cast<size_t>(windows) + 2047) / 2048);
+                block_end += blocks;
+                staged_chunks.push_back(
+                    {arena_used, block_end, static_cast<uint32_t>(genome), windows}
+                );
+                arena_used += size;
+                ++pieces;
+                return Ok();
+            };
+            // One launch for everything staged so far. Copies queued after it land in the arena
+            // only once the device has finished reading it, so no host wait is needed here.
+            auto flush = [&]() -> Result<void> {
+                if (staged_chunks.empty()) return Ok();
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
-                        device_span<uint32_t const>{registers.data() + BucketCount, 1},
-                        cuda::std::span{result.saturation_.data() + id, size_t{1}}
+                        cuda::std::span{staged_chunks.data(), staged_chunks.size()},
+                        device_span<detail::sequence_batch_chunk>{
+                            descriptors.data(), staged_chunks.size()
+                        }
                     )
                 );
-                CUDDL_CUDA_TRY(stream.sync());
-                result.names_.push_back(paths[id].string());
-                sequence.reset();
+                auto const grid = std::min(block_end, max_grid);
+                if (grid != 0) {
+                    detail::add_sequence_batch_kernel<BucketCount, Layout>
+                        <<<static_cast<uint32_t>(grid), 256, 0, stream.get()>>>(
+                            arena.data(),
+                            descriptors.data(),
+                            staged_chunks.size(),
+                            block_end,
+                            K,
+                            rows.data()
+                        );
+                    CUDDL_CUDA_TRY(cudaGetLastError());
+                }
+                ++batches;
+                staged_chunks.clear();
+                arena_used = 0;
+                block_end = 0;
+                return Ok();
+            };
+            size_t base = 0;
+            while (base < paths.size()) {
+                auto const count = std::min(group, paths.size() - base);
+                CUDDL_CUDA_TRY(
+                    cuda::fill_bytes(
+                        stream, cuda::std::span{rows.data(), count * row_words}, uint32_t{0}
+                    )
+                );
+                for (size_t id = base; id < base + count; ++id) {
+                    auto sequence = CUDDL_TRY(
+                        workers == 1
+                            ? detail::load_fastx_sequence_file(
+                                  paths[id].string(),
+                                  pinned_pool != nullptr
+                                      ? detail::decompression_source{
+                                            detail::acquire_pinned_target, pinned_pool
+                                        }
+                                      : detail::decompression_source{}
+                              )
+                            : loader->take(id)
+                    );
+                    auto const* const pinned_base = sequence->decompressed_target;
+                    auto const pinned_size = sequence->decompressed_size;
+                    auto const genome = id - base;
+                    for (auto const& extent : sequence->extents) {
+                        auto const* const record = extent.begin;
+                        auto const size = static_cast<size_t>(extent.end - extent.begin);
+                        size_t offset = 0;
+                        while (offset < size) {
+                            // A continuation re-stages the previous piece's last k - 1 bases, so
+                            // kmers spanning a piece boundary survive the split.
+                            auto const overlap =
+                                offset == 0 ? size_t{0} : std::min(offset, size_t{K - 1});
+                            auto const bases = std::min(size - offset, max_piece);
+                            auto const span = overlap + bases;
+                            if (span < K) break;  // fewer bases than one window
+                            if (staged_chunks.size() >= max_pieces || arena_used + span > staging) {
+                                CUDDL_TRY(flush());
+                            }
+                            auto const* const source = record + offset - overlap;
+                            auto const direct = pinned_base != nullptr && source >= pinned_base &&
+                                                source + span <= pinned_base + pinned_size;
+                            if (statistics != nullptr) {
+                                if (direct) {
+                                    statistics->direct_bytes += span;
+                                    ++statistics->direct_chunks;
+                                } else {
+                                    statistics->staged_bytes += span;
+                                    ++statistics->staged_chunks;
+                                }
+                            }
+                            CUDDL_TRY(
+                                stage(source, span, genome, static_cast<uint32_t>(span - K + 1))
+                            );
+                            offset += bases;
+                        }
+                    }
+                    result.names_.push_back(paths[id].string());
+                    sequence.reset();
+                }
+                // The group's rows are read back after its last batch, so a batch never spans a
+                // group boundary and the copies below always follow the writes they read.
+                CUDDL_TRY(flush());
+                for (size_t i = 0; i < count; ++i) {
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            device_span<uint32_t const>{rows.data() + i * row_words, BucketCount},
+                            cuda::std::span{
+                                result.rows_.data() + (base + i) * BucketCount, BucketCount
+                            }
+                        )
+                    );
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            device_span<uint32_t const>{
+                                rows.data() + i * row_words + BucketCount, 1
+                            },
+                            cuda::std::span{result.saturation_.data() + base + i, size_t{1}}
+                        )
+                    );
+                }
+                base += count;
             }
+            // One drain for the whole collection: every row copy above queues on this stream in
+            // reference order, so nothing needs to synchronise per genome.
+            CUDDL_CUDA_TRY(stream.sync());
             // Loaders still hold leases; join them before reading pool state.
             loader.reset();
             if (statistics != nullptr) {
                 statistics->pinned_buffers = pinned_buffers.buffers();
+                statistics->staging_bytes = staging;
+                statistics->batches = batches;
+                statistics->pieces = pieces;
             }
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);

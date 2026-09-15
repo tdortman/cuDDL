@@ -2,6 +2,7 @@
 
 #include <libdeflate.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <format>
@@ -32,7 +33,7 @@
 
 namespace cuddl::detail {
 
-/// @brief A contiguous run of sequence bytes (record header lines excluded).
+/// @brief A contiguous run of sequence bases (record headers and line breaks excluded).
 struct fastx_sequence_extent {
     char const* begin;
     char const* end;
@@ -674,6 +675,66 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
     return byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
 }
 
+/// @brief Compacts sequence whitespace in place, leaving every extent a run of bases.
+///
+/// Consumers stage extents verbatim and choose piece boundaries on any base, which needs
+/// contiguous bases. Compacting here moves the work onto the loader thread: each file is
+/// compacted while the other loaders are still decompressing, and a consumer that used to skip
+/// whitespace byte by byte now walks a dense span.
+inline void compact_fastx_sequence_extents(fastx_sequence_file& result) {
+    if (result.extents.empty()) return;
+    // Extents point into whichever buffer holds the bytes: a page-locked target, the heap copy of
+    // a compressed file, or the FASTQ sequence buffer. Those are writable; a memory-mapped plain
+    // file is not, so its bases are compacted into `decompressed` instead.
+    struct writable_buffer {
+        char* data;
+        size_t size;
+    };
+    auto const buffers = std::array{
+        writable_buffer{result.decompressed_target, result.decompressed_size},
+        writable_buffer{result.decompressed.data(), result.decompressed.size()},
+        writable_buffer{result.sequence.data(), result.sequence.size()},
+    };
+    auto const writable = [&](char const* first, size_t size) {
+        return std::any_of(buffers.begin(), buffers.end(), [&](writable_buffer const& buffer) {
+            return buffer.data != nullptr && buffer.size >= size && first >= buffer.data &&
+                   first + size <= buffer.data + buffer.size;
+        });
+    };
+    size_t raw_total = 0;
+    for (auto const& extent : result.extents) raw_total += static_cast<size_t>(extent.end - extent.begin);
+    // Reserved up front so appending cannot move the buffer the extents are about to point at.
+    std::string copied;
+    copied.reserve(raw_total);
+    std::vector<std::pair<size_t, std::pair<size_t, size_t>>> offsets;
+    for (size_t index = 0; index < result.extents.size(); ++index) {
+        auto const& extent = result.extents[index];
+        auto const size = static_cast<size_t>(extent.end - extent.begin);
+        if (writable(extent.begin, size)) {
+            // Compaction only ever moves bytes towards the buffer's start.
+            auto* write = const_cast<char*>(extent.begin);
+            for (auto const* cursor = extent.begin; cursor != extent.end; ++cursor) {
+                if (!fastx_is_sequence_whitespace(*cursor)) *write++ = *cursor;
+            }
+            result.extents[index] = {extent.begin, write};
+        } else {
+            auto const begin = copied.size();
+            for (auto const* cursor = extent.begin; cursor != extent.end; ++cursor) {
+                if (!fastx_is_sequence_whitespace(*cursor)) copied.push_back(*cursor);
+            }
+            offsets.emplace_back(index, std::pair{begin, copied.size()});
+        }
+    }
+    if (!copied.empty()) {
+        result.decompressed = std::move(copied);
+        for (auto const& [index, span] : offsets) {
+            result.extents[index] = {
+                result.decompressed.data() + span.first, result.decompressed.data() + span.second
+            };
+        }
+    }
+}
+
 inline Result<std::unique_ptr<fastx_sequence_file>>
 load_fastx_sequence_file(std::string const& path, decompression_source source = {}) {
     auto file = fastx_mapped_file::load(path);
@@ -731,7 +792,7 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
         }
         return result;
     }
-
+    compact_fastx_sequence_extents(*result);
     return result;
 }
 
