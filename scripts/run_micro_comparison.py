@@ -219,6 +219,7 @@ def main(
     genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
     queries: Annotated[list[Path] | None, typer.Option("--query", exists=True)] = None,
     query_fraction: Annotated[float | None, typer.Option(min=0, max=1)] = None,
+    query_count: Annotated[int | None, typer.Option(min=1)] = None,
     topology: Annotated[str, typer.Option()] = "all-to-all",
     tools: Annotated[str, typer.Option()] = DEFAULT_TOOLS,
     samples: Annotated[int, typer.Option(min=1)] = 3,
@@ -264,14 +265,16 @@ def main(
             if q.is_file()
         }
     )
-    if query_fraction is not None and topology != "batch":
-        raise typer.BadParameter("query-fraction needs batch topology")
+    if query_count is not None and query_fraction is not None:
+        raise typer.BadParameter("query-count and query-fraction exclude each other")
+    if (query_fraction is not None or query_count is not None) and topology != "batch":
+        raise typer.BadParameter("query-count and query-fraction need batch topology")
     if query_fraction is not None and not 0 < query_fraction <= 1:
         raise typer.BadParameter("query-fraction must be within (0, 1]")
-    if query_fraction is not None and query_list:
-        raise typer.BadParameter("query-fraction and --query exclude each other")
-    if topology == "batch" and not query_list and query_fraction is None:
-        raise typer.BadParameter("batch needs --query files or --query-fraction")
+    if (query_fraction is not None or query_count is not None) and query_list:
+        raise typer.BadParameter("query-count and query-fraction exclude --query")
+    if topology == "batch" and not query_list and query_fraction is None and query_count is None:
+        raise typer.BadParameter("batch needs --query files, --query-count, or --query-fraction")
     if topology == "all-to-all" and len(references) < 2:
         raise typer.BadParameter("all-to-all needs at least two genomes")
     # No fixed corpus ceiling: the autoscale block below samples the pair
@@ -325,9 +328,14 @@ def main(
         sizes = {
             p: _est_genome_bases(p) for p in dict.fromkeys([*references, *query_list])
         }
-        if query_fraction is not None:
+        if query_fraction is not None or query_count is not None:
             # Batch queries are a size-spread slice of the discovered files.
-            count = max(1, round(query_fraction * len(references)))
+            count = (
+                query_count
+                if query_count is not None
+                else max(1, round(query_fraction * len(references)))
+            )
+            count = max(1, min(count, len(references)))
             query_list = _spread_pick(references, sizes, count)
         typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
         auto_flags = {
@@ -494,7 +502,9 @@ def main(
             capacity = int(
                 budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
             )
-            if capacity < orig_pairs:
+            # An explicit query count is a decision, not a request to be second-guessed: the
+            # pairs it implies are reported below instead of being trimmed away silently.
+            if capacity < orig_pairs and query_count is None:
                 if topology == "all-to-all":
                     keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
                     references = _spread_pick(references, sizes, keep)
@@ -555,6 +565,13 @@ def main(
                 probe_per_pair_ms = oracle_wall_ms / max(len(oracle), 1)
         else:
             oracle = {}
+        if query_count is not None and total_pairs > 0:
+            minutes = total_pairs * probe_per_pair_ms / 1000 / 60
+            typer.echo(
+                f"query set: {len(query_list)} queries x {len(references)} references = "
+                f"{total_pairs} pairs, about {minutes:.1f} min per sample for the slowest lane "
+                f"({slowest} at {probe_per_pair_ms:.3f}ms/pair)"
+            )
         typer.echo(
             f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
         )
@@ -575,7 +592,45 @@ def main(
         # bounded: triangle materializes the full N x N matrix. Rows with
         # non-positive ANI are treated as unreported, as with triangle.
         skani_ani: dict[tuple[str, str], float] = {}
-        truth_queries = query_list if topology == "batch" else references
+        # Sketch both sides once. The truth runs per query chunk, and handing skani raw FASTAs
+        # would re-sketch every reference in every chunk: on a full corpus that is the whole
+        # corpus read once per chunk.
+        truth_db = work / "skani-truth-db"
+        run_timed(
+            f"skani truth: sketch {len(references)} references",
+            [
+                str(skani),
+                "sketch",
+                "--separate-sketches",
+                "-l",
+                str(skani_list(work, "truth-refs", [str(p) for p in references])),
+                "-o",
+                str(truth_db),
+                "-t",
+                str(threads),
+            ],
+        )
+        reference_sketches = sorted(str(p) for p in truth_db.glob("*.sketch"))
+        reference_list = skani_list(work, "truth-ref-sketches", reference_sketches)
+        if topology == "batch":
+            query_db = work / "skani-truth-queries"
+            run_timed(
+                f"skani truth: sketch {len(query_list)} queries",
+                [
+                    str(skani),
+                    "sketch",
+                    "--separate-sketches",
+                    "-l",
+                    str(skani_list(work, "truth-queries", [str(p) for p in query_list])),
+                    "-o",
+                    str(query_db),
+                    "-t",
+                    str(threads),
+                ],
+            )
+            truth_queries = sorted(str(p) for p in query_db.glob("*.sketch"))
+        else:
+            truth_queries = reference_sketches
         for chunk_base in range(0, len(truth_queries), skani_chunk):
             chunk = truth_queries[chunk_base : chunk_base + skani_chunk]
             chunk_tsv = work / f"skani-truth-{chunk_base}.tsv"
@@ -584,9 +639,9 @@ def main(
                     str(skani),
                     "dist",
                     "--ql",
-                    str(skani_list(work, f"truth-q-{chunk_base}", [str(p) for p in chunk])),
+                    str(skani_list(work, f"truth-q-{chunk_base}", chunk)),
                     "--rl",
-                    str(skani_list(work, "truth-r", [str(p) for p in references])),
+                    str(reference_list),
                     "-o",
                     str(chunk_tsv),
                     "-t",
