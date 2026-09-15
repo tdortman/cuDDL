@@ -249,6 +249,26 @@ class pinned_sequence_pool {
 
 namespace cuddl {
 
+/// @brief One record of a genome the caller already holds: bases only.
+///
+/// No header, no line breaks, no FASTQ qualities: the shape a parsed record has, which is what
+/// the encoder applies its window rules to. k-mers never cross two records.
+struct sequence_record {
+    std::string_view bases;
+};
+
+/// @brief One genome as its records, in order. No records keeps the genome's ID with a zero row.
+struct sequence_genome {
+    std::span<sequence_record const> records;
+    std::string_view name;  // copied into the labels; may be empty
+};
+
+/// @brief Knobs for a build that stages bases the caller already holds.
+struct reference_staging_options {
+    reference_build_statistics* statistics = nullptr;
+    size_t staging_bytes = 0;  // 0 sizes the arena from free device memory
+};
+
 /**
  * @brief Host-owned reference sketches and labels, ready for binary storage or GPU upload.
  *
@@ -346,27 +366,6 @@ class reference_database_file {
                 // every other loader sits idle.
                 loader.emplace(paths, workers, load_source, workers * 4);
             }
-            // Device budget: one arena of staged bases plus a store of register rows. The arena
-            // is sized from what is actually free, so a batch is as large as the device allows
-            // and one batch kernel covers every record staged into it, instead of a launch per
-            // slice with the host waiting on the device between them.
-            size_t free_bytes = 0, device_bytes = 0;
-            CUDDL_CUDA_TRY(cudaMemGetInfo(&free_bytes, &device_bytes));
-            auto const& device_pool = cuda::device_default_memory_pool(stream.device());
-            auto const pool_reserved =
-                device_pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
-            auto const pool_used =
-                device_pool.attribute(cuda::memory_pool_attributes::used_mem_current);
-            // Cached pool storage is reused by the next allocation, so it counts as available.
-            size_t const available = free_bytes + pool_reserved - std::min(pool_reserved, pool_used);
-            size_t const usable = available - available / 10;
-            // (BucketCount + 1) words hold one genome's registers plus its saturation flag.
-            size_t const row_words = BucketCount + 1;
-            size_t const row_bytes = row_words * sizeof(uint32_t);
-            // Rows are small next to the input, so the whole collection stays resident whenever
-            // that costs at most a quarter of what is affordable; otherwise rows stream back one
-            // group at a time as each group completes.
-            size_t const group = std::min(paths.size(), std::max<size_t>(1, usable / (4 * row_bytes)));
             // Exact staged bytes the collection can fill: the decompressed size of every input.
             // A bound from compressed sizes alone overestimates a corpus several times over, and
             // an arena past what the corpus can hold is memory the device never needs.
@@ -381,53 +380,15 @@ class reference_database_file {
                 auto const size = std::filesystem::file_size(path, error);
                 if (!error) staged_ceiling += size;
             }
-            // Four fifths of what is affordable goes to the arena, which leaves room for the
-            // row store, the descriptors, and whatever the caller keeps on the device. On a
-            // coherent CPU/GPU system the free memory reported here is host memory, so a share
-            // of host memory bounds the arena as well.
-            auto const pages = ::sysconf(_SC_PHYS_PAGES);
-            auto const page = ::sysconf(_SC_PAGE_SIZE);
-            size_t const host_share =
-                pages > 0 && page > 0
-                    ? static_cast<size_t>(pages) * static_cast<size_t>(page) / 8
-                    : std::numeric_limits<size_t>::max();
-            size_t const arena_ceiling = static_cast<size_t>(std::min(
-                {staged_ceiling,
-                 static_cast<uint64_t>(usable - usable / 5),
-                 static_cast<uint64_t>(host_share)}
-            ));
-            size_t const row_store_bytes = group * row_bytes;
-            size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
-            size_t staging = staging_bytes;
-            if (staging == 0) {
-                staging = std::min(after_rows, arena_ceiling);
-            }
-            // One piece of at least k bases plus its k - 1 byte overlap has to fit.
-            if (staging < K + 1 || staging > after_rows) {
-                return Err(Error::resource(
-                    "insufficient free device memory for reference staging (free " +
-                    std::to_string(free_bytes >> 20) + " MiB)"
-                ));
-            }
-            // One descriptor per staged piece; the cap keeps a corpus of very short records from
-            // demanding a descriptor per record.
-            size_t const max_pieces =
-                std::min<size_t>(size_t{1} << 20, std::max<size_t>(64, staging / K));
-            // Pieces are a quarter of the arena at most, so a batch always holds several, and
-            // short enough that a piece's window count stays representable.
-            size_t const max_piece = std::min(
-                {std::max<size_t>(K, staging / 4),
-                 static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - K + 1}
-            );
+            auto const plan = CUDDL_TRY((detail::plan_staging<K, BucketCount>(
+                paths.size(), staged_ceiling, staging_bytes, stream
+            )));
             detail::database_stager<K, BucketCount, Layout> stager(
-                stream,
-                paths.size(),
-                {group, staging, max_piece, max_pieces},
-                statistics
+                stream, paths.size(), plan, statistics
             );
             size_t base = 0;
             while (base < paths.size()) {
-                auto const count = std::min(group, paths.size() - base);
+                auto const count = std::min(plan.group, paths.size() - base);
                 CUDDL_TRY(stager.begin_group(count));
                 for (size_t id = base; id < base + count; ++id) {
                     auto sequence = CUDDL_TRY(
@@ -455,6 +416,81 @@ class reference_database_file {
                 statistics->pinned_buffers = pinned_buffers.buffers();
             }
             // Instantiate the same constraints as the destination GPU database.
+            static_assert(sizeof(database_type) > 0);
+            return result;
+        }();
+    } catch (cuda::cuda_error const& error) {
+        return Err(Error::cuda(static_cast<cudaError_t>(error.status())));
+    } catch (std::system_error const& error) {
+        return Err(Error::resource(error.what()));
+    } catch (std::bad_alloc const& error) {
+        return Err(Error::resource(error.what()));
+    }
+
+    /**
+     * @brief Builds one sketch per genome from bases the caller already holds.
+     *
+     * Each genome supplies its records as spans of consecutive bases with the line breaks
+     * already removed, the shape a parsed FASTX record has. The caller keeps every byte alive
+     * until this returns, and the build is synchronous like @ref build. Labels come from the
+     * genomes' names, and reference IDs follow the order of @p genomes.
+     */
+    template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
+    [[nodiscard]] static Result<reference_database_file> build_from_sequences(
+        std::span<sequence_genome const> genomes,
+        cuda::stream_ref stream,
+        reference_staging_options options = {}
+    ) try {
+        return [&]() -> Result<reference_database_file> {
+            using database_type = reference_database<K, BucketCount, Layout>;
+            if (genomes.size() > std::numeric_limits<uint32_t>::max() / BucketCount ||
+                genomes.size() >
+                    std::numeric_limits<size_t>::max() / (BucketCount * sizeof(uint32_t))) {
+                return Err(Error::resource("reference collection exceeds database index capacity"));
+            }
+            reference_database_file result;
+            result.metadata_ = {
+                score_compatibility::current<K, BucketCount, Layout>(),
+                static_cast<uint32_t>(genomes.size())
+            };
+            result.rows_.resize(genomes.size() * BucketCount);
+            result.saturation_.resize(genomes.size());
+            result.names_.reserve(genomes.size());
+            if (genomes.empty()) return result;
+            // The caller knows exactly what the corpus holds, so the arena ceiling is the sum of
+            // the bases rather than an estimate read out of file headers.
+            uint64_t staged_ceiling = 0;
+            for (auto const& genome : genomes) {
+                for (auto const& record : genome.records) staged_ceiling += record.bases.size();
+            }
+            auto const plan = CUDDL_TRY((detail::plan_staging<K, BucketCount>(
+                genomes.size(), staged_ceiling, options.staging_bytes, stream
+            )));
+            detail::database_stager<K, BucketCount, Layout> stager(
+                stream, genomes.size(), plan, options.statistics
+            );
+            std::vector<detail::fastx_sequence_extent> records;
+            size_t base = 0;
+            while (base < genomes.size()) {
+                auto const count = std::min(plan.group, genomes.size() - base);
+                CUDDL_TRY(stager.begin_group(count));
+                for (size_t index = base; index < base + count; ++index) {
+                    auto const& genome = genomes[index];
+                    records.clear();
+                    records.reserve(genome.records.size());
+                    for (auto const& record : genome.records) {
+                        if (record.bases.empty()) continue;
+                        records.push_back(
+                            {record.bases.data(), record.bases.data() + record.bases.size()}
+                        );
+                    }
+                    CUDDL_TRY(stager.add_genome(index - base, records));
+                    result.names_.push_back(std::string(genome.name));
+                }
+                CUDDL_TRY(stager.end_group(base, count));
+                base += count;
+            }
+            CUDDL_TRY(stager.finish(result.rows_, result.saturation_));
             static_assert(sizeof(database_type) > 0);
             return result;
         }();

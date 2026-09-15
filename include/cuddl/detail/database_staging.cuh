@@ -9,6 +9,8 @@
 #include <span>
 #include <vector>
 
+#include <unistd.h>
+
 #include <cuda/algorithm>
 #include <cuda/buffer>
 #include <cuda/devices>
@@ -21,6 +23,81 @@
 #include <cuddl/error.hpp>
 
 namespace cuddl::detail {
+
+/// @brief Sizing a build resolves before its first genome.
+struct staging_plan {
+    size_t group = 0;       // genomes whose register rows stay resident at once
+    size_t staging = 0;     // arena bytes
+    size_t max_piece = 0;   // bytes one piece may occupy
+    size_t max_pieces = 0;  // descriptors one batch may hold
+};
+
+/// @brief Sizes the arena and the row store from free device memory and the corpus.
+///
+/// @p staged_ceiling bounds the bytes the corpus can stage, which keeps a small collection from
+/// reserving an arena it could never fill. Zero @p staging_bytes sizes the arena from what is
+/// free; an explicit value is honoured, or rejected when it does not fit.
+template <uint32_t K, size_t BucketCount>
+[[nodiscard]] inline Result<staging_plan> plan_staging(
+    size_t references,
+    uint64_t staged_ceiling,
+    size_t staging_bytes,
+    cuda::stream_ref stream
+) {
+    size_t free_bytes = 0, device_bytes = 0;
+    CUDDL_CUDA_TRY(cudaMemGetInfo(&free_bytes, &device_bytes));
+    auto const& device_pool = cuda::device_default_memory_pool(stream.device());
+    auto const pool_reserved =
+        device_pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
+    auto const pool_used = device_pool.attribute(cuda::memory_pool_attributes::used_mem_current);
+    // Cached pool storage is reused by the next allocation, so it counts as available.
+    size_t const available = free_bytes + pool_reserved - std::min(pool_reserved, pool_used);
+    size_t const usable = available - available / 10;
+    // (BucketCount + 1) words hold one genome's registers plus its saturation flag.
+    size_t const row_bytes = (BucketCount + 1) * sizeof(uint32_t);
+    // Rows are small next to the input, so the whole collection stays resident whenever that
+    // costs at most a quarter of what is affordable; otherwise rows stream back one group at a
+    // time as each group completes.
+    size_t const group = std::min(references, std::max<size_t>(1, usable / (4 * row_bytes)));
+    // Four fifths of what is affordable goes to the arena, which leaves room for the row store,
+    // the descriptors and whatever the caller keeps on the device. On a coherent CPU/GPU system
+    // the free memory reported here is host memory, so a share of host memory bounds it as well.
+    auto const pages = ::sysconf(_SC_PHYS_PAGES);
+    auto const page = ::sysconf(_SC_PAGE_SIZE);
+    size_t const host_share = pages > 0 && page > 0
+                                  ? static_cast<size_t>(pages) * static_cast<size_t>(page) / 8
+                                  : std::numeric_limits<size_t>::max();
+    size_t const arena_ceiling = static_cast<size_t>(std::min(
+        {staged_ceiling,
+         static_cast<uint64_t>(usable - usable / 5),
+         static_cast<uint64_t>(host_share)}
+    ));
+    size_t const row_store_bytes = group * row_bytes;
+    size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
+    size_t staging = staging_bytes;
+    if (staging == 0) {
+        staging = std::min(after_rows, arena_ceiling);
+    }
+    // One piece of at least k bases plus its k - 1 byte overlap has to fit.
+    if (staging < K + 1 || staging > after_rows) {
+        return Err(
+            Error::resource(
+                "insufficient free device memory for reference staging (free " +
+                std::to_string(free_bytes >> 20) + " MiB)"
+            )
+        );
+    }
+    // One descriptor per staged piece; the cap keeps a corpus of very short records from
+    // demanding a descriptor per record.
+    size_t const max_pieces = std::min<size_t>(size_t{1} << 20, std::max<size_t>(64, staging / K));
+    // Pieces are a quarter of the arena at most, so a batch always holds several, and short
+    // enough that a piece's window count stays representable.
+    size_t const max_piece = std::min(
+        {std::max<size_t>(K, staging / 4),
+         static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - K + 1}
+    );
+    return staging_plan{group, staging, max_piece, max_pieces};
+}
 
 /// @brief Encodes genome records into register rows through a device arena.
 ///
@@ -35,14 +112,6 @@ namespace cuddl::detail {
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class database_stager {
    public:
-    /// @brief Sizing the producer resolves before the first genome.
-    struct limits {
-        size_t group = 0;       // genomes whose register rows stay resident at once
-        size_t staging = 0;     // arena bytes
-        size_t max_piece = 0;   // bytes one piece may occupy
-        size_t max_pieces = 0;  // descriptors one batch may hold
-    };
-
     /// Host memory the device still has to read must stay alive: the transfer engine's read of a
     /// pageable buffer is not ordered with the host writes that follow it. Sixteen slots take the
     /// tail off that wait; at four the tail reached hundreds of milliseconds while dozens of
@@ -57,7 +126,7 @@ class database_stager {
     database_stager(
         cuda::stream_ref stream,
         size_t references,
-        limits bounds,
+        staging_plan bounds,
         reference_build_statistics* statistics = nullptr
     )
         : stream_(stream),
@@ -335,7 +404,7 @@ class database_stager {
     }
 
     cuda::stream_ref stream_;
-    limits bounds_;
+    staging_plan bounds_;
     reference_build_statistics* statistics_;
     cuda::device_buffer<uint32_t> rows_;
     cuda::device_buffer<char> arena_;

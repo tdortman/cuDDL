@@ -3756,6 +3756,59 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
     std::filesystem::remove(path);
 }
 
+TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    // Two genomes: one in two records, one long enough that the arena splits it.
+    std::string const first{"ACGTACGTACGT"};
+    std::string const second{"TTTTACGTACGTACGTACGT"};
+    std::string const repeats(3000, 'A');
+    auto const path0 = write_tmp_fasta(">a\n" + first + "\n>b\n" + second + "\n");
+    auto const path1 = write_tmp_fasta(">c\n" + repeats + "\n");
+    std::vector<std::filesystem::path> const paths{path0, path1};
+
+    // The same bases, as records the caller holds with the line breaks already removed.
+    std::vector<cuddl::sequence_record> const records0{{.bases = first}, {.bases = second}};
+    std::vector<cuddl::sequence_record> const records1{{.bases = repeats}};
+    std::vector<cuddl::sequence_genome> const genomes{
+        {.records = records0, .name = "a"}, {.records = records1, .name = "c"}
+    };
+
+    auto const from_files =
+        CUDDL_UNWRAP((cuddl::reference_database_file::build<25, buckets>(paths, stream)));
+    auto const from_records = CUDDL_UNWRAP(
+        (cuddl::reference_database_file::build_from_sequences<25, buckets>(genomes, stream))
+    );
+
+    // Both producers must agree, and both must match the scalar parser for those bases.
+    ASSERT_EQ(from_records.rows().size(), from_files.rows().size());
+    EXPECT_TRUE(std::equal(
+        from_records.rows().begin(), from_records.rows().end(), from_files.rows().begin()
+    ));
+    ASSERT_EQ(from_records.saturation().size(), from_files.saturation().size());
+    EXPECT_TRUE(std::equal(
+        from_records.saturation().begin(),
+        from_records.saturation().end(),
+        from_files.saturation().begin()
+    ));
+    ASSERT_EQ(from_records.names().size(), paths.size());
+    EXPECT_EQ(from_records.names()[0], "a");
+    EXPECT_EQ(from_records.names()[1], "c");
+    for (size_t genome = 0; genome < paths.size(); ++genome) {
+        auto const parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[genome].string(), 25));
+        scalar_sketch<buckets> expected;
+        expected.add(parsed.kmers);
+        expected.pack_registers();
+        EXPECT_TRUE(std::equal(
+            expected.registers.begin(),
+            expected.registers.end(),
+            from_records.rows().begin() + genome * buckets
+        )) << "genome=" << genome;
+        EXPECT_EQ(expected.saturated, from_records.saturation()[genome]);
+    }
+    for (auto const& path : paths) std::filesystem::remove(path);
+}
+
 TEST(ReferenceDatabaseFileTest, EmptyCollectionRoundTrip) {
     cuda::stream stream{cuda::devices[0]};
     auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<3, 2048>({}, stream)));
