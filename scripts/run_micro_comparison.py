@@ -157,6 +157,7 @@ _PROBE_MIN_PAIRS = 12  # at or below this, skip the probe and run everything
 _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
 _CHUNK_BUDGET_BYTES = 1 << 30  # per-invocation truth output target
 _CHUNK_MIN_ROWS = 8 << 20  # row floor, so loading the reference sketches amortises
+_CHUNK_MAX_QUERIES = 50  # skani dist switches to its hash-table index path above this
 _PAIRS_TARGET_BYTES = 32 << 20  # stored-pairs output target
 _PAIR_ROW_BYTES = 160  # estimated stored bytes per pair row
 
@@ -544,8 +545,13 @@ def main(
             # enough for that load to disappear into the work. Take the larger of a byte target
             # and a row target: with a full-corpus reference set the byte target alone would
             # shrink chunks to a handful of queries and multiply the fixed cost by hundreds.
+            # Stay at or below _CHUNK_MAX_QUERIES: above it skani dist builds a marker
+            # hash table over the references per invocation. On a redundant corpus the
+            # screened path is both slower and a different filter, so the chunk never
+            # crosses that line.
             target = max(_CHUNK_BUDGET_BYTES, _CHUNK_MIN_ROWS * _CHUNK_ROW_BYTES)
-            skani_chunk = max(1, target // (max(1, len(references)) * _CHUNK_ROW_BYTES))
+            by_output = max(1, target // (max(1, len(references)) * _CHUNK_ROW_BYTES))
+            skani_chunk = min(_CHUNK_MAX_QUERIES, by_output)
         file_args = [str(p) for p in references] + [
             str(p) for p in query_list if p not in references
         ]
