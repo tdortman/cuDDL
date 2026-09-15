@@ -310,6 +310,18 @@ class fastx_load_pool {
 
 namespace cuddl {
 
+/// @brief Whether a build transfers decompressed bytes from page-locked memory by default.
+///
+/// Page-locked transfers win when the host writes to device-visible memory at full speed:
+/// measured 2.1x over staging on an x86 host with a discrete GPU. On a coherent CPU/GPU system
+/// the same mapping costs host writes more than the staging copy it removes, which is 2.9x
+/// slower end to end on Grace Hopper. The architecture picks the default; `pinned` overrides it.
+#if defined(__aarch64__)
+inline constexpr bool default_pinned_transfer = false;
+#else
+inline constexpr bool default_pinned_transfer = true;
+#endif
+
 /// @brief How a build moved sequence bytes to the device.
 ///
 /// A run that reports every byte as `direct` is reading the decompressed genome in place; a
@@ -366,7 +378,7 @@ class reference_database_file {
         cuda::stream_ref stream,
         unsigned parser_workers = 0,
         reference_build_statistics* statistics = nullptr,
-        bool pinned = true
+        bool pinned = default_pinned_transfer
     ) try {
         // NVCC 13.3 crashes on CUDDL_TRY directly inside a try block. Keep its GNU statement
         // expressions in a separate lambda scope, outside the exception-catching function.

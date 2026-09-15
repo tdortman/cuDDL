@@ -14,7 +14,7 @@ int main(int argc, char** argv) try {
     unsigned workers = 1;
     int copies = 1, samples = 5;
     bool parse_only = false;
-    bool pinned = true;
+    bool pinned = cuddl::default_pinned_transfer;
     CLI::App app{
         "NVBench wall timing of FASTX -> reference sketches -> binary file (k=25, buckets=2048)"
     };

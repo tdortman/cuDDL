@@ -208,13 +208,15 @@ def main(
         ),
     ] = False,
     hypergen_device: Annotated[str, typer.Option()] = "cpu",
-    cuddl_staged: Annotated[
-        bool,
+    cuddl_transfer: Annotated[
+        str,
         typer.Option(
-            help="Stage the cuDDL reference build's bytes instead of transferring them "
-            "page-locked. Worth trying when a host transfers page-locked memory slowly."
+            help="How the cuDDL reference build moves bytes: 'auto' follows the host "
+            "architecture, 'pinned' transfers page-locked memory, 'staged' copies through a "
+            "heap buffer first. Page-locked is faster on most hosts and 3x slower on "
+            "coherent ones such as Grace Hopper."
         ),
-    ] = False,
+    ] = "auto",
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if topology not in ("batch", "all-to-all"):
@@ -782,7 +784,8 @@ def main(
                     # parses every genome on the calling thread.
                     "--workers",
                     str(threads),
-                    *(["--no-pinned"] if cuddl_staged else []),
+                    *(["--pinned"] if cuddl_transfer == "pinned" else []),
+                    *(["--no-pinned"] if cuddl_transfer == "staged" else []),
                 ],
                 capture=True,
             )
@@ -1249,8 +1252,11 @@ def main(
             # The stage suite needs a query file even for all-to-all; match
             # rows stay triangular over references.
             search_queries = query_list or references[:1]
-            # Sketch-all searches the full-corpus index with subset queries.
+            # Sketch-all searches the full-corpus index with the subset as queries. All-to-all
+            # over that index would need N*(N-1)/2 result rows on the device, which is more than
+            # a GPU holds, so the lane runs as batch: same index, queries on one side.
             search_references = sketch_references if sketch_all else references
+            search_topology = "batch" if sketch_all and topology == "all-to-all" else topology
             cfg.write_text(
                 "reference = "
                 + jsonlib6.dumps([str(path) for path in search_references])
@@ -1265,7 +1271,7 @@ def main(
                 [
                     str(pipeline_bin),
                     "--topology",
-                    topology,
+                    search_topology,
                     "--samples",
                     str(max(samples, 2)),
                     "--warmups",
@@ -1306,8 +1312,8 @@ def main(
                             "cuddl",
                             str(
                                 search_references[m["case"]["query_id"]]
-                                if topology != "batch"
-                                else query_set[m["case"]["query_id"]]
+                                if search_topology != "batch"
+                                else search_queries[m["case"]["query_id"]]
                             ),
                             str(search_references[m["case"]["reference_id"]]),
                         )
