@@ -581,7 +581,8 @@ def main(
             "pair_budget_secs": budget_secs,
             "cub_per_pair_ms": round(probe_per_pair_ms, 3),
             "budget_tool": slowest,
-            "per_tool_pair_ms": {tool: round(value, 3) for tool, value in rates.items()},
+            # Metric values are scalars in this schema, so each tool's rate is its own field.
+            **{f"pair_ms_{tool}": round(value, 3) for tool, value in rates.items()},
             "pairs_evaluated": total_pairs,
             "pairs_total": orig_pairs,
             "auto_caps": ",".join(k for k, v in auto_flags.items() if v) or "none",

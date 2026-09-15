@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <exception>
 #include <memory>
@@ -129,6 +130,23 @@ class genome_parse_pool {
     bool stop_ = false;
 };
 
+/// @brief Host memory a run may spend on resident k-mer arrays, or 0 when it cannot be read.
+[[nodiscard]] size_t available_host_bytes() noexcept {
+    size_t available = 0;
+    if (std::FILE* info = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, info) != nullptr) {
+            unsigned long long kib = 0;
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+                available = static_cast<size_t>(kib) * 1024;
+                break;
+            }
+        }
+        std::fclose(info);
+    }
+    return available;
+}
+
 [[nodiscard]] unsigned parse_worker_count(size_t genomes) noexcept {
     auto const hardware = std::max(1U, std::thread::hardware_concurrency());
     return static_cast<unsigned>(std::max<size_t>(1, std::min<size_t>(genomes, std::min<unsigned>(8U, hardware))));
@@ -203,6 +221,7 @@ int run_main(
     size_t match_rows,
     bool sketch_only,
     unsigned parse_workers,
+    size_t stash_bytes,
     json& report
 ) {
     cudaStream_t stream = nullptr;
@@ -269,7 +288,14 @@ int run_main(
         needed[qa] = 1;
         needed[rb] = 1;
     }
+    // Retaining a genome's k-mers is what makes a pair cheap, but every genome touched by an
+    // evaluated pair would be kept: over a full corpus that is terabytes, which is how a run
+    // sets the machine's memory alight. Keep a budget and re-parse whatever falls outside it.
     std::vector<std::vector<uint64_t>> stashed(genomes);
+    std::vector<char> resident(genomes, 0);
+    std::vector<uint64_t> reparsed_a, reparsed_r;
+    size_t stashed_bytes = 0;
+    size_t reparsed_genomes = 0;
 
     device_buffer work, uniques, run_counts, concat, pair_uniques, pair_counts, num_runs_dev, temp;
     size_t max_keys = 0, max_pair = 0, temp_bytes = 0;
@@ -327,7 +353,15 @@ int run_main(
             }
             CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
             distinct[g] = count ? fetch_runs() : 0;
-            if (needed[g]) stashed[g] = std::move(packed);
+            if (needed[g]) {
+                auto const bytes = packed.size() * sizeof(uint64_t);
+                // Leave room for the pair working set as well as the resident arrays.
+                if (stashed_bytes + bytes <= stash_bytes) {
+                    stashed_bytes += bytes;
+                    resident[g] = 1;
+                    stashed[g] = std::move(packed);
+                }
+            }
         }
         // Pair buffers sized from the largest evaluated pair actually measured.
         for (size_t ordinal : evaluated) {
@@ -343,11 +377,22 @@ int run_main(
         auto const parse_done = clock_type::now();
         auto const compare_tick = clock_type::now();
         pair_rows = json::array();
+        reparsed_a.clear();
+        reparsed_r.clear();
         for (size_t ordinal : evaluated) {
             auto const [a, r] = pair_at(ordinal);
-            // Packed arrays were stashed during the sketch pass above.
-            auto const& packed_a = stashed[a];
-            auto const& packed_r = stashed[r];
+            // Resident arrays come from the sketch pass; anything outside the budget is packed
+            // again here, which costs a parse but keeps memory bounded.
+            if (!resident[a]) {
+                reparsed_a = parse_one(a);
+                ++reparsed_genomes;
+            }
+            if (!resident[r]) {
+                reparsed_r = parse_one(r);
+                ++reparsed_genomes;
+            }
+            auto const& packed_a = resident[a] ? stashed[a] : reparsed_a;
+            auto const& packed_r = resident[r] ? stashed[r] : reparsed_r;
             size_t shared = 0;
             if (distinct[a] && distinct[r]) {
                 auto* keys = static_cast<uint64_t*>(concat.data);
@@ -454,6 +499,10 @@ int run_main(
           {"pairs_total", total_pairs},
           {"pairs_evaluated", evaluated.size()},
           {"parse_workers", parse_workers},
+          {"stash_mb_allowed", stash_bytes >> 20},
+          {"stashed_genomes", static_cast<size_t>(std::count(resident.begin(), resident.end(), 1))},
+          {"stashed_mb", stashed_bytes >> 20},
+          {"reparsed_genomes", reparsed_genomes},
           {"pair_stride", pair_stride},
           {"pairs_emitted", emitted.size()}}},
         {"genomes", genome_rows},
@@ -480,6 +529,7 @@ int main(int argc, char** argv) try {
     int samples = 5, warmups = 1;
     size_t max_kmers = 32ULL << 20, max_pairs = 0, match_rows = 0;
     unsigned workers = 0;
+    size_t stash_mb = 0;
     CLI::App app{"Exact k-mer set baseline from CUB primitives (k=25)"};
     app.add_option("--reference", references)->required()->check(CLI::ExistingFile);
     app.add_option("--query", queries)->check(CLI::ExistingFile);
@@ -493,6 +543,12 @@ int main(int argc, char** argv) try {
         "--workers",
         workers,
         "Concurrent genome parsers ahead of the GPU loop; 0 selects up to 8"
+    );
+    app.add_option(
+        "--stash-mb",
+        stash_mb,
+        "Host memory for resident k-mer arrays; 0 uses half of MemAvailable. Arrays outside the "
+        "budget are packed again per pair instead of being retained."
     );
     app.add_option("--output", output)->required();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
@@ -517,6 +573,8 @@ int main(int argc, char** argv) try {
         match_rows,
         sketch_only,
         workers == 0 ? parse_worker_count(references.size() + queries.size()) : workers,
+        stash_mb ? stash_mb << 20
+                 : std::max<size_t>(available_host_bytes() / 2, size_t{1} << 30),
         report
     );
     FILE* stream = std::fopen(output.c_str(), "w");
