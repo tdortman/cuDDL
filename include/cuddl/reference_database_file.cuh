@@ -152,7 +152,18 @@ class pinned_sequence_pool {
         if (bytes == 0 || bytes > limit_) return {};
         std::lock_guard lock(mutex_);
         for (size_t i = 0; i < slots_.size(); ++i) {
-            if (in_use_[i] || slots_[i]->buffer.size() < bytes) continue;
+            if (in_use_[i]) continue;
+            if (slots_[i]->buffer.size() < bytes) {
+                // Grow a free buffer instead of falling back. Genome sizes vary within a
+                // corpus, and a buffer sized for the first small genome would otherwise
+                // never serve the larger ones. Doubling keeps reallocations rare.
+                auto const grown = std::max(bytes, slots_[i]->buffer.size() * 2);
+                slots_[i] = std::make_unique<slot>(
+                    cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
+                        stream_, cuda::pinned_default_memory_pool(), grown, cuda::no_init
+                    )
+                );
+            }
             in_use_[i] = true;
             return lease(i);
         }
@@ -171,6 +182,11 @@ class pinned_sequence_pool {
     /// @brief Number of buffers the pool may grow to.
     void set_capacity(size_t buffers) noexcept {
         capacity_ = std::max<size_t>(1, buffers);
+    }
+
+    /// @brief Buffers allocated so far. Read once the loaders have stopped.
+    [[nodiscard]] size_t buffers() const noexcept {
+        return slots_.size();
     }
 
    private:
@@ -289,6 +305,19 @@ class fastx_load_pool {
 
 namespace cuddl {
 
+/// @brief How a build moved sequence bytes to the device.
+///
+/// A run that reports every byte as `direct` is reading the decompressed genome in place; a
+/// large `staged` share means page-locked buffers were unavailable and bytes were copied into
+/// staging on the consumer thread instead.
+struct reference_build_statistics {
+    size_t direct_bytes = 0;
+    size_t staged_bytes = 0;
+    size_t direct_chunks = 0;
+    size_t staged_chunks = 0;
+    size_t pinned_buffers = 0;
+};
+
 /**
  * @brief Host-owned reference sketches and labels, ready for binary storage or GPU upload.
  *
@@ -327,7 +356,8 @@ class reference_database_file {
     [[nodiscard]] static Result<reference_database_file> build(
         std::span<std::filesystem::path const> paths,
         cuda::stream_ref stream,
-        unsigned parser_workers = 0
+        unsigned parser_workers = 0,
+        reference_build_statistics* statistics = nullptr
     ) try {
         // NVCC 13.3 crashes on CUDDL_TRY directly inside a try block. Keep its GNU statement
         // expressions in a separate lambda scope, outside the exception-catching function.
@@ -360,7 +390,9 @@ class reference_database_file {
             // Page-locked sequence buffers, one per loader, so the transfer engine reads the
             // decompressed genome in place instead of restaging it on the consumer thread.
             detail::pinned_sequence_pool pinned(stream, workers, pinned_limit);
-            pinned.set_capacity(workers);
+            // One buffer per in-flight file, plus headroom: a worker asks for its next file
+            // while every loaded file still holds a lease, so an exact match would refuse.
+            pinned.set_capacity(workers + 2);
             std::optional<detail::fastx_load_pool> loader;
             if (workers > 1) loader.emplace(paths, workers, &pinned);
             auto registers = CUDDL_CUDA_TRY(
@@ -394,6 +426,10 @@ class reference_database_file {
                                                  slice.data() + slice.size() <=
                                                      pinned_base + sequence->decompressed_size;
                         if (pinned_span) {
+                            if (statistics != nullptr) {
+                                statistics->direct_bytes += slice.size();
+                                ++statistics->direct_chunks;
+                            }
                             CUDDL_TRY((packer.add_direct<BucketCount, Layout>(
                                 slice.data(),
                                 slice.size(),
@@ -403,6 +439,10 @@ class reference_database_file {
                                 stream
                             )));
                         } else {
+                            if (statistics != nullptr) {
+                                statistics->staged_bytes += slice.size();
+                                ++statistics->staged_chunks;
+                            }
                             CUDDL_TRY((packer.add<BucketCount, Layout>(
                                 slice, K, registers.data(), registers.data()[BucketCount], stream
                             )));
@@ -412,6 +452,21 @@ class reference_database_file {
                 };
                 for (auto const& extent : sequence->extents) {
                     std::string_view const record{extent.begin, extent.end};
+                    auto const pinned_record = pinned_base != nullptr &&
+                                               record.data() >= pinned_base &&
+                                               record.data() + record.size() <=
+                                                   pinned_base + sequence->decompressed_size;
+                    if (pinned_record) {
+                        // Already page-locked, so this streams with no copy. Batching would move
+                        // it to the heap and lose that; batching exists only to spare fragmented
+                        // assemblies a launch per contig.
+                        if (!short_records.empty()) {
+                            CUDDL_TRY(add_sequence(short_records));
+                            short_records.clear();
+                        }
+                        CUDDL_TRY(add_sequence(record));
+                        continue;
+                    }
                     if (record.size() >= packer.capacity ||
                         short_records.size() + record.size() + 1 > packer.capacity) {
                         CUDDL_TRY(add_sequence(short_records));
@@ -426,7 +481,9 @@ class reference_database_file {
                         short_records.push_back('N');
                     }
                 }
-                CUDDL_TRY(add_sequence(short_records));
+                if (!short_records.empty()) {
+                    CUDDL_TRY(add_sequence(short_records));
+                }
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
@@ -444,6 +501,11 @@ class reference_database_file {
                 CUDDL_CUDA_TRY(stream.sync());
                 result.names_.push_back(paths[id].string());
                 sequence.reset();
+            }
+            // Loaders still hold leases; join them before reading pool state.
+            loader.reset();
+            if (statistics != nullptr) {
+                statistics->pinned_buffers = pinned.buffers();
             }
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);

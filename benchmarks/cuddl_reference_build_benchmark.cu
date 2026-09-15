@@ -40,6 +40,7 @@ int main(int argc, char** argv) try {
         }
     }
     cuda::stream stream{cuda::devices[0]};
+    cuddl::reference_build_statistics statistics;
     auto run = [&](nvbench::state& state, nvbench::type_list<>) {
         state.exec(nvbench::exec_tag::timer, [&](nvbench::launch&, auto& timer) {
             timer.start();
@@ -52,7 +53,9 @@ int main(int argc, char** argv) try {
                 }
             } else {
                 auto file = CUDDL_UNWRAP(
-                    (cuddl::reference_database_file::build<25, 2048>(paths, stream, workers))
+                    (cuddl::reference_database_file::build<25, 2048>(
+                        paths, stream, workers, &statistics
+                    ))
                 );
                 CUDDL_UNWRAP(file.save(output));
             }
@@ -82,7 +85,12 @@ int main(int argc, char** argv) try {
         {"source", "nvbench_cpu_wall"},
         {"references", paths.size()}, {"input_paths", references}, {"copies", copies},
         {"input_bytes", bytes}, {"parser_threads", threads}, {"parser_workers", workers}, {"samples", samples},
-        {"median_seconds", median}, {"input_MB_per_second", bytes / median / 1e6}
+        {"median_seconds", median}, {"input_MB_per_second", bytes / median / 1e6},
+        {"direct_bytes", statistics.direct_bytes},
+        {"staged_bytes", statistics.staged_bytes},
+        {"direct_chunks", statistics.direct_chunks},
+        {"staged_chunks", statistics.staged_chunks},
+        {"pinned_buffers", statistics.pinned_buffers}
     }.dump(2) << '\n';
 } catch (std::exception const& error) {
     std::cerr << "Error: " << error.what() << '\n';
