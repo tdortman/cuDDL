@@ -148,6 +148,7 @@ def count_pairs(references: list[Path], queries: list[Path], topology: str) -> i
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
+_RABBIT_RESIDENT_FRACTION = 4  # share of host memory RabbitSketch may hold as staged input
 _ARGV_PATH_LIMIT = 8192  # genome paths cub may take on one command line; beyond it, a config
 _PROBE_GENOMES = 24  # probe slice, sized so the pair gap below is measurable
 _PROBE_PAIRS = 30  # first probe size
@@ -917,6 +918,16 @@ def main(
             )
             rep = work / "rabbit.json"
             rabbit_samples = max(samples, 2)
+            # The packed ingest path keeps every input sequence resident, which the benchmark
+            # reserves for small corpora. Past a share of host memory, stream ASCII instead and
+            # cap the staging; its sketches stay corpus-sized either way.
+            staged_bytes = sum(sizes.get(p, 0) for p in (*references, *query_list))
+            stream_input = staged_bytes > _host_ram_bytes() // _RABBIT_RESIDENT_FRACTION
+            resident_cap = max(1 << 20, _host_ram_bytes() // 16)
+            typer.echo(
+                f"  rabbitsketch: {'streaming' if stream_input else 'resident'} ingest, "
+                f"{staged_bytes >> 30} GiB of input"
+            )
             run(
                 [
                     str(rabbit),
@@ -929,7 +940,9 @@ def main(
                     "--k",
                     "25",
                     "--ingest",
-                    "packed",
+                    "sequence" if stream_input else "packed",
+                    "--resident-bytes",
+                    str(resident_cap),
                     "--sketch-size",
                     "4096",
                     "--config",
