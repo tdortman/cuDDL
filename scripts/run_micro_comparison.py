@@ -208,6 +208,13 @@ def main(
         ),
     ] = False,
     hypergen_device: Annotated[str, typer.Option()] = "cpu",
+    cuddl_staged: Annotated[
+        bool,
+        typer.Option(
+            help="Stage the cuDDL reference build's bytes instead of transferring them "
+            "page-locked. Worth trying when a host transfers page-locked memory slowly."
+        ),
+    ] = False,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if topology not in ("batch", "all-to-all"):
@@ -439,12 +446,10 @@ def main(
             # Size the subset by the slowest compare lane we can measure. The exact oracle is
             # fast per pair and the ANI truth is not, and a budget that only fits the oracle
             # still leaves the other lane running for hours.
-            rates: dict[str, float] = {}
+            # The ANI truth always runs, so its rate is always available; the exact oracle is
+            # measured too when selected. Neither binary is touched unless it is in play.
+            rates: dict[str, float] = {"skani": skani_probe_rate()}
             if need_cub:
-                rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
-            if "skani" in selected:
-                rates["skani"] = skani_probe_rate()
-            if not rates:
                 rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
             slowest = max(rates, key=lambda tool: rates[tool])
             probe_per_pair_ms = rates[slowest]
@@ -596,6 +601,7 @@ def main(
             # (suffix, refs, queries): full-corpus sketch supplies timing in
             # sketch-all mode while the subset sketch feeds dist.
             hg_runs = [("", references, query_list)]
+            timed_suffix = "-full" if sketch_all else ""
             if sketch_all:
                 hg_runs.insert(0, ("-full", sketch_references, sketch_queries))
             hg_marks = {}
@@ -644,8 +650,10 @@ def main(
                             hypergen_device,
                         ]
                     )
-                hg_marks[suffix] = wall_of(sketch_cmds, samples, warmups)
-            timed_suffix = "-full" if sketch_all else ""
+                # The subset sketch only feeds dist; its timing is the full run's. One pass is
+                # enough, and repeating it four times just clutters the log.
+                reps = (samples, warmups) if suffix == timed_suffix else (1, 0)
+                hg_marks[suffix] = wall_of(sketch_cmds, reps[0], reps[1])
             marks = hg_marks[timed_suffix]
             sketch_times["hypergen"] = marks
             sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
@@ -695,14 +703,20 @@ def main(
             # (suffix, args): full-corpus sketch supplies timing in sketch-all
             # mode while the subset sketch feeds cmp.
             d2_runs = [("", file_args)]
+            d2_timed = "-full" if sketch_all else ""
             if sketch_all:
                 d2_runs.insert(0, ("-full", sketch_file_args))
             d2_marks = {}
+            d2_subset_rep = 0
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
+                # As with hypergen: the subset sketch only feeds cmp, so it runs once.
+                d2_reps = warmups + samples if suffix == d2_timed else 1
+                if suffix == d2_timed:
+                    d2_timed_rep = d2_reps - 1
                 rep_marks = []
-                for rep in range(warmups + samples):
+                for rep in range(d2_reps):
                     out_dir = work / f"d2{suffix}_{rep}"
                     out_dir.mkdir(exist_ok=True)
                     tick = time.perf_counter()
@@ -724,12 +738,11 @@ def main(
                     if rep >= warmups:
                         rep_marks.append((done - tick) * 1000)
                 d2_marks[suffix] = rep_marks
-            timed_suffix = "-full" if sketch_all else ""
-            marks = d2_marks[timed_suffix]
+            marks = d2_marks[d2_timed]
             sketch_times["dashing2"] = marks
             sketch_bytes["dashing2"] = sum(
                 p.stat().st_size
-                for p in (work / f"d2{timed_suffix}_{warmups + samples - 1}").rglob("*")
+                for p in (work / f"d2{d2_timed}_{d2_timed_rep}").rglob("*")
                 if p.is_file()
             )
             record_sketch(
@@ -769,6 +782,7 @@ def main(
                     # parses every genome on the calling thread.
                     "--workers",
                     str(threads),
+                    *(["--no-pinned"] if cuddl_staged else []),
                 ],
                 capture=True,
             )
@@ -973,7 +987,8 @@ def main(
 
         if "dashing2" in selected:
             listing = work / "d2list.txt"
-            sketch_files = sorted((work / f"d2_{warmups + samples - 1}").glob("*.opss"))
+            # The subset sketch is the cmp input, and it runs once, so its last rep is fixed.
+            sketch_files = sorted((work / f"d2_{d2_subset_rep}").glob("*.opss"))
             listing.write_text("".join(str(p) + "\n" for p in sketch_files))
             cmp_cmd = [
                 str(dashing2),

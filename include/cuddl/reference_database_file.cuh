@@ -156,8 +156,10 @@ class pinned_sequence_pool {
             if (slots_[i]->buffer.size() < bytes) {
                 // Grow a free buffer instead of falling back. Genome sizes vary within a
                 // corpus, and a buffer sized for the first small genome would otherwise
-                // never serve the larger ones. Doubling keeps reallocations rare.
-                auto const grown = std::max(bytes, slots_[i]->buffer.size() * 2);
+                // never serve the larger ones. Rounding up to a power of two bounds how many
+                // times any buffer is reallocated, and page-locked allocation is not cheap.
+                auto grown = size_t{1} << 16;
+                while (grown < bytes) grown *= 2;
                 slots_[i] = std::make_unique<slot>(
                     cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
                         stream_, cuda::pinned_default_memory_pool(), grown, cuda::no_init
@@ -278,7 +280,10 @@ class fastx_load_pool {
             }
             try {
                 auto loaded = load_fastx_sequence_file(
-                    paths_[id].string(), decompression_source{acquire_pinned_target, pinned_}
+                    paths_[id].string(),
+                    pinned_ != nullptr
+                        ? decompression_source{acquire_pinned_target, pinned_}
+                        : decompression_source{}
                 );
                 std::lock_guard lock(mutex_);
                 results_[id] = std::move(loaded);
@@ -353,11 +358,15 @@ class reference_database_file {
      * their IDs and have zero rows.
      */
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
+    /// @p pinned transfers decompressed bytes straight from page-locked memory. Disabling it
+    /// restores the heap buffer plus a staging copy, which some hosts do better; the
+    /// `direct_bytes` and `staged_bytes` counters say which path a build actually took.
     [[nodiscard]] static Result<reference_database_file> build(
         std::span<std::filesystem::path const> paths,
         cuda::stream_ref stream,
         unsigned parser_workers = 0,
-        reference_build_statistics* statistics = nullptr
+        reference_build_statistics* statistics = nullptr,
+        bool pinned = true
     ) try {
         // NVCC 13.3 crashes on CUDDL_TRY directly inside a try block. Keep its GNU statement
         // expressions in a separate lambda scope, outside the exception-catching function.
@@ -389,12 +398,13 @@ class reference_database_file {
             );
             // Page-locked sequence buffers, one per loader, so the transfer engine reads the
             // decompressed genome in place instead of restaging it on the consumer thread.
-            detail::pinned_sequence_pool pinned(stream, workers, pinned_limit);
+            detail::pinned_sequence_pool pinned_buffers(stream, workers, pinned_limit);
             // One buffer per in-flight file, plus headroom: a worker asks for its next file
             // while every loaded file still holds a lease, so an exact match would refuse.
-            pinned.set_capacity(workers + 2);
+            pinned_buffers.set_capacity(workers + 2);
+            auto* pinned_pool = pinned ? &pinned_buffers : nullptr;
             std::optional<detail::fastx_load_pool> loader;
-            if (workers > 1) loader.emplace(paths, workers, &pinned);
+            if (workers > 1) loader.emplace(paths, workers, pinned_pool);
             auto registers = CUDDL_CUDA_TRY(
                 cuda::make_device_buffer<uint32_t>(
                     stream, stream.device(), BucketCount + 1, cuda::no_init
@@ -408,7 +418,11 @@ class reference_database_file {
                     workers == 1
                         ? detail::load_fastx_sequence_file(
                               paths[id].string(),
-                              detail::decompression_source{detail::acquire_pinned_target, &pinned}
+                              pinned_pool != nullptr
+                                  ? detail::decompression_source{
+                                        detail::acquire_pinned_target, pinned_pool
+                                    }
+                                  : detail::decompression_source{}
                           )
                         : loader->take(id)
                 );
@@ -505,7 +519,7 @@ class reference_database_file {
             // Loaders still hold leases; join them before reading pool state.
             loader.reset();
             if (statistics != nullptr) {
-                statistics->pinned_buffers = pinned.buffers();
+                statistics->pinned_buffers = pinned_buffers.buffers();
             }
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);

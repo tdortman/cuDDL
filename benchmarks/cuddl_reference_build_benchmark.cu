@@ -14,6 +14,7 @@ int main(int argc, char** argv) try {
     unsigned workers = 1;
     int copies = 1, samples = 5;
     bool parse_only = false;
+    bool pinned = true;
     CLI::App app{
         "NVBench wall timing of FASTX -> reference sketches -> binary file (k=25, buckets=2048)"
     };
@@ -29,6 +30,11 @@ int main(int argc, char** argv) try {
     app.add_flag(
         "--parse-only", parse_only, "Time the serial CPU parser oracle, excluding GPU construction"
     );
+    app.add_flag(
+        "--pinned{true},!--no-pinned{false}",
+        pinned,
+        "Transfer page-locked decompressed bytes (default), or stage from a heap buffer"
+    )->capture_default_str();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     CLI11_PARSE(app, argc, argv);
     std::vector<std::filesystem::path> paths;
@@ -54,7 +60,7 @@ int main(int argc, char** argv) try {
             } else {
                 auto file = CUDDL_UNWRAP(
                     (cuddl::reference_database_file::build<25, 2048>(
-                        paths, stream, workers, &statistics
+                        paths, stream, workers, &statistics, pinned
                     ))
                 );
                 CUDDL_UNWRAP(file.save(output));
@@ -90,7 +96,8 @@ int main(int argc, char** argv) try {
         {"staged_bytes", statistics.staged_bytes},
         {"direct_chunks", statistics.direct_chunks},
         {"staged_chunks", statistics.staged_chunks},
-        {"pinned_buffers", statistics.pinned_buffers}
+        {"pinned_buffers", statistics.pinned_buffers},
+        {"pinned_requested", pinned}
     }.dump(2) << '\n';
 } catch (std::exception const& error) {
     std::cerr << "Error: " << error.what() << '\n';
