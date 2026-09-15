@@ -671,6 +671,26 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
 ///
 /// `ISIZE` holds one member's length modulo 2^32, so a concatenated stream is only sized
 /// correctly by its last member. A short buffer is refused later, never silently truncated.
+/// @brief Exact decompressed size of @p path, or 0 when it is not a readable gzip file.
+///
+/// A gzip member ends with a little-endian ISIZE, so this needs a 4-byte read instead of a full
+/// decompression pass. A corpus of these bounds how much a staged arena can ever hold.
+[[nodiscard]] inline uint64_t gzip_decompressed_size(std::string const& path) {
+    auto file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return 0;
+    uint64_t size = 0;
+    if (std::fseek(file, -4, SEEK_END) == 0) {
+        unsigned char trailer[4] = {};
+        if (std::fread(trailer, 1, sizeof(trailer), file) == sizeof(trailer)) {
+            size = static_cast<uint64_t>(trailer[0]) | (static_cast<uint64_t>(trailer[1]) << 8) |
+                   (static_cast<uint64_t>(trailer[2]) << 16) |
+                   (static_cast<uint64_t>(trailer[3]) << 24);
+        }
+    }
+    std::fclose(file);
+    return size;
+}
+
 [[nodiscard]] inline size_t gzip_size_hint(std::string_view input) {
     if (input.size() < 8) return 0;
     auto const byte = [&](size_t index) {

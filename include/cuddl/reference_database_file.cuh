@@ -361,16 +361,32 @@ class reference_database_file {
             // that costs at most a quarter of what is affordable; otherwise rows stream back one
             // group at a time as each group completes.
             size_t const group = std::min(paths.size(), std::max<size_t>(1, usable / (4 * row_bytes)));
-            uint64_t input_bytes = 0;
+            // Exact staged bytes the collection can fill: the decompressed size of every input.
+            // A bound from compressed sizes alone overestimates a corpus several times over, and
+            // an arena past what the corpus can hold is memory the device never needs.
+            uint64_t staged_ceiling = 0;
             for (auto const& path : paths) {
+                auto const decompressed = detail::gzip_decompressed_size(path.string());
+                if (decompressed != 0) {
+                    staged_ceiling += decompressed;
+                    continue;
+                }
                 std::error_code error;
                 auto const size = std::filesystem::file_size(path, error);
-                if (!error) input_bytes += size;
+                if (!error) staged_ceiling += size;
             }
-            // At most six staged bytes per input byte, so a small collection does not reserve an
-            // arena it could never fill.
-            size_t const arena_ceiling =
-                static_cast<size_t>(std::min<uint64_t>(input_bytes * 6, uint64_t{6} << 40));
+            // Device and host shares bound the arena as well. On a coherent CPU/GPU system the
+            // free device memory reported here is host memory, so asking for most of it both
+            // starves the rest of the build and leaves the allocator unable to release it.
+            auto const pages = ::sysconf(_SC_PHYS_PAGES);
+            auto const page = ::sysconf(_SC_PAGE_SIZE);
+            size_t const host_share =
+                pages > 0 && page > 0
+                    ? static_cast<size_t>(pages) * static_cast<size_t>(page) / 8
+                    : std::numeric_limits<size_t>::max();
+            size_t const arena_ceiling = static_cast<size_t>(std::min(
+                {staged_ceiling, static_cast<uint64_t>(usable / 4), static_cast<uint64_t>(host_share)}
+            ));
             size_t const row_store_bytes = group * row_bytes;
             size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
             size_t staging = staging_bytes;

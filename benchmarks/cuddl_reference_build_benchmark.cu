@@ -12,6 +12,7 @@ int main(int argc, char** argv) try {
     std::string output;
     unsigned threads = 0;
     unsigned workers = 1;
+    size_t staging_bytes = 0;
     int copies = 1, samples = 5;
     bool parse_only = false;
     bool pinned = cuddl::default_pinned_transfer;
@@ -24,6 +25,11 @@ int main(int argc, char** argv) try {
         "--threads", threads, "CPU oracle parser threads (--parse-only); 0 selects automatic"
     );
     app.add_option("--workers", workers, "Concurrent genome loaders; 0 selects automatic");
+    app.add_option(
+        "--staging-bytes",
+        staging_bytes,
+        "Cap the device staging arena; 0 sizes it from the inputs and free memory"
+    );
     app.add_option("--copies", copies, "Repeat inputs for an explicitly synthetic collection")
         ->check(CLI::Range(1, 100000));
     app.add_option("--samples", samples)->check(CLI::Range(2, 1000));
@@ -60,7 +66,7 @@ int main(int argc, char** argv) try {
             } else {
                 auto file = CUDDL_UNWRAP(
                     (cuddl::reference_database_file::build<25, 2048>(
-                        paths, stream, workers, &statistics, pinned
+                        paths, stream, workers, &statistics, pinned, staging_bytes
                     ))
                 );
                 CUDDL_UNWRAP(file.save(output));
@@ -97,7 +103,10 @@ int main(int argc, char** argv) try {
         {"direct_chunks", statistics.direct_chunks},
         {"staged_chunks", statistics.staged_chunks},
         {"pinned_buffers", statistics.pinned_buffers},
-        {"pinned_requested", pinned}
+        {"pinned_requested", pinned},
+        {"staging_bytes", statistics.staging_bytes},
+        {"batches", statistics.batches},
+        {"pieces", statistics.pieces}
     }.dump(2) << '\n';
 } catch (std::exception const& error) {
     std::cerr << "Error: " << error.what() << '\n';
