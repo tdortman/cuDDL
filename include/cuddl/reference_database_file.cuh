@@ -423,8 +423,27 @@ class reference_database_file {
                     stream, stream.device(), max_pieces, cuda::no_init
                 )
             );
-            std::vector<detail::sequence_batch_chunk> staged_chunks;
+            // Host memory the device still has to read must stay alive. The transfer engine's
+            // read of a pageable buffer is not ordered with the host writes that follow it, so
+            // each genome's bytes are held until an event recorded after its copies completes.
+            // Copying into page-locked memory instead would be far slower on a coherent
+            // CPU/GPU, where the host write costs more than the staging copy it removes.
+            constexpr size_t in_flight_files = 4;
+            std::vector<std::optional<std::unique_ptr<detail::fastx_sequence_file>>> held(
+                in_flight_files
+            );
+            std::vector<cuda::event> file_consumed;
+            file_consumed.reserve(in_flight_files);
+            for (size_t slot = 0; slot < in_flight_files; ++slot) {
+                file_consumed.emplace_back(stream);
+            }
+            // Descriptors are pageable host memory too, so the batch being copied and the batch
+            // being filled are different buffers, and a batch waits on the one before it.
+            std::vector<detail::sequence_batch_chunk> staged_chunks, copied_chunks;
             staged_chunks.reserve(std::min<size_t>(max_pieces, size_t{1} << 16));
+            copied_chunks.reserve(staged_chunks.capacity());
+            cuda::event copied_chunks_consumed{stream};
+            size_t files_seen = 0;
             auto const sm = static_cast<size_t>(
                 stream.device().attribute(cuda::device_attributes::multiprocessor_count)
             );
@@ -460,22 +479,25 @@ class reference_database_file {
             // only once the device has finished reading it, so no host wait is needed here.
             auto flush = [&]() -> Result<void> {
                 if (staged_chunks.empty()) return Ok();
+                copied_chunks_consumed.sync();
+                copied_chunks.swap(staged_chunks);
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
-                        cuda::std::span{staged_chunks.data(), staged_chunks.size()},
+                        cuda::std::span{copied_chunks.data(), copied_chunks.size()},
                         device_span<detail::sequence_batch_chunk>{
-                            descriptors.data(), staged_chunks.size()
+                            descriptors.data(), copied_chunks.size()
                         }
                     )
                 );
+                copied_chunks_consumed.record(stream);
                 auto const grid = std::min(block_end, max_grid);
                 if (grid != 0) {
                     detail::add_sequence_batch_kernel<BucketCount, Layout>
                         <<<static_cast<uint32_t>(grid), 256, 0, stream.get()>>>(
                             arena.data(),
                             descriptors.data(),
-                            staged_chunks.size(),
+                            copied_chunks.size(),
                             block_end,
                             K,
                             rows.data()
@@ -497,6 +519,13 @@ class reference_database_file {
                     )
                 );
                 for (size_t id = base; id < base + count; ++id) {
+                    // Release the slot from four genomes ago, whose copies have long completed,
+                    // then keep this genome's bytes until the device has taken them.
+                    auto const held_slot = files_seen++ % in_flight_files;
+                    if (held[held_slot]) {
+                        file_consumed[held_slot].sync();
+                        held[held_slot].reset();
+                    }
                     auto sequence = CUDDL_TRY(
                         workers == 1
                             ? detail::load_fastx_sequence_file(paths[id].string(), load_source)
@@ -539,7 +568,8 @@ class reference_database_file {
                         }
                     }
                     result.names_.push_back(paths[id].string());
-                    sequence.reset();
+                    file_consumed[held_slot].record(stream);
+                    held[held_slot] = std::move(sequence);
                 }
                 // The group's rows are read back after its last batch, so a batch never spans a
                 // group boundary and the copies below always follow the writes they read.
@@ -567,8 +597,9 @@ class reference_database_file {
                 base += count;
             }
             // One drain for the whole collection: every row copy above queues on this stream in
-            // reference order, so nothing needs to synchronise per genome.
+            // reference order, so nothing needs to synchronise per genome. Held files go with it.
             CUDDL_CUDA_TRY(stream.sync());
+            for (auto& file : held) file.reset();
             // Loaders still hold leases; join them before reading pool state.
             loader.reset();
             if (statistics != nullptr) {
