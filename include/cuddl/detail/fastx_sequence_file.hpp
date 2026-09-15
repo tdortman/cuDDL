@@ -4,10 +4,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -796,4 +801,112 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
     return result;
 }
 
+// Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
+// per genome costs tens of microseconds and dominates at high file counts. Workers pull
+// ids in order while the main thread takes results in order, so at most depth loads are
+// in flight and output order never depends on completion order. Loader exceptions are
+// rethrown by take, matching std::async propagation into the build error handlers.
+class fastx_load_pool {
+   public:
+    fastx_load_pool(
+        std::span<std::filesystem::path const> paths,
+        size_t depth,
+        decompression_source source = {}
+    )
+        : paths_(paths),
+          depth_(std::max(size_t{1}, depth)),
+          source_(source),
+          results_(paths.size()),
+          errors_(paths.size()) {
+        workers_.reserve(depth_);
+        for (size_t i = 0; i < depth_; ++i) workers_.emplace_back([this] { work(); });
+    }
+    ~fastx_load_pool() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        assign_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+    fastx_load_pool(fastx_load_pool const&) = delete;
+    fastx_load_pool& operator=(fastx_load_pool const&) = delete;
+
+    [[nodiscard]] Result<std::unique_ptr<fastx_sequence_file>> take(size_t id) {
+        std::unique_lock lock(mutex_);
+        filled_.wait(lock, [&] { return results_[id].has_value() || errors_[id] != nullptr; });
+        ++taken_;
+        assign_.notify_all();
+        lock.unlock();
+        if (errors_[id] != nullptr) std::rethrow_exception(errors_[id]);
+        return std::move(*results_[id]);
+    }
+
+   private:
+    void work() {
+        while (true) {
+            size_t id;
+            {
+                std::unique_lock lock(mutex_);
+                assign_.wait(lock, [&] {
+                    return stop_ || next_ >= paths_.size() || next_ - taken_ < depth_;
+                });
+                if (stop_ || next_ >= paths_.size()) return;
+                if (next_ - taken_ >= depth_) continue;
+                id = next_++;
+            }
+            try {
+                auto loaded = load_fastx_sequence_file(paths_[id].string(), source_);
+                std::lock_guard lock(mutex_);
+                results_[id] = std::move(loaded);
+            } catch (...) {
+                std::lock_guard lock(mutex_);
+                errors_[id] = std::current_exception();
+            }
+            filled_.notify_all();
+        }
+    }
+    std::span<std::filesystem::path const> paths_;
+    size_t depth_;
+    decompression_source source_;
+    std::vector<std::optional<Result<std::unique_ptr<fastx_sequence_file>>>> results_;
+    std::vector<std::exception_ptr> errors_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable assign_, filled_;
+    size_t next_ = 0, taken_ = 0;
+    bool stop_ = false;
+};
+
+}  // namespace cuddl::detail
+
+namespace cuddl {
+
+/// @brief Whether a build transfers decompressed bytes from page-locked memory by default.
+///
+/// Page-locked transfers win when the host writes to device-visible memory at full speed:
+/// measured 2.1x over staging on an x86 host with a discrete GPU. On a coherent CPU/GPU system
+/// the same mapping costs host writes more than the staging copy it removes, which is 2.9x
+/// slower end to end on Grace Hopper. The architecture picks the default; `pinned` overrides it.
+#if defined(__aarch64__)
+inline constexpr bool default_pinned_transfer = false;
+#else
+inline constexpr bool default_pinned_transfer = true;
+#endif
+
+/// @brief How a build moved sequence bytes to the device.
+///
+/// A run that reports every byte as `direct` is reading the decompressed genome in place; a
+/// large `staged` share means page-locked buffers were unavailable and bytes were copied into
+/// staging on the consumer thread instead.
+struct reference_build_statistics {
+    size_t direct_bytes = 0;
+    size_t staged_bytes = 0;
+    size_t direct_chunks = 0;
+    size_t staged_chunks = 0;
+    size_t pinned_buffers = 0;
+    size_t staging_bytes = 0;
+    size_t batches = 0;
+    size_t pieces = 0;
+};
 }  // namespace cuddl::detail

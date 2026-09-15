@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuddl/detail/fastx_sequence_file.hpp>
@@ -27,9 +30,18 @@ struct batch {
 // Batches may exceed UINT32_MAX bytes; every chunk's window count fits uint32. Records
 // stream through one bounded piece buffer with plain vector growth: no cap-sized reserves
 // and no whole-record stripped copy, so a huge budget over a tiny corpus stages tiny input.
+//
+// Files are decompressed and compacted by a loader pool rather than by the thread building
+// batches: parsing every genome on one core otherwise dominates a full corpus, and the whole
+// staging phase would sit on a single core while the workers wait.
 template <typename Consume>
-size_t
-for_each_batch(std::vector<std::string> const& paths, uint32_t k, size_t cap, Consume&& consume) {
+size_t for_each_batch(
+    std::vector<std::string> const& paths,
+    uint32_t k,
+    size_t cap,
+    Consume&& consume,
+    unsigned workers = 0
+) {
     if (k == 0 || cap < k) {
         throw std::invalid_argument("resident byte budget must be at least k");
     }
@@ -52,7 +64,6 @@ for_each_batch(std::vector<std::string> const& paths, uint32_t k, size_t cap, Co
         current.bases.clear();
         current.chunks.clear();
     };
-    std::vector<char> piece;
     size_t piece_limit = 0;
     auto refill = [&] {
         // No useful piece fits the rest of this batch; seal it first.
@@ -62,37 +73,47 @@ for_each_batch(std::vector<std::string> const& paths, uint32_t k, size_t cap, Co
         size_t const room = cap - current.bases.size();
         piece_limit = chunk_limit < room ? chunk_limit : room;
     };
-    auto append = [&](size_t genome, std::vector<char>& staged) {
-        if (staged.size() < k) {
+    auto append = [&](size_t genome, char const* data, size_t size) {
+        if (size < k) {
             return;
         }
-        if (staged.size() > cap - current.bases.size()) {
+        if (size > cap - current.bases.size()) {
             flush();
         }
-        current.chunks.push_back({genome, current.bases.size(), staged.size()});
-        current.bases.insert(current.bases.end(), staged.begin(), staged.end());
+        current.chunks.push_back({genome, current.bases.size(), size});
+        current.bases.insert(current.bases.end(), data, data + size);
     };
+
+    std::vector<std::filesystem::path> file_paths;
+    file_paths.reserve(paths.size());
+    for (auto const& path : paths) file_paths.emplace_back(path);
+    auto const depth = std::max<size_t>(
+        1,
+        std::min(
+            paths.size(),
+            size_t{workers != 0 ? workers : std::max(1U, std::thread::hardware_concurrency())}
+        )
+    );
+    cuddl::detail::fastx_load_pool loader(file_paths, depth);
     for (size_t genome = 0; genome < paths.size(); ++genome) {
-        auto loaded = cuddl::detail::load_fastx_sequence_file(paths[genome]);
-        if (!loaded) {
-            throw std::runtime_error(paths[genome] + ": " + loaded.error().message());
+        // Extents arrive compacted, so a piece is a straight copy of bases.
+        auto sequence = loader.take(genome);
+        if (!sequence) {
+            throw std::runtime_error(paths[genome] + ": " + sequence.error().message());
         }
-        for (auto const& extent : (*loaded)->extents) {
-            piece.clear();
-            refill();
-            for (auto cursor = extent.begin; cursor != extent.end; ++cursor) {
-                char const base = *cursor;
-                if (base == '\n' || base == '\r' || base == ' ' || base == '\t') {
-                    continue;
-                }
-                piece.push_back(base);
-                if (piece.size() == piece_limit) {
-                    append(genome, piece);
-                    piece.erase(piece.begin(), piece.end() - (k - 1U));
-                    refill();
-                }
+        for (auto const& extent : (*sequence)->extents) {
+            auto const* const bases = extent.begin;
+            auto const size = static_cast<size_t>(extent.end - extent.begin);
+            size_t start = 0;
+            while (start < size) {
+                refill();
+                auto const count = std::min(size - start, piece_limit);
+                append(genome, bases + start, count);
+                if (start + count == size) break;
+                // The next piece repeats the k - 1 bases it shares with this one, so no window
+                // is lost at the boundary and none is counted twice.
+                start += count - (k - 1U);
             }
-            append(genome, piece);
         }
     }
     flush();
