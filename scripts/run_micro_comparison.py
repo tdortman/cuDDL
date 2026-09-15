@@ -69,6 +69,37 @@ def run(cmd: list[str], capture: bool = False) -> str:
     return proc.stdout if capture else ""
 
 
+def skani_list(work: Path, name: str, paths: list[str]) -> Path:
+    """Writes @p paths to a file for skani, which takes lists instead of argv.
+
+    A full corpus does not fit on a command line, and `--ql`/`--rl` name the same files.
+    """
+    listing = work / f"skani-{name}.txt"
+    listing.write_text("".join(f"{p}\n" for p in paths))
+    return listing
+
+
+def cub_inputs(work: Path, name: str, references: list[Path], queries: list[Path]) -> list[str]:
+    """Returns cub's reference and query arguments for @p references and @p queries.
+
+    A full corpus does not fit on a command line, so past `_ARGV_PATH_LIMIT` paths the lists go
+    through the benchmark's TOML config instead. Both forms name the same files.
+    """
+    if len(references) + len(queries) <= _ARGV_PATH_LIMIT:
+        args = ["--reference", *[str(p) for p in references]]
+        if queries:
+            args += ["--query", *[str(p) for p in queries]]
+        return args
+    import json as jsonlib
+
+    config = work / f"cub-{name}.toml"
+    body = "reference = " + jsonlib.dumps([str(p) for p in references]) + "\n"
+    if queries:
+        body += "query = " + jsonlib.dumps([str(p) for p in queries]) + "\n"
+    config.write_text(body)
+    return ["--config", str(config)]
+
+
 def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
     """Runs one benchmark invocation, reporting what started and how long it took.
 
@@ -117,6 +148,7 @@ def count_pairs(references: list[Path], queries: list[Path], topology: str) -> i
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
+_ARGV_PATH_LIMIT = 8192  # genome paths cub may take on one command line; beyond it, a config
 _PROBE_GENOMES = 24  # probe slice, sized so the pair gap below is measurable
 _PROBE_PAIRS = 30  # first probe size
 _PROBE_PAIRS_HIGH = 240  # second probe size; the gap has to dwarf probe-to-probe noise
@@ -497,11 +529,9 @@ def main(
         if need_cub:
             cub_oracle = work / "oracle.json"
             oracle_cmd = [str(cub), "--topology", topology, "--samples", "1"]
-            if topology == "batch":
-                oracle_cmd += ["--reference", *[str(p) for p in references]]
-                oracle_cmd += ["--query", *[str(p) for p in query_list]]
-            else:
-                oracle_cmd += ["--reference", *[str(p) for p in references]]
+            oracle_cmd += cub_inputs(
+                work, "oracle", references, query_list if topology == "batch" else []
+            )
             oracle_cmd += [
                 "--max-kmers",
                 str(max_kmers),
@@ -553,10 +583,10 @@ def main(
                 [
                     str(skani),
                     "dist",
-                    "-q",
-                    *[str(p) for p in chunk],
-                    "-r",
-                    *[str(p) for p in references],
+                    "--ql",
+                    str(skani_list(work, f"truth-q-{chunk_base}", [str(p) for p in chunk])),
+                    "--rl",
+                    str(skani_list(work, "truth-r", [str(p) for p in references])),
                     "-o",
                     str(chunk_tsv),
                     "-t",
@@ -855,19 +885,6 @@ def main(
             if sketch_all:
                 # Full-corpus sketch supplies timing; the subset run below
                 # supplies compare rows. Full lists exceed argv, use config.
-                cub_cfg = work / "cub-sketch.toml"
-                cub_cfg.write_text(
-                    "reference = "
-                    + jsonlib4.dumps([str(p) for p in sketch_references])
-                    + "\n"
-                    + (
-                        "query = "
-                        + jsonlib4.dumps([str(p) for p in sketch_queries])
-                        + "\n"
-                        if topology == "batch"
-                        else ""
-                    )
-                )
                 run_timed(
                     f"cub-exact sketch: full corpus, {len(sketch_references)} genomes "
                     f"({samples} samples)",
@@ -879,8 +896,12 @@ def main(
                         str(samples),
                         "--warmups",
                         str(warmups),
-                        "--config",
-                        str(cub_cfg),
+                        *cub_inputs(
+                            work,
+                            "sketch",
+                            sketch_references,
+                            sketch_queries if topology == "batch" else [],
+                        ),
                         "--max-kmers",
                         str(max_kmers),
                         "--sketch-only",
@@ -898,11 +919,9 @@ def main(
                 "--warmups",
                 str(warmups),
             ]
-            if topology == "batch":
-                cub_cmd += ["--reference", *[str(p) for p in references]]
-                cub_cmd += ["--query", *[str(p) for p in query_list]]
-            else:
-                cub_cmd += ["--reference", *[str(p) for p in references]]
+            cub_cmd += cub_inputs(
+                work, "compare", references, query_list if topology == "batch" else []
+            )
             cub_cmd += [
                 "--max-kmers",
                 str(max_kmers),
@@ -1084,10 +1103,10 @@ def main(
                 [
                     str(skani),
                     "dist",
-                    "-q",
-                    *file_args,
-                    "-r",
-                    *file_args,
+                    "--ql",
+                    str(skani_list(work, "compare-q", file_args)),
+                    "--rl",
+                    str(skani_list(work, "compare-r", file_args)),
                     "-o",
                     str(dist_out),
                     "-t",
@@ -1328,13 +1347,14 @@ def main(
                     "search",
                     "-d",
                     str(skdb),
+                    "--ql",
+                    str(skani_list(work, "search-q", [str(q) for q in query_set])),
                     "-o",
                     str(search_out),
                     "--min-af",
                     "0",
                     "-t",
                     str(threads),
-                    *[str(q) for q in query_set],
                 ],
                 samples,
                 warmups,
