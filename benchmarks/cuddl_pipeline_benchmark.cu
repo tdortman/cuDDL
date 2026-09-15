@@ -14,6 +14,8 @@
 #include <cuddl/reference_database_file.cuh>
 #include <nvbench/nvbench.cuh>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +26,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -686,14 +689,19 @@ json collection_metrics(collection& group, cuda::stream_ref stream) {
     return output;
 }
 
-// Counts FASTX record extents one file at a time for the descriptor bound. No base
-// bytes are copied; only the current file's parser storage is alive at a time.
+// Counts FASTX record extents for the descriptor bound. No base bytes are copied, and the
+// loader pool bounds live parser storage by the worker count, so a full corpus does not walk
+// this pass on one core.
 size_t count_sequence_records(std::vector<std::string> const& paths) {
+    std::vector<std::filesystem::path> file_paths(paths.begin(), paths.end());
+    cuddl::detail::fastx_load_pool loader(
+        file_paths, std::max<unsigned>(1, std::thread::hardware_concurrency())
+    );
     size_t records = 0;
-    for (auto const& path : paths) {
-        auto loaded = cuddl::detail::load_fastx_sequence_file(path);
+    for (size_t index = 0; index < paths.size(); ++index) {
+        auto loaded = loader.take(index);
         if (!loaded) {
-            throw std::runtime_error("cannot load FASTX file: " + path);
+            throw std::runtime_error("cannot load FASTX file: " + paths[index]);
         }
         records += (*loaded)->extents.size();
     }
@@ -702,6 +710,7 @@ size_t count_sequence_records(std::vector<std::string> const& paths) {
 
 struct resident_budget {
     size_t cap = 0;  // Effective ASCII staging bytes per batch.
+    size_t host_cap_bytes = 0;  // Host share the staged ASCII may occupy.
     size_t free_bytes = 0;
     size_t reusable_pool_bytes = 0;
     size_t available_bytes = 0;
@@ -711,6 +720,16 @@ struct resident_budget {
     size_t total_records = 0;
     size_t metadata_bytes = 0;  // 24-byte chunk descriptors bound at the resolved cap.
 };
+
+// Host bytes one staged batch may occupy. The staged ASCII is host memory before the copy to
+// the device, so it is bounded by both, and an eighth of host memory leaves the sketches, the
+// result rows and the rest of the pipeline room to live.
+size_t host_staging_cap() {
+    auto const pages = ::sysconf(_SC_PHYS_PAGES);
+    auto const page = ::sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page <= 0) return std::numeric_limits<size_t>::max();
+    return static_cast<size_t>(pages) * static_cast<size_t>(page) / 8;
+}
 
 // Chunk-descriptor bound at @p cap: every staged piece holds at least k bytes, and
 // split pieces beyond record starts are bounded by the header's per-chunk UINT32
@@ -841,7 +860,11 @@ resident_budget resolve_resident_budget(
     if (reserve + peak >= available) {
         insufficient("staging budget");
     }
-    size_t const base = available - reserve - peak;
+    // A staged batch is host memory before it reaches the device, so free device memory alone
+    // does not bound it. Without a host bound, a large GPU derives a cap far past host RAM and
+    // the stage allocation is killed.
+    size_t const host_cap = host_staging_cap();
+    size_t const base = std::min(available - reserve - peak, host_cap);
     size_t cap = 0;
     if (opts.resident_bytes != 0) {
         cap = opts.resident_bytes;
@@ -865,6 +888,7 @@ resident_budget resolve_resident_budget(
     }
     return {
         cap,
+        host_cap,
         free_bytes,
         reusable,
         available,
@@ -1019,6 +1043,7 @@ json resident_timings(
             // timings. Batch counts come from real runs at the probed budget.
             *plan = json{
                 {"resident_batch_bytes", cap},
+                {"resident_host_cap_bytes", budget.host_cap_bytes},
                 {"requested_bytes", opts.resident_bytes},
                 {"free_bytes", budget.free_bytes},
                 {"reusable_pool_bytes", budget.reusable_pool_bytes},
