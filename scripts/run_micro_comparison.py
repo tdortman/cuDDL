@@ -540,6 +540,15 @@ def main(
             subset_note = f"subset {total_pairs}/{orig_pairs}"
         if match_rows is None:
             match_rows = _PAIRS_TARGET_BYTES // _PAIR_ROW_BYTES
+        # Packed ingest parses every genome into host memory: the fastest path for a small
+        # corpus, and fatal for a large one. Past a share of host memory the pipeline streams
+        # records through a device arena instead, sized from free device memory.
+        cuddl_staged_bytes = sum(sizes.get(p, 0) for p in (*references, *query_list))
+        cuddl_ingest = (
+            "sequence"
+            if cuddl_staged_bytes > _host_ram_bytes() // _RABBIT_RESIDENT_FRACTION
+            else "packed"
+        )
         if skani_chunk is None:
             # Every invocation reads the whole reference sketch set, so a chunk has to be big
             # enough for that load to disappear into the work. Take the larger of a byte target
@@ -1263,7 +1272,7 @@ def main(
                     "--warmups",
                     str(warmups),
                     "--ingest",
-                    "packed",
+                    cuddl_ingest,
                     "--resident-bytes",
                     "0",
                     "--rows",
@@ -1347,9 +1356,15 @@ def main(
         # SEARCH op: ranked retrieval per query; recall@k and top-1 hit rate
         # against the exact Jaccard ranking. Self-pairs never rank.
         query_set = query_list if topology == "batch" else references
-        candidates = {
-            str(q): sorted({str(r) for r in references} - {str(q)}) for q in query_set
-        }
+        # One shared name list: rebuilding the reference names per query allocates a fresh
+        # string per reference per query, which is tens of gigabytes of identical text at a few
+        # thousand queries. The list is already name-ordered, which is the tie-break order the
+        # exact ranking uses.
+        reference_names = sorted({str(r) for r in references})
+        candidates: dict[str, list[str]] = {}
+        for query in query_set:
+            name = str(query)
+            candidates[name] = [entry for entry in reference_names if entry != name]
         n_cand = min(len(v) for v in candidates.values())
         if n_cand < 1:
             raise typer.BadParameter("SEARCH needs at least one candidate per query")
@@ -1402,7 +1417,7 @@ def main(
                     "--warmups",
                     str(warmups),
                     "--ingest",
-                    "packed",
+                    cuddl_ingest,
                     "--resident-bytes",
                     "0",
                     "--rows",
