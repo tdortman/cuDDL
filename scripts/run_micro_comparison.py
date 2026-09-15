@@ -223,6 +223,12 @@ def main(
     queries: Annotated[list[Path] | None, typer.Option("--query", exists=True)] = None,
     query_fraction: Annotated[float | None, typer.Option(min=0, max=1)] = None,
     query_count: Annotated[int | None, typer.Option(min=1)] = None,
+    reference_count: Annotated[
+        int | None,
+        typer.Option(
+            min=1, help="Use only the first N references, in sorted path order."
+        ),
+    ] = None,
     topology: Annotated[str, typer.Option()] = "all-to-all",
     tools: Annotated[str, typer.Option()] = DEFAULT_TOOLS,
     samples: Annotated[int, typer.Option(min=1)] = 3,
@@ -269,6 +275,17 @@ def main(
     if hypergen_device not in ("cpu", "gpu"):
         raise typer.BadParameter("hypergen-device must be cpu or gpu")
     references = discover(genomes)
+    if reference_count is not None:
+        # A prefix of the sorted corpus, not a spread: two hosts that collected the same
+        # accessions then compare the same references even if one collection stopped earlier.
+        # Taking fewer than asked for would silently compare different corpora, so it is an
+        # error rather than a clamp.
+        if reference_count > len(references):
+            raise typer.BadParameter(
+                f"--reference-count {reference_count} exceeds the {len(references)} "
+                "genomes found"
+            )
+        references = references[:reference_count]
     query_list = sorted(
         {
             q
