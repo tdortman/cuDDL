@@ -117,8 +117,9 @@ def count_pairs(references: list[Path], queries: list[Path], topology: str) -> i
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
-_PROBE_PAIRS = 3  # stride-spread pairs timed to size the evaluated set
-_PROBE_PAIRS_HIGH = 12  # second probe size for the fixed-cost-canceling delta
+_PROBE_GENOMES = 24  # probe slice, sized so the pair gap below is measurable
+_PROBE_PAIRS = 30  # first probe size
+_PROBE_PAIRS_HIGH = 240  # second probe size; the gap has to dwarf probe-to-probe noise
 _PROBE_MIN_PAIRS = 12  # at or below this, skip the probe and run everything
 _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
 _CHUNK_BUDGET_BYTES = 256 << 20  # per-invocation truth output target
@@ -426,19 +427,30 @@ def main(
 
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
-                _spread_pick(references, sizes, 8)
-                if len(references) > 8
+                _spread_pick(references, sizes, _PROBE_GENOMES)
+                if len(references) > _PROBE_GENOMES
                 else references
             )
             probe_queries = (
-                _spread_pick(query_list, sizes, 8)
-                if topology == "batch" and len(query_list) > 8
+                _spread_pick(query_list, sizes, _PROBE_GENOMES)
+                if topology == "batch" and len(query_list) > _PROBE_GENOMES
                 else query_list
             )
-            probe_per_pair_ms = (
-                cub_probe_rate(probe_refs, probe_queries)
-                if need_cub
-                else skani_probe_rate()
+            # Size the subset by the slowest compare lane we can measure. The exact oracle is
+            # fast per pair and the ANI truth is not, and a budget that only fits the oracle
+            # still leaves the other lane running for hours.
+            rates: dict[str, float] = {}
+            if need_cub:
+                rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
+            if "skani" in selected:
+                rates["skani"] = skani_probe_rate()
+            if not rates:
+                rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
+            slowest = max(rates, key=lambda tool: rates[tool])
+            probe_per_pair_ms = rates[slowest]
+            rate_note = " ".join(
+                f"{tool}={value:.2f}ms" + ("*" if tool == slowest else "")
+                for tool, value in sorted(rates.items())
             )
             capacity = int(
                 budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
@@ -507,13 +519,15 @@ def main(
         else:
             oracle = {}
         typer.echo(
-            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} gpu={gpu_name}"
+            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
         )
         autoscale_case = {
             "threads": threads,
             "max_kmers": max_kmers,
             "pair_budget_secs": budget_secs,
             "cub_per_pair_ms": round(probe_per_pair_ms, 3),
+            "budget_tool": slowest,
+            "per_tool_pair_ms": {tool: round(value, 3) for tool, value in rates.items()},
             "pairs_evaluated": total_pairs,
             "pairs_total": orig_pairs,
             "auto_caps": ",".join(k for k, v in auto_flags.items() if v) or "none",
