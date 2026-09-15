@@ -28,6 +28,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -39,6 +45,94 @@
 namespace {
 
 using json = nlohmann::json;
+
+// Packing one genome into k-mers is a serial pass that costs an order of magnitude more than
+// that genome's device stages, so the sketch loop parses ahead on a bounded pool instead of
+// stalling the GPU. Depth bounds host memory: each worker holds one genome's packed k-mers.
+class genome_parse_pool {
+   public:
+    genome_parse_pool(
+        std::vector<std::string> const& names,
+        size_t depth,
+        size_t max_kmers
+    )
+        : names_(names), depth_(std::max<size_t>(1, depth)), max_kmers_(max_kmers),
+          results_(names.size()), errors_(names.size()) {
+        workers_.reserve(depth_);
+        for (size_t i = 0; i < depth_; ++i) {
+            workers_.emplace_back([this] { work(); });
+        }
+    }
+    ~genome_parse_pool() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        assign_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+    genome_parse_pool(genome_parse_pool const&) = delete;
+    genome_parse_pool& operator=(genome_parse_pool const&) = delete;
+
+    /// @brief Packed k-mers for genome @p index, in input order.
+    [[nodiscard]] std::vector<uint64_t> take(size_t index) {
+        std::unique_lock lock(mutex_);
+        filled_.wait(lock, [&] { return results_[index].has_value() || errors_[index] != nullptr; });
+        ++taken_;
+        assign_.notify_all();
+        lock.unlock();
+        if (errors_[index] != nullptr) std::rethrow_exception(errors_[index]);
+        return std::move(*results_[index]);
+    }
+
+   private:
+    void work() {
+        while (true) {
+            size_t index;
+            {
+                std::unique_lock lock(mutex_);
+                assign_.wait(lock, [&] {
+                    return stop_ || next_ >= names_.size() || next_ - taken_ < depth_;
+                });
+                if (stop_ || next_ >= names_.size()) return;
+                if (next_ - taken_ >= depth_) continue;
+                index = next_++;
+            }
+            try {
+                // One thread per genome: the pool supplies the concurrency.
+                auto parsed = cuddl::parse_fasta_file(names_[index], 25, 1);
+                if (!parsed) throw std::runtime_error(parsed.error().message());
+                if (parsed->kmers.size() > max_kmers_) {
+                    throw std::runtime_error(
+                        "genome exceeds --max-kmers, refusing: " + names_[index]
+                    );
+                }
+                std::lock_guard lock(mutex_);
+                results_[index] = std::move(parsed->kmers);
+            } catch (...) {
+                std::lock_guard lock(mutex_);
+                errors_[index] = std::current_exception();
+            }
+            filled_.notify_all();
+        }
+    }
+
+    std::vector<std::string> const& names_;
+    size_t depth_;
+    size_t max_kmers_;
+    std::vector<std::optional<std::vector<uint64_t>>> results_;
+    std::vector<std::exception_ptr> errors_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable assign_, filled_;
+    size_t next_ = 0, taken_ = 0;
+    bool stop_ = false;
+};
+
+[[nodiscard]] unsigned parse_worker_count(size_t genomes) noexcept {
+    auto const hardware = std::max(1U, std::thread::hardware_concurrency());
+    return static_cast<unsigned>(std::max<size_t>(1, std::min<size_t>(genomes, std::min<unsigned>(8U, hardware))));
+}
 
 using clock_type = std::chrono::steady_clock;
 
@@ -108,6 +202,7 @@ int run_main(
     size_t max_pairs,
     size_t match_rows,
     bool sketch_only,
+    unsigned parse_workers,
     json& report
 ) {
     cudaStream_t stream = nullptr;
@@ -134,6 +229,9 @@ int run_main(
         }
         return parsed.kmers;
     };
+    // Parsing runs ahead of the GPU loop; a serial loop leaves the device idle between packs.
+    std::optional<genome_parse_pool> parsers;
+    if (parse_workers > 1) parsers.emplace(names, parse_workers, max_kmers);
 
     // Pair space enumeration needs no packed data, only indices.
     size_t const total_pairs = [&] {
@@ -194,7 +292,7 @@ int run_main(
         auto parse_tick = clock_type::now();
         // Sketch streams one genome at a time; only counts are retained.
         for (size_t g = 0; g < genomes; ++g) {
-            auto packed = parse_one(g);
+            auto packed = parsers ? parsers->take(g) : parse_one(g);
             size_t const count = packed.size();
             kmers_of[g] = count;
             max_keys = std::max(max_keys, count);
@@ -355,6 +453,7 @@ int run_main(
           {"warmups", warmups},
           {"pairs_total", total_pairs},
           {"pairs_evaluated", evaluated.size()},
+          {"parse_workers", parse_workers},
           {"pair_stride", pair_stride},
           {"pairs_emitted", emitted.size()}}},
         {"genomes", genome_rows},
@@ -380,6 +479,7 @@ int main(int argc, char** argv) try {
     std::string topology = "batch", output;
     int samples = 5, warmups = 1;
     size_t max_kmers = 32ULL << 20, max_pairs = 0, match_rows = 0;
+    unsigned workers = 0;
     CLI::App app{"Exact k-mer set baseline from CUB primitives (k=25)"};
     app.add_option("--reference", references)->required()->check(CLI::ExistingFile);
     app.add_option("--query", queries)->check(CLI::ExistingFile);
@@ -389,6 +489,11 @@ int main(int argc, char** argv) try {
     app.add_option("--max-kmers", max_kmers);
     app.add_option("--max-pairs", max_pairs, "Evaluated pairs cap, even stride (0 disables)");
     app.add_option("--match-rows", match_rows, "Emitted pair rows cap, even stride (0 disables)");
+    app.add_option(
+        "--workers",
+        workers,
+        "Concurrent genome parsers ahead of the GPU loop; 0 selects up to 8"
+    );
     app.add_option("--output", output)->required();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     bool sketch_only = false;
@@ -411,6 +516,7 @@ int main(int argc, char** argv) try {
         max_pairs,
         match_rows,
         sketch_only,
+        workers == 0 ? parse_worker_count(references.size() + queries.size()) : workers,
         report
     );
     FILE* stream = std::fopen(output.c_str(), "w");
