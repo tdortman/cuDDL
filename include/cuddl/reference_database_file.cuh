@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <cuddl/detail/database_staging.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/fastx.hpp>
 #include <cuddl/reference_database.cuh>
@@ -418,283 +419,40 @@ class reference_database_file {
                 {std::max<size_t>(K, staging / 4),
                  static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - K + 1}
             );
-            auto rows = CUDDL_CUDA_TRY(
-                cuda::make_device_buffer<uint32_t>(
-                    stream, stream.device(), group * row_words, cuda::no_init
-                )
+            detail::database_stager<K, BucketCount, Layout> stager(
+                stream,
+                paths.size(),
+                {group, staging, max_piece, max_pieces},
+                statistics
             );
-            auto arena = CUDDL_CUDA_TRY(
-                cuda::make_device_buffer<char>(stream, stream.device(), staging, cuda::no_init)
-            );
-            auto descriptors = CUDDL_CUDA_TRY(
-                cuda::make_device_buffer<detail::sequence_batch_chunk>(
-                    stream, stream.device(), max_pieces, cuda::no_init
-                )
-            );
-            // Host memory the device still has to read must stay alive. The transfer engine's
-            // read of a pageable buffer is not ordered with the host writes that follow it, so
-            // each genome's bytes are held until an event recorded after its copies completes.
-            // Copying into page-locked memory instead would be far slower on a coherent
-            // CPU/GPU, where the host write costs more than the staging copy it removes.
-            // Deep enough that the wait on a slot is normally free. At four slots the tail of
-            // that wait reached hundreds of milliseconds, which is a stall while seventy-two
-            // loaders feed one consumer.
-            constexpr size_t in_flight_files = 16;
-            std::vector<std::optional<std::unique_ptr<detail::fastx_sequence_file>>> held(
-                in_flight_files
-            );
-            // Rows come back in one transfer per group and are unpacked once at the end. A copy
-            // per genome costs more in API calls than the bytes are worth: at 100,000 references
-            // that is 200,000 calls for 1.6 GB.
-            std::vector<uint32_t> staged_rows(paths.size() * row_words);
-            std::vector<cuda::event> file_consumed;
-            file_consumed.reserve(in_flight_files);
-            for (size_t slot = 0; slot < in_flight_files; ++slot) {
-                file_consumed.emplace_back(stream);
-            }
-            // Descriptors are pageable host memory too, so the batch being copied and the batch
-            // being filled are different buffers, and a batch waits on the one before it.
-            std::vector<detail::sequence_batch_chunk> staged_chunks, copied_chunks;
-            staged_chunks.reserve(std::min<size_t>(max_pieces, size_t{1} << 16));
-            copied_chunks.reserve(staged_chunks.capacity());
-            cuda::event copied_chunks_consumed{stream};
-            size_t files_seen = 0;
-            auto const sm = static_cast<size_t>(
-                stream.device().attribute(cuda::device_attributes::multiprocessor_count)
-            );
-            auto const max_grid = static_cast<size_t>(
-                stream.device().attribute(cuda::device_attributes::max_grid_dim_x)
-            );
-            size_t arena_used = 0, block_end = 0, batches = 0, transfers = 0;
-
-            // Records one chunk of the arena for the kernel: where it starts, how many windows
-            // it holds, and how many blocks those windows need.
-            auto describe = [&](size_t offset, uint32_t windows, size_t genome) {
-                auto const blocks =
-                    std::min(sm * 2, (static_cast<size_t>(windows) + 2047) / 2048);
-                block_end += blocks;
-                staged_chunks.push_back(
-                    {offset, block_end, static_cast<uint32_t>(genome), windows}
-                );
-            };
-            // Stages one span of bases and records its windows. A span that continues a record
-            // was widened by k - 1 bases on the host, so it holds one window per base it adds.
-            auto stage = [&](char const* source, size_t size, size_t genome, uint32_t windows
-                         ) -> Result<void> {
-                CUDDL_CUDA_TRY(
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{source, size},
-                        device_span<char>{arena.data() + arena_used, size}
-                    )
-                );
-                describe(arena_used, windows, genome);
-                arena_used += size;
-                ++transfers;
-                return Ok();
-            };
-            // One launch for everything staged so far. Copies queued after it land in the arena
-            // only once the device has finished reading it, so no host wait is needed here.
-            auto flush = [&]() -> Result<void> {
-                if (staged_chunks.empty()) {
-                    // Records shorter than k stage bytes but record no window, so a flush can
-                    // arrive with nothing to launch. The offsets still have to reset, or the
-                    // caller that flushed to make room would ask again for the same room.
-                    arena_used = 0;
-                    block_end = 0;
-                    return Ok();
-                }
-                copied_chunks_consumed.sync();
-                copied_chunks.swap(staged_chunks);
-                CUDDL_CUDA_TRY(
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{copied_chunks.data(), copied_chunks.size()},
-                        device_span<detail::sequence_batch_chunk>{
-                            descriptors.data(), copied_chunks.size()
-                        }
-                    )
-                );
-                copied_chunks_consumed.record(stream);
-                auto const grid = std::min(block_end, max_grid);
-                if (grid != 0) {
-                    detail::add_sequence_batch_kernel<BucketCount, Layout>
-                        <<<static_cast<uint32_t>(grid), 256, 0, stream.get()>>>(
-                            arena.data(),
-                            descriptors.data(),
-                            copied_chunks.size(),
-                            block_end,
-                            K,
-                            rows.data()
-                        );
-                    CUDDL_CUDA_TRY(cudaGetLastError());
-                }
-                ++batches;
-                staged_chunks.clear();
-                arena_used = 0;
-                block_end = 0;
-                return Ok();
-            };
             size_t base = 0;
             while (base < paths.size()) {
                 auto const count = std::min(group, paths.size() - base);
-                CUDDL_CUDA_TRY(
-                    cuda::fill_bytes(
-                        stream, cuda::std::span{rows.data(), count * row_words}, uint32_t{0}
-                    )
-                );
+                CUDDL_TRY(stager.begin_group(count));
                 for (size_t id = base; id < base + count; ++id) {
-                    // Release the slot from four genomes ago, whose copies have long completed,
-                    // then keep this genome's bytes until the device has taken them.
-                    auto const held_slot = files_seen++ % in_flight_files;
-                    if (held[held_slot]) {
-                        file_consumed[held_slot].sync();
-                        held[held_slot].reset();
-                    }
                     auto sequence = CUDDL_TRY(
                         workers == 1
                             ? detail::load_fastx_sequence_file(paths[id].string(), load_source)
                             : loader->take(id)
                     );
+                    // Read the loaded file's parts before the move below: argument order is
+                    // unspecified, so a moved-from Result must not be dereferenced.
                     auto const* const pinned_base = sequence->decompressed_target;
                     auto const pinned_size = sequence->decompressed_size;
-                    auto const genome = id - base;
-                    // Records reach the device in runs. One transfer covers as many whole
-                    // records as the arena has room for, and every record keeps its own
-                    // descriptor, so a window never spans two records and the kmer set is the
-                    // one per-record staging produces, at a fraction of the transfers.
                     auto const& extents = sequence->extents;
-                    auto const record_size = [&](size_t index) {
-                        return static_cast<size_t>(extents[index].end - extents[index].begin);
-                    };
-                    size_t record = 0;
-                    while (record < extents.size()) {
-                        auto const room = staging - arena_used;
-                        size_t run = record;
-                        while (run < extents.size()) {
-                            auto const run_bytes = static_cast<size_t>(
-                                extents[run].end - extents[record].begin
-                            );
-                            if (run_bytes > room || record_size(run) > max_piece ||
-                                staged_chunks.size() + (run - record) >= max_pieces) {
-                                break;
-                            }
-                            ++run;
-                        }
-                        if (run == record) {
-                            if (arena_used != 0) {
-                                CUDDL_TRY(flush());
-                                continue;
-                            }
-                            // A single record larger than the whole arena: split it, and give
-                            // each piece the k - 1 bases of overlap its kmers need.
-                            auto const size = record_size(record);
-                            size_t offset = 0;
-                            while (offset < size) {
-                                auto const overlap =
-                                    offset == 0 ? size_t{0} : std::min(offset, size_t{K - 1});
-                                auto const bases = std::min(size - offset, max_piece);
-                                auto const span = overlap + bases;
-                                if (span < K) break;
-                                if (arena_used + span > staging ||
-                                    staged_chunks.size() >= max_pieces) {
-                                    CUDDL_TRY(flush());
-                                }
-                                auto const* const source = extents[record].begin + offset - overlap;
-                                auto const direct = pinned_base != nullptr &&
-                                                    source >= pinned_base &&
-                                                    source + span <= pinned_base + pinned_size;
-                                if (statistics != nullptr) {
-                                    if (direct) {
-                                        statistics->direct_bytes += span;
-                                        ++statistics->direct_chunks;
-                                    } else {
-                                        statistics->staged_bytes += span;
-                                        ++statistics->staged_chunks;
-                                    }
-                                }
-                                CUDDL_TRY(stage(
-                                    source, span, genome, static_cast<uint32_t>(span - K + 1)
-                                ));
-                                offset += bases;
-                            }
-                            ++record;
-                            continue;
-                        }
-                        // Copy the run in one transfer, then describe each record inside it.
-                        auto const* const source = extents[record].begin;
-                        auto const run_bytes =
-                            static_cast<size_t>(extents[run - 1].end - source);
-                        auto const direct =
-                            pinned_base != nullptr && source >= pinned_base &&
-                            source + run_bytes <= pinned_base + pinned_size;
-                        if (statistics != nullptr) {
-                            if (direct) {
-                                statistics->direct_bytes += run_bytes;
-                                ++statistics->direct_chunks;
-                            } else {
-                                statistics->staged_bytes += run_bytes;
-                                ++statistics->staged_chunks;
-                            }
-                        }
-                        CUDDL_CUDA_TRY(
-                            cuda::copy_bytes(
-                                stream,
-                                cuda::std::span{source, run_bytes},
-                                device_span<char>{arena.data() + arena_used, run_bytes}
-                            )
-                        );
-                        for (size_t index = record; index < run; ++index) {
-                            auto const size = record_size(index);
-                            if (size < K) continue;  // no window to record
-                            describe(
-                                arena_used +
-                                    static_cast<size_t>(extents[index].begin - source),
-                                static_cast<uint32_t>(size - K + 1),
-                                genome
-                            );
-                        }
-                        arena_used += run_bytes;
-                        ++transfers;
-                        record = run;
-                    }
+                    CUDDL_TRY(stager.add_genome(
+                        id - base, extents, pinned_base, pinned_size, std::move(sequence)
+                    ));
                     result.names_.push_back(paths[id].string());
-                    file_consumed[held_slot].record(stream);
-                    held[held_slot] = std::move(sequence);
                 }
-                // The group's rows are read back after its last batch, so a batch never spans a
-                // group boundary and the copy below always follows the writes it reads.
-                CUDDL_TRY(flush());
-                CUDDL_CUDA_TRY(
-                    cuda::copy_bytes(
-                        stream,
-                        device_span<uint32_t const>{rows.data(), count * row_words},
-                        cuda::std::span{staged_rows.data() + base * row_words, count * row_words}
-                    )
-                );
+                CUDDL_TRY(stager.end_group(base, count));
                 base += count;
             }
-            // One drain for the whole collection: every row copy above queues on this stream in
-            // reference order, so nothing needs to synchronise per genome. Held files go with it.
-            CUDDL_CUDA_TRY(stream.sync());
-            for (auto& file : held) file.reset();
-            // The store pads each genome with its saturation word, so the rows are unpacked from
-            // the single read above into the file's own layout.
-            for (size_t id = 0; id < paths.size(); ++id) {
-                std::memcpy(
-                    result.rows_.data() + id * BucketCount,
-                    staged_rows.data() + id * row_words,
-                    BucketCount * sizeof(uint32_t)
-                );
-                result.saturation_[id] = staged_rows[id * row_words + BucketCount];
-            }
+            CUDDL_TRY(stager.finish(result.rows_, result.saturation_));
             // Loaders still hold leases; join them before reading pool state.
             loader.reset();
             if (statistics != nullptr) {
                 statistics->pinned_buffers = pinned_buffers.buffers();
-                statistics->staging_bytes = staging;
-                statistics->batches = batches;
-                statistics->transfers = transfers;
             }
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);
