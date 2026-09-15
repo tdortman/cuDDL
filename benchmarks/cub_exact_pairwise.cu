@@ -311,7 +311,14 @@ int run_main(
 
     std::vector<size_t> kmers_of(genomes, 0), distinct(genomes, 0);
     std::vector<double> parse_ms, sketch_ms, compare_ms, end_to_end_ms;
-    json pair_rows = json::array();
+    // Emitted rows stride-sample the evaluated pairs, first and last always kept. Applying the
+    // stride as rows are produced keeps only what will be reported: a full corpus evaluates
+    // hundreds of millions of pairs, and holding one JSON object each needs far more memory
+    // than the k-mer arrays this benchmark reads.
+    json emitted = json::array();
+    size_t const emit_stride = match_rows && evaluated.size() > match_rows
+                                   ? (evaluated.size() + match_rows - 1) / match_rows
+                                   : 1;
 
     for (int rep = -warmups; rep < samples; ++rep) {
         auto const sample_tick = clock_type::now();
@@ -376,9 +383,10 @@ int run_main(
         temp.reset(temp_bytes);
         auto const parse_done = clock_type::now();
         auto const compare_tick = clock_type::now();
-        pair_rows = json::array();
+        emitted = json::array();
         reparsed_a.clear();
         reparsed_r.clear();
+        size_t pair_index = 0;
         for (size_t ordinal : evaluated) {
             auto const [a, r] = pair_at(ordinal);
             // Resident arrays come from the sketch pass; anything outside the budget is packed
@@ -437,8 +445,9 @@ int run_main(
             if (jaccard > 0 && jaccard <= 1) {
                 mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
             }
-            pair_rows.push_back(
-                {{"query", names[a]},
+            if (pair_index % emit_stride == 0 || pair_index + 1 == evaluated.size()) {
+                emitted.push_back(
+                    {{"query", names[a]},
                  {"reference", names[r]},
                  {"distinct_a", distinct[a]},
                  {"distinct_b", distinct[r]},
@@ -449,8 +458,10 @@ int run_main(
                   distinct[a] ? static_cast<double>(shared) / distinct[a] : 0.0},
                  {"containment_b_in_a",
                   distinct[r] ? static_cast<double>(shared) / distinct[r] : 0.0},
-                 {"mash_ani", mash_ani}}
-            );
+                     {"mash_ani", mash_ani}}
+                );
+            }
+            ++pair_index;
         }
         auto const done = clock_type::now();
         if (rep >= 0) {
@@ -460,16 +471,6 @@ int run_main(
             compare_ms.push_back(ms(done - compare_tick).count());
             end_to_end_ms.push_back(ms(done - sample_tick).count());
         }
-    }
-
-    // Emitted rows stride-sample the evaluated pairs, first and last always kept.
-    json emitted = json::array();
-    size_t const emit_stride = match_rows && evaluated.size() > match_rows
-                                   ? (evaluated.size() + match_rows - 1) / match_rows
-                                   : 1;
-    for (size_t i = 0; i < pair_rows.size(); i += emit_stride) emitted.push_back(pair_rows[i]);
-    if (!pair_rows.empty() && (pair_rows.size() - 1) % emit_stride != 0) {
-        emitted.push_back(pair_rows.back());
     }
 
     json genome_rows = json::array();
