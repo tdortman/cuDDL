@@ -927,6 +927,6 @@ struct reference_build_statistics {
     size_t pinned_buffers = 0;
     size_t staging_bytes = 0;
     size_t batches = 0;
-    size_t pieces = 0;
+    size_t transfers = 0;  // runs copied in one piece, plus records split across pieces
 };
 }  // namespace cuddl::detail

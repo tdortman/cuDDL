@@ -375,9 +375,10 @@ class reference_database_file {
                 auto const size = std::filesystem::file_size(path, error);
                 if (!error) staged_ceiling += size;
             }
-            // Device and host shares bound the arena as well. On a coherent CPU/GPU system the
-            // free device memory reported here is host memory, so asking for most of it both
-            // starves the rest of the build and leaves the allocator unable to release it.
+            // Four fifths of what is affordable goes to the arena, which leaves room for the
+            // row store, the descriptors, and whatever the caller keeps on the device. On a
+            // coherent CPU/GPU system the free memory reported here is host memory, so a share
+            // of host memory bounds the arena as well.
             auto const pages = ::sysconf(_SC_PHYS_PAGES);
             auto const page = ::sysconf(_SC_PAGE_SIZE);
             size_t const host_share =
@@ -385,7 +386,9 @@ class reference_database_file {
                     ? static_cast<size_t>(pages) * static_cast<size_t>(page) / 8
                     : std::numeric_limits<size_t>::max();
             size_t const arena_ceiling = static_cast<size_t>(std::min(
-                {staged_ceiling, static_cast<uint64_t>(usable / 4), static_cast<uint64_t>(host_share)}
+                {staged_ceiling,
+                 static_cast<uint64_t>(usable - usable / 5),
+                 static_cast<uint64_t>(host_share)}
             ));
             size_t const row_store_bytes = group * row_bytes;
             size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
@@ -450,8 +453,18 @@ class reference_database_file {
             auto const max_grid = static_cast<size_t>(
                 stream.device().attribute(cuda::device_attributes::max_grid_dim_x)
             );
-            size_t arena_used = 0, block_end = 0, batches = 0, pieces = 0;
+            size_t arena_used = 0, block_end = 0, batches = 0, transfers = 0;
 
+            // Records one chunk of the arena for the kernel: where it starts, how many windows
+            // it holds, and how many blocks those windows need.
+            auto describe = [&](size_t offset, uint32_t windows, size_t genome) {
+                auto const blocks =
+                    std::min(sm * 2, (static_cast<size_t>(windows) + 2047) / 2048);
+                block_end += blocks;
+                staged_chunks.push_back(
+                    {offset, block_end, static_cast<uint32_t>(genome), windows}
+                );
+            };
             // Stages one span of bases and records its windows. A span that continues a record
             // was widened by k - 1 bases on the host, so it holds one window per base it adds.
             auto stage = [&](char const* source, size_t size, size_t genome, uint32_t windows
@@ -463,22 +476,22 @@ class reference_database_file {
                         device_span<char>{arena.data() + arena_used, size}
                     )
                 );
-                auto const blocks =
-                    windows == 0
-                        ? size_t{0}
-                        : std::min(sm * 2, (static_cast<size_t>(windows) + 2047) / 2048);
-                block_end += blocks;
-                staged_chunks.push_back(
-                    {arena_used, block_end, static_cast<uint32_t>(genome), windows}
-                );
+                describe(arena_used, windows, genome);
                 arena_used += size;
-                ++pieces;
+                ++transfers;
                 return Ok();
             };
             // One launch for everything staged so far. Copies queued after it land in the arena
             // only once the device has finished reading it, so no host wait is needed here.
             auto flush = [&]() -> Result<void> {
-                if (staged_chunks.empty()) return Ok();
+                if (staged_chunks.empty()) {
+                    // Records shorter than k stage bytes but record no window, so a flush can
+                    // arrive with nothing to launch. The offsets still have to reset, or the
+                    // caller that flushed to make room would ask again for the same room.
+                    arena_used = 0;
+                    block_end = 0;
+                    return Ok();
+                }
                 copied_chunks_consumed.sync();
                 copied_chunks.swap(staged_chunks);
                 CUDDL_CUDA_TRY(
@@ -534,38 +547,104 @@ class reference_database_file {
                     auto const* const pinned_base = sequence->decompressed_target;
                     auto const pinned_size = sequence->decompressed_size;
                     auto const genome = id - base;
-                    for (auto const& extent : sequence->extents) {
-                        auto const* const record = extent.begin;
-                        auto const size = static_cast<size_t>(extent.end - extent.begin);
-                        size_t offset = 0;
-                        while (offset < size) {
-                            // A continuation re-stages the previous piece's last k - 1 bases, so
-                            // kmers spanning a piece boundary survive the split.
-                            auto const overlap =
-                                offset == 0 ? size_t{0} : std::min(offset, size_t{K - 1});
-                            auto const bases = std::min(size - offset, max_piece);
-                            auto const span = overlap + bases;
-                            if (span < K) break;  // fewer bases than one window
-                            if (staged_chunks.size() >= max_pieces || arena_used + span > staging) {
-                                CUDDL_TRY(flush());
-                            }
-                            auto const* const source = record + offset - overlap;
-                            auto const direct = pinned_base != nullptr && source >= pinned_base &&
-                                                source + span <= pinned_base + pinned_size;
-                            if (statistics != nullptr) {
-                                if (direct) {
-                                    statistics->direct_bytes += span;
-                                    ++statistics->direct_chunks;
-                                } else {
-                                    statistics->staged_bytes += span;
-                                    ++statistics->staged_chunks;
-                                }
-                            }
-                            CUDDL_TRY(
-                                stage(source, span, genome, static_cast<uint32_t>(span - K + 1))
+                    // Records reach the device in runs. One transfer covers as many whole
+                    // records as the arena has room for, and every record keeps its own
+                    // descriptor, so a window never spans two records and the kmer set is the
+                    // one per-record staging produces, at a fraction of the transfers.
+                    auto const& extents = sequence->extents;
+                    auto const record_size = [&](size_t index) {
+                        return static_cast<size_t>(extents[index].end - extents[index].begin);
+                    };
+                    size_t record = 0;
+                    while (record < extents.size()) {
+                        auto const room = staging - arena_used;
+                        size_t run = record;
+                        while (run < extents.size()) {
+                            auto const run_bytes = static_cast<size_t>(
+                                extents[run].end - extents[record].begin
                             );
-                            offset += bases;
+                            if (run_bytes > room || record_size(run) > max_piece ||
+                                staged_chunks.size() + (run - record) >= max_pieces) {
+                                break;
+                            }
+                            ++run;
                         }
+                        if (run == record) {
+                            if (arena_used != 0) {
+                                CUDDL_TRY(flush());
+                                continue;
+                            }
+                            // A single record larger than the whole arena: split it, and give
+                            // each piece the k - 1 bases of overlap its kmers need.
+                            auto const size = record_size(record);
+                            size_t offset = 0;
+                            while (offset < size) {
+                                auto const overlap =
+                                    offset == 0 ? size_t{0} : std::min(offset, size_t{K - 1});
+                                auto const bases = std::min(size - offset, max_piece);
+                                auto const span = overlap + bases;
+                                if (span < K) break;
+                                if (arena_used + span > staging ||
+                                    staged_chunks.size() >= max_pieces) {
+                                    CUDDL_TRY(flush());
+                                }
+                                auto const* const source = extents[record].begin + offset - overlap;
+                                auto const direct = pinned_base != nullptr &&
+                                                    source >= pinned_base &&
+                                                    source + span <= pinned_base + pinned_size;
+                                if (statistics != nullptr) {
+                                    if (direct) {
+                                        statistics->direct_bytes += span;
+                                        ++statistics->direct_chunks;
+                                    } else {
+                                        statistics->staged_bytes += span;
+                                        ++statistics->staged_chunks;
+                                    }
+                                }
+                                CUDDL_TRY(stage(
+                                    source, span, genome, static_cast<uint32_t>(span - K + 1)
+                                ));
+                                offset += bases;
+                            }
+                            ++record;
+                            continue;
+                        }
+                        // Copy the run in one transfer, then describe each record inside it.
+                        auto const* const source = extents[record].begin;
+                        auto const run_bytes =
+                            static_cast<size_t>(extents[run - 1].end - source);
+                        auto const direct =
+                            pinned_base != nullptr && source >= pinned_base &&
+                            source + run_bytes <= pinned_base + pinned_size;
+                        if (statistics != nullptr) {
+                            if (direct) {
+                                statistics->direct_bytes += run_bytes;
+                                ++statistics->direct_chunks;
+                            } else {
+                                statistics->staged_bytes += run_bytes;
+                                ++statistics->staged_chunks;
+                            }
+                        }
+                        CUDDL_CUDA_TRY(
+                            cuda::copy_bytes(
+                                stream,
+                                cuda::std::span{source, run_bytes},
+                                device_span<char>{arena.data() + arena_used, run_bytes}
+                            )
+                        );
+                        for (size_t index = record; index < run; ++index) {
+                            auto const size = record_size(index);
+                            if (size < K) continue;  // no window to record
+                            describe(
+                                arena_used +
+                                    static_cast<size_t>(extents[index].begin - source),
+                                static_cast<uint32_t>(size - K + 1),
+                                genome
+                            );
+                        }
+                        arena_used += run_bytes;
+                        ++transfers;
+                        record = run;
                     }
                     result.names_.push_back(paths[id].string());
                     file_consumed[held_slot].record(stream);
@@ -606,7 +685,7 @@ class reference_database_file {
                 statistics->pinned_buffers = pinned_buffers.buffers();
                 statistics->staging_bytes = staging;
                 statistics->batches = batches;
-                statistics->pieces = pieces;
+                statistics->transfers = transfers;
             }
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);

@@ -106,7 +106,7 @@ int main(int argc, char** argv) try {
         {"pinned_requested", pinned},
         {"staging_bytes", statistics.staging_bytes},
         {"batches", statistics.batches},
-        {"pieces", statistics.pieces}
+        {"transfers", statistics.transfers}
     }.dump(2) << '\n';
 } catch (std::exception const& error) {
     std::cerr << "Error: " << error.what() << '\n';
