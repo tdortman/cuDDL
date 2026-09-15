@@ -431,10 +431,17 @@ class reference_database_file {
             // each genome's bytes are held until an event recorded after its copies completes.
             // Copying into page-locked memory instead would be far slower on a coherent
             // CPU/GPU, where the host write costs more than the staging copy it removes.
-            constexpr size_t in_flight_files = 4;
+            // Deep enough that the wait on a slot is normally free. At four slots the tail of
+            // that wait reached hundreds of milliseconds, which is a stall while seventy-two
+            // loaders feed one consumer.
+            constexpr size_t in_flight_files = 16;
             std::vector<std::optional<std::unique_ptr<detail::fastx_sequence_file>>> held(
                 in_flight_files
             );
+            // Rows come back in one transfer per group and are unpacked once at the end. A copy
+            // per genome costs more in API calls than the bytes are worth: at 100,000 references
+            // that is 200,000 calls for 1.6 GB.
+            std::vector<uint32_t> staged_rows(paths.size() * row_words);
             std::vector<cuda::event> file_consumed;
             file_consumed.reserve(in_flight_files);
             for (size_t slot = 0; slot < in_flight_files; ++slot) {
@@ -651,34 +658,31 @@ class reference_database_file {
                     held[held_slot] = std::move(sequence);
                 }
                 // The group's rows are read back after its last batch, so a batch never spans a
-                // group boundary and the copies below always follow the writes they read.
+                // group boundary and the copy below always follows the writes it reads.
                 CUDDL_TRY(flush());
-                for (size_t i = 0; i < count; ++i) {
-                    CUDDL_CUDA_TRY(
-                        cuda::copy_bytes(
-                            stream,
-                            device_span<uint32_t const>{rows.data() + i * row_words, BucketCount},
-                            cuda::std::span{
-                                result.rows_.data() + (base + i) * BucketCount, BucketCount
-                            }
-                        )
-                    );
-                    CUDDL_CUDA_TRY(
-                        cuda::copy_bytes(
-                            stream,
-                            device_span<uint32_t const>{
-                                rows.data() + i * row_words + BucketCount, 1
-                            },
-                            cuda::std::span{result.saturation_.data() + base + i, size_t{1}}
-                        )
-                    );
-                }
+                CUDDL_CUDA_TRY(
+                    cuda::copy_bytes(
+                        stream,
+                        device_span<uint32_t const>{rows.data(), count * row_words},
+                        cuda::std::span{staged_rows.data() + base * row_words, count * row_words}
+                    )
+                );
                 base += count;
             }
             // One drain for the whole collection: every row copy above queues on this stream in
             // reference order, so nothing needs to synchronise per genome. Held files go with it.
             CUDDL_CUDA_TRY(stream.sync());
             for (auto& file : held) file.reset();
+            // The store pads each genome with its saturation word, so the rows are unpacked from
+            // the single read above into the file's own layout.
+            for (size_t id = 0; id < paths.size(); ++id) {
+                std::memcpy(
+                    result.rows_.data() + id * BucketCount,
+                    staged_rows.data() + id * row_words,
+                    BucketCount * sizeof(uint32_t)
+                );
+                result.saturation_[id] = staged_rows[id * row_words + BucketCount];
+            }
             // Loaders still hold leases; join them before reading pool state.
             loader.reset();
             if (statistics != nullptr) {
