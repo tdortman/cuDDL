@@ -9,15 +9,15 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstring>
-#include <mutex>
-#include <string_view>
-#include <thread>
-#include <vector>
 #include <cuda/devices>
 #include <cuddl/detail/register.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
+#include <mutex>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 namespace cuddl::detail {
 
@@ -185,6 +185,53 @@ class fastx_device_builder {
         );
         CUDDL_CUDA_TRY(uploaded_.record(transfer_));
         CUDDL_CUDA_TRY(stream.wait(uploaded_));
+        return launch_from_device_chunk<BucketCount, Layout>(
+            device_input, bytes.size(), k, registers, saturation, stream
+        );
+    }
+
+    // Uploads from a caller's page-locked buffer straight into the device slot, skipping the
+    // staging copy. The caller must keep the bytes valid until this returns, which the transfer
+    // wait below guarantees before the launch that follows.
+    template <size_t BucketCount, typename Layout = default_register_layout>
+    Result<void> add_direct(
+        char const* host_bytes,
+        size_t size,
+        uint32_t k,
+        uint32_t* registers,
+        uint32_t& saturation,
+        cuda::stream_ref stream
+    ) {
+        if (size > capacity || k < 1 || k > 31) {
+            return Err(Error::invalid_argument("invalid FASTX packing chunk"));
+        }
+        if (size == 0) return Ok();
+        CUDDL_CUDA_TRY(consumed_[slot_].sync());
+        auto* device_input = raw_.data() + slot_ * capacity;
+        CUDDL_CUDA_TRY(
+            cuda::copy_bytes(
+                transfer_, cuda::std::span{host_bytes, size}, device_span<char>{device_input, size}
+            )
+        );
+        CUDDL_CUDA_TRY(uploaded_.record(transfer_));
+        CUDDL_CUDA_TRY(stream.wait(uploaded_));
+        return launch_from_device_chunk<BucketCount, Layout>(
+            device_input, size, k, registers, saturation, stream
+        );
+    }
+
+   private:
+    // Everything after a chunk's bytes have reached this slot: carry, whitespace compaction,
+    // and the tile launch. Both upload paths share it so their encode semantics cannot drift.
+    template <size_t BucketCount, typename Layout>
+    Result<void> launch_from_device_chunk(
+        char const* device_input,
+        size_t size,
+        uint32_t k,
+        uint32_t* registers,
+        uint32_t& saturation,
+        cuda::stream_ref stream
+    ) {
         if (reset_carry_) {
             CUDDL_CUDA_TRY(cuda::fill_bytes(stream, carry_, 'N'));
             reset_carry_ = false;
@@ -206,7 +253,7 @@ class fastx_device_builder {
                 device_input,
                 clean_.data() + k - 1,
                 counts_.data(),
-                static_cast<int32_t>(bytes.size()),
+                static_cast<int32_t>(size),
                 sequence_byte{},
                 stream.get()
             )
@@ -215,7 +262,7 @@ class fastx_device_builder {
         CUDDL_CUDA_TRY(consumed_[slot_].record(stream));
         slot_ ^= 1;
         auto const sm = stream.device().attribute(cuda::device_attributes::multiprocessor_count);
-        auto const blocks = std::min<uint32_t>(sm * 2, (bytes.size() + 2047) / 2048);
+        auto const blocks = std::min<uint32_t>(sm * 2, (size + 2047) / 2048);
         add_sequence_tile_kernel<BucketCount, Layout><<<blocks, 256, 0, stream.get()>>>(
             clean_.data(), counts_.data(), carry_.data(), k, registers, saturation
         );
@@ -223,7 +270,6 @@ class fastx_device_builder {
         return Ok();
     }
 
-   private:
     cuda::stream transfer_;
     cuda::event uploaded_;
     cuda::device_buffer<char> raw_, clean_, carry_;

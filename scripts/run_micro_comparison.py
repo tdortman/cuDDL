@@ -53,7 +53,9 @@ DEFAULT_TOOLS = "cuddl,rabbitsketch,hypergen,skani,dashing2,cub-exact"
 
 def run(cmd: list[str], capture: bool = False) -> str:
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=capture, text=True)
+        proc = subprocess.run(
+            cmd, cwd=ROOT, check=True, capture_output=capture, text=True
+        )
     except subprocess.CalledProcessError as error:
         detail = "\n".join(
             line
@@ -61,8 +63,23 @@ def run(cmd: list[str], capture: bool = False) -> str:
             if chunk
             for line in chunk.splitlines()[-15:]
         )
-        raise typer.BadParameter(f"command exited {error.returncode}: {cmd[0]}\n{detail}") from error
+        raise typer.BadParameter(
+            f"command exited {error.returncode}: {cmd[0]}\n{detail}"
+        ) from error
     return proc.stdout if capture else ""
+
+
+def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
+    """Runs one benchmark invocation, reporting what started and how long it took.
+
+    These phases run for minutes on a full corpus, so the log names the work in progress
+    rather than leaving a silent pause between measurements.
+    """
+    typer.echo(f"  {label}: running {Path(cmd[0]).name} ...")
+    tick = time.perf_counter()
+    stdout = run(cmd, capture=capture)
+    typer.echo(f"  {label}: done in {time.perf_counter() - tick:.1f}s")
+    return stdout
 
 
 def wall_of(
@@ -184,7 +201,10 @@ def main(
     skani_chunk: Annotated[int | None, typer.Option(min=1)] = None,
     budget_secs: Annotated[float, typer.Option(min=1)] = 600,
     sketch_all: Annotated[
-        bool, typer.Option(help="Sketch the full discovered corpus; compare stays on subset.")
+        bool,
+        typer.Option(
+            help="Sketch the full discovered corpus; compare stays on subset."
+        ),
     ] = False,
     hypergen_device: Annotated[str, typer.Option()] = "cpu",
 ) -> None:
@@ -337,7 +357,7 @@ def main(
                 str(work / "probe.json"),
             ]
             tick = time.perf_counter()
-            run(probe_cmd)
+            run_timed(f"cub-exact autoscale probe ({topology})", probe_cmd)
             probe_wall_ms = (time.perf_counter() - tick) * 1000
             import json as jsonlib_probe
 
@@ -353,7 +373,7 @@ def main(
             probe_cmd2[probe_cmd2.index("--match-rows") + 1] = "64"
             probe_cmd2[probe_cmd2.index("--output") + 1] = str(work / "probe2.json")
             tick2 = time.perf_counter()
-            run(probe_cmd2)
+            run_timed("cub-exact autoscale probe (larger sample)", probe_cmd2)
             probe_wall2_ms = (time.perf_counter() - tick2) * 1000
             probe_eval2 = jsonlib_probe.loads((work / "probe2.json").read_text())[
                 "case"
@@ -373,7 +393,9 @@ def main(
             # unrefined rows make this overestimate the per-pair cost, which
             # only tightens the subset.
             slice_refs = (
-                _spread_pick(references, sizes, 16) if len(references) > 16 else references
+                _spread_pick(references, sizes, 16)
+                if len(references) > 16
+                else references
             )
             slice_queries = (
                 _spread_pick(query_list, sizes, 16)
@@ -404,7 +426,9 @@ def main(
 
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
-                _spread_pick(references, sizes, 8) if len(references) > 8 else references
+                _spread_pick(references, sizes, 8)
+                if len(references) > 8
+                else references
             )
             probe_queries = (
                 _spread_pick(query_list, sizes, 8)
@@ -470,7 +494,7 @@ def main(
                 str(cub_oracle),
             ]
             oracle_tick = time.perf_counter()
-            run(oracle_cmd)
+            run_timed(f"cub-exact truth oracle ({total_pairs} pairs)", oracle_cmd)
             oracle_wall_ms = (time.perf_counter() - oracle_tick) * 1000
             import json as jsonlib
 
@@ -546,7 +570,8 @@ def main(
                     },
                     "timings": {"wall": summarize(marks)},
                     "metrics": {
-                        "per_genome_ms": statistics.median(marks) / len(sketch_file_args),
+                        "per_genome_ms": statistics.median(marks)
+                        / len(sketch_file_args),
                         **(extra or {}),
                     },
                 }
@@ -611,9 +636,14 @@ def main(
             sketch_times["hypergen"] = marks
             sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
             if topology == "batch":
-                sketch_bytes["hypergen"] += (work / f"hgq{timed_suffix}.sk").stat().st_size
+                sketch_bytes["hypergen"] += (
+                    (work / f"hgq{timed_suffix}.sk").stat().st_size
+                )
             record_sketch(
-                "hypergen", hypergen_device, marks, {"sketch_bytes": sketch_bytes["hypergen"]}
+                "hypergen",
+                hypergen_device,
+                marks,
+                {"sketch_bytes": sketch_bytes["hypergen"]},
             )
         if "skani" in selected:
             marks = []
@@ -705,12 +735,16 @@ def main(
 
                 ref_cfg = work / "refbuild.toml"
                 ref_cfg.write_text(
-                    "reference = " + jsonlib_ref.dumps([str(p) for p in sketch_file_args]) + "\n"
+                    "reference = "
+                    + jsonlib_ref.dumps([str(p) for p in sketch_file_args])
+                    + "\n"
                 )
                 ref_cmd += ["--config", str(ref_cfg)]
             else:
                 ref_cmd += ["--reference", *file_args]
-            stdout = run(
+            stdout = run_timed(
+                f"cuddl sketch: reference database for {len(sketch_file_args)} genomes "
+                f"({max(samples, 2)} samples, {threads} loaders)",
                 ref_cmd
                 + [
                     "--database",
@@ -796,12 +830,16 @@ def main(
                     + jsonlib4.dumps([str(p) for p in sketch_references])
                     + "\n"
                     + (
-                        "query = " + jsonlib4.dumps([str(p) for p in sketch_queries]) + "\n"
+                        "query = "
+                        + jsonlib4.dumps([str(p) for p in sketch_queries])
+                        + "\n"
                         if topology == "batch"
                         else ""
                     )
                 )
-                run(
+                run_timed(
+                    f"cub-exact sketch: full corpus, {len(sketch_references)} genomes "
+                    f"({samples} samples)",
                     [
                         str(cub),
                         "--topology",
@@ -817,7 +855,7 @@ def main(
                         "--sketch-only",
                         "--output",
                         str(work / "cub-sketch.json"),
-                    ]
+                    ],
                 )
                 sketch_payload = jsonlib4.loads((work / "cub-sketch.json").read_text())
             cub_cmd = [
@@ -844,7 +882,11 @@ def main(
                 "--output",
                 str(cub_rep),
             ]
-            run(cub_cmd)
+            run_timed(
+                f"cub-exact compare: {total_pairs} pairs over the budget subset "
+                f"({samples} samples)",
+                cub_cmd,
+            )
             payload = jsonlib4.loads(cub_rep.read_text())
             if sketch_all:
                 payload = sketch_payload
@@ -1060,7 +1102,9 @@ def main(
                 + "\n"
             )
             rep = work / "cuddl-compare.json"
-            run(
+            run_timed(
+                f"cuddl compare: {len(compare_queries)} queries x "
+                f"{len(references)} references ({topology})",
                 [
                     str(pipeline_bin),
                     "--topology",
@@ -1083,7 +1127,7 @@ def main(
                     str(cfg),
                     "--output",
                     str(rep),
-                ]
+                ],
             )
             payload = jsonlib5.loads(rep.read_text())
             pipe = next(
@@ -1186,7 +1230,9 @@ def main(
                 + "\n"
             )
             rep = work / "cuddl-search.json"
-            run(
+            run_timed(
+                f"cuddl search: index {len(search_references)} references, "
+                f"query {len(search_queries)}",
                 [
                     str(pipeline_bin),
                     "--topology",
@@ -1209,7 +1255,7 @@ def main(
                     str(cfg),
                     "--output",
                     str(rep),
-                ]
+                ],
             )
             payload = jsonlib6.loads(rep.read_text())
             pipe = next(

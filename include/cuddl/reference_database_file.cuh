@@ -135,6 +135,77 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
     return Ok();
 }
 
+// Page-locked sequence storage handed to loader threads. A lease returns to the pool when the
+// parsed file holding it dies, which is after the transfer engine has finished reading it, so a
+// buffer is never reused while a DMA may still be in flight.
+class pinned_sequence_pool {
+   public:
+    /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
+    pinned_sequence_pool(cuda::stream_ref stream, size_t buffers, size_t limit)
+        : stream_(stream), limit_(limit) {
+        slots_.reserve(buffers);
+        in_use_.reserve(buffers);
+    }
+
+    /// @brief Returns page-locked bytes, or a null target when the pool cannot serve.
+    [[nodiscard]] decompression_target acquire(size_t bytes) {
+        if (bytes == 0 || bytes > limit_) return {};
+        std::lock_guard lock(mutex_);
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (in_use_[i] || slots_[i]->buffer.size() < bytes) continue;
+            in_use_[i] = true;
+            return lease(i);
+        }
+        if (slots_.size() >= capacity_) return {};
+        slots_.push_back(
+            std::make_unique<slot>(
+                cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
+                    stream_, cuda::pinned_default_memory_pool(), bytes, cuda::no_init
+                )
+            )
+        );
+        in_use_.push_back(true);
+        return lease(slots_.size() - 1);
+    }
+
+    /// @brief Number of buffers the pool may grow to.
+    void set_capacity(size_t buffers) noexcept {
+        capacity_ = std::max<size_t>(1, buffers);
+    }
+
+   private:
+    struct slot {
+        cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible> buffer;
+    };
+
+    [[nodiscard]] decompression_target lease(size_t index) {
+        auto* pool = this;
+        auto* owner = slots_[index].get();
+        return {
+            owner->buffer.data(),
+            owner->buffer.size(),
+            std::shared_ptr<void>(owner, [pool](void* released) {
+                std::lock_guard lock(pool->mutex_);
+                for (size_t i = 0; i < pool->slots_.size(); ++i) {
+                    if (pool->slots_[i].get() == released) pool->in_use_[i] = false;
+                }
+            })
+        };
+    }
+
+    cuda::stream_ref stream_;
+    size_t limit_;
+    size_t capacity_{1};
+    std::vector<std::unique_ptr<slot>> slots_;
+    std::vector<bool> in_use_;
+    std::mutex mutex_;
+};
+
+/// @brief `decompression_source` trampoline for `pinned_sequence_pool`.
+[[nodiscard]] inline decompression_target acquire_pinned_target(void* context, size_t bytes) {
+    return static_cast<pinned_sequence_pool*>(context)->acquire(bytes);
+}
+
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
 // per genome costs tens of microseconds and dominates at high file counts. Workers pull
 // ids in order while the main thread takes results in order, so at most depth loads are
@@ -142,8 +213,15 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
 // rethrown by take, matching std::async propagation into the build error handlers.
 class fastx_load_pool {
    public:
-    fastx_load_pool(std::span<std::filesystem::path const> paths, size_t depth)
-        : paths_(paths), depth_(std::max(size_t{1}, depth)), results_(paths.size()),
+    fastx_load_pool(
+        std::span<std::filesystem::path const> paths,
+        size_t depth,
+        pinned_sequence_pool* pinned
+    )
+        : paths_(paths),
+          depth_(std::max(size_t{1}, depth)),
+          pinned_(pinned),
+          results_(paths.size()),
           errors_(paths.size()) {
         workers_.reserve(depth_);
         for (size_t i = 0; i < depth_; ++i) workers_.emplace_back([this] { work(); });
@@ -183,7 +261,9 @@ class fastx_load_pool {
                 id = next_++;
             }
             try {
-                auto loaded = load_fastx_sequence_file(paths_[id].string());
+                auto loaded = load_fastx_sequence_file(
+                    paths_[id].string(), decompression_source{acquire_pinned_target, pinned_}
+                );
                 std::lock_guard lock(mutex_);
                 results_[id] = std::move(loaded);
             } catch (...) {
@@ -195,6 +275,7 @@ class fastx_load_pool {
     }
     std::span<std::filesystem::path const> paths_;
     size_t depth_;
+    pinned_sequence_pool* pinned_;
     std::vector<std::optional<Result<std::unique_ptr<fastx_sequence_file>>>> results_;
     std::vector<std::exception_ptr> errors_;
     std::vector<std::thread> workers_;
@@ -265,6 +346,9 @@ class reference_database_file {
             result.rows_.resize(paths.size() * BucketCount);
             result.saturation_.resize(paths.size());
             result.names_.reserve(paths.size());
+            // Larger genomes keep the loader's own buffer rather than pinning that much RAM
+            // per loader for the whole run.
+            constexpr size_t pinned_limit = size_t{32} << 20;
             auto const hardware_threads = std::max(1U, std::thread::hardware_concurrency());
             auto const workers = std::max(
                 size_t{1},
@@ -273,8 +357,12 @@ class reference_database_file {
                     size_t{std::min(parser_workers ? parser_workers : 8U, hardware_threads)}
                 )
             );
+            // Page-locked sequence buffers, one per loader, so the transfer engine reads the
+            // decompressed genome in place instead of restaging it on the consumer thread.
+            detail::pinned_sequence_pool pinned(stream, workers, pinned_limit);
+            pinned.set_capacity(workers);
             std::optional<detail::fastx_load_pool> loader;
-            if (workers > 1) loader.emplace(paths, workers);
+            if (workers > 1) loader.emplace(paths, workers, &pinned);
             auto registers = CUDDL_CUDA_TRY(
                 cuda::make_device_buffer<uint32_t>(
                     stream, stream.device(), BucketCount + 1, cuda::no_init
@@ -285,21 +373,40 @@ class reference_database_file {
             std::string short_records;
             for (size_t id = 0; id < paths.size(); ++id) {
                 auto sequence = CUDDL_TRY(
-                    workers == 1 ? detail::load_fastx_sequence_file(paths[id].string())
-                                 : loader->take(id)
+                    workers == 1
+                        ? detail::load_fastx_sequence_file(
+                              paths[id].string(),
+                              detail::decompression_source{detail::acquire_pinned_target, &pinned}
+                          )
+                        : loader->take(id)
                 );
+                auto const* pinned_base = sequence->decompressed_target;
                 CUDDL_CUDA_TRY(cuda::fill_bytes(stream, registers, 0));
                 short_records.clear();
                 auto add_sequence = [&](std::string_view record) -> Result<void> {
                     packer.reset();
                     for (size_t offset = 0; offset < record.size(); offset += packer.capacity) {
-                        CUDDL_TRY((packer.add<BucketCount, Layout>(
-                            record.substr(offset, packer.capacity),
-                            K,
-                            registers.data(),
-                            registers.data()[BucketCount],
-                            stream
-                        )));
+                        auto const slice = record.substr(offset, packer.capacity);
+                        // Decompressed bytes already sit in page-locked memory, so they go
+                        // straight to the device; heap-backed records still stage first.
+                        auto const pinned_span = pinned_base != nullptr &&
+                                                 slice.data() >= pinned_base &&
+                                                 slice.data() + slice.size() <=
+                                                     pinned_base + sequence->decompressed_size;
+                        if (pinned_span) {
+                            CUDDL_TRY((packer.add_direct<BucketCount, Layout>(
+                                slice.data(),
+                                slice.size(),
+                                K,
+                                registers.data(),
+                                registers.data()[BucketCount],
+                                stream
+                            )));
+                        } else {
+                            CUDDL_TRY((packer.add<BucketCount, Layout>(
+                                slice, K, registers.data(), registers.data()[BucketCount], stream
+                            )));
+                        }
                     }
                     return Ok();
                 };

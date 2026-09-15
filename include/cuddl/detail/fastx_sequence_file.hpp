@@ -534,34 +534,62 @@ struct fastx_sequence_file {
     std::string decompressed;
     std::string sequence;
     std::vector<fastx_sequence_extent> extents;
+    // Set when the caller supplied memory for the decompressed bytes, which then live outside
+    // this object and stay valid as long as the caller keeps them. `decompressed` stays empty.
+    char* decompressed_target = nullptr;
+    size_t decompressed_size = 0;
+    std::shared_ptr<void> storage_owner;
 };
 
-/**
- * @brief Decompresses gzip members from a mapped buffer into one string.
- *
- * Members are decompressed one at a time so concatenated streams (BGZF among them) work.
- * libdeflate verifies each member's CRC32 and length trailer, so corrupt and truncated
- * input both fail here instead of yielding partial sequence.
- */
-[[nodiscard]] inline Result<std::string>
-gunzip_members(std::string_view input, std::string const& path) {
-    struct decompressor {
-        libdeflate_decompressor* handle{libdeflate_alloc_decompressor()};
-        decompressor() = default;
-        decompressor(decompressor const&) = delete;
-        decompressor& operator=(decompressor const&) = delete;
-        ~decompressor() {
-            libdeflate_free_decompressor(handle);
-        }
-    };
-    // libdeflate objects are single-threaded; loader pools call this from many threads.
-    static thread_local decompressor shared;
+/// @brief Host-visible buffer a caller offers for decompressed bytes.
+///
+/// GPU callers supply page-locked memory so the transfer engine can read the sequence
+/// in place, which removes the staging copy that a heap buffer would need. `owner` keeps the
+/// storage alive for as long as the parsed file holds it.
+struct decompression_target {
+    char* data = nullptr;
+    size_t capacity = 0;
+    std::shared_ptr<void> owner;
+};
+
+/// @brief Supplies page-locked storage for one file, or a null target when none is available.
+///
+/// Reusing buffers is the caller's problem, so it decides how much page-locked memory to
+/// commit. A null target simply leaves the loader on its own growing buffer.
+struct decompression_source {
+    decompression_target (*acquire)(void* context, size_t bytes) = nullptr;
+    void* context = nullptr;
+
+    [[nodiscard]] decompression_target request(size_t bytes) const {
+        return acquire != nullptr ? acquire(context, bytes) : decompression_target{};
+    }
+};
+
+/// @brief libdeflate handle, one per thread because the object is single-threaded.
+struct shared_gzip_decompressor {
+    libdeflate_decompressor* handle{libdeflate_alloc_decompressor()};
+    shared_gzip_decompressor() = default;
+    shared_gzip_decompressor(shared_gzip_decompressor const&) = delete;
+    shared_gzip_decompressor& operator=(shared_gzip_decompressor const&) = delete;
+    ~shared_gzip_decompressor() {
+        libdeflate_free_decompressor(handle);
+    }
+};
+
+/// @brief Decompresses gzip members from a mapped buffer into @p output, appending.
+///
+/// Members are decompressed one at a time so concatenated streams (BGZF among them) work.
+/// libdeflate verifies each member's CRC32 and length trailer, so corrupt and truncated
+/// input both fail here instead of yielding partial sequence. `output` grows as needed, so a
+/// caller that pre-sized storage can only ever save reallocations, never lose data.
+[[nodiscard]] inline Result<void>
+gunzip_members_into(std::string_view input, std::string& output, std::string const& path) {
+    static thread_local shared_gzip_decompressor shared;
     if (shared.handle == nullptr) {
         return Err(Error::resource("cannot allocate gzip decompressor"));
     }
     // Genomes compress around 3x; guessing low costs a realloc per member, not correctness.
-    std::string output;
-    output.resize(std::max<size_t>(input.size() * 4, 1U << 16));
+    if (output.empty()) output.resize(std::max<size_t>(input.size() * 4, 1U << 16));
     size_t consumed = 0;
     size_t produced = 0;
     while (consumed < input.size()) {
@@ -587,12 +615,67 @@ gunzip_members(std::string_view input, std::string const& path) {
         produced += member_out;
     }
     output.resize(produced);
-    return output;
+    return Ok();
 }
 
-inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
+/// @brief Decompresses gzip members straight into a caller's buffer.
+///
+/// Returns `Error::resource` when @p target is too small, which callers treat as a request to
+/// fall back to the growing-string path rather than a failure.
+[[nodiscard]] inline Result<size_t> gunzip_members_direct(
+    std::string_view input,
+    decompression_target target,
+    bool& insufficient,
     std::string const& path
 ) {
+    insufficient = false;
+    static thread_local shared_gzip_decompressor shared;
+    if (shared.handle == nullptr) {
+        return Err(Error::resource("cannot allocate gzip decompressor"));
+    }
+    size_t consumed = 0;
+    size_t produced = 0;
+    while (consumed < input.size()) {
+        size_t member_in = 0;
+        size_t member_out = 0;
+        auto const status = libdeflate_gzip_decompress_ex(
+            shared.handle,
+            input.data() + consumed,
+            input.size() - consumed,
+            target.data + produced,
+            target.capacity - produced,
+            &member_in,
+            &member_out
+        );
+        if (status == LIBDEFLATE_INSUFFICIENT_SPACE) {
+            // A caller-supplied buffer cannot grow, so the loader falls back instead.
+            insufficient = true;
+            return Result<size_t>::ok(0);
+        }
+        if (status != LIBDEFLATE_SUCCESS) {
+            return Err(Error::invalid_argument("gzip FASTX error: invalid stream: " + path));
+        }
+        consumed += member_in;
+        produced += member_out;
+    }
+    return produced;
+}
+
+/// @brief Uncompressed size the gzip trailer advertises, or 0 when it cannot be read.
+///
+/// `ISIZE` holds one member's length modulo 2^32, so a concatenated stream is only sized
+/// correctly by its last member. A short buffer is refused later, never silently truncated.
+[[nodiscard]] inline size_t gzip_size_hint(std::string_view input) {
+    if (input.size() < 8) return 0;
+    auto const byte = [&](size_t index) {
+        return static_cast<uint32_t>(static_cast<unsigned char>(input[index]));
+    };
+    auto const tail = input.size() - 4;
+    return byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
+}
+
+inline Result<std::unique_ptr<fastx_sequence_file>>
+load_fastx_sequence_file(std::string const& path, decompression_source source = {}) {
     auto file = fastx_mapped_file::load(path);
     if (!file) {
         return Err(Error::invalid_argument("cannot open FASTX file: " + path));
@@ -603,10 +686,23 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
         static_cast<unsigned char>(data[1]) == 0x8b) {
-        auto inflated = gunzip_members(data, path);
-        if (!inflated) return Err(inflated.error());
-        decompressed = std::move(*inflated);
-        data = decompressed;
+        auto target = source.request(gzip_size_hint(data));
+        bool insufficient = false;
+        if (target.data != nullptr && target.capacity > 0) {
+            auto written = gunzip_members_direct(data, target, insufficient, path);
+            if (!written) return Err(written.error());
+            if (!insufficient) {
+                result->decompressed_target = target.data;
+                result->decompressed_size = *written;
+                result->storage_owner = std::move(target.owner);
+                data = std::string_view{target.data, *written};
+            }
+        }
+        if (result->decompressed_target == nullptr) {
+            auto inflated = gunzip_members_into(data, decompressed, path);
+            if (!inflated) return Err(inflated.error());
+            data = decompressed;
+        }
     }
 
     auto& sequence = result->sequence;
