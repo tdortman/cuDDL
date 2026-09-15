@@ -241,6 +241,15 @@ def main(
         ),
     ] = False,
     hypergen_device: Annotated[str, typer.Option()] = "cpu",
+    cub_stash_mb: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Host memory cub-exact may hold in resident k-mer arrays. Defaults to half of "
+            "the machine's available memory; arrays outside the budget are packed again per "
+            "pair."
+        ),
+    ] = None,
     cuddl_transfer: Annotated[
         str,
         typer.Option(
@@ -291,6 +300,12 @@ def main(
     cub = build / "benchmarks/cub-exact-pairwise"
     refbuild = build / "benchmarks/cuddl-reference-build-benchmark"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
+    # Forwarded to every cub lane that evaluates pairs, so a large corpus can be told to keep
+    # less resident than the default share of host memory.
+    cub_stash: list[str] = []
+    if cub_stash_mb is not None:
+        cub_stash += ["--stash-mb", str(cub_stash_mb)]
+
     required = [skani]  # ANI oracle runs for every selection
     if "hypergen" in selected:
         required.append(hypergen)
@@ -539,6 +554,7 @@ def main(
         if need_cub:
             cub_oracle = work / "oracle.json"
             oracle_cmd = [str(cub), "--topology", topology, "--samples", "1"]
+            oracle_cmd += cub_stash
             oracle_cmd += cub_inputs(
                 work, "oracle", references, query_list if topology == "batch" else []
             )
@@ -952,6 +968,7 @@ def main(
                         str(samples),
                         "--warmups",
                         str(warmups),
+                        *cub_stash,
                         *cub_inputs(
                             work,
                             "sketch",
@@ -975,6 +992,7 @@ def main(
                 "--warmups",
                 str(warmups),
             ]
+            cub_cmd += cub_stash
             cub_cmd += cub_inputs(
                 work, "compare", references, query_list if topology == "batch" else []
             )
@@ -1008,7 +1026,8 @@ def main(
                     .items()
                 },
             )
-            cub_phases = jsonlib4.loads(cub_rep.read_text())["phases_ms"]
+            cub_compare = jsonlib4.loads(cub_rep.read_text())
+            cub_phases = cub_compare["phases_ms"]
 
         # COMPARE op per tool; errors join cub-exact Jaccard and skani ANI.
         def record_compare(
@@ -1293,6 +1312,14 @@ def main(
                 "cub-exact", "gpu-exact", [cub_phases["compare"]["median_ms"]], rows
             )
             measurements[-1]["metrics"].update(autoscale_case)
+            # Report what cub kept resident, so a bounded run says whether the budget bit.
+            measurements[-1]["metrics"].update(
+                {
+                    key: cub_compare["case"][key]
+                    for key in ("stash_mb_allowed", "stashed_mb", "reparsed_genomes")
+                    if key in cub_compare["case"]
+                }
+            )
 
         # SEARCH op: ranked retrieval per query; recall@k and top-1 hit rate
         # against the exact Jaccard ranking. Self-pairs never rank.
