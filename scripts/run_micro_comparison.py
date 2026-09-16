@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -49,6 +50,29 @@ from hypergen_pipeline import dataset_entries, summarize
 ROOT = Path(__file__).resolve().parent.parent
 APP = typer.Typer()
 DEFAULT_TOOLS = "cuddl,rabbitsketch,hypergen,skani,dashing2,cub-exact"
+TOOLS = tuple(DEFAULT_TOOLS.split(","))
+
+
+class Topology(StrEnum):
+    """How the lanes pair the corpus."""
+
+    BATCH = "batch"
+    ALL_TO_ALL = "all-to-all"
+
+
+class HypergenDevice(StrEnum):
+    """Device hypergen runs on."""
+
+    CPU = "cpu"
+    GPU = "gpu"
+
+
+class CuddlTransfer(StrEnum):
+    """How the cuDDL reference build moves bytes."""
+
+    AUTO = "auto"
+    PINNED = "pinned"
+    STAGED = "staged"
 
 
 def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
@@ -98,7 +122,9 @@ def skani_list(work: Path, name: str, paths: list[str]) -> Path:
     return listing
 
 
-def cub_inputs(work: Path, name: str, references: list[Path], queries: list[Path]) -> list[str]:
+def cub_inputs(
+    work: Path, name: str, references: list[Path], queries: list[Path]
+) -> list[str]:
     """Returns cub's reference and query arguments for @p references and @p queries.
 
     A full corpus does not fit on a command line, so past `_ARGV_PATH_LIMIT` paths the lists go
@@ -200,8 +226,12 @@ def count_pairs(references: list[Path], queries: list[Path], topology: str) -> i
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
-_RABBIT_RESIDENT_FRACTION = 4  # share of host memory RabbitSketch may hold as staged input
-_ARGV_PATH_LIMIT = 8192  # genome paths cub may take on one command line; beyond it, a config
+_RABBIT_RESIDENT_FRACTION = (
+    4  # share of host memory RabbitSketch may hold as staged input
+)
+_ARGV_PATH_LIMIT = (
+    8192  # genome paths cub may take on one command line; beyond it, a config
+)
 _PROBE_GENOMES = 24  # probe slice, sized so the pair gap below is measurable
 _PROBE_PAIRS = 30  # first probe size
 _PROBE_PAIRS_HIGH = 240  # second probe size; the gap has to dwarf probe-to-probe noise
@@ -210,14 +240,12 @@ _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
 _CHUNK_BUDGET_BYTES = 1 << 30  # per-invocation truth output target
 _CHUNK_MIN_ROWS = 8 << 20  # row floor, so loading the reference sketches amortises
 _CHUNK_MAX_QUERIES = 50  # skani dist switches to its hash-table index path above this
-_SKANI_REF_ROM_BYTES = 4 << 20  # resident per reference sketch: measured 1.07 MB, 2.2 MB at 100k
+_SKANI_REF_ROM_BYTES = (
+    4 << 20
+)  # resident per reference sketch: measured 1.07 MB, 2.2 MB at 100k
 _SKANI_RAM_FRACTION = 4  # share of host RAM one skani reference set may hold
 _PAIRS_TARGET_BYTES = 32 << 20  # stored-pairs output target
 _PAIR_ROW_BYTES = 160  # estimated stored bytes per pair row
-
-
-def _cpu_count() -> int:
-    return os.cpu_count() or 8
 
 
 def _host_ram_bytes() -> int:
@@ -273,62 +301,186 @@ def _spread_pick(paths: list[Path], sizes: dict[Path, int], count: int) -> list[
 
 @APP.command()
 def main(
-    genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
-    queries: Annotated[list[Path] | None, typer.Option("--query", exists=True)] = None,
-    query_fraction: Annotated[float | None, typer.Option(min=0, max=1)] = None,
-    query_count: Annotated[int | None, typer.Option(min=1)] = None,
+    genomes: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=False,
+            help="Directory of reference genomes. Discovered recursively, and reference IDs "
+            "follow the sorted paths.",
+        ),
+    ],
+    queries: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--query",
+            exists=True,
+            help="Files or directories to use as the query set. Without it, queries are a "
+            "size-spread slice of the references.",
+        ),
+    ] = None,
+    query_fraction: Annotated[
+        float | None,
+        typer.Option(
+            min=0,
+            max=1,
+            help="Share of the references to use as queries, taken spread over genome size. "
+            "Batch topology only, and excludes --query-count.",
+        ),
+    ] = None,
+    query_count: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Number of references to use as queries, taken spread over genome size. Batch "
+            "topology only, and excludes --query-fraction.",
+        ),
+    ] = None,
     reference_count: Annotated[
         int | None,
         typer.Option(
-            min=1, help="Use only the first N references, in sorted path order."
+            min=1,
+            help="Use only the first N references, in sorted path order, so two hosts compare "
+            "the same corpus. Asking for more than were found is an error.",
         ),
     ] = None,
-    topology: Annotated[str, typer.Option()] = "all-to-all",
-    tools: Annotated[str, typer.Option()] = DEFAULT_TOOLS,
-    samples: Annotated[int, typer.Option(min=1)] = 3,
-    warmups: Annotated[int, typer.Option(min=0)] = 1,
-    threads: Annotated[int | None, typer.Option(min=1)] = None,
-    output: Annotated[Path, typer.Option()] = Path("results/micro-comparison.json"),
-    pairs_out: Annotated[Path | None, typer.Option()] = None,
-    max_kmers: Annotated[int | None, typer.Option(min=1)] = None,
-    recall_k: Annotated[int, typer.Option(min=1)] = 3,
-    min_matches: Annotated[int, typer.Option(min=0)] = 5,
-    max_pairs: Annotated[int | None, typer.Option(min=0)] = None,
-    match_rows: Annotated[int | None, typer.Option(min=0)] = None,
-    skani_chunk: Annotated[int | None, typer.Option(min=1)] = None,
-    skani_refs: Annotated[int | None, typer.Option(min=1)] = None,
-    budget_secs: Annotated[float, typer.Option(min=1)] = 600,
+    topology: Annotated[
+        Topology,
+        typer.Option(
+            help="'batch' queries a reference set against a separate query set; 'all-to-all' "
+            "compares the references among themselves.",
+        ),
+    ] = Topology.ALL_TO_ALL,
+    tools: Annotated[
+        str,
+        typer.Option(
+            help="Comma-separated tools to measure: cuddl, rabbitsketch, hypergen, skani, "
+            "dashing2, cub-exact. skani always runs, because it is the ANI truth.",
+        ),
+    ] = DEFAULT_TOOLS,
+    samples: Annotated[
+        int,
+        typer.Option(
+            min=1, help="Timed repetitions per lane. Reported values are medians."
+        ),
+    ] = 3,
+    warmups: Annotated[
+        int,
+        typer.Option(min=0, help="Untimed repetitions before the timed ones."),
+    ] = 1,
+    threads: Annotated[
+        int,
+        typer.Option(
+            min=1, help="CPU threads one lane may use. Defaults to the core count."
+        ),
+    ] = os.cpu_count() or 8,
+    output: Annotated[
+        Path,
+        typer.Option(help="Results JSON, in the schema the plot scripts read."),
+    ] = Path("results/micro-comparison.json"),
+    pairs_out: Annotated[
+        Path | None,
+        typer.Option(
+            help="Also write the compared pairs, and their oracle scores, here."
+        ),
+    ] = None,
+    max_kmers: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Cap on the k-mers one genome may contribute, across every lane. Defaults to "
+            "what free VRAM allows, and a genome above the cap is an error rather than a "
+            "silent truncation.",
+        ),
+    ] = None,
+    recall_k: Annotated[
+        int,
+        typer.Option(min=1, help="k for the recall@k and top-1 search metrics."),
+    ] = 3,
+    min_matches: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Minimum matching k-mers before a pair is reported, in the lanes that filter.",
+        ),
+    ] = 5,
+    max_pairs: Annotated[
+        int | None,
+        typer.Option(
+            min=0,
+            help="Cap on the pairs cub-exact evaluates, taken as an even stride. Unset derives "
+            "the cap from a probe and a time budget.",
+        ),
+    ] = None,
+    match_rows: Annotated[
+        int | None,
+        typer.Option(
+            min=0,
+            help="Cap on the match rows a lane writes, taken as an even stride. Defaults to a "
+            "32 MiB row budget.",
+        ),
+    ] = None,
+    skani_chunk: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Queries per skani dist invocation, held at or below 50 so skani stays off its "
+            "hash-table index path, which screens differently from the linear path.",
+        ),
+    ] = None,
+    skani_refs: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Reference sketches per skani dist invocation. skani holds every reference "
+            "resident, so this is what bounds its memory; it defaults to a quarter of host RAM "
+            "at 4 MB per reference, 16000 on a 250 GiB host.",
+        ),
+    ] = None,
+    budget_secs: Annotated[
+        float,
+        typer.Option(
+            min=1,
+            help="Wall time the slowest lane may spend per sample. A corpus that would exceed "
+            "it is cut down to a size-spread subset.",
+        ),
+    ] = 600,
     sketch_all: Annotated[
         bool,
         typer.Option(
             help="Sketch the full discovered corpus; compare stays on subset."
         ),
-    ] = False,
-    hypergen_device: Annotated[str, typer.Option()] = "cpu",
+    ] = True,
+    hypergen_device: Annotated[
+        HypergenDevice,
+        typer.Option(help="Device hypergen runs on."),
+    ] = HypergenDevice.CPU,
     cub_stash_mb: Annotated[
         int | None,
         typer.Option(
             min=1,
             help="Host memory cub-exact may hold in resident k-mer arrays. Defaults to half of "
             "the machine's available memory; arrays outside the budget are packed again per "
-            "pair."
+            "pair.",
         ),
     ] = None,
     cuddl_transfer: Annotated[
-        str,
+        CuddlTransfer,
         typer.Option(
             help="How the cuDDL reference build moves bytes: 'auto' follows the host "
             "architecture, 'pinned' transfers page-locked memory, 'staged' copies through a "
             "heap buffer first. Page-locked is faster on most hosts and 3x slower on "
             "coherent ones such as Grace Hopper."
         ),
-    ] = "auto",
+    ] = CuddlTransfer.AUTO,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
-    if topology not in ("batch", "all-to-all"):
-        raise typer.BadParameter("topology must be batch or all-to-all")
-    if hypergen_device not in ("cpu", "gpu"):
-        raise typer.BadParameter("hypergen-device must be cpu or gpu")
+    selected = [t.strip() for t in tools.split(",") if t.strip()]
+    unknown = sorted({t for t in selected if t not in TOOLS})
+    if unknown:
+        raise typer.BadParameter(
+            f"unknown tool {', '.join(unknown)}; known tools are {', '.join(TOOLS)}"
+        )
     references = discover(genomes)
     if reference_count is not None:
         # A prefix of the sorted corpus, not a spread: two hosts that collected the same
@@ -357,13 +509,20 @@ def main(
         raise typer.BadParameter("query-fraction must be within (0, 1]")
     if (query_fraction is not None or query_count is not None) and query_list:
         raise typer.BadParameter("query-count and query-fraction exclude --query")
-    if topology == "batch" and not query_list and query_fraction is None and query_count is None:
-        raise typer.BadParameter("batch needs --query files, --query-count, or --query-fraction")
+    if (
+        topology == "batch"
+        and not query_list
+        and query_fraction is None
+        and query_count is None
+    ):
+        raise typer.BadParameter(
+            "batch needs --query files, --query-count, or --query-fraction"
+        )
     if topology == "all-to-all" and len(references) < 2:
         raise typer.BadParameter("all-to-all needs at least two genomes")
     # No fixed corpus ceiling: the autoscale block below samples the pair
     # space against a time budget instead of refusing large inputs.
-    selected = [t.strip() for t in tools.split(",") if t.strip()]
+
     unknown = [t for t in selected if t not in DEFAULT_TOOLS.split(",")]
     if unknown or not selected:
         raise typer.BadParameter(f"unknown tools: {', '.join(unknown) or 'none'}")
@@ -436,7 +595,6 @@ def main(
             "skani_chunk": skani_chunk is None,
             "skani_refs": skani_refs is None,
         }
-        threads = threads or _cpu_count()
         need_cub = "cub-exact" in selected
         gpu_name = "none"
         if need_cub:
@@ -566,6 +724,13 @@ def main(
             )
             return (time.perf_counter() - tick) * 1000 / pairs
 
+        # A corpus at or below the probe floor, or an explicit --max-pairs, runs without a
+        # probe. Then there is no measured per-pair rate to name or to budget against, and the
+        # report says so instead of reading names the probe never bound.
+        rates: dict[str, float] = {}
+        slowest = "unprobed"
+        probe_per_pair_ms = 0.0
+        rate_note = "unprobed"
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
                 _spread_pick(references, sizes, _PROBE_GENOMES)
@@ -582,7 +747,7 @@ def main(
             # still leaves the other lane running for hours.
             # The ANI truth always runs, so its rate is always available; the exact oracle is
             # measured too when selected. Neither binary is touched unless it is in play.
-            rates: dict[str, float] = {"skani": skani_probe_rate()}
+            rates = {"skani": skani_probe_rate()}
             if need_cub:
                 rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
             slowest = max(rates, key=lambda tool: rates[tool])
@@ -627,7 +792,9 @@ def main(
             # skani holds every reference sketch resident for the whole invocation, so the
             # reference side is chunked as well as the query side. Without this a full corpus
             # never fits: 100k references reached 215 GB on a 250 GB host and OOM'd it.
-            skani_refs = max(1, (_host_ram_bytes() // _SKANI_RAM_FRACTION) // _SKANI_REF_ROM_BYTES)
+            skani_refs = max(
+                1, (_host_ram_bytes() // _SKANI_RAM_FRACTION) // _SKANI_REF_ROM_BYTES
+            )
         skani_refs = max(1, min(skani_refs, len(references)))
         if skani_chunk is None:
             # A chunk has to be big enough for one reference chunk's load to disappear into the
@@ -681,12 +848,18 @@ def main(
         else:
             oracle = {}
         if query_count is not None and total_pairs > 0:
-            minutes = total_pairs * probe_per_pair_ms / 1000 / 60
-            typer.echo(
-                f"query set: {len(query_list)} queries x {len(references)} references = "
-                f"{total_pairs} pairs, about {minutes:.1f} min per sample for the slowest lane "
-                f"({slowest} at {probe_per_pair_ms:.3f}ms/pair)"
-            )
+            if not rates:
+                typer.echo(
+                    f"query set: {len(query_list)} queries x {len(references)} references = "
+                    f"{total_pairs} pairs, unprobed"
+                )
+            else:
+                minutes = total_pairs * probe_per_pair_ms / 1000 / 60
+                typer.echo(
+                    f"query set: {len(query_list)} queries x {len(references)} references = "
+                    f"{total_pairs} pairs, about {minutes:.1f} min per sample for the slowest "
+                    f"lane ({slowest} at {probe_per_pair_ms:.3f}ms/pair)"
+                )
         typer.echo(
             f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} skani_refs={skani_refs} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
         )
@@ -736,7 +909,9 @@ def main(
                     "sketch",
                     "--separate-sketches",
                     "-l",
-                    str(skani_list(work, "truth-queries", [str(p) for p in query_list])),
+                    str(
+                        skani_list(work, "truth-queries", [str(p) for p in query_list])
+                    ),
                     "-o",
                     str(query_db),
                     "-t",
@@ -757,7 +932,9 @@ def main(
                         str(skani),
                         "dist",
                         "--ql",
-                        str(skani_list(work, f"truth-q-{ref_base}-{chunk_base}", chunk)),
+                        str(
+                            skani_list(work, f"truth-q-{ref_base}-{chunk_base}", chunk)
+                        ),
                         "--rl",
                         str(ref_list),
                         "-o",
@@ -1301,7 +1478,11 @@ def main(
                             str(skani),
                             "dist",
                             "--ql",
-                            str(skani_list(work, f"compare-q-{ref_base}-{q_base}", q_chunk)),
+                            str(
+                                skani_list(
+                                    work, f"compare-q-{ref_base}-{q_base}", q_chunk
+                                )
+                            ),
                             "--rl",
                             str(ref_list),
                             "-o",
@@ -1486,7 +1667,9 @@ def main(
             # over that index would need N*(N-1)/2 result rows on the device, which is more than
             # a GPU holds, so the lane runs as batch: same index, queries on one side.
             search_references = sketch_references if sketch_all else references
-            search_topology = "batch" if sketch_all and topology == "all-to-all" else topology
+            search_topology = (
+                "batch" if sketch_all and topology == "all-to-all" else topology
+            )
             cfg.write_text(
                 "reference = "
                 + jsonlib6.dumps([str(path) for path in search_references])
