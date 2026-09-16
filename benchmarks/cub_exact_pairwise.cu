@@ -534,10 +534,11 @@ int run_main(
         // A staged batch holds its bytes, its windows and their flags at once, so it is sized by
         // the room left once the sorted store is placed.
         // A staged byte becomes a window, and a window costs eight bytes of keys twice over (the
-        // emitted and the compacted arrays) plus a flag and the compaction's scratch, so the batch
-        // is sized by a twentieth of what the device has left rather than by the bytes alone.
+        // emitted and the compacted arrays) plus a flag and the compaction and sort scratch.
+        // Sizing the batch by the bytes alone overcommits a device that is also holding the
+        // sorted store and the resident arrays.
         size_t const staging_bytes = std::max<size_t>(
-            size_t{64} << 20, std::min<size_t>(available_device_bytes() / 24, size_t{512} << 20)
+            size_t{32} << 20, std::min<size_t>(available_device_bytes() / 80, size_t{256} << 20)
         );
         std::vector<staged_chunk> chunk_host;
         std::vector<size_t> chunk_genomes;
