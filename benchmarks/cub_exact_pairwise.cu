@@ -18,6 +18,7 @@
 // matching the CLI tools, with the parse subtotal reported separately.
 // Allocation and temp-storage sizing stay outside timing; the report carries
 // buffer sizes instead.
+#include <vector_types.h>
 #include <cuddl/cuda_error.hpp>
 #include <cuddl/error.hpp>
 #include <cuddl/fastx.hpp>
@@ -267,13 +268,53 @@ struct pair_job {
     uint32_t b_len;
 };
 
+/// @brief Four keys of the sixteen-byte-aligned block that holds index @p pos.
+///
+/// An eight-byte key still costs a whole sector, so a four-key register block taken with one
+/// aligned vector load is what keeps the walk off the load-request limit. @p keys is the start of
+/// the array, @p pos the index to cover, and [@p lo, @p hi) the range the caller owns: a block
+/// that reaches outside it, or past the end of the array, falls back to a scalar window. Keys
+/// past the end repeat the last one, so the compare chain reads nothing it should not.
+struct key_block {
+    uint64_t keys[4];
+    size_t base;
+    size_t count;
+};
+
+__device__ __forceinline__ key_block
+load_block(uint64_t const* keys, size_t pos, size_t lo, size_t hi) {
+    auto const pad = ((16 - (reinterpret_cast<uintptr_t>(keys) & 15)) & 15) / sizeof(uint64_t);
+    key_block block;
+    if (pos >= pad) {
+        auto const aligned = pad + ((pos - pad) / 4) * 4;
+        if (aligned >= lo && aligned + 4 <= hi) {
+            auto const value = *reinterpret_cast<ulonglong4 const*>(keys + aligned);
+            block.keys[0] = value.x;
+            block.keys[1] = value.y;
+            block.keys[2] = value.z;
+            block.keys[3] = value.w;
+            block.base = aligned;
+            block.count = 4;
+            return block;
+        }
+    }
+    block.base = pos;
+    block.count = min(static_cast<size_t>(4), hi - pos);
+    _Pragma("unroll")
+    for (size_t i = 0; i < 4; ++i) {
+        block.keys[i] = i < block.count ? keys[pos + i] : keys[hi - 1];
+    }
+    return block;
+}
+
 /// @brief Counts the k-mers two sorted, deduplicated sets share, one block per pair.
 ///
 /// Both sides arrive sorted and deduplicated, so the intersection is one linear pass over them:
 /// each thread takes a slice of one side and the range of the other covering it, found by two
-/// binary searches, and the two walk together. Nothing is written but one integer per pair, and a
-/// whole batch of pairs goes in one launch, which is what keeps the device busy instead of running
-/// a merge and an encode for every pair.
+/// binary searches, and the two walk together. Each side is taken four keys at a time, so a
+/// thread has eight loads in flight instead of a chain of two, and an aligned four-key load costs
+/// one request where four scalar loads cost four. Nothing is written but one integer per pair, and
+/// a whole batch of pairs goes in one launch.
 __global__ void exact_intersection_kernel(pair_job const* jobs, uint32_t* counts) {
     auto const job = jobs[blockIdx.x];
     if (job.a_len == 0 || job.b_len == 0) {
@@ -300,16 +341,38 @@ __global__ void exact_intersection_kernel(pair_job const* jobs, uint32_t* counts
     if (a_begin < a_end) {
         size_t mine = a_begin;
         size_t theirs = bound(job.a[a_begin], false);
+        auto const theirs_begin = theirs;
         auto const theirs_end = bound(job.a[a_end - 1], true);
         while (mine < a_end && theirs < theirs_end) {
-            if (job.a[mine] == job.b[theirs]) {
-                ++matches;
-                ++mine;
-                ++theirs;
-            } else if (job.a[mine] < job.b[theirs]) {
-                ++mine;
+            auto const a_block = load_block(job.a, mine, a_begin, a_end);
+            auto const b_block = load_block(job.b, theirs, theirs_begin, theirs_end);
+            // Both tiles sit in registers, so every key pair is one static comparison with no load
+            // in the chain and no branch to diverge on. A tile may start before the walk position
+            // when the walk is not block-aligned, and the keys it holds back are already counted,
+            // so only the ones the walk has not passed are compared.
+            _Pragma("unroll")
+            for (size_t i = 0; i < 4; ++i) {
+                _Pragma("unroll")
+                for (size_t j = 0; j < 4; ++j) {
+                    bool const live = i < a_block.count && j < b_block.count &&
+                                      a_block.base + i >= mine && b_block.base + j >= theirs;
+                    matches += static_cast<size_t>(live && a_block.keys[i] == b_block.keys[j]);
+                }
+            }
+            // A tile's keys are all accounted for once the walk passes them, and a key is only
+            // passed when the other side can no longer produce one that equals it. The step stops
+            // at the end of the window: an aligned window can end before the walk's own block does,
+            // and stepping past it would pass keys no window ever held.
+            auto const a_step = min(a_block.base + a_block.count - mine, static_cast<size_t>(4));
+            auto const b_step = min(b_block.base + b_block.count - theirs, static_cast<size_t>(4));
+            // A short window repeats its last key, so index 3 is that key either way.
+            if (a_block.keys[3] < b_block.keys[3]) {
+                mine += a_step;
+            } else if (b_block.keys[3] < a_block.keys[3]) {
+                theirs += b_step;
             } else {
-                ++theirs;
+                mine += a_step;
+                theirs += b_step;
             }
         }
     }
