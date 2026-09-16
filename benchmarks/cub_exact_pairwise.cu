@@ -172,9 +172,7 @@ class genome_parse_pool {
 
 [[nodiscard]] unsigned parse_worker_count(size_t genomes) noexcept {
     auto const hardware = std::max(1U, std::thread::hardware_concurrency());
-    return static_cast<unsigned>(
-        std::max<size_t>(1, std::min<size_t>(genomes, std::min<unsigned>(8U, hardware)))
-    );
+    return static_cast<unsigned>(std::max<size_t>(1, std::min<size_t>(genomes, hardware)));
 }
 
 using clock_type = std::chrono::steady_clock;
@@ -574,7 +572,6 @@ int run_main(
             }
             auto const& packed_a = resident[a] ? stashed[a] : reparsed_a;
             auto const& packed_r = resident[r] ? stashed[r] : reparsed_r;
-            size_t shared = 0;
             if (distinct[a] && distinct[r]) {
                 // Both sides are sorted and deduplicated, so the union is one merge pass over
                 // them plus a run count, not a sort of everything they hold together.
@@ -606,17 +603,24 @@ int run_main(
                         stream
                     )
                 );
-                size_t const union_size = fetch_runs();
-                shared = distinct[a] + distinct[r] - union_size;
-            }
-            size_t const pair_union = distinct[a] + distinct[r] - shared;
-            double const jaccard = pair_union ? static_cast<double>(shared) / pair_union : 0.0;
-            double mash_ani = 0.0;
-            if (jaccard > 0 && jaccard <= 1) {
-                mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
             }
             if (scheduled.evaluated_index % emit_stride == 0 ||
                 scheduled.evaluated_index + 1 == evaluated.size()) {
+                // Only a reported pair needs its run count on the host. Waiting for it on every
+                // pair leaves the device with one pair in flight at a time, which is what holds
+                // the GPU and the CPU near idle while the pair space is walked.
+                size_t shared = 0;
+                if (distinct[a] && distinct[r]) {
+                    auto const union_size = fetch_runs();
+                    shared = distinct[a] + distinct[r] - union_size;
+                }
+                size_t const pair_union = distinct[a] + distinct[r] - shared;
+                double const jaccard =
+                    pair_union ? static_cast<double>(shared) / pair_union : 0.0;
+                double mash_ani = 0.0;
+                if (jaccard > 0 && jaccard <= 1) {
+                    mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
+                }
                 emitted.push_back(
                     {{"query", names[a]},
                      {"reference", names[r]},
@@ -711,7 +715,9 @@ int main(int argc, char** argv) try {
     app.add_option("--max-pairs", max_pairs, "Evaluated pairs cap, even stride (0 disables)");
     app.add_option("--match-rows", match_rows, "Emitted pair rows cap, even stride (0 disables)");
     app.add_option(
-        "--workers", workers, "Concurrent genome parsers ahead of the GPU loop; 0 selects up to 8"
+        "--workers",
+        workers,
+        "Concurrent genome parsers ahead of the GPU loop; 0 uses the hardware thread count"
     );
     app.add_option(
         "--stash-mb",
