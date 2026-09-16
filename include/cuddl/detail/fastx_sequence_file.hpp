@@ -962,19 +962,24 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
         auto request = std::max(gzip_size_hint(data), data.size() * 8);
         auto target = source.request(request);
         bool insufficient = false;
-        auto written = Result<size_t>::ok(0);
+        bool inflated = false;
+        size_t produced = 0;
         while (target.data != nullptr && target.capacity > 0) {
-            written = gunzip_members_direct(data, target, insufficient, path);
+            auto const written = gunzip_members_direct(data, target, insufficient, path);
             if (!written) return Err(written.error());
-            if (!insufficient) break;
+            produced = *written;
+            if (!insufficient) {
+                inflated = true;
+                break;
+            }
             request = std::max(request * 2, data.size());
             target = source.request(request);
         }
-        if (target.data != nullptr && target.capacity > 0 && !insufficient) {
+        if (inflated) {
             result->decompressed_target = target.data;
-            result->decompressed_size = *written;
+            result->decompressed_size = produced;
             result->storage_owner = std::move(target.owner);
-            data = std::string_view{target.data, *written};
+            data = std::string_view{target.data, produced};
         }
         if (result->decompressed_target == nullptr) {
             auto inflated = gunzip_members_into(data, decompressed, path);
