@@ -210,6 +210,8 @@ _CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
 _CHUNK_BUDGET_BYTES = 1 << 30  # per-invocation truth output target
 _CHUNK_MIN_ROWS = 8 << 20  # row floor, so loading the reference sketches amortises
 _CHUNK_MAX_QUERIES = 50  # skani dist switches to its hash-table index path above this
+_SKANI_REF_ROM_BYTES = 4 << 20  # resident per reference sketch: measured 1.07 MB, 2.2 MB at 100k
+_SKANI_RAM_FRACTION = 4  # share of host RAM one skani reference set may hold
 _PAIRS_TARGET_BYTES = 32 << 20  # stored-pairs output target
 _PAIR_ROW_BYTES = 160  # estimated stored bytes per pair row
 
@@ -294,6 +296,7 @@ def main(
     max_pairs: Annotated[int | None, typer.Option(min=0)] = None,
     match_rows: Annotated[int | None, typer.Option(min=0)] = None,
     skani_chunk: Annotated[int | None, typer.Option(min=1)] = None,
+    skani_refs: Annotated[int | None, typer.Option(min=1)] = None,
     budget_secs: Annotated[float, typer.Option(min=1)] = 600,
     sketch_all: Annotated[
         bool,
@@ -431,6 +434,7 @@ def main(
             "max_pairs": max_pairs is None,
             "match_rows": match_rows is None,
             "skani_chunk": skani_chunk is None,
+            "skani_refs": skani_refs is None,
         }
         threads = threads or _cpu_count()
         need_cub = "cub-exact" in selected
@@ -619,17 +623,22 @@ def main(
             if cuddl_staged_bytes > _host_ram_bytes() // _RABBIT_RESIDENT_FRACTION
             else "packed"
         )
+        if skani_refs is None:
+            # skani holds every reference sketch resident for the whole invocation, so the
+            # reference side is chunked as well as the query side. Without this a full corpus
+            # never fits: 100k references reached 215 GB on a 250 GB host and OOM'd it.
+            skani_refs = max(1, (_host_ram_bytes() // _SKANI_RAM_FRACTION) // _SKANI_REF_ROM_BYTES)
+        skani_refs = max(1, min(skani_refs, len(references)))
         if skani_chunk is None:
-            # Every invocation reads the whole reference sketch set, so a chunk has to be big
-            # enough for that load to disappear into the work. Take the larger of a byte target
-            # and a row target: with a full-corpus reference set the byte target alone would
-            # shrink chunks to a handful of queries and multiply the fixed cost by hundreds.
+            # A chunk has to be big enough for one reference chunk's load to disappear into the
+            # work, so take the larger of a byte target and a row target against that reference
+            # chunk rather than the whole corpus.
             # Stay at or below _CHUNK_MAX_QUERIES: above it skani dist builds a marker
             # hash table over the references per invocation. On a redundant corpus the
             # screened path is both slower and a different filter, so the chunk never
             # crosses that line.
             target = max(_CHUNK_BUDGET_BYTES, _CHUNK_MIN_ROWS * _CHUNK_ROW_BYTES)
-            by_output = max(1, target // (max(1, len(references)) * _CHUNK_ROW_BYTES))
+            by_output = max(1, target // (max(1, skani_refs) * _CHUNK_ROW_BYTES))
             skani_chunk = min(_CHUNK_MAX_QUERIES, by_output)
         file_args = [str(p) for p in references] + [
             str(p) for p in query_list if p not in references
@@ -679,7 +688,7 @@ def main(
                 f"({slowest} at {probe_per_pair_ms:.3f}ms/pair)"
             )
         typer.echo(
-            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
+            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} skani_refs={skani_refs} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
         )
         autoscale_case = {
             "threads": threads,
@@ -718,7 +727,6 @@ def main(
             ],
         )
         reference_sketches = sorted(str(p) for p in truth_db.glob("*.sketch"))
-        reference_list = skani_list(work, "truth-ref-sketches", reference_sketches)
         if topology == "batch":
             query_db = work / "skani-truth-queries"
             run_timed(
@@ -738,36 +746,39 @@ def main(
             truth_queries = sorted(str(p) for p in query_db.glob("*.sketch"))
         else:
             truth_queries = reference_sketches
-        for chunk_base in range(0, len(truth_queries), skani_chunk):
-            chunk = truth_queries[chunk_base : chunk_base + skani_chunk]
-            chunk_tsv = work / f"skani-truth-{chunk_base}.tsv"
-            run(
-                [
-                    str(skani),
-                    "dist",
-                    "--ql",
-                    str(skani_list(work, f"truth-q-{chunk_base}", chunk)),
-                    "--rl",
-                    str(reference_list),
-                    "-o",
-                    str(chunk_tsv),
-                    "-t",
-                    str(threads),
-                ],
-                quiet=True,
-            )
-            for line in chunk_tsv.read_text().splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split()
-                if len(fields) >= 3:
-                    try:
-                        value = float(fields[2])
-                    except ValueError:
+        for ref_base in range(0, len(reference_sketches), skani_refs):
+            ref_chunk = reference_sketches[ref_base : ref_base + skani_refs]
+            ref_list = skani_list(work, f"truth-refs-{ref_base}", ref_chunk)
+            for chunk_base in range(0, len(truth_queries), skani_chunk):
+                chunk = truth_queries[chunk_base : chunk_base + skani_chunk]
+                chunk_tsv = work / f"skani-truth-{ref_base}-{chunk_base}.tsv"
+                run(
+                    [
+                        str(skani),
+                        "dist",
+                        "--ql",
+                        str(skani_list(work, f"truth-q-{ref_base}-{chunk_base}", chunk)),
+                        "--rl",
+                        str(ref_list),
+                        "-o",
+                        str(chunk_tsv),
+                        "-t",
+                        str(threads),
+                    ],
+                    quiet=True,
+                )
+                for line in chunk_tsv.read_text().splitlines():
+                    if not line or line.startswith("#"):
                         continue
-                    if value > 0:
-                        skani_ani[(fields[1], fields[0])] = value
-                        skani_ani[(fields[0], fields[1])] = value
+                    fields = line.split()
+                    if len(fields) >= 3:
+                        try:
+                            value = float(fields[2])
+                        except ValueError:
+                            continue
+                        if value > 0:
+                            skani_ani[(fields[1], fields[0])] = value
+                            skani_ani[(fields[0], fields[1])] = value
 
         def record_sketch(
             tool: str, variant: str, marks: list[float], extra: dict | None = None
@@ -1273,40 +1284,51 @@ def main(
                         continue
             record_compare("hypergen", hypergen_device, marks, rows)
         if "skani" in selected:
-            dist_out = work / "skani-dist.tsv"
-            marks = wall_of(
-                [
-                    str(skani),
-                    "dist",
-                    "--ql",
-                    str(skani_list(work, "compare-q", file_args)),
-                    "--rl",
-                    str(skani_list(work, "compare-r", file_args)),
-                    "-o",
-                    str(dist_out),
-                    "-t",
-                    str(threads),
-                ],
-                samples,
-                warmups,
-            )
+            # Chunked like the truth lane: one invocation per reference chunk, so skani never
+            # holds the whole corpus resident. The sample is the sum over chunks, which is what a
+            # host-sized run costs.
+            compare_commands: list[list[str]] = []
+            compare_outs: list[Path] = []
+            for ref_base in range(0, len(file_args), skani_refs):
+                ref_chunk = file_args[ref_base : ref_base + skani_refs]
+                ref_list = skani_list(work, f"compare-r-{ref_base}", ref_chunk)
+                for q_base in range(0, len(file_args), skani_chunk):
+                    q_chunk = file_args[q_base : q_base + skani_chunk]
+                    chunk_out = work / f"skani-dist-{ref_base}-{q_base}.tsv"
+                    compare_outs.append(chunk_out)
+                    compare_commands.append(
+                        [
+                            str(skani),
+                            "dist",
+                            "--ql",
+                            str(skani_list(work, f"compare-q-{ref_base}-{q_base}", q_chunk)),
+                            "--rl",
+                            str(ref_list),
+                            "-o",
+                            str(chunk_out),
+                            "-t",
+                            str(threads),
+                        ]
+                    )
+            marks = wall_of(compare_commands, samples, warmups)
             rows = []
-            for line in dist_out.read_text().splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split()
-                if len(fields) >= 4:
-                    try:
-                        rows.append(
-                            {
-                                "query": fields[1],
-                                "reference": fields[0],
-                                "jaccard": None,
-                                "ani": float(fields[2]),
-                            }
-                        )
-                    except ValueError:
+            for dist_out in compare_outs:
+                for line in dist_out.read_text().splitlines():
+                    if not line or line.startswith("#"):
                         continue
+                    fields = line.split()
+                    if len(fields) >= 4:
+                        try:
+                            rows.append(
+                                {
+                                    "query": fields[1],
+                                    "reference": fields[0],
+                                    "jaccard": None,
+                                    "ani": float(fields[2]),
+                                }
+                            )
+                        except ValueError:
+                            continue
             record_compare("skani", "cpu", marks, rows)
 
         if "cuddl" in selected:
