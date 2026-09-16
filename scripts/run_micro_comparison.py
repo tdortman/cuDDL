@@ -17,9 +17,11 @@ outputs; accuracy joins against exact oracles afterwards:
   tools their native compare commands.
 
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
-verified bit-identical against a Python oracle) and chunked skani dist
-(ANI). k and sketch sizes stay native per tool and are recorded; tools
-are compared in error-versus-time space, never by equalizing inputs.
+verified bit-identical against a Python oracle) and, when --skani-truth is
+passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
+work and the slowest lane on a full corpus: it can run on a host that is not
+measuring a GPU. k and sketch sizes stay native per tool and are recorded;
+tools are compared in error-versus-time space, never by equalizing inputs.
 
 Caps are automatic unless passed explicitly: threads default to the CPU
 count, max-kmers derives from free VRAM, the evaluated pair set derives
@@ -438,6 +440,15 @@ def main(
             "at 4 MB per reference, 16000 on a 250 GiB host.",
         ),
     ] = None,
+    skani_truth: Annotated[
+        bool,
+        typer.Option(
+            "--skani-truth/--no-skani-truth",
+            help="Run the chunked skani dist ANI oracle. Off by default: it is the slowest lane "
+            "on a full corpus and it is CPU work, so it can run on a host that is not measuring "
+            "a GPU. Without it the ANI error metrics are omitted.",
+        ),
+    ] = False,
     budget_secs: Annotated[
         float,
         typer.Option(
@@ -541,7 +552,7 @@ def main(
     if cub_stash_mb is not None:
         cub_stash += ["--stash-mb", str(cub_stash_mb)]
 
-    required = [skani]  # ANI oracle runs for every selection
+    required = [skani] if skani_truth else []  # the ANI oracle is opt-in
     if "hypergen" in selected:
         required.append(hypergen)
     if "dashing2" in selected:
@@ -754,33 +765,36 @@ def main(
             # Size the subset by the slowest compare lane we can measure. The exact oracle is
             # fast per pair and the ANI truth is not, and a budget that only fits the oracle
             # still leaves the other lane running for hours.
-            # The ANI truth always runs, so its rate is always available; the exact oracle is
-            # measured too when selected. Neither binary is touched unless it is in play.
-            rates = {"skani": skani_probe_rate()}
+            # Neither binary is touched unless it is in play, and a run whose oracles are all
+            # opted out has nothing to rate and nothing to subset for.
+            rates = {"skani": skani_probe_rate()} if skani_truth else {}
             if need_cub:
                 rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
-            slowest = max(rates, key=lambda tool: rates[tool])
-            probe_per_pair_ms = rates[slowest]
-            rate_note = " ".join(
-                f"{tool}={value:.2f}ms" + ("*" if tool == slowest else "")
-                for tool, value in sorted(rates.items())
-            )
-            capacity = int(
-                budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
-            )
-            # An explicit query count is a decision, not a request to be second-guessed: the
-            # pairs it implies are reported below instead of being trimmed away silently.
-            if capacity < orig_pairs and query_count is None:
-                if topology == "all-to-all":
-                    keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
-                    references = _spread_pick(references, sizes, keep)
-                else:
-                    keep = max(
-                        1, min(len(query_list), capacity // max(1, len(references)))
-                    )
-                    query_list = _spread_pick(query_list, sizes, keep)
-                subset_note = "budget subset"
-            capacity_pairs = max(1, capacity)
+            if rates:
+                slowest = max(rates, key=lambda tool: rates[tool])
+                probe_per_pair_ms = rates[slowest]
+                rate_note = " ".join(
+                    f"{tool}={value:.2f}ms" + ("*" if tool == slowest else "")
+                    for tool, value in sorted(rates.items())
+                )
+                capacity = int(
+                    budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
+                )
+                # An explicit query count is a decision, not a request to be second-guessed: the
+                # pairs it implies are reported below instead of being trimmed away silently.
+                if capacity < orig_pairs and query_count is None:
+                    if topology == "all-to-all":
+                        keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
+                        references = _spread_pick(references, sizes, keep)
+                    else:
+                        keep = max(
+                            1, min(len(query_list), capacity // max(1, len(references)))
+                        )
+                        query_list = _spread_pick(query_list, sizes, keep)
+                    subset_note = "budget subset"
+                capacity_pairs = max(1, capacity)
+            else:
+                capacity_pairs = None
         else:
             capacity_pairs = None
         total_pairs = count_pairs(references, query_list, topology)
@@ -902,48 +916,53 @@ def main(
 
         # ANI oracle from skani dist, chunked per query group so memory stays
         # bounded: triangle materializes the full N x N matrix. Rows with
-        # non-positive ANI are treated as unreported, as with triangle.
+        # non-positive ANI are treated as unreported, as with triangle. Opt in with
+        # --skani-truth: on a full corpus it is the slowest lane in the harness by a wide margin,
+        # and it is CPU work, so it is the lane to leave off the host that is measuring a GPU.
         skani_ani: dict[tuple[str, str], float] = {}
-        # Sketch both sides once. The truth runs per query chunk, and handing skani raw FASTAs
-        # would re-sketch every reference in every chunk: on a full corpus that is the whole
-        # corpus read once per chunk.
-        truth_db = work / "skani-truth-db"
-        run_timed(
-            f"skani truth: sketch {len(references)} references",
-            [
-                str(skani),
-                "sketch",
-                "--separate-sketches",
-                "-l",
-                str(skani_list(work, "truth-refs", [str(p) for p in references])),
-                "-o",
-                str(truth_db),
-                "-t",
-                str(threads),
-            ],
-        )
-        reference_sketches = sorted(str(p) for p in truth_db.glob("*.sketch"))
-        if topology == "batch":
-            query_db = work / "skani-truth-queries"
+        reference_sketches: list[str] = []
+        truth_queries: list[str] = []
+        if skani_truth:
+            # Sketch both sides once. The truth runs per query chunk, and handing skani raw FASTAs
+            # would re-sketch every reference in every chunk: on a full corpus that is the whole
+            # corpus read once per chunk.
+            truth_db = work / "skani-truth-db"
             run_timed(
-                f"skani truth: sketch {len(query_list)} queries",
+                f"skani truth: sketch {len(references)} references",
                 [
                     str(skani),
                     "sketch",
                     "--separate-sketches",
                     "-l",
-                    str(
-                        skani_list(work, "truth-queries", [str(p) for p in query_list])
-                    ),
+                    str(skani_list(work, "truth-refs", [str(p) for p in references])),
                     "-o",
-                    str(query_db),
+                    str(truth_db),
                     "-t",
                     str(threads),
                 ],
             )
-            truth_queries = sorted(str(p) for p in query_db.glob("*.sketch"))
-        else:
-            truth_queries = reference_sketches
+            reference_sketches = sorted(str(p) for p in truth_db.glob("*.sketch"))
+            if topology == "batch":
+                query_db = work / "skani-truth-queries"
+                run_timed(
+                    f"skani truth: sketch {len(query_list)} queries",
+                    [
+                        str(skani),
+                        "sketch",
+                        "--separate-sketches",
+                        "-l",
+                        str(
+                            skani_list(work, "truth-queries", [str(p) for p in query_list])
+                        ),
+                        "-o",
+                        str(query_db),
+                        "-t",
+                        str(threads),
+                    ],
+                )
+                truth_queries = sorted(str(p) for p in query_db.glob("*.sketch"))
+            else:
+                truth_queries = reference_sketches
         for ref_base in range(0, len(reference_sketches), skani_refs):
             ref_chunk = reference_sketches[ref_base : ref_base + skani_refs]
             ref_list = skani_list(work, f"truth-refs-{ref_base}", ref_chunk)
