@@ -955,17 +955,26 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
         static_cast<unsigned char>(data[1]) == 0x8b) {
-        auto target = source.request(gzip_size_hint(data));
+        // ISIZE is one member's length, so it sizes nothing for a BGZF stream: those end in an
+        // empty EOF block, which reads back as zero, and a concatenated stream advertises only its
+        // last member. Ask for the same over-estimate the heap path assumes, then grow the request
+        // on a short target, which keeps a multi-member file off the heap path.
+        auto request = std::max(gzip_size_hint(data), data.size() * 8);
+        auto target = source.request(request);
         bool insufficient = false;
-        if (target.data != nullptr && target.capacity > 0) {
-            auto written = gunzip_members_direct(data, target, insufficient, path);
+        auto written = Result<size_t>::ok(0);
+        while (target.data != nullptr && target.capacity > 0) {
+            written = gunzip_members_direct(data, target, insufficient, path);
             if (!written) return Err(written.error());
-            if (!insufficient) {
-                result->decompressed_target = target.data;
-                result->decompressed_size = *written;
-                result->storage_owner = std::move(target.owner);
-                data = std::string_view{target.data, *written};
-            }
+            if (!insufficient) break;
+            request = std::max(request * 2, data.size());
+            target = source.request(request);
+        }
+        if (target.data != nullptr && target.capacity > 0 && !insufficient) {
+            result->decompressed_target = target.data;
+            result->decompressed_size = *written;
+            result->storage_owner = std::move(target.owner);
+            data = std::string_view{target.data, *written};
         }
         if (result->decompressed_target == nullptr) {
             auto inflated = gunzip_members_into(data, decompressed, path);
