@@ -678,6 +678,14 @@ def main(
             probe_eval2 = jsonlib_probe.loads((work / "probe2.json").read_text())[
                 "case"
             ]["pairs_evaluated"]
+            # The benchmark times its own pair phase, which is the number wanted: a wall-clock
+            # delta still carries everything else that scales with the corpus rather than with
+            # the pairs, and cub-exact sorts and deduplicates each genome before any pair runs.
+            # Measured that way the rate was 8.5 ms a pair where the pair phase is 0.17 ms, which
+            # inflated every estimate and shrank the oracle cap to match.
+            phases = jsonlib_probe.loads((work / "probe2.json").read_text())["phases_ms"]
+            if probe_eval2 > 0 and "compare" in phases:
+                return phases["compare"]["median_ms"] / probe_eval2
             probe_per_pair_ms = 0.0
             if probe_eval2 > probe_eval:
                 probe_per_pair_ms = (probe_wall2_ms - probe_wall_ms) / (
