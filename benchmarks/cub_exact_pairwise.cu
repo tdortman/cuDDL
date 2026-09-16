@@ -259,6 +259,66 @@ size_t merge_temp_bytes(size_t count) {
     return bytes;
 }
 
+/// @brief One pair of sorted, deduplicated k-mer arrays to count the intersection of.
+struct pair_job {
+    uint64_t const* a;
+    uint32_t a_len;
+    uint64_t const* b;
+    uint32_t b_len;
+};
+
+/// @brief Counts the k-mers two sorted, deduplicated sets share, one block per pair.
+///
+/// Both sides arrive sorted and deduplicated, so the intersection is one linear pass over them:
+/// each thread takes a slice of one side and the range of the other covering it, found by two
+/// binary searches, and the two walk together. Nothing is written but one integer per pair, and a
+/// whole batch of pairs goes in one launch, which is what keeps the device busy instead of running
+/// a merge and an encode for every pair.
+__global__ void exact_intersection_kernel(pair_job const* jobs, uint32_t* counts) {
+    auto const job = jobs[blockIdx.x];
+    if (job.a_len == 0 || job.b_len == 0) {
+        if (threadIdx.x == 0) counts[blockIdx.x] = 0;
+        return;
+    }
+    auto const bound = [&](uint64_t value, bool upper) {
+        uint32_t lo = 0, hi = job.b_len;
+        while (lo < hi) {
+            auto const mid = lo + (hi - lo) / 2;
+            if (job.b[mid] < value || (upper && job.b[mid] == value)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    };
+    auto const per = (static_cast<size_t>(job.a_len) + blockDim.x - 1) / blockDim.x;
+    auto const a_begin =
+        min(static_cast<size_t>(threadIdx.x) * per, static_cast<size_t>(job.a_len));
+    auto const a_end = min(a_begin + per, static_cast<size_t>(job.a_len));
+    size_t matches = 0;
+    if (a_begin < a_end) {
+        size_t mine = a_begin;
+        size_t theirs = bound(job.a[a_begin], false);
+        auto const theirs_end = bound(job.a[a_end - 1], true);
+        while (mine < a_end && theirs < theirs_end) {
+            if (job.a[mine] == job.b[theirs]) {
+                ++matches;
+                ++mine;
+                ++theirs;
+            } else if (job.a[mine] < job.b[theirs]) {
+                ++mine;
+            } else {
+                ++theirs;
+            }
+        }
+    }
+    using reduce_type = cub::BlockReduce<size_t, 256>;
+    __shared__ typename reduce_type::TempStorage storage;
+    auto const total = reduce_type(storage).Sum(matches);
+    if (threadIdx.x == 0) counts[blockIdx.x] = static_cast<uint32_t>(total);
+}
+
 int run_main(
     std::vector<std::string> const& references,
     std::vector<std::string> const& queries,
@@ -492,11 +552,77 @@ int run_main(
         temp.reset(temp_bytes);
         auto const parse_done = clock_type::now();
         auto const compare_tick = clock_type::now();
+        // Pairs are counted in batches: one launch and one host read for a whole batch, instead of
+        // a merge, an encode and a pair-sized copy for each pair. A batched job points into the
+        // stash or a scratch, so the batch is flushed as soon as a scratch is rebuilt.
+        struct job_row {
+            size_t a;
+            size_t r;
+            char emit;
+        };
+        std::vector<pair_job> jobs;
+        std::vector<job_row> job_rows;
+        device_buffer jobs_dev, counts_dev;
+        std::vector<uint32_t> intersections;
+        auto flush_jobs = [&]() {
+            if (jobs.empty()) return;
+            jobs_dev.reset(jobs.size() * sizeof(pair_job));
+            counts_dev.reset(jobs.size() * sizeof(uint32_t));
+            CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                jobs_dev.data,
+                jobs.data(),
+                jobs.size() * sizeof(pair_job),
+                cudaMemcpyHostToDevice,
+                stream
+            ));
+            exact_intersection_kernel<<<static_cast<uint32_t>(jobs.size()), 256, 0, stream>>>(
+                static_cast<pair_job const*>(jobs_dev.data),
+                static_cast<uint32_t*>(counts_dev.data)
+            );
+            CUDDL_CUDA_CALL(cudaGetLastError());
+            intersections.resize(jobs.size());
+            CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                intersections.data(),
+                counts_dev.data,
+                jobs.size() * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost,
+                stream
+            ));
+            CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+            for (size_t i = 0; i < jobs.size(); ++i) {
+                if (!job_rows[i].emit) continue;
+                auto const qa = job_rows[i].a, rb = job_rows[i].r;
+                auto const shared = intersections[i];
+                auto const pair_union = distinct[qa] + distinct[rb] - shared;
+                auto const jaccard = pair_union ? static_cast<double>(shared) / pair_union : 0.0;
+                auto mash_ani = 0.0;
+                if (jaccard > 0 && jaccard <= 1) {
+                    mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
+                }
+                emitted.push_back(
+                    {{"query", names[qa]},
+                     {"reference", names[rb]},
+                     {"distinct_a", distinct[qa]},
+                     {"distinct_b", distinct[rb]},
+                     {"intersection", shared},
+                     {"union", pair_union},
+                     {"jaccard", jaccard},
+                     {"containment_a_in_b",
+                      distinct[qa] ? static_cast<double>(shared) / distinct[qa] : 0.0},
+                     {"containment_b_in_a",
+                      distinct[rb] ? static_cast<double>(shared) / distinct[rb] : 0.0},
+                     {"mash_ani", mash_ani}}
+                );
+            }
+            jobs.clear();
+            job_rows.clear();
+        };
         emitted = json::array();
         reparsed_a.clear();
         reparsed_r.clear();
         // Which genome each reparse buffer holds, so a group reuses one parse across its pairs.
         size_t cached_a = genomes, cached_r = genomes;
+        bool scratch_rebuilt = false;
         // Sorted, deduplicated k-mers for the two sides of the current pair. A side the sketch
         // pass packed for the device already has them; anything else is uploaded and reduced once
         // per group, which the reference-major schedule makes one pass per genome.
@@ -514,6 +640,9 @@ int run_main(
                 };
             }
             if (state.genome != g) {
+                // Pending jobs still point at this scratch, so they are counted before it is
+                // filled with another genome.
+                scratch_rebuilt = true;
                 auto const count = packed.size();
                 if (state.keys.bytes < count * sizeof(uint64_t)) {
                     state.keys.reset(count * sizeof(uint64_t));
@@ -572,71 +701,40 @@ int run_main(
             }
             auto const& packed_a = resident[a] ? stashed[a] : reparsed_a;
             auto const& packed_r = resident[r] ? stashed[r] : reparsed_r;
+            if (scratch_rebuilt) {
+                flush_jobs();
+                scratch_rebuilt = false;
+            }
+            // Both sides are sorted and deduplicated, so a pair is one linear pass over them and
+            // the union follows from distinct[a] + distinct[r] - shared. An empty side shares
+            // nothing, which the kernel handles without reading anything.
+            uint64_t const* left = nullptr;
+            uint64_t const* right = nullptr;
+            size_t left_len = 0, right_len = 0;
             if (distinct[a] && distinct[r]) {
-                // Both sides are sorted and deduplicated, so the union is one merge pass over
-                // them plus a run count, not a sort of everything they hold together.
-                auto const left = sorted_for(side_a, a, packed_a);
-                auto const right = sorted_for(side_r, r, packed_r);
-                auto const total = left.second + right.second;
-                CUDDL_CUDA_CALL(
-                    cub::DeviceMerge::MergeKeys(
-                        temp.data,
-                        temp.bytes,
-                        left.first,
-                        static_cast<int>(left.second),
-                        right.first,
-                        static_cast<int>(right.second),
-                        static_cast<uint64_t*>(pair_uniques.data),
-                        cuda::std::less<uint64_t>{},
-                        stream
-                    )
-                );
-                CUDDL_CUDA_CALL(
-                    cub::DeviceRunLengthEncode::Encode(
-                        temp.data,
-                        temp.bytes,
-                        static_cast<uint64_t*>(pair_uniques.data),
-                        static_cast<uint64_t*>(concat.data),
-                        static_cast<int*>(pair_counts.data),
-                        static_cast<int*>(num_runs_dev.data),
-                        total,
-                        stream
-                    )
-                );
+                auto const packed_left = sorted_for(side_a, a, packed_a);
+                auto const packed_right = sorted_for(side_r, r, packed_r);
+                left = packed_left.first;
+                left_len = packed_left.second;
+                right = packed_right.first;
+                right_len = packed_right.second;
             }
-            if (scheduled.evaluated_index % emit_stride == 0 ||
-                scheduled.evaluated_index + 1 == evaluated.size()) {
-                // Only a reported pair needs its run count on the host. Waiting for it on every
-                // pair leaves the device with one pair in flight at a time, which is what holds
-                // the GPU and the CPU near idle while the pair space is walked.
-                size_t shared = 0;
-                if (distinct[a] && distinct[r]) {
-                    auto const union_size = fetch_runs();
-                    shared = distinct[a] + distinct[r] - union_size;
-                }
-                size_t const pair_union = distinct[a] + distinct[r] - shared;
-                double const jaccard =
-                    pair_union ? static_cast<double>(shared) / pair_union : 0.0;
-                double mash_ani = 0.0;
-                if (jaccard > 0 && jaccard <= 1) {
-                    mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
-                }
-                emitted.push_back(
-                    {{"query", names[a]},
-                     {"reference", names[r]},
-                     {"distinct_a", distinct[a]},
-                     {"distinct_b", distinct[r]},
-                     {"intersection", shared},
-                     {"union", pair_union},
-                     {"jaccard", jaccard},
-                     {"containment_a_in_b",
-                      distinct[a] ? static_cast<double>(shared) / distinct[a] : 0.0},
-                     {"containment_b_in_a",
-                      distinct[r] ? static_cast<double>(shared) / distinct[r] : 0.0},
-                     {"mash_ani", mash_ani}}
-                );
-            }
+            jobs.push_back({
+                left,
+                static_cast<uint32_t>(left_len),
+                right,
+                static_cast<uint32_t>(right_len),
+            });
+            job_rows.push_back({
+                a,
+                r,
+                static_cast<char>(
+                    scheduled.evaluated_index % emit_stride == 0 ||
+                    scheduled.evaluated_index + 1 == evaluated.size()
+                ),
+            });
         }
+        flush_jobs();
         auto const done = clock_type::now();
         if (rep >= 0) {
             using ms = std::chrono::duration<double, std::milli>;
