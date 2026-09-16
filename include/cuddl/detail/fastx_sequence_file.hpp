@@ -702,6 +702,140 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
     return byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#include <tmmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+namespace compact_impl {
+
+/// @brief Shuffle controls per whitespace mask, for the vector paths.
+///
+/// Indexed by one half block's mask, an entry lists the positions of the bytes it keeps followed
+/// by stop markers. Both the x86 shuffle and the aarch64 table lookup read the same table, and a
+/// stop marker gathers nothing on either.
+struct compact_shuffle_table {
+    alignas(64) uint8_t control[256][16];
+    uint8_t kept[256];
+    compact_shuffle_table() noexcept {
+        for (int mask = 0; mask < 256; ++mask) {
+            int at = 0;
+            for (int bit = 0; bit < 8; ++bit) {
+                if ((mask & (1 << bit)) == 0) control[mask][at++] = static_cast<uint8_t>(bit);
+            }
+            for (; at < 16; ++at) control[mask][at] = 0x80U;
+            kept[mask] = static_cast<uint8_t>(8 - __builtin_popcount(static_cast<unsigned>(mask)));
+        }
+    }
+};
+
+[[nodiscard]] inline compact_shuffle_table const& compact_shuffle() noexcept {
+    static compact_shuffle_table const table;
+    return table;
+}
+
+#if defined(__ARM_NEON)
+/// @brief One bit per byte of @p flags, which holds a lane of 0x00 or 0xff per comparison.
+[[nodiscard]] inline unsigned compact_mask(uint8x16_t flags) noexcept {
+    constexpr std::uint8_t weights[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    auto const weighted = vandq_u8(vshrq_n_u8(flags, 7), vld1q_u8(weights));
+    return static_cast<unsigned>(vaddv_u8(vget_low_u8(weighted))) |
+           (static_cast<unsigned>(vaddv_u8(vget_high_u8(weighted))) << 8U);
+}
+#endif
+
+}  // namespace compact_impl
+
+#if defined(__ARM_NEON)
+inline char* compact_sequence_whitespace_neon(char const* first, char const* last, char* out) {
+    auto const& table = compact_impl::compact_shuffle();
+    auto const newline = vdupq_n_u8('\n');
+    auto const carriage = vdupq_n_u8('\r');
+    auto const space = vdupq_n_u8(' ');
+    auto const tab = vdupq_n_u8('\t');
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 16) {
+        auto const block = vld1q_u8(reinterpret_cast<std::uint8_t const*>(at));
+        auto const whitespace = vorrq_u8(
+            vorrq_u8(vceqq_u8(block, newline), vceqq_u8(block, carriage)),
+            vorrq_u8(vceqq_u8(block, space), vceqq_u8(block, tab))
+        );
+        auto const flags = compact_impl::compact_mask(whitespace);
+        auto const low = flags & 0xFFU;
+        auto const high = (flags >> 8U) & 0xFFU;
+        auto const packed_low = vqtbl1q_u8(block, vld1q_u8(table.control[low]));
+        auto const packed_high = vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
+        vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_low);
+        out += table.kept[low];
+        vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_high);
+        out += table.kept[high];
+        at += 16;
+    }
+    for (; at != last; ++at) {
+        if (!fastx_is_sequence_whitespace(*at)) *out++ = *at;
+    }
+    return out;
+}
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+/// @brief The same compaction two halves at a time over 32 bytes.
+///
+/// Measured level with the sixteen byte path on a desktop whose store bandwidth saturates first,
+/// and ahead of it where the machine has the width to spend.
+__attribute__((target("avx2"))) inline char* compact_sequence_whitespace_avx2(
+    char const* first, char const* last, char* out
+) {
+    auto const& table = compact_impl::compact_shuffle();
+    auto const newline = _mm256_set1_epi8('\n');
+    auto const carriage = _mm256_set1_epi8('\r');
+    auto const space = _mm256_set1_epi8(' ');
+    auto const tab = _mm256_set1_epi8('\t');
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 32) {
+        auto const block = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(at));
+        auto const whitespace = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(block, newline), _mm256_cmpeq_epi8(block, carriage)),
+            _mm256_or_si256(_mm256_cmpeq_epi8(block, space), _mm256_cmpeq_epi8(block, tab))
+        );
+        auto const flags = static_cast<unsigned>(_mm256_movemask_epi8(whitespace));
+        auto const low_first = flags & 0xFFU;
+        auto const low_second = (flags >> 8U) & 0xFFU;
+        auto const high_first = (flags >> 16U) & 0xFFU;
+        auto const high_second = (flags >> 24U) & 0xFFU;
+        auto const control_first = _mm256_set_m128i(
+            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_first])),
+            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_first]))
+        );
+        auto const control_second = _mm256_set_m128i(
+            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_second])),
+            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_second]))
+        );
+        auto const packed_first = _mm256_shuffle_epi8(block, control_first);
+        auto const packed_second = _mm256_shuffle_epi8(_mm256_bsrli_epi128(block, 8), control_second);
+        // A lane holds the kept bytes of two halves, which are eight bytes apart in the vector and
+        // adjacent in the output, so each half is stored where its own count puts it.
+        // The halves leave the vector in the order 0-7, 16-23, 8-15, 24-31, and the output wants
+        // them in byte order, so each half is stored where its own count puts it.
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_first));
+        out += table.kept[low_first];
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_second));
+        out += table.kept[low_second];
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_first, 1));
+        out += table.kept[high_first];
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_second, 1));
+        out += table.kept[high_second];
+        at += 32;
+    }
+    for (; at != last; ++at) {
+        if (!fastx_is_sequence_whitespace(*at)) *out++ = *at;
+    }
+    return out;
+}
+#endif
+
 /// @brief Copies bases from [@p first, @p last) to @p out, dropping sequence whitespace.
 ///
 /// A sequence line is a long run of bases closed by a line ending, so a test per byte is the bulk
@@ -711,6 +845,13 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
 ///
 /// @return The end of the written span.
 inline char* compact_sequence_whitespace(char const* first, char const* last, char* out) {
+    if (static_cast<size_t>(last - first) >= 64) {
+#if defined(__ARM_NEON)
+        return compact_sequence_whitespace_neon(first, last, out);
+#elif defined(__x86_64__) || defined(__i386__)
+        return compact_sequence_whitespace_avx2(first, last, out);
+#endif
+    }
     constexpr uint64_t ones = 0x0101010101010101ULL;
     auto const has_zero_byte = [](uint64_t word) {
         return (word - ones) & ~word & 0x8080808080808080ULL;
