@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -49,7 +50,8 @@ using json = nlohmann::json;
 
 // Packing one genome into k-mers is a serial pass that costs an order of magnitude more than
 // that genome's device stages, so the sketch loop parses ahead on a bounded pool instead of
-// stalling the GPU. Depth bounds host memory: each worker holds one genome's packed k-mers.
+// stalling the GPU. Depth bounds how many parses run at once; what is held afterwards is the
+// stash budget's decision, not this pool's.
 class genome_parse_pool {
    public:
     genome_parse_pool(
@@ -58,7 +60,7 @@ class genome_parse_pool {
         size_t max_kmers
     )
         : names_(names), depth_(std::max<size_t>(1, depth)), max_kmers_(max_kmers),
-          results_(names.size()), errors_(names.size()) {
+          results_(names.size()), errors_(names.size()), state_(names.size(), idle) {
         workers_.reserve(depth_);
         for (size_t i = 0; i < depth_; ++i) {
             workers_.emplace_back([this] { work(); });
@@ -76,28 +78,46 @@ class genome_parse_pool {
     genome_parse_pool& operator=(genome_parse_pool const&) = delete;
 
     /// @brief Packed k-mers for genome @p index, in input order.
+    ///
+    /// Every take parses. The sketch loop asks for each genome once per sample, so a result an
+    /// earlier take moved out is gone; what to keep instead is the stash budget's decision.
+    /// Asking for @p index also queues the genome @p depth ahead of it, which is the read-ahead
+    /// that keeps the device fed.
     [[nodiscard]] std::vector<uint64_t> take(size_t index) {
         std::unique_lock lock(mutex_);
-        filled_.wait(lock, [&] { return results_[index].has_value() || errors_[index] != nullptr; });
-        ++taken_;
-        assign_.notify_all();
+        request(index);
+        if (index + depth_ < names_.size()) request(index + depth_);
+        ready_.wait(lock, [&] { return state_[index] == done; });
+        state_[index] = idle;
+        auto error = std::exchange(errors_[index], nullptr);
+        std::vector<uint64_t> packed;
+        if (error == nullptr) packed = std::move(*results_[index]);
+        results_[index].reset();
         lock.unlock();
-        if (errors_[index] != nullptr) std::rethrow_exception(errors_[index]);
-        return std::move(*results_[index]);
+        if (error != nullptr) std::rethrow_exception(error);
+        return packed;
     }
 
    private:
+    enum : char { idle = 0, queued = 1, done = 2 };
+
+    /// @brief Queues @p index unless a worker already has it or its result is waiting.
+    void request(size_t index) {
+        if (state_[index] != idle) return;
+        state_[index] = queued;
+        pending_.push_back(index);
+        assign_.notify_all();
+    }
+
     void work() {
         while (true) {
             size_t index;
             {
                 std::unique_lock lock(mutex_);
-                assign_.wait(lock, [&] {
-                    return stop_ || next_ >= names_.size() || next_ - taken_ < depth_;
-                });
-                if (stop_ || next_ >= names_.size()) return;
-                if (next_ - taken_ >= depth_) continue;
-                index = next_++;
+                assign_.wait(lock, [&] { return stop_ || !pending_.empty(); });
+                if (stop_) return;
+                index = pending_.front();
+                pending_.pop_front();
             }
             try {
                 // One thread per genome: the pool supplies the concurrency.
@@ -110,11 +130,13 @@ class genome_parse_pool {
                 }
                 std::lock_guard lock(mutex_);
                 results_[index] = std::move(parsed->kmers);
+                state_[index] = done;
             } catch (...) {
                 std::lock_guard lock(mutex_);
                 errors_[index] = std::current_exception();
+                state_[index] = done;
             }
-            filled_.notify_all();
+            ready_.notify_all();
         }
     }
 
@@ -123,10 +145,11 @@ class genome_parse_pool {
     size_t max_kmers_;
     std::vector<std::optional<std::vector<uint64_t>>> results_;
     std::vector<std::exception_ptr> errors_;
+    std::vector<char> state_;
+    std::deque<size_t> pending_;
     std::vector<std::thread> workers_;
     std::mutex mutex_;
-    std::condition_variable assign_, filled_;
-    size_t next_ = 0, taken_ = 0;
+    std::condition_variable assign_, ready_;
     bool stop_ = false;
 };
 
@@ -280,6 +303,29 @@ int run_main(
             evaluated.push_back(total_pairs - 1);
         }
     }
+    // The query side is touched by every reference and the reference side by every query, so
+    // whichever of them stays resident decides how often the other is parsed. Queries come first
+    // because a batch run reuses each of them across the whole reference set.
+    auto const query_side = [&](size_t g) { return !all_to_all && g >= query_base; };
+    auto const stash_order = [&](size_t pass, size_t g) {
+        return pass == 0 ? query_side(g) : !query_side(g);
+    };
+    // Pairs are processed reference-major: one group per reference, every query against it. With
+    // the queries resident that is one parse per reference instead of one per pair.
+    struct scheduled_pair {
+        size_t ordinal;
+        size_t evaluated_index;
+    };
+    std::vector<scheduled_pair> schedule;
+    schedule.reserve(evaluated.size());
+    for (size_t i = 0; i < evaluated.size(); ++i) {
+        schedule.push_back({evaluated[i], i});
+    }
+    std::stable_sort(
+        schedule.begin(), schedule.end(), [&](auto const& left, auto const& right) {
+            return pair_at(left.ordinal).second < pair_at(right.ordinal).second;
+        }
+    );
     // Genomes touched by evaluated pairs keep their packed arrays across the
     // pair loop; the rest stream through for distinct counts only.
     std::vector<char> needed(genomes, 0);
@@ -323,8 +369,12 @@ int run_main(
     for (int rep = -warmups; rep < samples; ++rep) {
         auto const sample_tick = clock_type::now();
         auto parse_tick = clock_type::now();
-        // Sketch streams one genome at a time; only counts are retained.
-        for (size_t g = 0; g < genomes; ++g) {
+        // Sketch streams one genome at a time; only counts are retained. The order decides who
+        // wins the stash: the reused side is packed first, so a small budget keeps the side that
+        // every pair touches instead of the first genomes in the corpus.
+        for (size_t pass = 0; pass < 2; ++pass) {
+            for (size_t g = 0; g < genomes; ++g) {
+            if (!stash_order(pass, g)) continue;
             auto packed = parsers ? parsers->take(g) : parse_one(g);
             size_t const count = packed.size();
             kmers_of[g] = count;
@@ -369,6 +419,7 @@ int run_main(
                     stashed[g] = std::move(packed);
                 }
             }
+            }
         }
         // Pair buffers sized from the largest evaluated pair actually measured.
         for (size_t ordinal : evaluated) {
@@ -386,17 +437,20 @@ int run_main(
         emitted = json::array();
         reparsed_a.clear();
         reparsed_r.clear();
-        size_t pair_index = 0;
-        for (size_t ordinal : evaluated) {
-            auto const [a, r] = pair_at(ordinal);
+        // Which genome each reparse buffer holds, so a group reuses one parse across its pairs.
+        size_t cached_a = genomes, cached_r = genomes;
+        for (auto const& scheduled : schedule) {
+            auto const [a, r] = pair_at(scheduled.ordinal);
             // Resident arrays come from the sketch pass; anything outside the budget is packed
             // again here, which costs a parse but keeps memory bounded.
-            if (!resident[a]) {
+            if (!resident[a] && cached_a != a) {
                 reparsed_a = parse_one(a);
+                cached_a = a;
                 ++reparsed_genomes;
             }
-            if (!resident[r]) {
+            if (!resident[r] && cached_r != r) {
                 reparsed_r = parse_one(r);
+                cached_r = r;
                 ++reparsed_genomes;
             }
             auto const& packed_a = resident[a] ? stashed[a] : reparsed_a;
@@ -445,7 +499,8 @@ int run_main(
             if (jaccard > 0 && jaccard <= 1) {
                 mash_ani = (1.0 + std::log(2 * jaccard / (1 + jaccard)) / 25.0) * 100.0;
             }
-            if (pair_index % emit_stride == 0 || pair_index + 1 == evaluated.size()) {
+            if (scheduled.evaluated_index % emit_stride == 0 ||
+                scheduled.evaluated_index + 1 == evaluated.size()) {
                 emitted.push_back(
                     {{"query", names[a]},
                  {"reference", names[r]},
@@ -461,7 +516,6 @@ int run_main(
                      {"mash_ani", mash_ani}}
                 );
             }
-            ++pair_index;
         }
         auto const done = clock_type::now();
         if (rep >= 0) {
