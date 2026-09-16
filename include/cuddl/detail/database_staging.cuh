@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -305,7 +306,15 @@ class database_stager {
                                   static_cast<size_t>(records[index].begin - source);
                 describe(bases, static_cast<uint32_t>(size - K + 1), genome);
             }
-            if (!direct_) {
+            if (direct_) {
+                // Staged in place the arena never fills, so the bytes held for the device are
+                // what bounds a batch. Half the arena, because a batch is still held while the
+                // next one fills: the two together then cost what the copies would have.
+                held_bytes_ += run_bytes;
+                if (held_bytes_ >= bounds_.staging / 2) {
+                    CUDDL_TRY(flush());
+                }
+            } else {
                 arena_used_ += run_bytes;
                 ++transfers_;
             }
@@ -440,15 +449,35 @@ class database_stager {
                 );
             CUDDL_CUDA_TRY(cudaGetLastError());
         }
+        if (direct_ && !batch_files_.empty()) {
+            // The launch above is what reads those buffers, so they wait on this batch's event.
+            released_.push_back({cuda::event{stream_}, std::move(batch_files_)});
+            batch_files_.clear();
+            released_.back().first.record(stream_);
+            while (released_.size() > held_batches) {
+                released_.front().first.sync();
+                released_.pop_front();
+            }
+        }
         ++batches_;
         staged_chunks_.clear();
         arena_used_ = 0;
+        held_bytes_ = 0;
         block_end_ = 0;
         return Ok();
     }
 
-    /// @brief Keeps one genome's bytes until the device has taken every copy made from them.
+    /// @brief Keeps one genome's bytes until the device has finished reading them.
+    ///
+    /// A copy is read by the transfer engine before the enqueue returns, so a ring of slots that
+    /// a later genome releases is enough. Staged in place the *kernel* reads the bytes, and it
+    /// runs at the next flush: releasing on the next genome would free a buffer the device is
+    /// still reading.
     void hold(std::unique_ptr<fastx_sequence_file> holder) {
+        if (direct_) {
+            batch_files_.push_back(std::move(holder));
+            return;
+        }
         auto const slot = held_count_++ % held_.size();
         if (held_[slot]) {
             held_consumed_[slot].sync();
@@ -466,12 +495,17 @@ class database_stager {
     cuda::device_buffer<char> arena_;
     cuda::device_buffer<sequence_batch_chunk> descriptors_;
     std::vector<uint32_t> host_rows_;
+    /// Batches whose kernels may still be reading a held buffer.
+    static constexpr size_t held_batches = 1;
+    std::deque<std::pair<cuda::event, std::vector<std::unique_ptr<fastx_sequence_file>>>> released_;
+    std::vector<std::unique_ptr<fastx_sequence_file>> batch_files_;
     std::vector<std::optional<std::unique_ptr<fastx_sequence_file>>> held_;
     std::vector<cuda::event> held_consumed_;
     cuda::event copied_consumed_{stream_};
     std::vector<sequence_batch_chunk> staged_chunks_, copied_chunks_;
     size_t const sm_, max_grid_;
     size_t arena_used_ = 0, block_end_ = 0, batches_ = 0, transfers_ = 0, held_count_ = 0;
+    size_t held_bytes_ = 0;
 };
 
 /// @brief One genome of bases the caller already holds.
@@ -725,6 +759,11 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 ) {
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
+    }
+    if (transfer == transfer_mode::in_place && !device_reads_pageable_memory(stream.device())) {
+        return Err(Error::invalid_argument(
+            "in-place staging needs a device that reads pageable host memory"
+        ));
     }
     if (paths.empty()) return std::vector<uint32_t>{};
     auto const in_place = stages_in_place(transfer, stream.device());
