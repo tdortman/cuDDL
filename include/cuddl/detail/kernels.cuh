@@ -228,7 +228,8 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     }
     // Keep a partial final warp together; individual loads remain bounds-checked.
     auto const lane_offset = FloorRounds != 0U ? (threadIdx.x % warpSize) * 4U : 0U;
-    for (auto offset = index + stride * FloorRounds; offset - lane_offset < input_size; offset += stride) {
+    for (auto offset = index + stride * FloorRounds; offset - lane_offset < input_size;
+         offset += stride) {
         // Reconverge after score filtering before issuing the next global load.
         if constexpr (FloorRounds != 0U) __syncwarp();
         if (vector_input && offset + 4U <= input_size) {
@@ -640,6 +641,12 @@ __device__ inline uint2 index_posting_range(
 /// One warp owns each bucket cell and walks its posting list with a lane stride,
 /// so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
 /// postings at a time instead of serially by a single thread.
+///
+/// When the launch stages one shared counter per reference, postings accumulate in
+/// shared memory and flush once per block instead of contending on the global
+/// counters for every posting. Blocks whose total posting work is below one hit per
+/// reference skip the staging and keep the original global path, so cold buckets
+/// never pay the staging scan.
 template <size_t BucketCount>
 __global__ void count_index_matches_kernel(
     uint16_t const* query,
@@ -648,30 +655,72 @@ __global__ void count_index_matches_kernel(
     uint32_t indexed_bucket_count,
     uint16_t key_mask,
     uint32_t* match_counts,
-    uint16_t const* sorted_keys = nullptr,
-    uint32_t reference_count = 0U
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    bool use_shared_counters
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = block_size / warp_width;
+    extern __shared__ uint32_t shared_counts[];
+    __shared__ uint32_t block_posting_total;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
     auto const bucket = static_cast<size_t>(blockIdx.x) * warps_per_block + warp;
-    if (bucket >= indexed_bucket_count) {
+    // Tail warps read an empty score instead of returning, so every thread reaches
+    // the staging barriers below on the shared path.
+    auto const score = bucket < indexed_bucket_count ? query[bucket] : uint16_t{0};
+    uint32_t begin = 0U;
+    uint32_t end = 0U;
+    if (score != 0U) {
+        auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+        auto const key = static_cast<uint32_t>(score & key_mask);
+        auto const range = index_posting_range(
+            offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
+        );
+        begin = range.x;
+        end = range.y;
+    }
+    if (!use_shared_counters || reference_count == 0U) {
+        if (score == 0U) {
+            return;
+        }
+        for (auto posting = begin + lane; posting < end; posting += warp_width) {
+            atomicAdd(&match_counts[postings[posting]], 1U);
+        }
         return;
     }
-    auto const score = query[bucket];
-    if (score == 0U) {
+    if (threadIdx.x == 0U) {
+        block_posting_total = 0U;
+    }
+    __syncthreads();
+    if (lane == 0U && end != begin) {
+        atomicAdd(&block_posting_total, end - begin);
+    }
+    __syncthreads();
+    if (block_posting_total < reference_count) {
+        if (score == 0U) {
+            return;
+        }
+        for (auto posting = begin + lane; posting < end; posting += warp_width) {
+            atomicAdd(&match_counts[postings[posting]], 1U);
+        }
         return;
     }
-    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-    auto const key = static_cast<uint32_t>(score & key_mask);
-    auto const range = index_posting_range(
-        offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
-    );
-    auto const begin = range.x;
-    auto const end = range.y;
-    for (auto posting = begin + lane; posting < end; posting += warp_width) {
-        atomicAdd(&match_counts[postings[posting]], 1U);
+    for (auto i = threadIdx.x; i < reference_count; i += blockDim.x) {
+        shared_counts[i] = 0U;
+    }
+    __syncthreads();
+    if (score != 0U) {
+        for (auto posting = begin + lane; posting < end; posting += warp_width) {
+            atomicAdd(&shared_counts[postings[posting]], 1U);
+        }
+    }
+    __syncthreads();
+    for (auto i = threadIdx.x; i < reference_count; i += blockDim.x) {
+        auto const staged = shared_counts[i];
+        if (staged != 0U) {
+            atomicAdd(&match_counts[i], staged);
+        }
     }
 }
 

@@ -651,8 +651,32 @@ class reference_database_view {
         constexpr uint32_t warps_per_block = detail::block_size / warp_width;
         auto const bucket_blocks =
             static_cast<uint32_t>((indexed_bucket_count + warps_per_block - 1U) / warps_per_block);
+        // Reserve the static block-total word as well as the dynamic counters.
+        // A fixed opt-in limit cannot be lowered by a concurrent smaller query.
+        constexpr size_t counter_optin_bytes = 64U * 1024U;
+        size_t counter_smem_bytes = 0;
+        auto const counter_need_bytes =
+            static_cast<size_t>(metadata_.reference_count) * sizeof(uint32_t);
+        if (counter_need_bytes + sizeof(uint32_t) <= 48U * 1024U) {
+            counter_smem_bytes = counter_need_bytes;
+        } else if (counter_need_bytes <= counter_optin_bytes) {
+            int device = 0;
+            CUDDL_CUDA_TRY(cudaGetDevice(&device));
+            int optin_max = 0;
+            CUDDL_CUDA_TRY(
+                cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device)
+            );
+            if (optin_max >= static_cast<int>(counter_optin_bytes + sizeof(uint32_t))) {
+                CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+                    reinterpret_cast<void const*>(detail::count_index_matches_kernel<BucketCount>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(counter_optin_bytes)
+                ));
+                counter_smem_bytes = counter_need_bytes;
+            }
+        }
         detail::count_index_matches_kernel<BucketCount>
-            <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
+            <<<bucket_blocks, detail::block_size, counter_smem_bytes, stream.get()>>>(
                 query.data(),
                 index_offsets_.data(),
                 index_postings_.data(),
@@ -660,7 +684,8 @@ class reference_database_view {
                 metadata_.compatibility.key_mask,
                 match_counts,
                 index_keys_.data(),
-                metadata_.reference_count
+                metadata_.reference_count,
+                counter_smem_bytes != 0
             );
         CUDDL_CUDA_TRY(cudaGetLastError());
 
