@@ -1481,11 +1481,15 @@ def main(
             # host-sized run costs.
             compare_commands: list[list[str]] = []
             compare_outs: list[Path] = []
+            # skani compares each query against each reference. A batch run's query side is the
+            # query set, not every file: putting file_args on both sides made this lane square the
+            # corpus, 50256 x 50256 pairs across 4024 invocations instead of 256 x 50000.
+            compare_queries = query_list if topology == "batch" and query_list else file_args
             for ref_base in range(0, len(file_args), skani_refs):
                 ref_chunk = file_args[ref_base : ref_base + skani_refs]
                 ref_list = skani_list(work, f"compare-r-{ref_base}", ref_chunk)
-                for q_base in range(0, len(file_args), skani_chunk):
-                    q_chunk = file_args[q_base : q_base + skani_chunk]
+                for q_base in range(0, len(compare_queries), skani_chunk):
+                    q_chunk = compare_queries[q_base : q_base + skani_chunk]
                     chunk_out = work / f"skani-dist-{ref_base}-{q_base}.tsv"
                     compare_outs.append(chunk_out)
                     compare_commands.append(
