@@ -58,13 +58,19 @@ enum class transfer_mode {
 }
 
 /// @brief Whether a build in @p mode stages the caller's bytes in place.
+///
+/// `in_place` is opt-in. Measured on Grace Hopper with the loaders running, it costs the same as
+/// a staging copy (1.27 s against 1.22 s for 2000 genomes) while holding the sources instead of
+/// an arena, so `automatic` leaves it alone.
 [[nodiscard]] inline bool stages_in_place(transfer_mode mode, cuda::device_ref device) noexcept {
-    if (mode == transfer_mode::in_place) return true;
-    if (mode != transfer_mode::automatic) return false;
-    return device_reads_pageable_memory(device);
+    static_cast<void>(device);
+    return mode == transfer_mode::in_place;
 }
 
 /// @brief Whether a build in @p mode decompresses into page-locked buffers.
+///
+/// `automatic` keys on the device rather than the architecture: a device that reads pageable host
+/// memory is coherent, and there the host writes to page-locked memory are the slow part.
 [[nodiscard]] inline bool pages_locked(transfer_mode mode, cuda::device_ref device) noexcept {
     if (mode == transfer_mode::pinned) return true;
     if (mode != transfer_mode::automatic) return false;
