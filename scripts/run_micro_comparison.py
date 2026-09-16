@@ -772,14 +772,28 @@ def main(
                     )
                     query_list = _spread_pick(query_list, sizes, keep)
                 subset_note = "budget subset"
-            max_pairs = 0
-        elif max_pairs is None:
-            max_pairs = 0
+            capacity_pairs = max(1, capacity)
+        else:
+            capacity_pairs = None
         total_pairs = count_pairs(references, query_list, topology)
         if subset_note != "all pairs":
             subset_note = f"subset {total_pairs}/{orig_pairs}"
         if match_rows is None:
             match_rows = _PAIRS_TARGET_BYTES // _PAIR_ROW_BYTES
+        # The oracle and the cub-exact compare lane want different things from the same knob.
+        # The oracle feeds the correctness metrics from the rows that survive the emit stride, so
+        # evaluating more than that buys nothing: uncapped, a 256 x 50000 corpus spends about two
+        # hours to report 209715 rows. The compare lane is the performance comparison and keeps
+        # the whole pair space, like every other tool.
+        if max_pairs is None:
+            oracle_pairs = min(match_rows or total_pairs, total_pairs)
+            if capacity_pairs is not None:
+                oracle_pairs = min(oracle_pairs, capacity_pairs)
+            all_pairs = 0
+            typer.echo(f"exact oracle: {oracle_pairs} of {total_pairs} pairs")
+        else:
+            oracle_pairs = max_pairs
+            all_pairs = max_pairs
         # Packed ingest parses every genome into host memory: the fastest path for a small
         # corpus, and fatal for a large one. Past a share of host memory the pipeline streams
         # records through a device arena instead, sized from free device memory.
@@ -829,7 +843,7 @@ def main(
                 "--max-kmers",
                 str(max_kmers),
                 "--max-pairs",
-                str(max_pairs),
+                str(oracle_pairs),
                 "--match-rows",
                 str(match_rows),
                 "--output",
@@ -1295,7 +1309,7 @@ def main(
                 "--max-kmers",
                 str(max_kmers),
                 "--max-pairs",
-                str(max_pairs),
+                str(all_pairs),
                 "--match-rows",
                 str(match_rows),
                 "--output",
