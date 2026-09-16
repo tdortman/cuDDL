@@ -912,17 +912,6 @@ class fastx_load_pool {
 
 namespace cuddl {
 
-/// @brief Whether a build transfers decompressed bytes from page-locked memory by default.
-///
-/// Page-locked transfers win when the host writes to device-visible memory at full speed:
-/// measured 2.1x over staging on an x86 host with a discrete GPU. On a coherent CPU/GPU system
-/// the same mapping costs host writes more than the staging copy it removes, which is 2.9x
-/// slower end to end on Grace Hopper. The architecture picks the default; `pinned` overrides it.
-#if defined(__aarch64__)
-inline constexpr bool default_pinned_transfer = false;
-#else
-inline constexpr bool default_pinned_transfer = true;
-#endif
 
 /// @brief How a build moved sequence bytes to the device.
 ///
@@ -936,6 +925,7 @@ struct reference_build_statistics {
     size_t staged_chunks = 0;
     size_t pinned_buffers = 0;
     unsigned workers = 0;  // loaders the build ran, after its own defaulting
+    bool in_place = false;  // the kernels read the loader's own buffers, so nothing was copied
     size_t staging_bytes = 0;
     size_t batches = 0;
     size_t transfers = 0;  // runs copied in one piece, plus records split across pieces

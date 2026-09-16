@@ -140,6 +140,9 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
 
 namespace cuddl {
 
+/// @brief How a build gets its sequence bytes to the device.
+using transfer_mode = detail::transfer_mode;
+
 /// @brief One record of a genome the caller already holds: bases only.
 using sequence_record = detail::sequence_record;
 
@@ -158,12 +161,12 @@ struct path_build_options {
     /// Arena bytes. Unset sizes the arena from free device memory and what the inputs can fill,
     /// which is the only case a build cannot know in advance.
     std::optional<size_t> staging_bytes{};
-    /// Transfers decompressed bytes straight from page-locked memory. On a coherent CPU/GPU
-    /// system, Grace Hopper and Grace Blackwell among them, the device reads host memory anyway
-    /// and page-locking only costs host writes, so the default turns it off there and the heap
-    /// buffer plus a staging copy wins; the `direct_bytes` and `staged_bytes` counters say which
-    /// path a build actually took.
-    bool pinned = default_pinned_transfer;
+    /// How the build moves bytes. `automatic` asks the device: a device that reads pageable host
+    /// memory, which is what makes Grace Hopper and Grace Blackwell coherent, stages the loader's
+    /// buffers in place and copies nothing; anything else opts into or out of page-locked
+    /// transfers. The `direct_bytes`, `staged_bytes` and `in_place` fields say which path a build
+    /// actually took.
+    transfer_mode transfer = transfer_mode::automatic;
 };
 
 /// @brief Knobs for a build the caller feeds with bases it already holds.
@@ -237,7 +240,7 @@ class reference_database_file {
                 stream,
                 options.staging_bytes,
                 options.parser_workers,
-                options.pinned,
+                options.transfer,
                 options.statistics
             )));
             detail::unpack_store<BucketCount>(store, result.rows_, result.saturation_);

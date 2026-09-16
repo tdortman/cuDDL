@@ -58,7 +58,7 @@ class query_sketch_batch {
                 stream,
                 options.staging_bytes,
                 options.parser_workers,
-                options.pinned,
+                options.transfer,
                 options.statistics
             )));
             return compact(store, paths.size(), stream);

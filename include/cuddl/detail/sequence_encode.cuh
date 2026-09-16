@@ -151,8 +151,12 @@ __global__ void add_sequence_tile_kernel(
     );
 }
 
+/// @brief One piece of sequence of one genome, and where its bytes are.
+///
+/// @p bases names the piece directly: a device arena the producer copied it into, or the
+/// producer's own pageable buffer on a host whose device reads pageable memory itself.
 struct sequence_batch_chunk {
-    size_t offset;
+    char const* bases;
     size_t block_end;
     uint32_t genome;
     uint32_t windows;
@@ -161,7 +165,6 @@ struct sequence_batch_chunk {
 // Logical blocks cover every chunk in one launch, including independent short records.
 template <size_t BucketCount, typename Layout>
 __global__ void add_sequence_batch_kernel(
-    char const* sequence,
     sequence_batch_chunk const* chunks,
     size_t chunk_count,
     size_t block_count,
@@ -187,7 +190,7 @@ __global__ void add_sequence_batch_kernel(
         __syncthreads();
         auto* target = registers + size_t{chunk.genome} * (BucketCount + 1);
         add_sequence_windows<BucketCount, Layout>(
-            sequence + chunk.offset,
+            chunk.bases,
             chunk.windows,
             (block - first_block) * 2048,
             (chunk.block_end - first_block) * 2048,

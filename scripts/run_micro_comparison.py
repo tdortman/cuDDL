@@ -68,11 +68,12 @@ class HypergenDevice(StrEnum):
 
 
 class CuddlTransfer(StrEnum):
-    """How the cuDDL reference build moves bytes."""
+    """How the cuDDL reference build gets bytes to the device."""
 
-    AUTO = "auto"
+    AUTOMATIC = "automatic"
     PINNED = "pinned"
     STAGED = "staged"
+    IN_PLACE = "in-place"
 
 
 def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
@@ -467,12 +468,12 @@ def main(
     cuddl_transfer: Annotated[
         CuddlTransfer,
         typer.Option(
-            help="How the cuDDL reference build moves bytes: 'auto' follows the host "
-            "architecture, 'pinned' transfers page-locked memory, 'staged' copies through a "
-            "heap buffer first. Page-locked is faster on most hosts and 3x slower on "
-            "coherent ones such as Grace Hopper."
+            help="How the cuDDL reference build gets bytes to the device: 'automatic' asks the "
+            "device, 'pinned' transfers page-locked memory, 'staged' copies each genome through "
+            "a heap buffer, 'in-place' lets the kernels read that heap buffer, which only a "
+            "device that reads pageable host memory can do."
         ),
-    ] = CuddlTransfer.AUTO,
+    ] = CuddlTransfer.AUTOMATIC,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     selected = [t.strip() for t in tools.split(",") if t.strip()]
@@ -1167,8 +1168,8 @@ def main(
                     # parses every genome on the calling thread.
                     "--workers",
                     str(threads),
-                    *(["--pinned"] if cuddl_transfer == "pinned" else []),
-                    *(["--no-pinned"] if cuddl_transfer == "staged" else []),
+                    "--transfer",
+                    cuddl_transfer,
                 ],
                 capture=True,
             )

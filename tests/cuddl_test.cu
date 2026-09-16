@@ -3723,7 +3723,7 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
     };
     for (size_t const staging : {size_t{64}, size_t{512}, size_t{4096}}) {
         auto built = cuddl::reference_database_file::build<25, buckets>(
-            paths, stream, {.parser_workers = 4, .staging_bytes = staging, .pinned = true}
+            paths, stream, {.parser_workers = 4, .staging_bytes = staging, .transfer = cuddl::transfer_mode::pinned}
         );
         ASSERT_TRUE(built) << built.error().message() << " staging=" << staging;
         ASSERT_EQ(built->rows().size(), paths.size() * buckets);
@@ -3764,7 +3764,7 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
             auto built = cuddl::reference_database_file::build<k, 2048>(
                 std::vector<std::filesystem::path>{path},
                 stream,
-                {.parser_workers = 1, .staging_bytes = staging, .pinned = true}
+                {.parser_workers = 1, .staging_bytes = staging, .transfer = cuddl::transfer_mode::pinned}
             );
             ASSERT_TRUE(built) << built.error().message() << " k=" << k;
             EXPECT_EQ(oracle.saturated, built->saturation().front()) << "k=" << k;

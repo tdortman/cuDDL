@@ -17,7 +17,7 @@ int main(int argc, char** argv) try {
     std::optional<size_t> staging_bytes;
     int copies = 1, samples = 5;
     bool parse_only = false;
-    bool pinned = cuddl::default_pinned_transfer;
+    std::string transfer = "automatic";
     CLI::App app{
         "NVBench wall timing of FASTX -> reference sketches -> binary file (k=25, buckets=2048)"
     };
@@ -38,14 +38,23 @@ int main(int argc, char** argv) try {
     app.add_flag(
         "--parse-only", parse_only, "Time the serial CPU parser oracle, excluding GPU construction"
     );
-    app.add_flag(
-           "--pinned{true},!--no-pinned{false}",
-           pinned,
-           "Transfer page-locked decompressed bytes (default), or stage from a heap buffer"
+    app.add_option(
+           "--transfer",
+           transfer,
+           "How the build gets bytes to the device: automatic asks the device, pinned uses "
+           "page-locked buffers, staged copies through a heap buffer, in-place lets the kernels "
+           "read the heap buffer"
     )
+        ->check(CLI::IsMember({"automatic", "pinned", "staged", "in-place"}))
         ->capture_default_str();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     CLI11_PARSE(app, argc, argv);
+    auto const requested_transfer = [&] {
+        if (transfer == "pinned") return cuddl::transfer_mode::pinned;
+        if (transfer == "staged") return cuddl::transfer_mode::staged;
+        if (transfer == "in-place") return cuddl::transfer_mode::in_place;
+        return cuddl::transfer_mode::automatic;
+    }();
     std::vector<std::filesystem::path> paths;
     uint64_t bytes = 0;
     for (int copy = 0; copy < copies; ++copy) {
@@ -73,7 +82,7 @@ int main(int argc, char** argv) try {
                     {.statistics = &statistics,
                      .parser_workers = workers,
                      .staging_bytes = staging_bytes,
-                     .pinned = pinned}
+                     .transfer = requested_transfer}
                 )));
                 CUDDL_UNWRAP(file.save(output));
             }
@@ -109,7 +118,9 @@ int main(int argc, char** argv) try {
         {"direct_chunks", statistics.direct_chunks},
         {"staged_chunks", statistics.staged_chunks},
         {"pinned_buffers", statistics.pinned_buffers},
-        {"pinned_requested", pinned},
+        {"transfer_requested", transfer},
+        {"in_place", statistics.in_place},
+        {"parsers", static_cast<int>(statistics.workers)},
         {"staging_bytes", statistics.staging_bytes},
         {"batches", statistics.batches},
         {"transfers", statistics.transfers}

@@ -28,6 +28,48 @@
 
 namespace cuddl::detail {
 
+/// @brief How a build gets its sequence bytes to the device.
+enum class transfer_mode {
+    /// Page-locked buffers where the host writes them well, in-place staging where the device
+    /// reads pageable memory itself, and a staging copy everywhere else.
+    automatic,
+    /// Decompress into page-locked buffers, which the transfer engine reads directly. Measured
+    /// 2.1x faster than staging on an x86 host with a discrete GPU, and slower on a coherent
+    /// system, where the same mapping costs host writes more than the copy it removes.
+    pinned,
+    /// Decompress into a heap buffer and copy it to the device. On a coherent system that copy
+    /// is a single-threaded bounce through the driver, which is what leaves 72 loaders parked
+    /// while one core copies and the device waits for data.
+    staged,
+    /// Decompress into a heap buffer and let the kernels read it there. Only a device that reads
+    /// pageable host memory can do this, and it pays neither the copy nor the page-locking.
+    in_place,
+};
+
+/// @brief Whether @p device reads pageable host memory itself.
+///
+/// This is what makes a CPU/GPU system coherent, Grace Hopper and Grace Blackwell among them,
+/// and what lets a kernel read the loader's buffer instead of a copy of it.
+[[nodiscard]] inline bool device_reads_pageable_memory(cuda::device_ref device) noexcept {
+    return device.attribute(cuda::device_attributes::pageable_memory_access) != 0 &&
+           device.attribute(cuda::device_attributes::pageable_memory_access_uses_host_page_tables
+           ) != 0;
+}
+
+/// @brief Whether a build in @p mode stages the caller's bytes in place.
+[[nodiscard]] inline bool stages_in_place(transfer_mode mode, cuda::device_ref device) noexcept {
+    if (mode == transfer_mode::in_place) return true;
+    if (mode != transfer_mode::automatic) return false;
+    return device_reads_pageable_memory(device);
+}
+
+/// @brief Whether a build in @p mode decompresses into page-locked buffers.
+[[nodiscard]] inline bool pages_locked(transfer_mode mode, cuda::device_ref device) noexcept {
+    if (mode == transfer_mode::pinned) return true;
+    if (mode != transfer_mode::automatic) return false;
+    return !device_reads_pageable_memory(device);
+}
+
 /// @brief Sizing a build resolves before its first genome.
 struct staging_plan {
     size_t group = 0;       // genomes whose register rows stay resident at once
@@ -128,15 +170,19 @@ class database_stager {
     }
 
     /// @throws cuda::cuda_error or std::bad_alloc when the device buffers cannot be allocated.
+    /// @param direct stages the caller's bytes in place, for a device that reads pageable host
+    /// memory: no copy, and the arena stays unused.
     database_stager(
         cuda::stream_ref stream,
         size_t references,
         staging_plan bounds,
-        reference_build_statistics* statistics = nullptr
+        reference_build_statistics* statistics = nullptr,
+        bool direct = false
     )
         : stream_(stream),
           bounds_(bounds),
           statistics_(statistics),
+          direct_(direct),
           rows_(
               cuda::make_device_buffer<uint32_t>(
                   stream,
@@ -191,7 +237,9 @@ class database_stager {
         };
         size_t record = 0;
         while (record < records.size()) {
-            auto const room = bounds_.staging - arena_used_;
+            // Staged in place, the arena is not the limit; the descriptors and the piece size are.
+            auto const room = direct_ ? std::numeric_limits<size_t>::max()
+                                      : bounds_.staging - arena_used_;
             size_t run = record;
             while (run < records.size()) {
                 auto const run_bytes =
@@ -234,28 +282,33 @@ class database_stager {
                 ++record;
                 continue;
             }
-            // Copy the run in one transfer, then describe each record inside it.
+            // Copy the run in one transfer, then describe each record inside it. Staged in
+            // place, the records keep their own addresses and there is nothing to copy.
             auto const* const source = records[record].begin;
             auto const run_bytes = static_cast<size_t>(records[run - 1].end - source);
             account(source, run_bytes, pinned_base, pinned_size);
-            CUDDL_CUDA_TRY(
-                cuda::copy_bytes(
-                    stream_,
-                    cuda::std::span{source, run_bytes},
-                    device_span<char>{arena_.data() + arena_used_, run_bytes}
-                )
-            );
+            if (!direct_) {
+                CUDDL_CUDA_TRY(
+                    cuda::copy_bytes(
+                        stream_,
+                        cuda::std::span{source, run_bytes},
+                        device_span<char>{arena_.data() + arena_used_, run_bytes}
+                    )
+                );
+            }
             for (size_t index = record; index < run; ++index) {
                 auto const size = record_size(index);
                 if (size < K) continue;  // no window to record
-                describe(
-                    arena_used_ + static_cast<size_t>(records[index].begin - source),
-                    static_cast<uint32_t>(size - K + 1),
-                    genome
-                );
+                auto const* const bases =
+                    direct_ ? records[index].begin
+                            : arena_.data() + arena_used_ +
+                                  static_cast<size_t>(records[index].begin - source);
+                describe(bases, static_cast<uint32_t>(size - K + 1), genome);
             }
-            arena_used_ += run_bytes;
-            ++transfers_;
+            if (!direct_) {
+                arena_used_ += run_bytes;
+                ++transfers_;
+            }
             record = run;
         }
         if (holder) hold(std::move(holder));
@@ -300,11 +353,11 @@ class database_stager {
     }
 
    private:
-    /// @brief Records one chunk of the arena for the kernel.
-    void describe(size_t offset, uint32_t windows, size_t genome) {
+    /// @brief Records one piece of sequence for the kernel, naming its bytes.
+    void describe(char const* bases, uint32_t windows, size_t genome) {
         auto const blocks = std::min(sm_ * 2, (static_cast<size_t>(windows) + 2047) / 2048);
         block_end_ += blocks;
-        staged_chunks_.push_back({offset, block_end_, static_cast<uint32_t>(genome), windows});
+        staged_chunks_.push_back({bases, block_end_, static_cast<uint32_t>(genome), windows});
     }
 
     void account(char const* source, size_t size, char const* pinned_base, size_t pinned_size) {
@@ -333,6 +386,12 @@ class database_stager {
         size_t pinned_size
     ) {
         account(source, size, pinned_base, pinned_size);
+        if (direct_) {
+            // The device reads the caller's bytes where they are, so nothing is copied and the
+            // arena stays empty; the hold keeps those bytes alive until the batch has run.
+            describe(source, windows, genome);
+            return Ok();
+        }
         CUDDL_CUDA_TRY(
             cuda::copy_bytes(
                 stream_,
@@ -340,7 +399,7 @@ class database_stager {
                 device_span<char>{arena_.data() + arena_used_, size}
             )
         );
-        describe(arena_used_, windows, genome);
+        describe(arena_.data() + arena_used_, windows, genome);
         arena_used_ += size;
         ++transfers_;
         return Ok();
@@ -373,7 +432,6 @@ class database_stager {
         if (grid != 0) {
             add_sequence_batch_kernel<BucketCount, Layout>
                 <<<static_cast<uint32_t>(grid), 256, 0, stream_.get()>>>(
-                    arena_.data(),
                     descriptors_.data(),
                     copied_chunks_.size(),
                     block_end_,
@@ -403,6 +461,7 @@ class database_stager {
     cuda::stream_ref stream_;
     staging_plan bounds_;
     reference_build_statistics* statistics_;
+    bool direct_ = false;
     cuda::device_buffer<uint32_t> rows_;
     cuda::device_buffer<char> arena_;
     cuda::device_buffer<sequence_batch_chunk> descriptors_;
@@ -630,11 +689,12 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     std::optional<size_t> staging_bytes,
     cuda::stream_ref stream,
     reference_build_statistics* statistics,
-    Fill&& fill
+    Fill&& fill,
+    bool in_place = false
 ) {
     auto const plan =
         CUDDL_TRY((plan_staging<K, BucketCount>(genomes, staged_ceiling, staging_bytes, stream)));
-    database_stager<K, BucketCount, Layout> stager(stream, genomes, plan, statistics);
+    database_stager<K, BucketCount, Layout> stager(stream, genomes, plan, statistics, in_place);
     size_t base = 0;
     while (base < genomes) {
         auto const count = std::min(plan.group, genomes - base);
@@ -660,13 +720,15 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
-    bool page_locked,
+    transfer_mode transfer,
     reference_build_statistics* statistics
 ) {
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
     }
     if (paths.empty()) return std::vector<uint32_t>{};
+    auto const in_place = stages_in_place(transfer, stream.device());
+    auto const page_locked = pages_locked(transfer, stream.device());
     path_loaders loaders(stream, paths, parser_workers, page_locked);
     uint64_t staged_ceiling = 0;
     for (auto const& path : paths) {
@@ -699,11 +761,13 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                 ));
             }
             return Ok();
-        }
+        },
+        in_place
     )));
     if (statistics != nullptr) {
         statistics->pinned_buffers = loaders.page_locked_buffers();
         statistics->workers = static_cast<unsigned>(loaders.workers());
+        statistics->in_place = in_place;
     }
     loaders.reset();
     return store;

@@ -1068,7 +1068,7 @@ json resident_timings(
             auto const grid = static_cast<uint32_t>(std::min(block_end, max_grid));
             cuddl::detail::add_sequence_batch_kernel<buckets, cuddl::default_register_layout>
                 <<<grid, 256, 0, s.get()>>>(
-                    input->data(), staged->data(), host.size(), block_end, k, store.data()
+                    staged->data(), host.size(), block_end, k, store.data()
                 );
             CUDDL_CUDA_CALL(cudaGetLastError());
         };
@@ -1098,8 +1098,24 @@ json resident_timings(
             } else {
                 count = resident_sequence::for_each_batch(
                     paths, k, cap, [&](resident_sequence::batch const& batch) {
-                        // Host windows arithmetic stays size_t; the header caps chunk windows
-                        // at UINT32_MAX so the narrowing cast below cannot wrap.
+                        if (!input || input->size() < batch.bases.size()) {
+                            // Free before growing so two near-capacity allocations cannot overlap.
+                            input.reset();
+                            setup.sync();
+                            input.emplace(
+                                cuda::make_device_buffer<char>(
+                                    setup, setup.device(), batch.bases.size(), cuda::no_init
+                                )
+                            );
+                        }
+                        cuda::copy_bytes(
+                            setup,
+                            cuda::std::span{batch.bases.data(), batch.bases.size()},
+                            cuddl::device_span<char>{input->data(), batch.bases.size()}
+                        );
+                        // Chunks name their bytes in the batch buffer, so they are built after it
+                        // exists. Host windows arithmetic stays size_t; the header caps chunk
+                        // windows at UINT32_MAX so the narrowing cast cannot wrap.
                         host.clear();
                         host.reserve(batch.chunks.size());
                         block_end = 0;
@@ -1117,21 +1133,11 @@ json resident_timings(
                             block_end +=
                                 std::min(per_chunk_blocks, (windows + size_t{2047}) / size_t{2048});
                             host.push_back({
-                                chunk.offset,
+                                input->data() + chunk.offset,
                                 block_end,
                                 static_cast<uint32_t>(chunk.genome),
                                 static_cast<uint32_t>(windows),
                             });
-                        }
-                        if (!input || input->size() < batch.bases.size()) {
-                            // Free before growing so two near-capacity allocations cannot overlap.
-                            input.reset();
-                            setup.sync();
-                            input.emplace(
-                                cuda::make_device_buffer<char>(
-                                    setup, setup.device(), batch.bases.size(), cuda::no_init
-                                )
-                            );
                         }
                         if (!staged || staged->size() < host.size()) {
                             staged.reset();
@@ -1142,11 +1148,6 @@ json resident_timings(
                                 )
                             );
                         }
-                        cuda::copy_bytes(
-                            setup,
-                            cuda::std::span{batch.bases.data(), batch.bases.size()},
-                            cuddl::device_span<char>{input->data(), batch.bases.size()}
-                        );
                         cuda::copy_bytes(
                             setup,
                             cuda::std::span{host.data(), host.size()},
