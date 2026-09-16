@@ -157,7 +157,7 @@ struct path_build_options {
     unsigned parser_workers = default_parser_workers;
     /// Arena bytes. Unset sizes the arena from free device memory and what the inputs can fill,
     /// which is the only case a build cannot know in advance.
-    std::optional<size_t> staging_bytes;
+    std::optional<size_t> staging_bytes{};
     /// Transfers decompressed bytes straight from page-locked memory. On a coherent CPU/GPU
     /// system, Grace Hopper and Grace Blackwell among them, the device reads host memory anyway
     /// and page-locking only costs host writes, so the default turns it off there and the heap
@@ -170,7 +170,7 @@ struct path_build_options {
 struct sequence_build_options {
     reference_build_statistics* statistics = nullptr;
     /// Arena bytes. Unset sizes the arena from free device memory and what the bases can fill.
-    std::optional<size_t> staging_bytes;
+    std::optional<size_t> staging_bytes{};
 };
 
 /**
