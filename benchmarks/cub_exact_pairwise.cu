@@ -1,15 +1,12 @@
 // cub-exact-pairwise: exact k-mer set baseline from CUB device primitives.
 //
-// Parses FASTA files with the cuDDL parser (k=25 canonical packed k-mers)
-// one genome at a time. Genomes touched by evaluated pairs keep their
-// packed arrays; the rest stream through for distinct counts only, so
-// host memory stays bounded by the evaluated set. Per genome: upload,
-// CUB radix sort, run-length encode; the run count is the exact
-// distinct cardinality. Per evaluated pair: concatenate on device, sort,
-// run-length encode; the run count is the exact
-// union cardinality, so shared = |A| + |B| - union. No custom kernels:
-// sort and encode are CUB device-wide calls. The only downloads are one
-// integer per stage; pair metrics are host math.
+// Parses FASTA files with the cuDDL parser (k=25 canonical packed k-mers). Genomes touched by
+// evaluated pairs keep their packed arrays; the rest stream through for distinct counts only, so
+// host memory stays bounded by the evaluated set. Sketching queues a batch of genomes' sorts and
+// encodes behind each other and reads the whole batch's run counts back at once, so no genome
+// waits on a host round trip. Per evaluated pair: one block counts the shared k-mers of two
+// sorted, deduplicated arrays, so shared = |A| + |B| - union. The only downloads are the
+// per-batch counts and one integer per pair batch; pair metrics are host math.
 //
 // --max-pairs stride-samples the evaluated pair space (first and last pair
 // always measured) and --match-rows stride-samples the emitted rows the same
@@ -26,6 +23,8 @@
 #include <CLI/CLI.hpp>
 #include <cub/cub.cuh>
 #include <nlohmann/json.hpp>
+
+#include "resident_sequence_batches.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -49,110 +48,8 @@ namespace {
 
 using json = nlohmann::json;
 
-// Packing one genome into k-mers is a serial pass that costs an order of magnitude more than
-// that genome's device stages, so the sketch loop parses ahead on a bounded pool instead of
-// stalling the GPU. Depth bounds how many parses run at once; what is held afterwards is the
-// stash budget's decision, not this pool's.
-class genome_parse_pool {
-   public:
-    genome_parse_pool(std::vector<std::string> const& names, size_t depth, size_t max_kmers)
-        : names_(names),
-          depth_(std::max<size_t>(1, depth)),
-          max_kmers_(max_kmers),
-          results_(names.size()),
-          errors_(names.size()),
-          state_(names.size(), idle) {
-        workers_.reserve(depth_);
-        for (size_t i = 0; i < depth_; ++i) {
-            workers_.emplace_back([this] { work(); });
-        }
-    }
-    ~genome_parse_pool() {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-        }
-        assign_.notify_all();
-        for (auto& worker : workers_) worker.join();
-    }
-    genome_parse_pool(genome_parse_pool const&) = delete;
-    genome_parse_pool& operator=(genome_parse_pool const&) = delete;
-
-    /// @brief Packed k-mers for genome @p index, in input order.
-    ///
-    /// Every take parses. The sketch loop asks for each genome once per sample, so a result an
-    /// earlier take moved out is gone; what to keep instead is the stash budget's decision.
-    /// Asking for @p index also queues the genome @p depth ahead of it, which is the read-ahead
-    /// that keeps the device fed.
-    [[nodiscard]] std::vector<uint64_t> take(size_t index) {
-        std::unique_lock lock(mutex_);
-        request(index);
-        if (index + depth_ < names_.size()) request(index + depth_);
-        ready_.wait(lock, [&] { return state_[index] == done; });
-        state_[index] = idle;
-        auto error = std::exchange(errors_[index], nullptr);
-        std::vector<uint64_t> packed;
-        if (error == nullptr) packed = std::move(*results_[index]);
-        results_[index].reset();
-        lock.unlock();
-        if (error != nullptr) std::rethrow_exception(error);
-        return packed;
-    }
-
-   private:
-    enum : char { idle = 0, queued = 1, done = 2 };
-
-    /// @brief Queues @p index unless a worker already has it or its result is waiting.
-    void request(size_t index) {
-        if (state_[index] != idle) return;
-        state_[index] = queued;
-        pending_.push_back(index);
-        assign_.notify_all();
-    }
-
-    void work() {
-        while (true) {
-            size_t index;
-            {
-                std::unique_lock lock(mutex_);
-                assign_.wait(lock, [&] { return stop_ || !pending_.empty(); });
-                if (stop_) return;
-                index = pending_.front();
-                pending_.pop_front();
-            }
-            try {
-                // One thread per genome: the pool supplies the concurrency.
-                auto parsed = cuddl::parse_fasta_file(names_[index], 25, 1);
-                if (!parsed) throw std::runtime_error(parsed.error().message());
-                if (parsed->kmers.size() > max_kmers_) {
-                    throw std::runtime_error(
-                        "genome exceeds --max-kmers, refusing: " + names_[index]
-                    );
-                }
-                std::lock_guard lock(mutex_);
-                results_[index] = std::move(parsed->kmers);
-                state_[index] = done;
-            } catch (...) {
-                std::lock_guard lock(mutex_);
-                errors_[index] = std::current_exception();
-                state_[index] = done;
-            }
-            ready_.notify_all();
-        }
-    }
-
-    std::vector<std::string> const& names_;
-    size_t depth_;
-    size_t max_kmers_;
-    std::vector<std::optional<std::vector<uint64_t>>> results_;
-    std::vector<std::exception_ptr> errors_;
-    std::vector<char> state_;
-    std::deque<size_t> pending_;
-    std::vector<std::thread> workers_;
-    std::mutex mutex_;
-    std::condition_variable assign_, ready_;
-    bool stop_ = false;
-};
+// Canonical packed k-mer length, the same one the cuDDL parser this baseline stages from uses.
+uint32_t constexpr kmer_length = 25;
 
 /// @brief Host memory a run may spend on resident k-mer arrays, or 0 when it cannot be read.
 [[nodiscard]] size_t available_host_bytes() noexcept {
@@ -234,6 +131,24 @@ size_t encode_temp_bytes(size_t count) {
     return bytes;
 }
 
+size_t select_temp_bytes(size_t count) {
+    size_t bytes = 0;
+    if (count) {
+        CUDDL_CUDA_CALL(
+            cub::DeviceSelect::Flagged(
+                nullptr,
+                bytes,
+                static_cast<uint64_t const*>(nullptr),
+                static_cast<uint8_t const*>(nullptr),
+                static_cast<uint64_t*>(nullptr),
+                static_cast<int*>(nullptr),
+                static_cast<int64_t>(count)
+            )
+        );
+    }
+    return bytes;
+}
+
 /// @brief Device memory this run may spend on sorted k-mer arrays, or 0 when it cannot be read.
 [[nodiscard]] size_t available_device_bytes() noexcept {
     size_t free_bytes = 0, total_bytes = 0;
@@ -241,23 +156,50 @@ size_t encode_temp_bytes(size_t count) {
     return free_bytes;
 }
 
-size_t merge_temp_bytes(size_t count) {
-    size_t bytes = 0;
-    if (count) {
-        CUDDL_CUDA_CALL(
-            cub::DeviceMerge::MergeKeys(
-                nullptr,
-                bytes,
-                static_cast<uint64_t const*>(nullptr),
-                static_cast<int>(count),
-                static_cast<uint64_t const*>(nullptr),
-                static_cast<int>(count),
-                static_cast<uint64_t*>(nullptr),
-                cuda::std::less<uint64_t>{}
-            )
-        );
+/// @brief One staged piece of one genome's sequence, and the windows it contributes.
+///
+/// The loader gives each piece the k - 1 bases it shares with the previous one, so a piece's
+/// windows are disjoint from its neighbours' and never span a record: `size - k + 1` windows is
+/// exactly the window count a host parse of that piece would have seen, counted once.
+struct staged_chunk {
+    size_t offset;       // first byte of the piece inside the staged batch
+    size_t window_base;  // first window of the piece inside the flat window array
+    uint32_t windows;    // complete windows the piece holds
+};
+
+/// @brief Emits the canonical packed k-mers of every staged piece, one block per piece.
+///
+/// Packing k-mers on the host spent the corpus on 72 cores while the device idled. A window is
+/// one k-mer unless an ambiguous base breaks it, which emits nothing and clears its flag for the
+/// compaction to drop. A genome's pieces stay in order, so its keys stay together for the sort.
+__global__ void emit_chunk_kmers(
+    char const* bases,
+    staged_chunk const* chunks,
+    uint32_t k,
+    uint64_t* keys,
+    uint8_t* flags,
+    uint32_t* valid
+) {
+    auto const chunk = chunks[blockIdx.x];
+    char const* const sequence = bases + chunk.offset;
+    uint32_t mine = 0;
+    for (uint32_t i = threadIdx.x; i < chunk.windows; i += blockDim.x) {
+        uint64_t forward = 0;
+        bool complete = true;
+        for (uint32_t j = 0; j < k; ++j) {
+            auto const symbol = cuddl::detail::encode_base(sequence[i + j]);
+            complete = complete && symbol != 0xFFU;
+            forward = (forward << 2U) | (symbol & 3U);
+        }
+        auto const reverse = cuddl::detail::reverse_complement(forward, k);
+        keys[chunk.window_base + i] = forward > reverse ? forward : reverse;
+        flags[chunk.window_base + i] = complete ? 1U : 0U;
+        mine += complete ? 1U : 0U;
     }
-    return bytes;
+    using reduce_type = cub::BlockReduce<uint32_t, 256>;
+    __shared__ typename reduce_type::TempStorage storage;
+    auto const total = reduce_type(storage).Sum(mine);
+    if (threadIdx.x == 0) valid[blockIdx.x] = total;
 }
 
 /// @brief One pair of sorted, deduplicated k-mer arrays to count the intersection of.
@@ -415,17 +357,15 @@ int run_main(
     size_t const query_base = all_to_all ? 0 : reference_count;
     size_t const query_count = all_to_all ? genomes : genomes - reference_count;
 
+    // A rebuilt side re-parses a single genome, so it parses on one thread: the default would
+    // spin up the machine's whole thread count for a file the device then waits on anyway.
     auto parse_one = [&](size_t g) {
-        auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(names[g], 25));
+        auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(names[g], kmer_length, 1));
         if (parsed.kmers.size() > max_kmers) {
             throw std::runtime_error("genome exceeds --max-kmers, refusing: " + names[g]);
         }
         return parsed.kmers;
     };
-    // Parsing runs ahead of the GPU loop; a serial loop leaves the device idle between packs.
-    std::optional<genome_parse_pool> parsers;
-    if (parse_workers > 1) parsers.emplace(names, parse_workers, max_kmers);
-
     // Pair space enumeration needs no packed data, only indices.
     size_t const total_pairs = [&] {
         if (all_to_all) return genomes * (genomes - 1) / 2;
@@ -487,8 +427,13 @@ int run_main(
     }
     // Retaining a genome's k-mers is what makes a pair cheap, but every genome touched by an
     // evaluated pair would be kept: over a full corpus that is terabytes, which is how a run
-    // sets the machine's memory alight. Keep a budget and re-parse whatever falls outside it.
-    std::vector<std::vector<uint64_t>> stashed(genomes);
+    // sets the machine's memory alight. What a rebuild needs is the sequence, so the budget holds
+    // staged bytes, about a tenth of the packed keys.
+    struct stashed_sequence {
+        std::vector<char> bases;
+        std::vector<staged_chunk> pieces;
+    };
+    std::vector<stashed_sequence> stashed(genomes);
     std::vector<char> resident(genomes, 0);
     // A pair needs two sorted arrays. Sorting each genome once and keeping the sorted copy on
     // the device turns the per-pair cost from an 8-pass sort of both sets into one merge pass
@@ -498,20 +443,59 @@ int run_main(
     std::vector<uint32_t> sorted_count(genomes, 0);
     size_t sorted_bytes = 0;
     if (device_stash_bytes >= sizeof(uint64_t)) sorted_store.reset(device_stash_bytes);
-    std::vector<uint64_t> reparsed_a, reparsed_r;
     size_t stashed_bytes = 0;
     size_t reparsed_genomes = 0;
 
-    device_buffer work, uniques, run_counts, concat, pair_uniques, pair_counts, num_runs_dev, temp;
+    device_buffer unique_regions, run_counts_dev, pair_counts, num_runs_dev, temp, staged_bases,
+        staged_chunks, window_keys, window_flags, chunk_valid, compacted_keys;
     size_t max_keys = 0, max_pair = 0, temp_bytes = 0;
     num_runs_dev.reset(sizeof(size_t));
-    auto fetch_runs = [&] {
-        int runs = 0;
-        CUDDL_CUDA_CALL(
-            cudaMemcpyAsync(&runs, num_runs_dev.data, sizeof(runs), cudaMemcpyDeviceToHost, stream)
+
+    // Packs staged sequence bytes into a compacted key array: the emit pass, then the compaction
+    // that drops the windows an ambiguous base broke. The sketch and a rebuilt side both go
+    // through here, so a rebuild returns to bytes rather than to the host parser.
+    auto stage_and_compact = [&](std::vector<char> const& bases,
+                                 std::vector<staged_chunk> const& pieces,
+                                 size_t windows_total) {
+        staged_bases.reset(bases.size());
+        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+            staged_bases.data, bases.data(), bases.size(), cudaMemcpyHostToDevice, stream
+        ));
+        staged_chunks.reset(pieces.size() * sizeof(staged_chunk));
+        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+            staged_chunks.data,
+            pieces.data(),
+            pieces.size() * sizeof(staged_chunk),
+            cudaMemcpyHostToDevice,
+            stream
+        ));
+        window_keys.reset(windows_total * sizeof(uint64_t));
+        window_flags.reset(windows_total);
+        chunk_valid.reset(pieces.size() * sizeof(uint32_t));
+        compacted_keys.reset(windows_total * sizeof(uint64_t));
+        temp_bytes = std::max(temp_bytes, select_temp_bytes(windows_total));
+        temp.reset(temp_bytes);
+        emit_chunk_kmers<<<static_cast<uint32_t>(pieces.size()), 256, 0, stream>>>(
+            static_cast<char const*>(staged_bases.data),
+            static_cast<staged_chunk const*>(staged_chunks.data),
+            static_cast<uint32_t>(kmer_length),
+            static_cast<uint64_t*>(window_keys.data),
+            static_cast<uint8_t*>(window_flags.data),
+            static_cast<uint32_t*>(chunk_valid.data)
         );
-        CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
-        return runs;
+        CUDDL_CUDA_CALL(cudaGetLastError());
+        CUDDL_CUDA_CALL(
+            cub::DeviceSelect::Flagged(
+                temp.data,
+                temp.bytes,
+                static_cast<uint64_t const*>(window_keys.data),
+                static_cast<uint8_t const*>(window_flags.data),
+                static_cast<uint64_t*>(compacted_keys.data),
+                static_cast<int*>(num_runs_dev.data),
+                static_cast<int64_t>(windows_total),
+                stream
+            )
+        );
     };
 
     std::vector<size_t> kmers_of(genomes, 0), distinct(genomes, 0);
@@ -530,28 +514,134 @@ int run_main(
         auto parse_tick = clock_type::now();
         sorted_bytes = 0;
         std::fill(sorted_count.begin(), sorted_count.end(), 0);
-        // Sketch streams one genome at a time; only counts are retained. The order decides who
-        // wins the stash: the reused side is packed first, so a small budget keeps the side that
-        // every pair touches instead of the first genomes in the corpus.
+        // Sketch order decides who wins the stash: the reused side is packed first, so a small
+        // budget keeps the side that every pair touches instead of the first genomes in the
+        // corpus.
+        std::vector<size_t> sketch_order;
+        sketch_order.reserve(genomes);
         for (size_t pass = 0; pass < 2; ++pass) {
             for (size_t g = 0; g < genomes; ++g) {
-                if (!stash_order(pass, g)) continue;
-                auto packed = parsers ? parsers->take(g) : parse_one(g);
-                size_t const count = packed.size();
-                kmers_of[g] = count;
-                max_keys = std::max(max_keys, count);
-                work.reset(count * sizeof(uint64_t));
-                uniques.reset(count * sizeof(uint64_t));
-                run_counts.reset(count * sizeof(int));
-                auto* keys = static_cast<uint64_t*>(work.data);
+                if (stash_order(pass, g)) sketch_order.push_back(g);
+            }
+        }
+        // Sketching stages sequence bytes and lets the device pack the k-mers: the host parser
+        // spent the whole corpus on 72 cores while the device idled. The loader decompresses in
+        // parallel and hands over complete windows per piece, so what the device packs is what a
+        // host parse of the same piece would have produced.
+        std::vector<std::string> sketch_paths;
+        sketch_paths.reserve(sketch_order.size());
+        for (size_t const g : sketch_order) sketch_paths.push_back(names[g]);
+        // A staged batch holds its bytes, its windows and their flags at once, so it is sized by
+        // the room left once the sorted store is placed.
+        // A staged byte becomes a window, and a window costs eight bytes of keys twice over (the
+        // emitted and the compacted arrays) plus a flag and the compaction's scratch, so the batch
+        // is sized by a twentieth of what the device has left rather than by the bytes alone.
+        size_t const staging_bytes = std::max<size_t>(
+            size_t{64} << 20, std::min<size_t>(available_device_bytes() / 24, size_t{512} << 20)
+        );
+        std::vector<staged_chunk> chunk_host;
+        std::vector<size_t> chunk_genomes;
+        std::vector<uint32_t> chunk_valid_host;
+        std::vector<size_t> batch_genomes, batch_offsets;
+        std::vector<int> batch_runs;
+        resident_sequence::for_each_batch(
+            sketch_paths,
+            static_cast<uint32_t>(kmer_length),
+            staging_bytes,
+            [&](resident_sequence::batch const& batch) {
+                chunk_host.clear();
+                chunk_genomes.clear();
+                size_t windows_total = 0;
+                for (auto const& chunk : batch.chunks) {
+                    if (chunk.size < kmer_length) continue;
+                    auto const windows = chunk.size - kmer_length + 1;
+                    chunk_host.push_back(
+                        {chunk.offset, windows_total, static_cast<uint32_t>(windows)}
+                    );
+                    chunk_genomes.push_back(chunk.genome);
+                    windows_total += windows;
+                }
+                if (chunk_host.empty() || !windows_total) return;
+                stage_and_compact(batch.bases, chunk_host, windows_total);
+                chunk_valid_host.resize(chunk_host.size());
+                CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                    chunk_valid_host.data(),
+                    chunk_valid.data,
+                    chunk_host.size() * sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost,
+                    stream
+                ));
+                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+                // One genome can arrive as several pieces; the loader emits them in genome order,
+                // so their valid windows add up in order and each genome's keys stay together for
+                // the sort that follows.
+                batch_genomes.clear();
+                batch_offsets.clear();
+                size_t elements = 0;
+                for (size_t c = 0; c < chunk_host.size();) {
+                    auto const piece = c;
+                    auto const g = chunk_genomes[c];
+                    size_t count = 0;
+                    while (c < chunk_host.size() && chunk_genomes[c] == g) {
+                        count += chunk_valid_host[c];
+                        ++c;
+                    }
+                    batch_genomes.push_back(g);
+                    batch_offsets.push_back(elements);
+                    elements += count;
+                    auto const name = sketch_order[g];
+                    kmers_of[name] = count;
+                    max_keys = std::max(max_keys, count);
+                    if (count > max_kmers) {
+                        throw std::runtime_error(
+                            "genome exceeds --max-kmers, refusing: " + names[name]
+                        );
+                    }
+                    // Held for the pair loop: a genome's pieces sit next to each other in
+                    // the staged batch, so one copy takes its sequence and rebases the pieces
+                    // onto it.
+                    if (!needed[name]) continue;
+                    auto const last = c - 1;
+                    auto const begin = chunk_host[piece].offset;
+                    auto const end =
+                        chunk_host[last].offset + chunk_host[last].windows + kmer_length - 1;
+                    if (stashed_bytes + (end - begin) > stash_bytes) continue;
+                    auto& held = stashed[name];
+                    held.bases.assign(
+                        batch.bases.begin() + static_cast<ptrdiff_t>(begin),
+                        batch.bases.begin() + static_cast<ptrdiff_t>(end)
+                    );
+                    held.pieces.clear();
+                    for (size_t p = piece; p <= last; ++p) {
+                        held.pieces.push_back({
+                            chunk_host[p].offset - begin,
+                            chunk_host[p].window_base - chunk_host[piece].window_base,
+                            chunk_host[p].windows,
+                        });
+                    }
+                    stashed_bytes += end - begin;
+                    resident[name] = 1;
+                }
+                auto const segments = batch_genomes.size();
+                unique_regions.reset(elements * sizeof(uint64_t));
+                run_counts_dev.reset(segments * sizeof(int));
+                // A genome with no k-mers is never encoded, so its slot has to start at zero
+                // rather than at whatever the allocation held.
+                CUDDL_CUDA_CALL(
+                    cudaMemsetAsync(run_counts_dev.data, 0, segments * sizeof(int), stream)
+                );
+                // The encode writes one run length per k-mer, so the scratch is sized by the
+                // largest genome seen.
+                pair_counts.reset(max_keys * sizeof(int));
                 temp_bytes = std::max(
-                    temp_bytes, std::max(sort_temp_bytes(count), encode_temp_bytes(count))
+                    temp_bytes, std::max(sort_temp_bytes(max_keys), encode_temp_bytes(max_keys))
                 );
                 temp.reset(temp_bytes);
-                CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                    keys, packed.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice, stream
-                ));
-                if (count) {
+                for (size_t i = 0; i < segments; ++i) {
+                    auto const count =
+                        (i + 1 < segments ? batch_offsets[i + 1] : elements) - batch_offsets[i];
+                    if (!count) continue;
+                    auto* keys = static_cast<uint64_t*>(compacted_keys.data) + batch_offsets[i];
                     CUDDL_CUDA_CALL(
                         cub::DeviceRadixSort::SortKeys(
                             temp.data, temp.bytes, keys, keys, count, 0, 64, stream
@@ -562,24 +652,38 @@ int run_main(
                             temp.data,
                             temp.bytes,
                             keys,
-                            static_cast<uint64_t*>(uniques.data),
-                            static_cast<int*>(run_counts.data),
-                            static_cast<int*>(num_runs_dev.data),
+                            static_cast<uint64_t*>(unique_regions.data) + batch_offsets[i],
+                            static_cast<int*>(pair_counts.data),
+                            static_cast<int*>(run_counts_dev.data) + i,
                             count,
                             stream
                         )
                     );
                 }
-                auto const runs = count ? fetch_runs() : 0;
-                distinct[g] = runs;
-                if (count && runs && needed[g] && sorted_store.bytes) {
-                    auto const bytes = static_cast<size_t>(runs) * sizeof(uint64_t);
-                    if (sorted_bytes + bytes <= sorted_store.bytes) {
+                batch_runs.assign(segments, 0);
+                CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                    batch_runs.data(),
+                    run_counts_dev.data,
+                    segments * sizeof(int),
+                    cudaMemcpyDeviceToHost,
+                    stream
+                ));
+                CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+                for (size_t i = 0; i < segments; ++i) {
+                    distinct[sketch_order[batch_genomes[i]]] = static_cast<size_t>(batch_runs[i]);
+                }
+                // The store keeps what device memory has room for.
+                for (size_t i = 0; i < segments; ++i) {
+                    auto const g = sketch_order[batch_genomes[i]];
+                    auto const runs = static_cast<size_t>(batch_runs[i]);
+                    auto const bytes = runs * sizeof(uint64_t);
+                    if (runs && needed[g] && sorted_store.bytes &&
+                        sorted_bytes + bytes <= sorted_store.bytes) {
                         sorted_offset[g] = sorted_bytes / sizeof(uint64_t);
                         sorted_count[g] = static_cast<uint32_t>(runs);
                         CUDDL_CUDA_CALL(cudaMemcpyAsync(
                             static_cast<uint64_t*>(sorted_store.data) + sorted_offset[g],
-                            uniques.data,
+                            static_cast<uint64_t const*>(unique_regions.data) + batch_offsets[i],
                             bytes,
                             cudaMemcpyDeviceToDevice,
                             stream
@@ -587,31 +691,18 @@ int run_main(
                         sorted_bytes += bytes;
                     }
                 }
-                if (needed[g]) {
-                    auto const bytes = packed.size() * sizeof(uint64_t);
-                    // Leave room for the pair working set as well as the resident arrays.
-                    if (stashed_bytes + bytes <= stash_bytes) {
-                        stashed_bytes += bytes;
-                        resident[g] = 1;
-                        stashed[g] = std::move(packed);
-                    }
-                }
-            }
-        }
+            },
+            parse_workers
+        );
         // Pair buffers sized from the largest evaluated pair actually measured.
         for (size_t ordinal : evaluated) {
             auto const [qa, rb] = pair_at(ordinal);
             max_pair = std::max(max_pair, kmers_of[qa] + kmers_of[rb]);
         }
-        concat.reset(max_pair * sizeof(uint64_t));
-        pair_uniques.reset(max_pair * sizeof(uint64_t));
-        pair_counts.reset(max_pair * sizeof(int));
-        temp_bytes = std::max(
-            temp_bytes,
-            std::max(
-                {sort_temp_bytes(max_pair), encode_temp_bytes(max_pair), merge_temp_bytes(max_pair)}
-            )
-        );
+        // A rebuilt side sorts one genome and run-length encodes it, so what it needs is sized by
+        // the largest genome rather than by the largest pair.
+        pair_counts.reset(max_keys * sizeof(int));
+        temp_bytes = std::max({temp_bytes, sort_temp_bytes(max_keys), encode_temp_bytes(max_keys)});
         temp.reset(temp_bytes);
         auto const parse_done = clock_type::now();
         auto const compare_tick = clock_type::now();
@@ -639,8 +730,7 @@ int run_main(
                 stream
             ));
             exact_intersection_kernel<<<static_cast<uint32_t>(jobs.size()), 256, 0, stream>>>(
-                static_cast<pair_job const*>(jobs_dev.data),
-                static_cast<uint32_t*>(counts_dev.data)
+                static_cast<pair_job const*>(jobs_dev.data), static_cast<uint32_t*>(counts_dev.data)
             );
             CUDDL_CUDA_CALL(cudaGetLastError());
             intersections.resize(jobs.size());
@@ -681,11 +771,6 @@ int run_main(
             job_rows.clear();
         };
         emitted = json::array();
-        reparsed_a.clear();
-        reparsed_r.clear();
-        // Which genome each reparse buffer holds, so a group reuses one parse across its pairs.
-        size_t cached_a = genomes, cached_r = genomes;
-        bool scratch_rebuilt = false;
         // Sorted, deduplicated k-mers for the two sides of the current pair. A side the sketch
         // pass packed for the device already has them; anything else is uploaded and reduced once
         // per group, which the reference-major schedule makes one pass per genome.
@@ -695,7 +780,7 @@ int run_main(
             size_t genome = std::numeric_limits<size_t>::max();
         };
         sorted_side side_a, side_r;
-        auto sorted_for = [&](sorted_side& state, size_t g, std::vector<uint64_t> const& packed) {
+        auto sorted_for = [&](sorted_side& state, size_t g) {
             if (sorted_count[g]) {
                 return std::pair{
                     static_cast<uint64_t const*>(sorted_store.data) + sorted_offset[g],
@@ -703,38 +788,61 @@ int run_main(
                 };
             }
             if (state.genome != g) {
-                // Pending jobs still point at this scratch, so they are counted before it is
-                // filled with another genome.
-                scratch_rebuilt = true;
-                auto const count = packed.size();
-                if (state.keys.bytes < count * sizeof(uint64_t)) {
-                    state.keys.reset(count * sizeof(uint64_t));
+                // Pending jobs point at this scratch, so they are counted before it is filled
+                // with another genome. Deferring the flush to the next iteration in the caller
+                // is too late: the rebuild below overwrites or frees what they read.
+                flush_jobs();
+                // A held sequence is re-extracted on the device; anything outside the budget is
+                // packed again here, which costs a parse but keeps memory bounded.
+                std::vector<uint64_t> parsed;
+                uint64_t* keys = nullptr;
+                size_t count = 0;
+                if (resident[g]) {
+                    // The emitter fills a slot per window, broken ones included, so the array is
+                    // sized by the genome's windows and the compaction is what leaves the
+                    // valid ones behind.
+                    size_t windows = 0;
+                    for (auto const& piece : stashed[g].pieces) windows += piece.windows;
+                    stage_and_compact(stashed[g].bases, stashed[g].pieces, windows);
+                    count = kmers_of[g];
+                    keys = static_cast<uint64_t*>(compacted_keys.data);
+                } else {
+                    parsed = parse_one(g);
+                    ++reparsed_genomes;
+                    count = parsed.size();
+                    if (count) {
+                        if (state.keys.bytes < count * sizeof(uint64_t)) {
+                            state.keys.reset(count * sizeof(uint64_t));
+                        }
+                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                            state.keys.data,
+                            parsed.data(),
+                            count * sizeof(uint64_t),
+                            cudaMemcpyHostToDevice,
+                            stream
+                        ));
+                        keys = static_cast<uint64_t*>(state.keys.data);
+                    }
+                }
+                if (state.unique.bytes < count * sizeof(uint64_t)) {
                     state.unique.reset(count * sizeof(uint64_t));
                 }
-                CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                    state.keys.data,
-                    packed.data(),
-                    count * sizeof(uint64_t),
-                    cudaMemcpyHostToDevice,
-                    stream
-                ));
+                if (!count) {
+                    state.genome = g;
+                    return std::pair{
+                        static_cast<uint64_t const*>(state.unique.data), static_cast<size_t>(0)
+                    };
+                }
                 CUDDL_CUDA_CALL(
                     cub::DeviceRadixSort::SortKeys(
-                        temp.data,
-                        temp.bytes,
-                        static_cast<uint64_t*>(state.keys.data),
-                        static_cast<uint64_t*>(state.keys.data),
-                        count,
-                        0,
-                        64,
-                        stream
+                        temp.data, temp.bytes, keys, keys, count, 0, 64, stream
                     )
                 );
                 CUDDL_CUDA_CALL(
                     cub::DeviceRunLengthEncode::Encode(
                         temp.data,
                         temp.bytes,
-                        static_cast<uint64_t*>(state.keys.data),
+                        keys,
                         static_cast<uint64_t*>(state.unique.data),
                         static_cast<int*>(pair_counts.data),
                         static_cast<int*>(num_runs_dev.data),
@@ -750,24 +858,6 @@ int run_main(
         };
         for (auto const& scheduled : schedule) {
             auto const [a, r] = pair_at(scheduled.ordinal);
-            // Resident arrays come from the sketch pass; anything outside the budget is packed
-            // again here, which costs a parse but keeps memory bounded.
-            if (!resident[a] && cached_a != a) {
-                reparsed_a = parse_one(a);
-                cached_a = a;
-                ++reparsed_genomes;
-            }
-            if (!resident[r] && cached_r != r) {
-                reparsed_r = parse_one(r);
-                cached_r = r;
-                ++reparsed_genomes;
-            }
-            auto const& packed_a = resident[a] ? stashed[a] : reparsed_a;
-            auto const& packed_r = resident[r] ? stashed[r] : reparsed_r;
-            if (scratch_rebuilt) {
-                flush_jobs();
-                scratch_rebuilt = false;
-            }
             // Both sides are sorted and deduplicated, so a pair is one linear pass over them and
             // the union follows from distinct[a] + distinct[r] - shared. An empty side shares
             // nothing, which the kernel handles without reading anything.
@@ -775,8 +865,8 @@ int run_main(
             uint64_t const* right = nullptr;
             size_t left_len = 0, right_len = 0;
             if (distinct[a] && distinct[r]) {
-                auto const packed_left = sorted_for(side_a, a, packed_a);
-                auto const packed_right = sorted_for(side_r, r, packed_r);
+                auto const packed_left = sorted_for(side_a, a);
+                auto const packed_right = sorted_for(side_r, r);
                 left = packed_left.first;
                 left_len = packed_left.second;
                 right = packed_right.first;
@@ -895,7 +985,7 @@ int main(int argc, char** argv) try {
     app.add_option("--output", output)->required();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     bool sketch_only = false;
-    app.add_flag("--sketch-only", sketch_only, "Parse plus per-genome device work only, no pairs");
+    app.add_flag("--sketch-only", sketch_only, "Parse plus device sketch only, no pairs");
     CLI11_PARSE(app, argc, argv);
     if (topology == "batch" && (references.empty() || queries.empty())) {
         throw std::runtime_error("batch needs nonempty --reference and --query");

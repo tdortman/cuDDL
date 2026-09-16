@@ -34,6 +34,11 @@ struct fasta_parse_result {
 /// Reverses the order of the 2-bit base digits with mask-swap rounds, shifts the reversed `2k`
 /// bits down from the high end, then complements every base (`^0b10`). Byte-identical to the
 /// scalar loop formulation for every `k <= 32`; longer k-mers fall back to the scalar loop.
+/// The `__host__ __device__` annotation only exists under the CUDA compiler so plain host
+/// translation units see a normal inline function, as with @ref encode_base.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
 inline constexpr uint64_t reverse_complement(uint64_t packed, uint32_t k) noexcept {
     if (k > 32) {
         uint64_t result = 0;
