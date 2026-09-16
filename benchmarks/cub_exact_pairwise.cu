@@ -28,19 +28,19 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
+#include <cmath>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
-#include <cmath>
-#include <cstdint>
-#include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,13 +54,13 @@ using json = nlohmann::json;
 // stash budget's decision, not this pool's.
 class genome_parse_pool {
    public:
-    genome_parse_pool(
-        std::vector<std::string> const& names,
-        size_t depth,
-        size_t max_kmers
-    )
-        : names_(names), depth_(std::max<size_t>(1, depth)), max_kmers_(max_kmers),
-          results_(names.size()), errors_(names.size()), state_(names.size(), idle) {
+    genome_parse_pool(std::vector<std::string> const& names, size_t depth, size_t max_kmers)
+        : names_(names),
+          depth_(std::max<size_t>(1, depth)),
+          max_kmers_(max_kmers),
+          results_(names.size()),
+          errors_(names.size()),
+          state_(names.size(), idle) {
         workers_.reserve(depth_);
         for (size_t i = 0; i < depth_; ++i) {
             workers_.emplace_back([this] { work(); });
@@ -172,7 +172,9 @@ class genome_parse_pool {
 
 [[nodiscard]] unsigned parse_worker_count(size_t genomes) noexcept {
     auto const hardware = std::max(1U, std::thread::hardware_concurrency());
-    return static_cast<unsigned>(std::max<size_t>(1, std::min<size_t>(genomes, std::min<unsigned>(8U, hardware))));
+    return static_cast<unsigned>(
+        std::max<size_t>(1, std::min<size_t>(genomes, std::min<unsigned>(8U, hardware)))
+    );
 }
 
 using clock_type = std::chrono::steady_clock;
@@ -233,6 +235,32 @@ size_t encode_temp_bytes(size_t count) {
     return bytes;
 }
 
+/// @brief Device memory this run may spend on sorted k-mer arrays, or 0 when it cannot be read.
+[[nodiscard]] size_t available_device_bytes() noexcept {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return 0;
+    return free_bytes;
+}
+
+size_t merge_temp_bytes(size_t count) {
+    size_t bytes = 0;
+    if (count) {
+        CUDDL_CUDA_CALL(
+            cub::DeviceMerge::MergeKeys(
+                nullptr,
+                bytes,
+                static_cast<uint64_t const*>(nullptr),
+                static_cast<int>(count),
+                static_cast<uint64_t const*>(nullptr),
+                static_cast<int>(count),
+                static_cast<uint64_t*>(nullptr),
+                cuda::std::less<uint64_t>{}
+            )
+        );
+    }
+    return bytes;
+}
+
 int run_main(
     std::vector<std::string> const& references,
     std::vector<std::string> const& queries,
@@ -245,6 +273,7 @@ int run_main(
     bool sketch_only,
     unsigned parse_workers,
     size_t stash_bytes,
+    size_t device_stash_bytes,
     json& report
 ) {
     cudaStream_t stream = nullptr;
@@ -257,6 +286,7 @@ int run_main(
     } guard{stream};
 
     std::vector<std::string> names;
+    names.reserve(references.size());
     for (auto const& path : references) names.push_back(path);
     size_t const reference_count = names.size();
     for (auto const& path : queries) names.push_back(path);
@@ -306,7 +336,9 @@ int run_main(
     // The query side is touched by every reference and the reference side by every query, so
     // whichever of them stays resident decides how often the other is parsed. Queries come first
     // because a batch run reuses each of them across the whole reference set.
-    auto const query_side = [&](size_t g) { return !all_to_all && g >= query_base; };
+    auto const query_side = [&](size_t g) {
+        return !all_to_all && g >= query_base;
+    };
     auto const stash_order = [&](size_t pass, size_t g) {
         return pass == 0 ? query_side(g) : !query_side(g);
     };
@@ -321,11 +353,9 @@ int run_main(
     for (size_t i = 0; i < evaluated.size(); ++i) {
         schedule.push_back({evaluated[i], i});
     }
-    std::stable_sort(
-        schedule.begin(), schedule.end(), [&](auto const& left, auto const& right) {
-            return pair_at(left.ordinal).second < pair_at(right.ordinal).second;
-        }
-    );
+    std::stable_sort(schedule.begin(), schedule.end(), [&](auto const& left, auto const& right) {
+        return pair_at(left.ordinal).second < pair_at(right.ordinal).second;
+    });
     // Genomes touched by evaluated pairs keep their packed arrays across the
     // pair loop; the rest stream through for distinct counts only.
     std::vector<char> needed(genomes, 0);
@@ -339,6 +369,14 @@ int run_main(
     // sets the machine's memory alight. Keep a budget and re-parse whatever falls outside it.
     std::vector<std::vector<uint64_t>> stashed(genomes);
     std::vector<char> resident(genomes, 0);
+    // A pair needs two sorted arrays. Sorting each genome once and keeping the sorted copy on
+    // the device turns the per-pair cost from an 8-pass sort of both sets into one merge pass
+    // over them, and the genomes a run reuses most are the ones it packs first.
+    device_buffer sorted_store;
+    std::vector<size_t> sorted_offset(genomes, 0);
+    std::vector<uint32_t> sorted_count(genomes, 0);
+    size_t sorted_bytes = 0;
+    if (device_stash_bytes >= sizeof(uint64_t)) sorted_store.reset(device_stash_bytes);
     std::vector<uint64_t> reparsed_a, reparsed_r;
     size_t stashed_bytes = 0;
     size_t reparsed_genomes = 0;
@@ -369,56 +407,74 @@ int run_main(
     for (int rep = -warmups; rep < samples; ++rep) {
         auto const sample_tick = clock_type::now();
         auto parse_tick = clock_type::now();
+        sorted_bytes = 0;
+        std::fill(sorted_count.begin(), sorted_count.end(), 0);
         // Sketch streams one genome at a time; only counts are retained. The order decides who
         // wins the stash: the reused side is packed first, so a small budget keeps the side that
         // every pair touches instead of the first genomes in the corpus.
         for (size_t pass = 0; pass < 2; ++pass) {
             for (size_t g = 0; g < genomes; ++g) {
-            if (!stash_order(pass, g)) continue;
-            auto packed = parsers ? parsers->take(g) : parse_one(g);
-            size_t const count = packed.size();
-            kmers_of[g] = count;
-            max_keys = std::max(max_keys, count);
-            work.reset(count * sizeof(uint64_t));
-            uniques.reset(count * sizeof(uint64_t));
-            run_counts.reset(count * sizeof(int));
-            auto* keys = static_cast<uint64_t*>(work.data);
-            temp_bytes =
-                std::max(temp_bytes, std::max(sort_temp_bytes(count), encode_temp_bytes(count)));
-            temp.reset(temp_bytes);
-            CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                keys, packed.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice, stream
-            ));
-            if (count) {
-                CUDDL_CUDA_CALL(
-                    cub::DeviceRadixSort::SortKeys(
-                        temp.data, temp.bytes, keys, keys, count, 0, 64, stream
-                    )
+                if (!stash_order(pass, g)) continue;
+                auto packed = parsers ? parsers->take(g) : parse_one(g);
+                size_t const count = packed.size();
+                kmers_of[g] = count;
+                max_keys = std::max(max_keys, count);
+                work.reset(count * sizeof(uint64_t));
+                uniques.reset(count * sizeof(uint64_t));
+                run_counts.reset(count * sizeof(int));
+                auto* keys = static_cast<uint64_t*>(work.data);
+                temp_bytes = std::max(
+                    temp_bytes, std::max(sort_temp_bytes(count), encode_temp_bytes(count))
                 );
-                CUDDL_CUDA_CALL(
-                    cub::DeviceRunLengthEncode::Encode(
-                        temp.data,
-                        temp.bytes,
-                        keys,
-                        static_cast<uint64_t*>(uniques.data),
-                        static_cast<int*>(run_counts.data),
-                        static_cast<int*>(num_runs_dev.data),
-                        count,
-                        stream
-                    )
-                );
-            }
-            CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
-            distinct[g] = count ? fetch_runs() : 0;
-            if (needed[g]) {
-                auto const bytes = packed.size() * sizeof(uint64_t);
-                // Leave room for the pair working set as well as the resident arrays.
-                if (stashed_bytes + bytes <= stash_bytes) {
-                    stashed_bytes += bytes;
-                    resident[g] = 1;
-                    stashed[g] = std::move(packed);
+                temp.reset(temp_bytes);
+                CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                    keys, packed.data(), count * sizeof(uint64_t), cudaMemcpyHostToDevice, stream
+                ));
+                if (count) {
+                    CUDDL_CUDA_CALL(
+                        cub::DeviceRadixSort::SortKeys(
+                            temp.data, temp.bytes, keys, keys, count, 0, 64, stream
+                        )
+                    );
+                    CUDDL_CUDA_CALL(
+                        cub::DeviceRunLengthEncode::Encode(
+                            temp.data,
+                            temp.bytes,
+                            keys,
+                            static_cast<uint64_t*>(uniques.data),
+                            static_cast<int*>(run_counts.data),
+                            static_cast<int*>(num_runs_dev.data),
+                            count,
+                            stream
+                        )
+                    );
                 }
-            }
+                auto const runs = count ? fetch_runs() : 0;
+                distinct[g] = runs;
+                if (count && runs && needed[g] && sorted_store.bytes) {
+                    auto const bytes = static_cast<size_t>(runs) * sizeof(uint64_t);
+                    if (sorted_bytes + bytes <= sorted_store.bytes) {
+                        sorted_offset[g] = sorted_bytes / sizeof(uint64_t);
+                        sorted_count[g] = static_cast<uint32_t>(runs);
+                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                            static_cast<uint64_t*>(sorted_store.data) + sorted_offset[g],
+                            uniques.data,
+                            bytes,
+                            cudaMemcpyDeviceToDevice,
+                            stream
+                        ));
+                        sorted_bytes += bytes;
+                    }
+                }
+                if (needed[g]) {
+                    auto const bytes = packed.size() * sizeof(uint64_t);
+                    // Leave room for the pair working set as well as the resident arrays.
+                    if (stashed_bytes + bytes <= stash_bytes) {
+                        stashed_bytes += bytes;
+                        resident[g] = 1;
+                        stashed[g] = std::move(packed);
+                    }
+                }
             }
         }
         // Pair buffers sized from the largest evaluated pair actually measured.
@@ -429,8 +485,12 @@ int run_main(
         concat.reset(max_pair * sizeof(uint64_t));
         pair_uniques.reset(max_pair * sizeof(uint64_t));
         pair_counts.reset(max_pair * sizeof(int));
-        temp_bytes =
-            std::max(temp_bytes, std::max(sort_temp_bytes(max_pair), encode_temp_bytes(max_pair)));
+        temp_bytes = std::max(
+            temp_bytes,
+            std::max(
+                {sort_temp_bytes(max_pair), encode_temp_bytes(max_pair), merge_temp_bytes(max_pair)}
+            )
+        );
         temp.reset(temp_bytes);
         auto const parse_done = clock_type::now();
         auto const compare_tick = clock_type::now();
@@ -439,6 +499,65 @@ int run_main(
         reparsed_r.clear();
         // Which genome each reparse buffer holds, so a group reuses one parse across its pairs.
         size_t cached_a = genomes, cached_r = genomes;
+        // Sorted, deduplicated k-mers for the two sides of the current pair. A side the sketch
+        // pass packed for the device already has them; anything else is uploaded and reduced once
+        // per group, which the reference-major schedule makes one pass per genome.
+        struct sorted_side {
+            device_buffer keys;
+            device_buffer unique;
+            size_t genome = std::numeric_limits<size_t>::max();
+        };
+        sorted_side side_a, side_r;
+        auto sorted_for = [&](sorted_side& state, size_t g, std::vector<uint64_t> const& packed) {
+            if (sorted_count[g]) {
+                return std::pair{
+                    static_cast<uint64_t const*>(sorted_store.data) + sorted_offset[g],
+                    static_cast<size_t>(sorted_count[g])
+                };
+            }
+            if (state.genome != g) {
+                auto const count = packed.size();
+                if (state.keys.bytes < count * sizeof(uint64_t)) {
+                    state.keys.reset(count * sizeof(uint64_t));
+                    state.unique.reset(count * sizeof(uint64_t));
+                }
+                CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                    state.keys.data,
+                    packed.data(),
+                    count * sizeof(uint64_t),
+                    cudaMemcpyHostToDevice,
+                    stream
+                ));
+                CUDDL_CUDA_CALL(
+                    cub::DeviceRadixSort::SortKeys(
+                        temp.data,
+                        temp.bytes,
+                        static_cast<uint64_t*>(state.keys.data),
+                        static_cast<uint64_t*>(state.keys.data),
+                        count,
+                        0,
+                        64,
+                        stream
+                    )
+                );
+                CUDDL_CUDA_CALL(
+                    cub::DeviceRunLengthEncode::Encode(
+                        temp.data,
+                        temp.bytes,
+                        static_cast<uint64_t*>(state.keys.data),
+                        static_cast<uint64_t*>(state.unique.data),
+                        static_cast<int*>(pair_counts.data),
+                        static_cast<int*>(num_runs_dev.data),
+                        count,
+                        stream
+                    )
+                );
+                state.genome = g;
+            }
+            return std::pair{
+                static_cast<uint64_t const*>(state.unique.data), static_cast<size_t>(distinct[g])
+            };
+        };
         for (auto const& scheduled : schedule) {
             auto const [a, r] = pair_at(scheduled.ordinal);
             // Resident arrays come from the sketch pass; anything outside the budget is packed
@@ -457,33 +576,30 @@ int run_main(
             auto const& packed_r = resident[r] ? stashed[r] : reparsed_r;
             size_t shared = 0;
             if (distinct[a] && distinct[r]) {
-                auto* keys = static_cast<uint64_t*>(concat.data);
-                CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                    keys,
-                    packed_a.data(),
-                    packed_a.size() * sizeof(uint64_t),
-                    cudaMemcpyHostToDevice,
-                    stream
-                ));
-                CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                    keys + packed_a.size(),
-                    packed_r.data(),
-                    packed_r.size() * sizeof(uint64_t),
-                    cudaMemcpyHostToDevice,
-                    stream
-                ));
-                size_t const total = packed_a.size() + packed_r.size();
+                // Both sides are sorted and deduplicated, so the union is one merge pass over
+                // them plus a run count, not a sort of everything they hold together.
+                auto const left = sorted_for(side_a, a, packed_a);
+                auto const right = sorted_for(side_r, r, packed_r);
+                auto const total = left.second + right.second;
                 CUDDL_CUDA_CALL(
-                    cub::DeviceRadixSort::SortKeys(
-                        temp.data, temp.bytes, keys, keys, total, 0, 64, stream
+                    cub::DeviceMerge::MergeKeys(
+                        temp.data,
+                        temp.bytes,
+                        left.first,
+                        static_cast<int>(left.second),
+                        right.first,
+                        static_cast<int>(right.second),
+                        static_cast<uint64_t*>(pair_uniques.data),
+                        cuda::std::less<uint64_t>{},
+                        stream
                     )
                 );
                 CUDDL_CUDA_CALL(
                     cub::DeviceRunLengthEncode::Encode(
                         temp.data,
                         temp.bytes,
-                        keys,
                         static_cast<uint64_t*>(pair_uniques.data),
+                        static_cast<uint64_t*>(concat.data),
                         static_cast<int*>(pair_counts.data),
                         static_cast<int*>(num_runs_dev.data),
                         total,
@@ -503,16 +619,16 @@ int run_main(
                 scheduled.evaluated_index + 1 == evaluated.size()) {
                 emitted.push_back(
                     {{"query", names[a]},
-                 {"reference", names[r]},
-                 {"distinct_a", distinct[a]},
-                 {"distinct_b", distinct[r]},
-                 {"intersection", shared},
-                 {"union", pair_union},
-                 {"jaccard", jaccard},
-                 {"containment_a_in_b",
-                  distinct[a] ? static_cast<double>(shared) / distinct[a] : 0.0},
-                 {"containment_b_in_a",
-                  distinct[r] ? static_cast<double>(shared) / distinct[r] : 0.0},
+                     {"reference", names[r]},
+                     {"distinct_a", distinct[a]},
+                     {"distinct_b", distinct[r]},
+                     {"intersection", shared},
+                     {"union", pair_union},
+                     {"jaccard", jaccard},
+                     {"containment_a_in_b",
+                      distinct[a] ? static_cast<double>(shared) / distinct[a] : 0.0},
+                     {"containment_b_in_a",
+                      distinct[r] ? static_cast<double>(shared) / distinct[r] : 0.0},
                      {"mash_ani", mash_ani}}
                 );
             }
@@ -584,7 +700,7 @@ int main(int argc, char** argv) try {
     int samples = 5, warmups = 1;
     size_t max_kmers = 32ULL << 20, max_pairs = 0, match_rows = 0;
     unsigned workers = 0;
-    size_t stash_mb = 0;
+    size_t stash_mb = 0, device_stash_mb = 0;
     CLI::App app{"Exact k-mer set baseline from CUB primitives (k=25)"};
     app.add_option("--reference", references)->required()->check(CLI::ExistingFile);
     app.add_option("--query", queries)->check(CLI::ExistingFile);
@@ -595,15 +711,19 @@ int main(int argc, char** argv) try {
     app.add_option("--max-pairs", max_pairs, "Evaluated pairs cap, even stride (0 disables)");
     app.add_option("--match-rows", match_rows, "Emitted pair rows cap, even stride (0 disables)");
     app.add_option(
-        "--workers",
-        workers,
-        "Concurrent genome parsers ahead of the GPU loop; 0 selects up to 8"
+        "--workers", workers, "Concurrent genome parsers ahead of the GPU loop; 0 selects up to 8"
     );
     app.add_option(
         "--stash-mb",
         stash_mb,
         "Host memory for resident k-mer arrays; 0 uses half of MemAvailable. Arrays outside the "
         "budget are packed again per pair instead of being retained."
+    );
+    app.add_option(
+        "--device-stash-mb",
+        device_stash_mb,
+        "Device memory for sorted k-mer arrays; 0 uses half of what is free. A pair merges two "
+        "sorted arrays instead of sorting both again, which is what that memory buys."
     );
     app.add_option("--output", output)->required();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
@@ -628,8 +748,8 @@ int main(int argc, char** argv) try {
         match_rows,
         sketch_only,
         workers == 0 ? parse_worker_count(references.size() + queries.size()) : workers,
-        stash_mb ? stash_mb << 20
-                 : std::max<size_t>(available_host_bytes() / 2, size_t{1} << 30),
+        stash_mb ? stash_mb << 20 : std::max<size_t>(available_host_bytes() / 2, size_t{1} << 30),
+        device_stash_mb ? device_stash_mb << 20 : available_device_bytes() / 2,
         report
     );
     FILE* stream = std::fopen(output.c_str(), "w");
