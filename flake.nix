@@ -66,6 +66,13 @@
               nsight_compute
               cudaSanitizer
 
+              # nvCOMP ships its headers, library and CMake config in separate
+              # outputs, so the merge takes each of them: the default output is
+              # the licence text and leaves the toolkit root empty of nvcomp.
+              nvcomp.include
+              nvcomp.lib
+              nvcomp.dev
+
               # NVML and CUPTI are required by nvbench
               # (benchmark GPU monitoring).
               cuda_nvml_dev.include
