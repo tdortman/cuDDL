@@ -467,6 +467,15 @@ def main(
         HypergenDevice,
         typer.Option(help="Device hypergen runs on."),
     ] = HypergenDevice.CPU,
+    cuddl_workers: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Loader workers for the cuDDL reference build. Unset uses the thread count, "
+            "which past the machine's decompression bandwidth costs instead of saving: on a "
+            "24 thread desktop 8 workers built the 5000 genome corpus 18 percent faster.",
+        ),
+    ] = None,
     cub_stash_mb: Annotated[
         int | None,
         typer.Option(
@@ -1208,7 +1217,7 @@ def main(
                     # The benchmark defaults to one loader, which gunzips and
                     # parses every genome on the calling thread.
                     "--workers",
-                    str(threads),
+                    str(cuddl_workers if cuddl_workers is not None else threads),
                     "--transfer",
                     cuddl_transfer,
                 ],
