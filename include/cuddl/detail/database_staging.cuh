@@ -666,18 +666,22 @@ class path_loaders {
         unsigned parser_workers,
         bool page_locked
     )
-        : buffers_(stream, worker_count(paths.size(), parser_workers), size_t{32} << 20),
+        : workers_(worker_count(paths.size(), parser_workers)),
+          buffers_(stream, workers_, size_t{32} << 20),
           page_locked_(page_locked) {
         // One buffer per in-flight file, plus headroom: a worker asks for its next file while
         // every loaded file still holds a lease, so an exact match would refuse.
-        buffers_.set_capacity(workers() + 2);
+        buffers_.set_capacity(workers_ + 2);
         if (page_locked_) source_ = {acquire_pinned_target, &buffers_};
-        if (workers() > 1) pool_.emplace(paths, workers(), source_, workers() * 4);
+        if (workers_ > 1) pool_.emplace(paths, workers_, source_, workers_ * 4);
     }
 
     /// @brief Loaders this build runs.
+    ///
+    /// The pinned pool allocates its buffers lazily, so its own count says nothing about how many
+    /// loaders there are: reading it here once left every build on the calling thread.
     [[nodiscard]] size_t workers() const noexcept {
-        return buffers_.buffers();
+        return workers_;
     }
 
     /// @brief Page-locked buffers the loaders held, for the statistics.
@@ -706,6 +710,7 @@ class path_loaders {
         return std::max<size_t>(1, std::min(paths, loaders));
     }
 
+    size_t workers_ = 1;
     pinned_sequence_pool buffers_;
     bool page_locked_ = false;
     decompression_source source_{};
