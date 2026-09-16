@@ -1,6 +1,8 @@
 #pragma once
 
 #include <libdeflate.h>
+
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -700,6 +702,44 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
     return byte(tail) | (byte(tail + 1) << 8) | (byte(tail + 2) << 16) | (byte(tail + 3) << 24);
 }
 
+/// @brief Copies bases from [@p first, @p last) to @p out, dropping sequence whitespace.
+///
+/// A sequence line is a long run of bases closed by a line ending, so a test per byte is the bulk
+/// of loading a corpus. Whole words are copied while none of their bytes is whitespace, and only a
+/// word that holds one falls back to bytes, which leaves the common case at one store per eight
+/// bases and keeps @p out no further along than the word being read.
+///
+/// @return The end of the written span.
+inline char* compact_sequence_whitespace(char const* first, char const* last, char* out) {
+    constexpr uint64_t ones = 0x0101010101010101ULL;
+    auto const has_zero_byte = [](uint64_t word) {
+        return (word - ones) & ~word & 0x8080808080808080ULL;
+    };
+    auto const has_byte = [&](uint64_t word, uint64_t byte) {
+        return has_zero_byte(word ^ (ones * byte));
+    };
+    auto const* word = first;
+    while (static_cast<size_t>(last - word) >= sizeof(uint64_t)) {
+        uint64_t value = 0;
+        std::memcpy(&value, word, sizeof(value));
+        auto const whitespace = has_byte(value, ' ') | has_byte(value, '\t') |
+                                has_byte(value, '\n') | has_byte(value, '\r');
+        if (whitespace == 0) {
+            std::memcpy(out, word, sizeof(value));
+            out += sizeof(value);
+        } else {
+            for (size_t index = 0; index < sizeof(value); ++index) {
+                if (!fastx_is_sequence_whitespace(word[index])) *out++ = word[index];
+            }
+        }
+        word += sizeof(value);
+    }
+    for (auto const* at = word; at != last; ++at) {
+        if (!fastx_is_sequence_whitespace(*at)) *out++ = *at;
+    }
+    return out;
+}
+
 /// @brief Compacts sequence whitespace in place, leaving every extent a run of bases.
 ///
 /// Consumers stage extents verbatim and choose piece boundaries on any base, which needs
@@ -737,16 +777,18 @@ inline void compact_fastx_sequence_extents(fastx_sequence_file& result) {
         auto const size = static_cast<size_t>(extent.end - extent.begin);
         if (writable(extent.begin, size)) {
             // Compaction only ever moves bytes towards the buffer's start.
-            auto* write = const_cast<char*>(extent.begin);
-            for (auto const* cursor = extent.begin; cursor != extent.end; ++cursor) {
-                if (!fastx_is_sequence_whitespace(*cursor)) *write++ = *cursor;
-            }
+            auto* const write = compact_sequence_whitespace(
+                extent.begin, extent.end, const_cast<char*>(extent.begin)
+            );
             result.extents[index] = {extent.begin, write};
         } else {
             auto const begin = copied.size();
-            for (auto const* cursor = extent.begin; cursor != extent.end; ++cursor) {
-                if (!fastx_is_sequence_whitespace(*cursor)) copied.push_back(*cursor);
-            }
+            // Sized before the copy so the write needs no bounds check per byte.
+            copied.resize(begin + size);
+            auto* const write = compact_sequence_whitespace(
+                extent.begin, extent.end, copied.data() + begin
+            );
+            copied.resize(static_cast<size_t>(write - copied.data()));
             offsets.emplace_back(index, std::pair{begin, copied.size()});
         }
     }
