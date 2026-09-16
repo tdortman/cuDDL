@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -35,13 +39,13 @@ struct staging_plan {
 /// @brief Sizes the arena and the row store from free device memory and the corpus.
 ///
 /// @p staged_ceiling bounds the bytes the corpus can stage, which keeps a small collection from
-/// reserving an arena it could never fill. Zero @p staging_bytes sizes the arena from what is
-/// free; an explicit value is honoured, or rejected when it does not fit.
+/// reserving an arena it could never fill. An unset @p staging_bytes sizes the arena from what
+/// is free; a value is honoured, or rejected when it does not fit.
 template <uint32_t K, size_t BucketCount>
 [[nodiscard]] inline Result<staging_plan> plan_staging(
     size_t references,
     uint64_t staged_ceiling,
-    size_t staging_bytes,
+    std::optional<size_t> staging_bytes,
     cuda::stream_ref stream
 ) {
     size_t free_bytes = 0, device_bytes = 0;
@@ -74,10 +78,11 @@ template <uint32_t K, size_t BucketCount>
     ));
     size_t const row_store_bytes = group * row_bytes;
     size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
-    size_t staging = staging_bytes;
-    if (staging == 0) {
-        staging = std::min(after_rows, arena_ceiling);
+    if (staging_bytes.has_value() && *staging_bytes < K + 1) {
+        return Err(Error::invalid_argument("an explicit staging arena must hold one window"));
     }
+    size_t const staging =
+        staging_bytes.has_value() ? *staging_bytes : std::min(after_rows, arena_ceiling);
     // One piece of at least k bases plus its k - 1 byte overlap has to fit.
     if (staging < K + 1 || staging > after_rows) {
         return Err(
@@ -280,26 +285,18 @@ class database_stager {
         return Ok();
     }
 
-    /// @brief Waits for the device, then unpacks the rows into the caller's storage.
+    /// @brief Waits for the device, then hands over the store it filled.
     ///
-    /// The store pads each genome with its saturation word, so the rows are unpacked from the
-    /// single read `end_group` issued rather than copied once per genome.
-    [[nodiscard]] Result<void> finish(std::span<uint32_t> rows, std::span<uint32_t> saturation) {
+    /// The store holds `row_words()` words per genome: `BucketCount` packed registers followed by
+    /// that genome's saturation word, the layout a single sketch allocation has.
+    [[nodiscard]] Result<std::vector<uint32_t>> release_store() {
         CUDDL_CUDA_TRY(stream_.sync());
-        for (size_t genome = 0; genome < saturation.size(); ++genome) {
-            std::memcpy(
-                rows.data() + genome * BucketCount,
-                host_rows_.data() + genome * row_words(),
-                BucketCount * sizeof(uint32_t)
-            );
-            saturation[genome] = host_rows_[genome * row_words() + BucketCount];
-        }
         if (statistics_ != nullptr) {
             statistics_->staging_bytes = bounds_.staging;
             statistics_->batches = batches_;
             statistics_->transfers = transfers_;
         }
-        return Ok();
+        return std::move(host_rows_);
     }
 
    private:
@@ -417,5 +414,340 @@ class database_stager {
     size_t const sm_, max_grid_;
     size_t arena_used_ = 0, block_end_ = 0, batches_ = 0, transfers_ = 0, held_count_ = 0;
 };
+
+/// @brief One genome of bases the caller already holds.
+///
+/// Records are the shape a parsed FASTX record has: bases only, no header, no line breaks, no
+/// FASTQ qualities. k-mers never cross two records.
+struct sequence_record {
+    std::string_view bases;
+};
+
+/// @brief One genome as its records, in order. No records keeps the genome's ID with a zero row.
+struct sequence_genome {
+    std::span<sequence_record const> records;
+    std::string_view name;  // copied into the labels; may be empty
+};
+
+/// @brief Unpacks a store into packed rows and one saturation word per genome.
+///
+/// The store pads each genome with its saturation word, so a build unpacked as it read the store
+/// would copy once per genome; this reads the padding it already holds.
+template <size_t BucketCount>
+void unpack_store(
+    std::span<uint32_t const> store,
+    std::span<uint32_t> rows,
+    std::span<uint32_t> saturation
+) noexcept {
+    for (size_t genome = 0; genome < saturation.size(); ++genome) {
+        std::memcpy(
+            rows.data() + genome * BucketCount,
+            store.data() + genome * (BucketCount + 1),
+            BucketCount * sizeof(uint32_t)
+        );
+        saturation[genome] = store[genome * (BucketCount + 1) + BucketCount];
+    }
+}
+
+// Page-locked sequence storage handed to loader threads. A lease returns to the pool when the
+// parsed file holding it dies, which is after the caller enqueued every copy that reads it.
+// Releasing records that point on the stream; the next loader to take the slot waits for it
+// there, so a buffer is never rewritten under a DMA and the build never has to drain.
+class pinned_sequence_pool {
+   public:
+    /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
+    pinned_sequence_pool(cuda::stream_ref stream, size_t buffers, size_t limit)
+        : stream_(stream), limit_(limit) {
+        slots_.reserve(buffers);
+        in_use_.reserve(buffers);
+        consumed_.reserve(buffers);
+    }
+
+    /// @brief Number of buffers the pool may grow to.
+    void set_capacity(size_t buffers) noexcept {
+        capacity_ = std::max<size_t>(1, buffers);
+    }
+
+    /// @brief Buffers allocated so far. Read once the loaders have stopped.
+    [[nodiscard]] size_t buffers() const noexcept {
+        return slots_.size();
+    }
+
+    /// @brief Returns page-locked bytes, or a null target when the pool cannot serve.
+    [[nodiscard]] decompression_target acquire(size_t bytes) {
+        if (bytes == 0 || bytes > limit_) return {};
+        size_t index = 0;
+        {
+            std::lock_guard lock(mutex_);
+            index = claim(bytes);
+            if (index == slots_.size()) return {};
+        }
+        // Wait on the loader thread rather than the build loop: the slot is already reserved,
+        // so this blocks only the genome that needs it. A failing wait throws out of the loader,
+        // which reports it through the pool's error slot like any other load failure.
+        consumed_[index].sync();
+        return lease(index);
+    }
+
+   private:
+    /// @brief Reserves a free slot holding at least @p bytes, or returns slots_.size().
+    [[nodiscard]] size_t claim(size_t bytes) {
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (in_use_[i]) continue;
+            if (slots_[i]->buffer.size() < bytes) {
+                // Grow a free buffer instead of falling back. Genome sizes vary within a
+                // corpus, and a buffer sized for the first small genome would otherwise
+                // never serve the larger ones. Rounding up to a power of two bounds how many
+                // times any buffer is reallocated, and page-locked allocation is not cheap.
+                auto grown = size_t{1} << 16;
+                while (grown < bytes) grown *= 2;
+                slots_[i] = std::make_unique<slot>(
+                    cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
+                        stream_, cuda::pinned_default_memory_pool(), grown, cuda::no_init
+                    )
+                );
+            }
+            in_use_[i] = true;
+            return i;
+        }
+        if (slots_.size() >= capacity_) return slots_.size();
+        slots_.push_back(
+            std::make_unique<slot>(
+                cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
+                    stream_, cuda::pinned_default_memory_pool(), bytes, cuda::no_init
+                )
+            )
+        );
+        in_use_.push_back(true);
+        consumed_.emplace_back(stream_);
+        return slots_.size() - 1;
+    }
+
+   private:
+    struct slot {
+        cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible> buffer;
+    };
+
+    [[nodiscard]] decompression_target lease(size_t index) {
+        auto* pool = this;
+        auto* owner = slots_[index].get();
+        return {
+            owner->buffer.data(),
+            owner->buffer.size(),
+            std::shared_ptr<void>(owner, [pool, index](void*) {
+                std::lock_guard lock(pool->mutex_);
+                // Record before publishing the slot: a loader that takes it must see the
+                // event of every copy the previous lease fed.
+                pool->consumed_[index].record(pool->stream_);
+                pool->in_use_[index] = false;
+            })
+        };
+    }
+
+    cuda::stream_ref stream_;
+    size_t limit_;
+    size_t capacity_{1};
+    std::vector<std::unique_ptr<slot>> slots_;
+    std::vector<bool> in_use_;
+    std::vector<cuda::event> consumed_;
+    std::mutex mutex_;
+};
+
+/// @brief `decompression_source` trampoline for `pinned_sequence_pool`.
+[[nodiscard]] inline decompression_target acquire_pinned_target(void* context, size_t bytes) {
+    return static_cast<pinned_sequence_pool*>(context)->acquire(bytes);
+}
+
+/// @brief Loader state a build fed by paths keeps for its whole run.
+///
+/// One page-locked sequence buffer per loader lets the transfer engine read the decompressed
+/// genome in place instead of restaging it on the consumer thread. The pool hands out load
+/// results a few files ahead of the consumer, which takes them in order: a window of one
+/// worker-worth leaves the consumer waiting on a straggler while every other loader sits idle.
+class path_loaders {
+   public:
+    /// @param page_locked gives the loaders page-locked buffers to decompress into.
+    path_loaders(
+        cuda::stream_ref stream,
+        std::span<std::filesystem::path const> paths,
+        unsigned parser_workers,
+        bool page_locked
+    )
+        : buffers_(stream, worker_count(paths.size(), parser_workers), size_t{32} << 20),
+          page_locked_(page_locked) {
+        // One buffer per in-flight file, plus headroom: a worker asks for its next file while
+        // every loaded file still holds a lease, so an exact match would refuse.
+        buffers_.set_capacity(workers() + 2);
+        if (page_locked_) source_ = {acquire_pinned_target, &buffers_};
+        if (workers() > 1) pool_.emplace(paths, workers(), source_, workers() * 4);
+    }
+
+    /// @brief Loaders this build runs.
+    [[nodiscard]] size_t workers() const noexcept {
+        return buffers_.buffers();
+    }
+
+    /// @brief Page-locked buffers the loaders held, for the statistics.
+    [[nodiscard]] size_t page_locked_buffers() const noexcept {
+        return buffers_.buffers();
+    }
+
+    /// @brief Loads genome @p id, through the pool when the build runs more than one loader.
+    [[nodiscard]] Result<std::unique_ptr<fastx_sequence_file>>
+    take(std::span<std::filesystem::path const> paths, size_t id) {
+        if (pool_.has_value()) return pool_->take(id);
+        return load_fastx_sequence_file(paths[id].string(), source_);
+    }
+
+    /// @brief Joins the loaders. They hold leases, so pool state is only readable after this.
+    void reset() noexcept {
+        pool_.reset();
+    }
+
+   private:
+    /// @brief Loaders to run: at most one per input, at most the requested workers, at most the
+    /// hardware, and never none.
+    static size_t worker_count(size_t paths, unsigned parser_workers) noexcept {
+        auto const hardware = std::max(1U, std::thread::hardware_concurrency());
+        auto const loaders = static_cast<size_t>(std::min(parser_workers, hardware));
+        return std::max<size_t>(1, std::min(paths, loaders));
+    }
+
+    pinned_sequence_pool buffers_;
+    bool page_locked_ = false;
+    decompression_source source_{};
+    std::optional<fastx_load_pool> pool_;
+};
+
+/// @brief Runs the staging loop over a collection, filling one group at a time.
+///
+/// @p fill receives the stager, a group's first genome and its size, and stages that whole group.
+/// Genomes are numbered within their group, so a fill stages genome @c genome - @c base.
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout, typename Fill>
+[[nodiscard]] Result<std::vector<uint32_t>> stage_groups(
+    size_t genomes,
+    uint64_t staged_ceiling,
+    std::optional<size_t> staging_bytes,
+    cuda::stream_ref stream,
+    reference_build_statistics* statistics,
+    Fill&& fill
+) {
+    auto const plan =
+        CUDDL_TRY((plan_staging<K, BucketCount>(genomes, staged_ceiling, staging_bytes, stream)));
+    database_stager<K, BucketCount, Layout> stager(stream, genomes, plan, statistics);
+    size_t base = 0;
+    while (base < genomes) {
+        auto const count = std::min(plan.group, genomes - base);
+        CUDDL_TRY(stager.begin_group(count));
+        CUDDL_TRY(fill(stager, base, count));
+        CUDDL_TRY(stager.end_group(base, count));
+        base += count;
+    }
+    return stager.release_store();
+}
+
+/// @brief Stages a path collection and returns the store.
+///
+/// @p parser_workers is a value, not a sentinel: the build clamps it to what the inputs and the
+/// hardware allow, so asking for the default is asking for the default.
+///
+/// The arena ceiling is the decompressed size of every input: a bound from compressed sizes alone
+/// overestimates a corpus several times over, and an arena past what the corpus can hold is
+/// memory the device never needs.
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
+[[nodiscard]] Result<std::vector<uint32_t>> stage_paths(
+    std::span<std::filesystem::path const> paths,
+    cuda::stream_ref stream,
+    std::optional<size_t> staging_bytes,
+    unsigned parser_workers,
+    bool page_locked,
+    reference_build_statistics* statistics
+) {
+    if (parser_workers == 0) {
+        return Err(Error::invalid_argument("a path build needs at least one loader"));
+    }
+    if (paths.empty()) return std::vector<uint32_t>{};
+    path_loaders loaders(stream, paths, parser_workers, page_locked);
+    uint64_t staged_ceiling = 0;
+    for (auto const& path : paths) {
+        auto const decompressed = gzip_decompressed_size(path.string());
+        if (decompressed != 0) {
+            staged_ceiling += decompressed;
+            continue;
+        }
+        std::error_code error;
+        auto const size = std::filesystem::file_size(path, error);
+        if (!error) staged_ceiling += size;
+    }
+    auto store = CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
+        paths.size(),
+        staged_ceiling,
+        staging_bytes,
+        stream,
+        statistics,
+        [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
+            -> Result<void> {
+            for (size_t id = base; id < base + count; ++id) {
+                auto sequence = CUDDL_TRY(loaders.take(paths, id));
+                // Read the loaded file's parts before the move below: argument order is
+                // unspecified, so a moved-from Result must not be dereferenced.
+                auto const* const pinned_base = sequence->decompressed_target;
+                auto const pinned_size = sequence->decompressed_size;
+                auto const& extents = sequence->extents;
+                CUDDL_TRY(stager.add_genome(
+                    id - base, extents, pinned_base, pinned_size, std::move(sequence)
+                ));
+            }
+            return Ok();
+        }
+    )));
+    if (statistics != nullptr) {
+        statistics->pinned_buffers = loaders.page_locked_buffers();
+        statistics->workers = static_cast<unsigned>(loaders.workers());
+    }
+    loaders.reset();
+    return store;
+}
+
+/// @brief Stages bases the caller already holds and returns the store.
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
+[[nodiscard]] Result<std::vector<uint32_t>> stage_sequences(
+    std::span<sequence_genome const> genomes,
+    cuda::stream_ref stream,
+    std::optional<size_t> staging_bytes,
+    reference_build_statistics* statistics
+) {
+    if (genomes.empty()) return std::vector<uint32_t>{};
+    // The caller knows exactly what the corpus holds, so the ceiling is the sum of its bases
+    // rather than an estimate read out of file headers.
+    uint64_t staged_ceiling = 0;
+    for (auto const& genome : genomes) {
+        for (auto const& record : genome.records) staged_ceiling += record.bases.size();
+    }
+    std::vector<fastx_sequence_extent> records;
+    return stage_groups<K, BucketCount, Layout>(
+        genomes.size(),
+        staged_ceiling,
+        staging_bytes,
+        stream,
+        statistics,
+        [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
+            -> Result<void> {
+            for (size_t id = base; id < base + count; ++id) {
+                auto const& genome = genomes[id];
+                records.clear();
+                records.reserve(genome.records.size());
+                for (auto const& record : genome.records) {
+                    if (record.bases.empty()) continue;
+                    records.push_back(
+                        {record.bases.data(), record.bases.data() + record.bases.size()}
+                    );
+                }
+                CUDDL_TRY(stager.add_genome(id - base, records));
+            }
+            return Ok();
+        }
+    );
+}
 
 }  // namespace cuddl::detail

@@ -46,7 +46,7 @@ struct options {
     std::string rows = "compact", index = "sparse", topology = "batch";
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
-    unsigned workers = 0;
+    unsigned workers = cuddl::default_parser_workers;
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
     bool resident_plan = false;
     int samples = 20, warmups = 3;
@@ -156,6 +156,7 @@ struct genome_rows {
     std::vector<uint32_t> registers;
     std::vector<uint32_t> saturation;
     uint64_t input_bytes = 0;
+    unsigned parser_workers = 0;  // loaders the ingest ran, after the build's defaulting
 };
 
 genome_rows stream_genomes(
@@ -164,10 +165,12 @@ genome_rows stream_genomes(
     cuda::stream_ref stream
 ) {
     std::vector<std::filesystem::path> files{paths.begin(), paths.end()};
-    auto file = CUDDL_UNWRAP(
-        (cuddl::reference_database_file::build<k, buckets>(files, stream, opts.workers))
-    );
+    cuddl::reference_build_statistics statistics;
+    auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<k, buckets>(
+        files, stream, {.statistics = &statistics, .parser_workers = opts.workers}
+    )));
     genome_rows result;
+    result.parser_workers = statistics.workers;
     auto const count = file.saturation().size();
     result.saturation.assign(file.saturation().begin(), file.saturation().end());
     result.registers.resize(count * (buckets + 1));
@@ -709,7 +712,7 @@ size_t count_sequence_records(std::vector<std::string> const& paths) {
 }
 
 struct resident_budget {
-    size_t cap = 0;  // Effective ASCII staging bytes per batch.
+    size_t cap = 0;             // Effective ASCII staging bytes per batch.
     size_t host_cap_bytes = 0;  // Host share the staged ASCII may occupy.
     size_t free_bytes = 0;
     size_t reusable_pool_bytes = 0;
@@ -1794,9 +1797,8 @@ json run(options const& opts) {
               {"hash_identity", compatibility(opts).hash_identity},
               {"hash_seed", compatibility(opts).hash_seed},
               {"canonicalisation_policy", compatibility(opts).canonicalisation_policy},
-              {"exponent_bits", compatibility(opts).exponent_bits},
+              {"parser_threads", streamed ? static_cast<int>(reference_rows.parser_workers) : 0},
               {"mantissa_bits", compatibility(opts).mantissa_bits},
-              {"parser_threads", streamed ? static_cast<int>(opts.workers) : 0},
               {"application_queries", opts.topology == "batch" ? queries.sketches.size() : 0},
               {"references", refs.sketches.size()},
               {"queries", queries.sketches.size()},
@@ -1880,8 +1882,12 @@ int main(int argc, char** argv) try {
            "bounded memory, required for a large corpus"
     )
         ->check(CLI::IsMember({"packed", "sequence"}));
-    app.add_option("--workers", opts.workers, "File loading workers for --ingest sequence")
-        ->check(CLI::Range(0u, 64u));
+    app.add_option(
+           "--workers",
+           opts.workers,
+           "File loading workers for --ingest sequence (leave unset for automatic)"
+    )
+        ->check(CLI::Range(1u, 64u));
     app.add_option(
            "--resident-bytes",
            opts.resident_bytes,

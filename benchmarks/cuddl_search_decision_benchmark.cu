@@ -1124,9 +1124,7 @@ struct refseq_fixture {
         );
     }
     auto opaque = cuddl_bench::read_file_any(g_refseq_asset_path);
-    auto decoded = CUDDL_UNWRAP(
-        cuddl::a48::decode_a48_tsv_parallel(opaque, std::thread::hardware_concurrency())
-    );
+    auto decoded = CUDDL_UNWRAP(cuddl::a48::decode_a48_tsv_parallel(opaque));
     if (!decoded.metadata.has_kmer_length || decoded.metadata.kmer_length != k_kmer_length ||
         !decoded.metadata.has_seed || !decoded.metadata.has_exponent ||
         decoded.metadata.exponent_bits != 5U ||

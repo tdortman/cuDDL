@@ -935,6 +935,7 @@ struct reference_build_statistics {
     size_t direct_chunks = 0;
     size_t staged_chunks = 0;
     size_t pinned_buffers = 0;
+    unsigned workers = 0;  // loaders the build ran, after its own defaulting
     size_t staging_bytes = 0;
     size_t batches = 0;
     size_t transfers = 0;  // runs copied in one piece, plus records split across pieces

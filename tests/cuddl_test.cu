@@ -367,9 +367,8 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
 TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
     cuda::stream stream{cuda::devices[0]};
     constexpr size_t chunk_size = 4093;
-    auto chunk = cuda::make_device_buffer<uint64_t>(
-        stream, stream.device(), chunk_size, cuda::no_init
-    );
+    auto chunk =
+        cuda::make_device_buffer<uint64_t>(stream, stream.device(), chunk_size, cuda::no_init);
     for (auto const& inputs : {make_inputs(50000), std::vector<uint64_t>(65537, 12345)}) {
         auto full_input = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
         cuddl::sketch<k_default, b_default> full(stream), incremental(stream);
@@ -378,7 +377,8 @@ TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
         for (size_t offset = 0; offset < inputs.size(); offset += chunk_size) {
             auto const size = std::min(chunk_size, inputs.size() - offset);
             cuda::copy_bytes(
-                stream, cuda::std::span{inputs.data() + offset, size},
+                stream,
+                cuda::std::span{inputs.data() + offset, size},
                 cuddl::device_span<uint64_t>{chunk.data(), size}
             );
             ASSERT_TRUE(incremental.add_async({chunk.data(), size}, stream));
@@ -390,8 +390,10 @@ TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
         cuda::copy_bytes(stream, incremental.data(), actual);
         stream.sync();
         EXPECT_EQ(actual, expected);
-        EXPECT_EQ(CUDDL_UNWRAP(incremental.winner_counts(stream)),
-                  CUDDL_UNWRAP(full.winner_counts(stream)));
+        EXPECT_EQ(
+            CUDDL_UNWRAP(incremental.winner_counts(stream)),
+            CUDDL_UNWRAP(full.winner_counts(stream))
+        );
     }
 }
 
@@ -1240,10 +1242,10 @@ TEST_F(ReferenceDatabaseTest, IndexCountsInitializeTrailingScanElement) {
     auto counts = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), buckets * keys + 1U, uint32_t{42}
     );
-    cuddl::detail::count_index_cells_bucket_kernel<<<
-        2, 1024, keys / 4U * sizeof(uint32_t), stream.get()>>>(
-        scores.data(), buckets, 1U, 0x7fffU, counts.data()
-    );
+    cuddl::detail::
+        count_index_cells_bucket_kernel<<<2, 1024, keys / 4U * sizeof(uint32_t), stream.get()>>>(
+            scores.data(), buckets, 1U, 0x7fffU, counts.data()
+        );
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     uint32_t trailing = 42U;
     cuda::copy_bytes(
@@ -3356,7 +3358,8 @@ TEST(SketchTest, ConstructionFloorMatchesScalarOracleAndAppend) {
     constexpr size_t threshold = size_t{24} << 20U;
     auto const multiprocessors =
         stream.device().attribute(cuda::device_attributes::multiprocessor_count);
-    auto const stride = size_t{2} * multiprocessors * cuddl::detail::shared_construction_block_size * 4U;
+    auto const stride =
+        size_t{2} * multiprocessors * cuddl::detail::shared_construction_block_size * 4U;
     // Exercise post-warm-up iterations and a partial final warp on this device.
     auto const tail_size = stride * 2U + 7U;
     for (auto const size : {size_t{0}, size_t{7}, size_t{3073}, tail_size, threshold}) {
@@ -3482,6 +3485,25 @@ TEST(ResultTest, ErrorCategoryEnumMatchesVariantOrder) {
     );
     EXPECT_EQ(cuddl::Error::resource("x").category(), cuddl::ErrorCategory::resource);
     EXPECT_EQ(cuddl::Error::invalid_argument("x").as_invalid_argument()->message, "x");
+}
+
+/// @brief Element-wise equality, which spans themselves do not offer.
+template <typename Left, typename Right>
+bool same_elements(Left const& left, Right const& right) {
+    return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin());
+}
+
+/// @brief Deterministic pseudo-random bases: two genomes differ in almost every k-mer.
+std::string random_bases(uint64_t seed, size_t length) {
+    static constexpr std::string_view alphabet = "ACGT";
+    std::string bases;
+    bases.reserve(length);
+    uint64_t state = seed;
+    for (size_t base = 0; base < length; ++base) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        bases.push_back(alphabet[(state >> 33) & 3U]);
+    }
+    return bases;
 }
 
 std::string write_tmp_fasta(std::string const& content) {
@@ -3701,7 +3723,7 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
     };
     for (size_t const staging : {size_t{64}, size_t{512}, size_t{4096}}) {
         auto built = cuddl::reference_database_file::build<25, buckets>(
-            paths, stream, 4, nullptr, true, staging
+            paths, stream, {.parser_workers = 4, .staging_bytes = staging, .pinned = true}
         );
         ASSERT_TRUE(built) << built.error().message() << " staging=" << staging;
         ASSERT_EQ(built->rows().size(), paths.size() * buckets);
@@ -3717,7 +3739,8 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
                     expected.registers.end(),
                     built->rows().begin() + i * buckets
                 )
-            ) << "staging=" << staging << " genome=" << i;
+            ) << "staging="
+              << staging << " genome=" << i;
             EXPECT_EQ(expected.saturated, built->saturation()[i])
                 << "staging=" << staging << " genome=" << i;
         }
@@ -3739,7 +3762,9 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
         oracle.pack_registers();
         for (size_t const staging : {size_t{64}, size_t{128}}) {
             auto built = cuddl::reference_database_file::build<k, 2048>(
-                std::vector<std::filesystem::path>{path}, stream, 1, nullptr, true, staging
+                std::vector<std::filesystem::path>{path},
+                stream,
+                {.parser_workers = 1, .staging_bytes = staging, .pinned = true}
             );
             ASSERT_TRUE(built) << built.error().message() << " k=" << k;
             EXPECT_EQ(oracle.saturated, built->saturation().front()) << "k=" << k;
@@ -3782,15 +3807,19 @@ TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
 
     // Both producers must agree, and both must match the scalar parser for those bases.
     ASSERT_EQ(from_records.rows().size(), from_files.rows().size());
-    EXPECT_TRUE(std::equal(
-        from_records.rows().begin(), from_records.rows().end(), from_files.rows().begin()
-    ));
+    EXPECT_TRUE(
+        std::equal(
+            from_records.rows().begin(), from_records.rows().end(), from_files.rows().begin()
+        )
+    );
     ASSERT_EQ(from_records.saturation().size(), from_files.saturation().size());
-    EXPECT_TRUE(std::equal(
-        from_records.saturation().begin(),
-        from_records.saturation().end(),
-        from_files.saturation().begin()
-    ));
+    EXPECT_TRUE(
+        std::equal(
+            from_records.saturation().begin(),
+            from_records.saturation().end(),
+            from_files.saturation().begin()
+        )
+    );
     ASSERT_EQ(from_records.names().size(), paths.size());
     EXPECT_EQ(from_records.names()[0], "a");
     EXPECT_EQ(from_records.names()[1], "c");
@@ -3799,14 +3828,153 @@ TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
         scalar_sketch<buckets> expected;
         expected.add(parsed.kmers);
         expected.pack_registers();
-        EXPECT_TRUE(std::equal(
-            expected.registers.begin(),
-            expected.registers.end(),
-            from_records.rows().begin() + genome * buckets
-        )) << "genome=" << genome;
+        EXPECT_TRUE(
+            std::equal(
+                expected.registers.begin(),
+                expected.registers.end(),
+                from_records.rows().begin() + genome * buckets
+            )
+        ) << "genome="
+          << genome;
         EXPECT_EQ(expected.saturated, from_records.saturation()[genome]);
     }
     for (auto const& path : paths) std::filesystem::remove(path);
+}
+
+TEST(QuerySketchBatchTest, ScoresMatchTheScalarOracleAndDriveASearch) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    std::string const alpha = random_bases(1, 4000);
+    std::string const beta = random_bases(2, 4000);
+    std::string const gamma = random_bases(3, 4000);
+    std::vector<std::filesystem::path> const references{
+        write_tmp_fasta(">alpha\n" + alpha + "\n"),
+        write_tmp_fasta(">beta\n" + beta + "\n"),
+        write_tmp_fasta(">gamma\n" + gamma + "\n"),
+    };
+    auto file =
+        CUDDL_UNWRAP((cuddl::reference_database_file::build<25, buckets>(references, stream)));
+    auto const database = CUDDL_UNWRAP((file.upload<25, buckets>(stream)));
+
+    // The query is beta itself, so its scores must be exactly what the scalar parser produces.
+    std::vector<std::filesystem::path> const queries{write_tmp_fasta(">beta\n" + beta + "\n")};
+    auto batch = CUDDL_UNWRAP((cuddl::query_sketch_batch<25, buckets>::sketch(queries, stream)));
+    ASSERT_EQ(batch.query_count(), 1U);
+    std::vector<uint16_t> scores(batch.scores().size());
+    cuda::copy_bytes(stream, batch.scores(), scores);
+    stream.sync();
+    scalar_sketch<buckets> query_oracle;
+    auto const parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(queries.front().string(), 25));
+    query_oracle.add(parsed.kmers);
+    query_oracle.pack_registers();
+    EXPECT_EQ(scores, query_oracle.winners);
+    EXPECT_TRUE(same_elements(batch.saturation(), (std::vector<uint32_t>{0U})));
+
+    // Searching with those scores finds the genome they came from, at no difference.
+    auto output = cuda::make_device_buffer<cuddl::reference_search_result>(
+        stream, stream.device(), database.reference_count(), cuda::no_init
+    );
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), database.single_query_workspace_bytes(), cuda::no_init
+    );
+    ASSERT_TRUE(database
+                    .search_async(
+                        batch.scores(),
+                        cuddl::query_sketch_batch<25, buckets>::compatibility(),
+                        {workspace.data(), workspace.size()},
+                        {output.data(), output.size()},
+                        stream
+                    )
+                    .has_value());
+    std::vector<cuddl::reference_search_result> hits;
+    ASSERT_TRUE(copy_device_buffer(output, hits));
+    auto const self = std::find_if(hits.begin(), hits.end(), [](auto const& hit) {
+        return hit.reference_id == 1U;
+    });
+    ASSERT_NE(self, hits.end()) << "the query's own genome is missing from the results";
+    scalar_sketch<buckets> reference_oracle;
+    reference_oracle.add(CUDDL_UNWRAP(cuddl::parse_fasta_file(references[1].string(), 25)).kmers);
+    reference_oracle.pack_registers();
+    EXPECT_EQ(self->summary.counts, query_oracle.compare(reference_oracle));
+    for (auto const& path : references) std::filesystem::remove(path);
+    std::filesystem::remove(queries.front());
+}
+
+TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    std::vector<std::filesystem::path> const paths{
+        write_tmp_fasta(">alpha\n" + random_bases(11, 3000) + "\n"),
+        write_tmp_fasta(">beta\n" + random_bases(12, 3000) + "\n"),
+    };
+    auto built = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, buckets>(paths, stream)));
+    // A store is what a build stages: one reference's registers followed by its saturation word,
+    // so adopting it is one copy for both.
+    std::vector<uint32_t> const store = [&] {
+        std::vector<uint32_t> packed(built.saturation().size() * (buckets + 1));
+        for (size_t reference = 0; reference < built.saturation().size(); ++reference) {
+            std::copy_n(
+                built.rows().begin() + reference * buckets,
+                buckets,
+                packed.begin() + reference * (buckets + 1)
+            );
+            packed[reference * (buckets + 1) + buckets] = built.saturation()[reference];
+        }
+        return packed;
+    }();
+    auto device_store = cuda::make_device_buffer<uint32_t>(stream, stream.device(), store);
+    std::vector<std::string> const labels{"alpha", "beta"};
+    auto adopted = CUDDL_UNWRAP((cuddl::reference_database_file::from_store<25, buckets>(
+        {device_store.data(), device_store.size()}, labels, stream
+    )));
+    EXPECT_EQ(adopted.metadata(), built.metadata());
+    EXPECT_TRUE(same_elements(adopted.rows(), built.rows()));
+    EXPECT_TRUE(same_elements(adopted.saturation(), built.saturation()));
+    ASSERT_EQ(adopted.names().size(), labels.size());
+    EXPECT_EQ(adopted.names()[0], labels[0]);
+    EXPECT_EQ(adopted.names()[1], labels[1]);
+
+    auto const file = paths.front().string() + ".adopted.cuddl";
+    ASSERT_TRUE(adopted.save(file));
+    auto loaded = CUDDL_UNWRAP(cuddl::reference_database_file::load(file));
+    EXPECT_TRUE(same_elements(loaded.rows(), built.rows()));
+    EXPECT_TRUE(same_elements(loaded.saturation(), built.saturation()));
+    EXPECT_EQ(loaded.names().size(), labels.size());
+
+    // Counts that do not match the rows, and labels that match neither, are refused.
+    cuddl::device_span<uint32_t const> const partial{device_store.data(), device_store.size() - 1};
+    EXPECT_FALSE(
+        (cuddl::reference_database_file::from_store<25, buckets>(partial, labels, stream))
+    );
+    EXPECT_FALSE((cuddl::reference_database_file::from_store<25, buckets>(
+        {device_store.data(), device_store.size()},
+        std::span<std::string const>{labels}.first(1),
+        stream
+    )));
+    std::filesystem::remove(file);
+    for (auto const& path : paths) std::filesystem::remove(path);
+}
+
+TEST(ReferenceDatabaseFileTest, AnExplicitZeroIsRefusedRatherThanMeaningAutomatic) {
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    std::vector<std::filesystem::path> const paths{
+        write_tmp_fasta(">alpha\n" + random_bases(21, 400) + "\n")
+    };
+    EXPECT_FALSE(
+        (cuddl::reference_database_file::build<25, buckets>(paths, stream, {.parser_workers = 0}))
+    );
+    EXPECT_FALSE(
+        (cuddl::reference_database_file::build<25, buckets>(paths, stream, {.staging_bytes = 0}))
+    );
+    EXPECT_FALSE(
+        (cuddl::query_sketch_batch<25, buckets>::sketch(paths, stream, {.staging_bytes = 0}))
+    );
+    // One loader and a small arena are ordinary values, not sentinels.
+    EXPECT_TRUE((cuddl::reference_database_file::build<25, buckets>(
+        paths, stream, {.parser_workers = 1, .staging_bytes = size_t{1} << 20}
+    )));
+    std::filesystem::remove(paths.front());
 }
 
 TEST(ReferenceDatabaseFileTest, EmptyCollectionRoundTrip) {
@@ -3903,7 +4071,9 @@ TEST(FastaTest, FastqMatchesFastaIncludingWrappedRecordsAndQualities) {
 
 TEST(FastaTest, RejectsMalformedFastq) {
     for (auto const* content : {
-             "@a\nACGT\n", "@a\nACGT\n+\n!!!", "@a\nACGT\n+\n!!!!!",
+             "@a\nACGT\n",
+             "@a\nACGT\n+\n!!!",
+             "@a\nACGT\n+\n!!!!!",
              "@a\nACGT\n+\n!!!!\n>b\nACGT\n",
          }) {
         auto const path = write_tmp_fasta(content);
@@ -3920,9 +4090,8 @@ TEST(FastaTest, ParallelFastqMatchesSerialFasta) {
         sequence += "ACGTACGTACGTACGTACGTACGTACGTACGTN";
     }
     auto const fasta = write_tmp_fasta(">a\n" + sequence + "\n");
-    auto const fastq = write_tmp_fasta(
-        "@a\n" + sequence + "\n+\n" + std::string(sequence.size(), 'A') + "\n"
-    );
+    auto const fastq =
+        write_tmp_fasta("@a\n" + sequence + "\n+\n" + std::string(sequence.size(), 'A') + "\n");
     auto const expected = cuddl::parse_fasta_file(fasta, 25, 1);
     auto const actual = cuddl::parse_fasta_file(fastq, 25, 4);
     std::remove(fasta.c_str());

@@ -5,14 +5,16 @@
 
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <vector>
 
 int main(int argc, char** argv) try {
     std::vector<std::string> references;
     std::string output;
-    unsigned threads = 0;
+    unsigned threads = std::thread::hardware_concurrency();
+    // One loader by default: run_micro_comparison.py measures ingest this way.
     unsigned workers = 1;
-    size_t staging_bytes = 0;
+    std::optional<size_t> staging_bytes;
     int copies = 1, samples = 5;
     bool parse_only = false;
     bool pinned = cuddl::default_pinned_transfer;
@@ -22,13 +24,13 @@ int main(int argc, char** argv) try {
     app.add_option("--reference", references)->required()->check(CLI::ExistingFile);
     app.add_option("--database", output, "Temporary benchmark database destination")->required();
     app.add_option(
-        "--threads", threads, "CPU oracle parser threads (--parse-only); 0 selects automatic"
+        "--threads", threads, "CPU oracle parser threads (--parse-only); defaults to all cores"
     );
-    app.add_option("--workers", workers, "Concurrent genome loaders; 0 selects automatic");
+    app.add_option("--workers", workers, "Concurrent genome loaders (default: 1)");
     app.add_option(
         "--staging-bytes",
         staging_bytes,
-        "Cap the device staging arena; 0 sizes it from the inputs and free memory"
+        "Cap the device staging arena; unset sizes it from the inputs and free memory"
     );
     app.add_option("--copies", copies, "Repeat inputs for an explicitly synthetic collection")
         ->check(CLI::Range(1, 100000));
@@ -37,10 +39,11 @@ int main(int argc, char** argv) try {
         "--parse-only", parse_only, "Time the serial CPU parser oracle, excluding GPU construction"
     );
     app.add_flag(
-        "--pinned{true},!--no-pinned{false}",
-        pinned,
-        "Transfer page-locked decompressed bytes (default), or stage from a heap buffer"
-    )->capture_default_str();
+           "--pinned{true},!--no-pinned{false}",
+           pinned,
+           "Transfer page-locked decompressed bytes (default), or stage from a heap buffer"
+    )
+        ->capture_default_str();
     app.set_config("--config", "TOML file with options, e.g. reference = [...]");
     CLI11_PARSE(app, argc, argv);
     std::vector<std::filesystem::path> paths;
@@ -64,11 +67,14 @@ int main(int argc, char** argv) try {
                     }
                 }
             } else {
-                auto file = CUDDL_UNWRAP(
-                    (cuddl::reference_database_file::build<25, 2048>(
-                        paths, stream, workers, &statistics, pinned, staging_bytes
-                    ))
-                );
+                auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(
+                    paths,
+                    stream,
+                    {.statistics = &statistics,
+                     .parser_workers = workers,
+                     .staging_bytes = staging_bytes,
+                     .pinned = pinned}
+                )));
                 CUDDL_UNWRAP(file.save(output));
             }
             timer.stop();

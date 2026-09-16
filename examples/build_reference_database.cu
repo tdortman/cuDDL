@@ -4,6 +4,7 @@
 #include <cctype>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,9 +28,9 @@ void build_database(
         throw std::invalid_argument("k must be between 1 and 31");
     }
     auto save = [&]<size_t BucketCount>() {
-        auto file = CUDDL_UNWRAP(
-            (cuddl::reference_database_file::build<K, BucketCount>(paths, stream, workers))
-        );
+        auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<K, BucketCount>(
+            paths, stream, {.parser_workers = workers}
+        )));
         CUDDL_UNWRAP(file.save(output));
     };
     switch (buckets) {
@@ -59,7 +60,7 @@ int main(int argc, char** argv) {
     std::string output = "references.cuddl";
     uint32_t k{};
     uint32_t buckets{};
-    unsigned workers = 0;
+    unsigned workers = cuddl::default_parser_workers;
     CLI::App app{
         "Build one reference sketch per FASTA/FASTQ file in a folder, recursing into "
         "subdirectories. "
@@ -74,12 +75,7 @@ int main(int argc, char** argv) {
         ->check(CLI::IsMember({2048, 4096, 8192, 16384, 32768, 65536, 131072}));
     app.add_option("-o,--output", output, "Binary database destination (replaces existing file)")
         ->default_val(output);
-    app.add_option(
-           "--workers",
-           workers,
-           "Concurrent genomes in host memory; 0 selects up to 8, 1 minimizes RAM"
-    )
-        ->default_val(workers);
+    app.add_option("--workers", workers, "Concurrent genome loaders (default: 8); 1 minimizes RAM");
     CLI11_PARSE(app, argc, argv);
 
     try {

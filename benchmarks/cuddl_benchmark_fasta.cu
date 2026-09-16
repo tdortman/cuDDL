@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
         size_t buckets = 2048;
         uint32_t runs = 5;
         uint32_t warmup = 1;
-        uint32_t threads = 0;
+        unsigned threads = std::thread::hardware_concurrency();
         app.add_option("--reference", reference, "Reference FASTA file")->required();
         app.add_option("--query", query, "Query FASTA file")->required();
         app.add_option("--k", k, "K-mer length")->check(CLI::Range(1U, 31U));
@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
         app.add_option("--backend", backend, "Backend: gpu or cpu");
         app.add_option("--runs", runs, "Number of measured runs");
         app.add_option("--warmup", warmup, "Number of untimed warm-up runs");
-        app.add_option("--threads", threads, "FASTA parse worker count (0 = all cores)");
+        app.add_option("--threads", threads, "FASTA parse worker count (default: all cores)");
         app.add_option("--output", output_path, "Output JSON path")->required();
         CLI11_PARSE(app, argc, argv);
 

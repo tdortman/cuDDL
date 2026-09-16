@@ -424,15 +424,18 @@ decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t e
     return Result<database>::ok(std::move(result));
 }
 
-
 /// @brief Multithreaded variant of @ref decode_a48_tsv.
 ///
 /// One pass discovers file-level metadata, record header blocks, and data-row spans. The first
 /// record is decoded synchronously to establish the bucket width; the remaining independent
 /// records are decoded by a fixed pool and written directly to their ordinal slots, so order and
 /// strict validation are identical to the single-threaded decoder.
-[[nodiscard]] inline Result<database>
-decode_a48_tsv_parallel(std::string_view input, uint32_t requested_threads = 0) {
+///
+/// @p requested_threads defaults to `std::thread::hardware_concurrency()`.
+[[nodiscard]] inline Result<database> decode_a48_tsv_parallel(
+    std::string_view input,
+    unsigned requested_threads = std::thread::hardware_concurrency()
+) {
     struct record_job {
         std::string header;
         std::string_view data;
@@ -530,7 +533,9 @@ decode_a48_tsv_parallel(std::string_view input, uint32_t requested_threads = 0) 
             header_block.clear();
             if (meta.offset >= 0 && !has_exponent) {
                 return Err(
-                    Error::invalid_argument("relative-encoded A48 record requires a #exponent header")
+                    Error::invalid_argument(
+                        "relative-encoded A48 record requires a #exponent header"
+                    )
                 );
             }
             auto scores = CUDDL_TRY(decode_a48_row(line, meta, exponent_bits));
@@ -569,8 +574,7 @@ decode_a48_tsv_parallel(std::string_view input, uint32_t requested_threads = 0) 
     }
 
     result.records.resize(result.records.size() + jobs.size());
-    auto const requested = requested_threads == 0U ? std::thread::hardware_concurrency()
-                                                   : requested_threads;
+    auto const requested = requested_threads;
     auto const worker_count = static_cast<size_t>(std::max(1U, requested));
     std::vector<std::thread> workers;
     std::vector<std::exception_ptr> errors(worker_count);

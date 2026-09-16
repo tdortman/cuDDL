@@ -2,6 +2,7 @@
 
 #include <cuda/std/cstdint>
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,13 +25,15 @@ using fasta_parse_result = detail::fasta_parse_result;
  * breaks the rolling window, and no k-mer spanning it is emitted. Record boundaries also reset
  * the window, without contributing to `invalid_windows`. See @ref detail::parse_fasta.
  *
- * @param threads Worker count for parallel files (0 selects
- *        `std::thread::hardware_concurrency()`); files at or below 1 MiB parse serially.
+ * @param threads Worker count for parallel files, defaulting to
+ *        `std::thread::hardware_concurrency()`; files at or below 1 MiB parse serially.
  *
  * @return Parsed k-mers and counts, or an error if the file cannot be opened.
  */
 inline Result<fasta_parse_result> parse_fasta_file(
-    std::string const& path, uint32_t k, unsigned threads = 0
+    std::string const& path,
+    uint32_t k,
+    unsigned threads = std::thread::hardware_concurrency()
 ) {
     return detail::parse_fasta(path, k, threads);
 }

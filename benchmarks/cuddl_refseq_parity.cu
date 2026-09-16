@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -584,8 +585,7 @@ int main(int argc, char** argv) {
 
         // Decode A48
         auto const t_parse_start = now_ms();
-        auto decoded =
-            cuddl::a48::decode_a48_tsv_parallel(opaque, std::thread::hardware_concurrency());
+        auto decoded = cuddl::a48::decode_a48_tsv_parallel(opaque);
         auto const t_parse_end = now_ms();
         if (!decoded) {
             throw std::runtime_error("A48 decode failed: " + decoded.error().message());

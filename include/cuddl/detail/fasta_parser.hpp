@@ -3,6 +3,7 @@
 #include <cuda/std/cstdint>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -270,15 +271,18 @@ inline void consume_byte(
  * window prefix and then consumes its segments, and the per-span results concatenate to the
  * byte-identical single-threaded output.
  *
- * @param threads Worker count for parallel files (0 selects
- *        `std::thread::hardware_concurrency()`); files at or below 1 MiB parse serially
+ * @param threads Worker count for parallel files, defaulting to
+ *        `std::thread::hardware_concurrency()`; files at or below 1 MiB parse serially
  *        regardless.
  *
  * @return A `fasta_parse_result`, or an error if the file cannot be opened, mapped, or contains
  *         bytes but no FASTA records, or malformed FASTQ records.
  */
-inline Result<fasta_parse_result>
-parse_fasta(std::string const& path, uint32_t k, unsigned threads = 0) {
+inline Result<fasta_parse_result> parse_fasta(
+    std::string const& path,
+    uint32_t k,
+    unsigned threads = std::thread::hardware_concurrency()
+) {
     auto source = CUDDL_TRY(load_fastx_sequence_file(path));
     auto& extents = source->extents;
     if (extents.empty()) return fasta_parse_result{};
@@ -304,7 +308,7 @@ parse_fasta(std::string const& path, uint32_t k, unsigned threads = 0) {
 
     unsigned worker_count = 1;
     if (total >= (uint64_t{1} << 20)) {
-        auto const available = threads > 0 ? threads : std::thread::hardware_concurrency();
+        auto const available = threads > 0 ? threads : 1U;
         worker_count = available > 0 ? available : 1U;
     }
 
