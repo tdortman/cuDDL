@@ -3,3 +3,7 @@
 # line-ending normalisation makes the build fail with "listed checksum ... has
 # changed".
 subprojects/packagefiles/rust/vendor/** -text
+
+# Meson wrap vendoring (third-party sources overlaid via packagefiles):
+# excluded from GitHub language stats.
+subprojects/** linguist-vendored=true
