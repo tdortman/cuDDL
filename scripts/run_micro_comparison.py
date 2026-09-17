@@ -34,6 +34,7 @@ fits the budget; every lane runs the same files.
 import gzip
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -1115,8 +1116,12 @@ def main(
             marks = []
             sketch_list = work / "skani-list.txt"
             sketch_list.write_text("".join(p + "\n" for p in sketch_file_args))
+            out_dir = work / "skdb"
             for rep in range(warmups + samples):
-                out_dir = work / f"skdb{rep}"
+                # One database at a time. skani sketches into this directory, and only the last
+                # rep is measured for size, so a full-corpus copy per rep only grows the work
+                # directory. Clearing it keeps each rep a real sketch rather than a reuse.
+                shutil.rmtree(out_dir, ignore_errors=True)
                 tick = time.perf_counter()
                 run(
                     [
@@ -1130,15 +1135,14 @@ def main(
                         str(threads),
                     ],
                     quiet=True,
+                    log_tail=True,
                 )
                 done = time.perf_counter()
                 if rep >= warmups:
                     marks.append((done - tick) * 1000)
             sketch_times["skani"] = marks
             sketch_bytes["skani"] = sum(
-                p.stat().st_size
-                for p in (work / f"skdb{warmups + samples - 1}").rglob("*")
-                if p.is_file()
+                p.stat().st_size for p in out_dir.rglob("*") if p.is_file()
             )
             record_sketch(
                 "skani", "cpu", marks, {"sketch_bytes": sketch_bytes["skani"]}
@@ -1798,7 +1802,7 @@ def main(
                     ] = metrics["wkid"]
 
         if "skani" in selected:
-            skdb = work / f"skdb{warmups + samples - 1}"
+            skdb = work / "skdb"
             search_out = work / "skani-search.tsv"
             marks = wall_of(
                 [
