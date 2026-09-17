@@ -78,7 +78,9 @@ class CuddlTransfer(StrEnum):
     IN_PLACE = "in-place"
 
 
-def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
+def run(
+    cmd: list[str], capture: bool = False, quiet: bool = False, log_tail: bool = False
+) -> str:
     """Runs @p cmd and returns its output when @p capture is set.
 
     @p quiet discards the command's stdout instead. A timed pass needs its time and nothing
@@ -86,9 +88,17 @@ def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
     would otherwise bury the runner's own report. Stderr stays connected so a failure is still
     readable.
     """
+    log = None
     if capture:
         stdout: object = subprocess.PIPE
         stderr: object = None
+    elif quiet and log_tail:
+        # Kept off the terminal but still kept: these tools explain a failure only on stderr, and
+        # discarding it turns a one line answer into a bisect. Only calls whose output is a short
+        # log ask for this, because the dashing2 matrix alone is quadratic in the corpus.
+        log = tempfile.TemporaryFile(mode="w+")
+        stdout = log
+        stderr = subprocess.STDOUT
     elif quiet:
         # Some tools print a per-sequence log or a whole similarity matrix on stderr as well,
         # and capturing those to report only on failure is not an option: the dashing2 matrix
@@ -103,14 +113,13 @@ def run(cmd: list[str], capture: bool = False, quiet: bool = False) -> str:
             cmd, cwd=ROOT, check=True, stdout=stdout, stderr=stderr, text=True
         )
     except subprocess.CalledProcessError as error:
-        detail = "\n".join(
-            line
-            for chunk in (error.stdout, error.stderr)
-            if chunk
-            for line in chunk.splitlines()[-15:]
-        )
+        captured = error.stdout if error.stdout else error.stderr
+        if log is not None and not captured:
+            log.seek(0)
+            captured = log.read()
+        detail = "\n".join(line for line in (captured or "").splitlines()[-15:])
         raise typer.BadParameter(
-            f"command exited {error.returncode}: {cmd[0]}\n{detail}"
+            f"command exited {error.returncode}: {' '.join(cmd)}\n{detail}"
         ) from error
     return proc.stdout if capture else ""
 
@@ -994,6 +1003,7 @@ def main(
                         str(threads),
                     ],
                     quiet=True,
+                    log_tail=True,
                 )
                 for line in chunk_tsv.read_text().splitlines():
                     if not line or line.startswith("#"):
