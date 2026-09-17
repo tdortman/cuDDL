@@ -835,15 +835,12 @@ def main(
         else:
             oracle_pairs = max_pairs
             all_pairs = max_pairs
-        # Packed ingest parses every genome into host memory: the fastest path for a small
-        # corpus, and fatal for a large one. Past a share of host memory the pipeline streams
-        # records through a device arena instead, sized from free device memory.
-        cuddl_staged_bytes = sum(sizes.get(p, 0) for p in (*references, *query_list))
-        cuddl_ingest = (
-            "sequence"
-            if cuddl_staged_bytes > _host_ram_bytes() // _RABBIT_RESIDENT_FRACTION
-            else "packed"
-        )
+        # The packed ingest parses every genome into host memory, and its footprint runs to
+        # several times the corpus: a 66 GB corpus reached 291 GB on a 384 GB host, so the
+        # share-of-RAM test that used to pick it under-estimated and the kernel OOM-killed the
+        # lane. Stream records through the device arena instead, which is sized from free
+        # device memory and does not grow with the corpus.
+        cuddl_ingest = "sequence"
         if skani_refs is None:
             # skani holds every reference sketch resident for the whole invocation, so the
             # reference side is chunked as well as the query side. Without this a full corpus
