@@ -14,7 +14,10 @@ outputs; accuracy joins against exact oracles afterwards:
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
   cuDDL runs the pipeline benchmark with threshold zero (full refinement),
   RabbitSketch its pipeline query, cub-exact its device phase, and the CLI
-  tools their native compare commands.
+  tools their native compare commands. Each lane's times cover producing the
+  pairwise results; the pipeline benchmarks' own output phases (per-genome
+  metrics and a JSON sample of match rows) are recorded beside them, never
+  counted as comparison.
 
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
 verified bit-identical against a Python oracle) and, when --skani-truth is
@@ -234,6 +237,44 @@ def count_pairs(references: list[Path], queries: list[Path], topology: str) -> i
     if topology == "all-to-all":
         return len(references) * (len(references) - 1) // 2
     return len(queries) * len(references)
+
+
+def retrieval_phases(
+    payload: dict, result_phase: str, device_phase: str | None = None
+) -> dict[str, float]:
+    """Returns a pipeline run's retrieval cost and the phases its query interval adds.
+
+    The pipeline interval carries the benchmark's own output phase: cuDDL serializes per-genome
+    metrics and a sample of match rows into a JSON DOM, RabbitSketch dumps the same shape, and
+    the DOM costs milliseconds per reference whatever the pair count is. Reporting that interval
+    as the compare or search time prices the benchmark's bookkeeping as if it compared sketches,
+    so the lanes report the phase that produced the pairwise results and record the rest beside
+    it. @p device_phase, where a tool has one, is the comparison on its own.
+    """
+    timings = payload["timings"]
+    retrieval = timings[result_phase]["median_ms"]
+    interval = timings["query_output_wall"]["median_ms"]
+    phases = {
+        "retrieval_ms": retrieval,
+        "excluded_output_ms": interval - retrieval,
+        "end_to_end_ms": timings["end_to_end_wall"]["median_ms"],
+    }
+    if device_phase is not None:
+        phases["device_search_ms"] = timings[device_phase]["median_ms"]
+    return phases
+
+
+# The phase that produces the pairwise results, per tool and topology. RabbitSketch's search is
+# host-resident, so that phase is its whole retrieval. cuDDL's equivalent is search_and_download,
+# and the phase below is its device-only part: the comparison without the result transfer.
+_RABBITS_RESULT_PHASES = {
+    "batch": "search_batch_exhaustive",
+    "all-to-all": "search_all_to_all_exhaustive",
+}
+_CUDDL_DEVICE_PHASES = {
+    "batch": "search_batch_indexed",
+    "all-to-all": "search_all_to_all_indexed",
+}
 
 
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
@@ -1644,12 +1685,16 @@ def main(
                         "ani": metrics.get("ani"),
                     }
                 )
-            query_wall = pipe["timings"]["query_output_wall"]
+            # Search and download is the index scan, the refinement and the copy of every result
+            # row to the host, which is the pairwise work a caller of the search sees. The device
+            # phase alone is the comparison; the difference is the result transfer.
+            phases = retrieval_phases(pipe, "search_and_download", _CUDDL_DEVICE_PHASES[topology])
             evaluated = pipe["metrics"].get("match_rows_total")
             record_compare(
-                "cuddl", "gpu", [query_wall["median_ms"]] * max(samples, 1), rows,
+                "cuddl", "gpu", [phases["retrieval_ms"]] * max(samples, 1), rows,
                 evaluated=evaluated,
             )
+            measurements[-1]["metrics"].update(phases)
 
         if "rabbitsketch" in selected:
             query_paths = query_list if topology == "batch" else references
@@ -1665,10 +1710,16 @@ def main(
                             "ani": metrics.get("ani"),
                         }
                     )
-            query_wall = rabbit_rows["timings"]["query_output_wall"]
-            marks = [query_wall["median_ms"]] * max(samples, 1)
+            phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
-            record_compare("rabbitsketch", "FastKMV", marks, rows, evaluated=evaluated)
+            record_compare(
+                "rabbitsketch",
+                "FastKMV",
+                [phases["retrieval_ms"]] * max(samples, 1),
+                rows,
+                evaluated=evaluated,
+            )
+            measurements[-1]["metrics"].update(phases)
 
         if "cub-exact" in selected:
             rows = [
@@ -1724,6 +1775,7 @@ def main(
             exact_rank[query] = ranked
         search_index_ms: dict[str, list[float]] = {}
         search_query_ms: dict[str, list[float]] = {}
+        search_phases: dict[str, dict[str, float]] = {}
         search_scores: dict[tuple[str, str, str], float] = {}
 
         if "cuddl" in selected:
@@ -1784,10 +1836,14 @@ def main(
                 for m in payload["measurements"]
                 if m["case"].get("measurement") == "pipeline"
             )
+            # Same counting rule as the compare lane: the query interval here also runs the
+            # benchmark's output phase, which prunes nothing when the threshold drops pairs.
+            phases = retrieval_phases(
+                pipe, "search_and_download", _CUDDL_DEVICE_PHASES[search_topology]
+            )
+            search_phases["cuddl"] = phases
             search_index_ms["cuddl"] = [pipe["timings"]["prepare_wall"]["median_ms"]]
-            search_query_ms["cuddl"] = [
-                pipe["timings"]["query_output_wall"]["median_ms"]
-            ]
+            search_query_ms["cuddl"] = [phases["retrieval_ms"]]
             for m in payload["measurements"]:
                 if m["case"].get("measurement") == "match":
                     metrics = m.get("metrics", {})
@@ -1885,7 +1941,9 @@ def main(
                             "jaccard"
                         ]
 
-        def record_search(tool: str, variant: str) -> None:
+        def record_search(
+            tool: str, variant: str, extra: dict[str, float] | None = None
+        ) -> None:
             recalls, top1 = [], 0
             counted = 0
             for query, refs in candidates.items():
@@ -1925,6 +1983,7 @@ def main(
                         "per_query_ms": (
                             statistics.median(search_query_ms[tool]) / max(counted, 1)
                         ),
+                        **(extra or {}),
                     },
                 }
             )
@@ -1939,7 +1998,7 @@ def main(
         }
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
-                record_search(tool, variants[tool])
+                record_search(tool, variants[tool], search_phases.get(tool))
 
     datasets = dataset_entries("reference", references, 8)
     datasets.update(dataset_entries("query", query_list, 8))
@@ -1974,6 +2033,19 @@ def main(
             f"{m['implementation']['name']:<14}{op:<9}{wall:>10.1f}{unit:>13.2f}"
             f"{metrics.get('jaccard_mae_vs_exact', float('nan')):>10.4f}"
             f"{metrics.get('ani_mae_vs_skani', float('nan')):>10.4f}"
+        )
+    # The pipeline lanes' query interval also runs each benchmark's own output phase. Say what
+    # is not in the numbers above it, so nobody reads it as comparison time.
+    excluded = [
+        (m["implementation"]["name"], m["metrics"]["excluded_output_ms"])
+        for m in measurements
+        if m["case"]["measurement"] == "micro-compare"
+        and "excluded_output_ms" in m["metrics"]
+    ]
+    if excluded:
+        typer.echo(
+            "excluded from the lanes above (per-genome metrics + match-row JSON): "
+            + ", ".join(f"{tool} {value:.1f}ms" for tool, value in excluded)
         )
     typer.echo(
         f"{'tool':<14}{'op':<9}{'index_ms':>10}{'query_ms':>10}{'recall@k':>10}{'top1':>10}"
