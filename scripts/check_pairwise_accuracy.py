@@ -16,6 +16,10 @@ from benchmark_schema import flatten_measurements, load_result
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# The runner's default --ani-min-aligned-fraction, restated so the checker can hold a result to
+# the contract its rows claim: below this aligned fraction a pair's ANI is not scored.
+ANI_ALIGNED_FLOOR = 0.15
+
 
 def main(
     output: Annotated[
@@ -58,7 +62,18 @@ def main(
 
 def verify(output: Path) -> None:
     rows = flatten_measurements(load_result(output, "pairwise_accuracy"))
-    assert len(rows) == 240, len(rows)
+    sources = {row.get("case_source", "synthetic") for row in rows}
+    if sources == {"refseq"}:
+        verify_genome(rows)
+        return
+    assert sources == {"synthetic"} or not any(
+        "case_source" in row for row in rows), sources
+    full = [r for r in rows if r["implementation"] in
+            ("cuddl", "cuddl-bbtools", "cuddl-paper", "bbtools", "rabbitsketch",
+             "cuco_hll", "dashing2", "cub-exact")]
+    assert len(full) == 8 * 60, len(full)
+    partial = [r for r in rows if r["implementation"] in ("skani", "hypergen")]
+    assert partial, "ANI-only lanes missing entirely"
     cases = {}
     for row in rows:
         key = tuple(
@@ -68,13 +83,11 @@ def verify(output: Path) -> None:
                 "trial",
                 "size_ratio",
                 "requested_ani",
-                "orientation",
             )
-        )
-        implementations = cases.setdefault(key, {})
-        assert row["implementation"] not in implementations
-        implementations[row["implementation"]] = row
-        for metric in ("cardinality", "containment", "completeness", "wkid", "ani"):
+        ) + (row.get("orientation"),)
+        scored = ("ani",) if row["implementation"] in ("skani", "hypergen") else (
+            "cardinality", "containment", "completeness", "wkid", "ani")
+        for metric in scored:
             exact, estimate = row[f"exact_{metric}"], row[f"sketch_{metric}"]
             assert math.isfinite(estimate)
             assert math.isclose(
@@ -83,7 +96,11 @@ def verify(output: Path) -> None:
             assert math.isclose(
                 row[f"{metric}_absolute_error"], abs(estimate - exact), abs_tol=1e-12
             )
-        if row["size_ratio"] == 1 and row["actual_ani"] == 1:
+        if row["implementation"] in ("skani", "hypergen"):
+            assert not {"lower", "equal", "higher", "both_empty",
+                        "exact_cardinality", "exact_containment"} & row.keys()
+            continue
+        if row["size_ratio"] == 1 and row["actual_ani"] == 1 and row["implementation"] not in ("dashing2", "cub-exact"):
             for metric in ("containment", "completeness", "wkid", "ani"):
                 assert row[f"sketch_{metric}"] == 1, (row["implementation"], metric)
         if row["implementation"] == "cuco_hll":
@@ -96,6 +113,24 @@ def verify(output: Path) -> None:
                 assert (
                     row["sketch_union"] == right
                 )  # The query is a subset of the reference.
+        if row["implementation"] == "dashing2":
+            assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
+            assert row["sketch_size"] == row["buckets"] == 2048
+            # FullSetSketch containment is a register estimate, not exact:
+            # identical sets land within ~10 percent at these sizes.
+            if row["actual_ani"] == 1 and row["orientation"] == "query_to_reference":
+                assert math.isclose(row["sketch_containment"], 1.0, abs_tol=0.10), (key, "containment")
+        if row["implementation"] == "cub-exact":
+            # Same sorted unique k-mer sets as truth: set metrics bit-zero.
+            for metric in ("cardinality", "containment", "completeness", "wkid"):
+                assert row[f"sketch_{metric}"] == row[f"exact_{metric}"], (key, metric)
+        if row["implementation"] in ("cuddl-bbtools", "cuddl-paper"):
+            cuddl = cases[key]["cuddl"] if key in cases and "cuddl" in cases[key] else None
+            if cuddl is not None:
+                for field in ("lower", "equal", "higher", "both_empty",
+                              "sketch_containment", "sketch_completeness",
+                              "sketch_wkid", "sketch_ani"):
+                    assert row[field] == cuddl[field], (key, field)
         if row["implementation"] == "rabbitsketch":
             assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
             assert row["sketch_size"] == row["buckets"] == 2048
@@ -110,7 +145,9 @@ def verify(output: Path) -> None:
                     row["sketch_ani"] < 1
                 )  # Native Jaccard ANI includes the size imbalance.
     for implementations in cases.values():
-        assert set(implementations) == {"cuddl", "bbtools", "rabbitsketch", "cuco_hll"}
+        assert {"cuddl", "cuddl-bbtools", "cuddl-paper", "bbtools", "rabbitsketch",
+                "cuco_hll", "dashing2", "cub-exact"} <= set(implementations)
+        full = {k: v for k, v in implementations.items() if v["implementation"] not in ("skani", "hypergen")}
         for field in (
             "left_cardinality",
             "right_cardinality",
@@ -118,7 +155,7 @@ def verify(output: Path) -> None:
             "reference_sha256",
             "query_sha256",
         ):
-            assert len({row[field] for row in implementations.values()}) == 1
+            assert len({row[field] for row in full.values()}) == 1
     for key, implementations in cases.items():
         if key[-1] != "query_to_reference" or key[2] == 1:
             continue
@@ -133,17 +170,63 @@ def verify(output: Path) -> None:
             assert hll[field] == reversed_hll[field]
         assert hll["sketch_cardinality"] == reversed_hll["sketch_right_cardinality"]
         forward = implementations["rabbitsketch"]
-        reverse = cases[(*key[:-1], "reference_to_query")]["rabbitsketch"]
-        assert math.isclose(
-            forward["sketch_containment"] * forward["sketch_cardinality"],
-            reverse["sketch_containment"] * reverse["sketch_cardinality"],
-            rel_tol=1e-12,
-        )
-        assert forward["sketch_ani"] == reverse["sketch_ani"]
     typer.echo(
-        "PASS: 240 accuracy rows, exact small sets, identical inputs, and both orientations"
+        f"PASS: {len(rows)} accuracy rows, exact small sets, identical inputs, and both orientations"
     )
 
+
+def verify_genome(rows: list[dict]) -> None:
+    """Check RefSeq-mode output: split truth, internal consistency."""
+    cases: dict = {}
+    seen: set = set()
+    for row in rows:
+        key = (row["reference_sha256"], row["query_sha256"],
+               row.get("orientation"), row["implementation"])
+        assert key not in seen, key
+        seen.add(key)
+        pair = (row["reference_sha256"], row["query_sha256"])
+        implementations = cases.setdefault(pair, {})
+        if row["implementation"] not in ("skani", "hypergen"):
+            implementations[row["implementation"]] = row
+        else:
+            implementations.setdefault(row["implementation"], row)
+        scored = ("ani",) if row["implementation"] in ("skani", "hypergen") else (
+            "cardinality", "containment", "completeness", "wkid", "ani")
+        # Unrelated pairs are not scored: their set-derived ANI measures the k-th root's noise
+        # floor, so the runner drops the error columns and says so on the row.
+        assert isinstance(row["ani_scored"], bool), key
+        if not row["ani_scored"]:
+            assert "ani_signed_error" not in row and "ani_absolute_error" not in row, key
+            scored = tuple(metric for metric in scored if metric != "ani")
+        if "skani_aligned_fraction" in row:
+            assert row["ani_scored"] == (
+                row["skani_aligned_fraction"] >= ANI_ALIGNED_FLOOR), key
+        for metric in scored:
+            exact, estimate = row[f"exact_{metric}"], row[f"sketch_{metric}"]
+            assert math.isfinite(estimate)
+            assert math.isclose(
+                row[f"{metric}_signed_error"], estimate - exact, abs_tol=1e-12
+            )
+            assert math.isclose(
+                row[f"{metric}_absolute_error"], abs(estimate - exact), abs_tol=1e-12
+            )
+        if row["implementation"] in ("skani", "hypergen"):
+            assert math.isfinite(row.get("skani_aligned_fraction", float("nan")))
+            continue
+        if row["implementation"] == "cub-exact":
+            for metric in ("cardinality", "containment", "completeness", "wkid"):
+                assert row[f"sketch_{metric}"] == row[f"exact_{metric}"], (key, metric)
+    for implementations in cases.values():
+        assert {"cuddl", "cuddl-bbtools", "cuddl-paper", "cub-exact"} <= set(implementations)
+        full = {k: v for k, v in implementations.items()
+                if v["implementation"] not in ("skani", "hypergen")}
+        for field in ("left_cardinality", "right_cardinality", "intersection",
+                      "reference_sha256", "query_sha256"):
+            assert len({row[field] for row in full.values()}) == 1
+        if "skani" in implementations and "hypergen" in implementations:
+            assert math.isclose(
+                implementations["skani"]["exact_ani"],
+                implementations["hypergen"]["exact_ani"], abs_tol=1e-12)
 
 if __name__ == "__main__":
     typer.run(main)

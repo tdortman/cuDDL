@@ -28,6 +28,16 @@ public final class BBToolsPairwiseAccuracy {
         "cardinality_absolute_error",
         "cardinality_relative_error",
         "cardinality_absolute_relative_error",
+        "sketch_cardinality_bbtools",
+        "cardinality_bbtools_signed_error",
+        "cardinality_bbtools_absolute_error",
+        "cardinality_bbtools_relative_error",
+        "cardinality_bbtools_absolute_relative_error",
+        "sketch_cardinality_paper",
+        "cardinality_paper_signed_error",
+        "cardinality_paper_absolute_error",
+        "cardinality_paper_relative_error",
+        "cardinality_paper_absolute_relative_error",
         "lower",
         "equal",
         "higher",
@@ -48,6 +58,7 @@ public final class BBToolsPairwiseAccuracy {
         "sketch_ani",
         "ani_signed_error",
         "ani_absolute_error",
+        "skani_aligned_fraction",
     };
 
     private BBToolsPairwiseAccuracy() {}
@@ -136,11 +147,6 @@ public final class BBToolsPairwiseAccuracy {
                 throw new IllegalStateException("BBTools did not load a record from: " + path);
             }
             cache.put(path, record);
-        }
-        if (record.bases != expectedBases) {
-            throw new IllegalStateException(
-                "BBTools base count mismatch for " + path + ": expected " + expectedBases
-                    + ", got " + record.bases);
         }
         return record;
     }

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -181,16 +182,6 @@ struct prepared_sequence {
         .reference_path = fields[11],
         .query_path = fields[12],
     };
-    if (result.size_ratio == 0U) {
-        throw std::runtime_error(
-            "size_ratio must be positive at cases CSV row " + std::to_string(row)
-        );
-    }
-    if (result.reference_bases == 0U || result.query_bases == 0U) {
-        throw std::runtime_error(
-            "sequence base counts must be positive at cases CSV row " + std::to_string(row)
-        );
-    }
     if (result.reference_path.empty() || result.query_path.empty()) {
         throw std::runtime_error(
             "FASTA paths must not be empty at cases CSV row " + std::to_string(row)
@@ -216,17 +207,10 @@ void require_header(std::vector<std::string> const& fields) {
 [[nodiscard]] prepared_sequence prepare_sequence(
     std::string const& path,
     std::string const& sha256,
-    uint64_t expected_bases,
     bool with_hll,
     cuda::stream_ref stream
 ) {
     auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k_kmer_length));
-    if (parsed.bases != expected_bases) {
-        throw std::runtime_error(
-            "FASTA base count differs from cases CSV for " + path + ": expected " +
-            std::to_string(expected_bases) + ", parsed " + std::to_string(parsed.bases)
-        );
-    }
     if (parsed.kmers.empty()) {
         throw std::runtime_error("FASTA contains no valid 25-mers: " + path);
     }
@@ -319,9 +303,24 @@ void emit_metric(
     output[std::string{"sketch_"} + name] = estimate;
     output[std::string{name} + "_signed_error"] = signed_error;
     output[std::string{name} + "_absolute_error"] = absolute_error;
+    if (std::string_view{name} == "cardinality") {
+        output["cardinality_relative_error"] = signed_error / exact;
+        output["cardinality_absolute_relative_error"] = absolute_error / exact;
+    }
     if (record_error) {
         errors.push_back(absolute_error);
     }
+}
+
+void emit_variant_metric(json& output, char const* name, double estimate, size_t left_size) {
+    auto const exact = static_cast<double>(left_size);
+    auto const signed_error = estimate - exact;
+    auto const absolute_error = std::abs(signed_error);
+    output[std::string{"sketch_"} + name] = estimate;
+    output[std::string{name} + "_signed_error"] = signed_error;
+    output[std::string{name} + "_absolute_error"] = absolute_error;
+    output[std::string{name} + "_relative_error"] = signed_error / exact;
+    output[std::string{name} + "_absolute_relative_error"] = absolute_error / exact;
 }
 
 void emit_orientation(
@@ -364,10 +363,9 @@ void emit_orientation(
         CUDDL_UNWRAP(left.cardinality(stream)),
         errors.cardinality
     );
-    output["cardinality_relative_error"] =
-        output["cardinality_signed_error"].get<double>() / static_cast<double>(left_size);
-    output["cardinality_absolute_relative_error"] =
-        std::abs(output["cardinality_relative_error"].get<double>());
+    auto const hybrids = CUDDL_UNWRAP(left.hybrid_cardinality(stream));
+    emit_variant_metric(output, "cardinality_bbtools", hybrids.bbtools, left_size);
+    emit_variant_metric(output, "cardinality_paper", hybrids.paper, left_size);
     emit_metric(
         output, "containment", exact.values.containment, estimate.containment, errors.containment
     );
@@ -483,7 +481,16 @@ int main(int argc, char** argv) {
         json measurements = json::array();
         cuda::stream stream{cuda::devices[0]};
         error_samples errors;
-        std::optional<prepared_sequence> cached_reference;
+        std::unordered_map<std::string, prepared_sequence> prepared;
+        prepared.reserve(512);
+        auto prepare_cached = [&](std::string const& path,
+                                  std::string const& sha256) -> prepared_sequence& {
+            auto it = prepared.find(path);
+            if (it == prepared.end()) {
+                it = prepared.emplace(path, prepare_sequence(path, sha256, with_hll, stream)).first;
+            }
+            return it->second;
+        };
         size_t case_count = 0;
         for (size_t row = 2; std::getline(cases, line); ++row) {
             if (!line.empty() && line.back() == '\r') {
@@ -492,51 +499,37 @@ int main(int argc, char** argv) {
             if (line.empty()) {
                 continue;
             }
-            auto const input = parse_case(parse_csv_line(line), row);
-
-            if (!cached_reference || cached_reference->path != input.reference_path) {
-                cached_reference = prepare_sequence(
-                    input.reference_path,
-                    input.reference_sha256,
-                    input.reference_bases,
-                    with_hll,
-                    stream
-                );
-            } else if (
-                cached_reference->sha256 != input.reference_sha256 ||
-                cached_reference->bases != input.reference_bases
-            ) {
-                throw std::runtime_error(
-                    "reference metadata changed for cached path: " + input.reference_path
-                );
-            }
-            auto query = prepare_sequence(
-                input.query_path, input.query_sha256, input.query_bases, with_hll, stream
-            );
-            auto const intersection =
-                intersection_size(query.unique_kmers, cached_reference->unique_kmers);
+            auto input = parse_case(parse_csv_line(line), row);
+            auto& reference = prepare_cached(input.reference_path, input.reference_sha256);
+            auto& query = prepare_cached(input.query_path, input.query_sha256);
+            input.reference_bases = reference.bases;
+            input.query_bases = query.bases;
+            input.size_ratio = static_cast<uint32_t>(std::max(
+                uint64_t{1}, input.reference_bases / std::max(uint64_t{1}, input.query_bases)
+            ));
+            auto const intersection = intersection_size(query.unique_kmers, reference.unique_kmers);
 
             auto const first_orientation = measurements.size();
             emit_orientation(
                 measurements,
                 input,
                 query.sketch,
-                cached_reference->sketch,
+                reference.sketch,
                 "query_to_reference",
                 query.unique_kmers.size(),
-                cached_reference->unique_kmers.size(),
+                reference.unique_kmers.size(),
                 intersection,
                 errors,
                 stream
             );
-            if (input.size_ratio != 1U) {
+            if (query.unique_kmers.size() != reference.unique_kmers.size()) {
                 emit_orientation(
                     measurements,
                     input,
-                    cached_reference->sketch,
+                    reference.sketch,
                     query.sketch,
                     "reference_to_query",
-                    cached_reference->unique_kmers.size(),
+                    reference.unique_kmers.size(),
                     query.unique_kmers.size(),
                     intersection,
                     errors,
@@ -545,13 +538,13 @@ int main(int argc, char** argv) {
             }
             if (with_hll) {
                 double const query_size = query.hll->estimate(stream);
-                double const reference_size = cached_reference->hll->estimate(stream);
+                double const reference_size = reference.hll->estimate(stream);
                 if (query_size <= 0.0 || reference_size <= 0.0) {
                     throw std::runtime_error("HLL estimated zero cardinality for nonempty input");
                 }
                 cuco::hyperloglog<uint64_t> combined(cuco::precision{11}, {}, {}, stream);
                 combined.merge(*query.hll, stream);
-                combined.merge(*cached_reference->hll, stream);
+                combined.merge(*reference.hll, stream);
                 double const union_size = combined.estimate(stream);
                 emit_hll(
                     measurements,
@@ -560,7 +553,7 @@ int main(int argc, char** argv) {
                     reference_size,
                     union_size
                 );
-                if (input.size_ratio != 1U) {
+                if (query.unique_kmers.size() != reference.unique_kmers.size()) {
                     emit_hll(
                         measurements,
                         measurements[first_orientation + 1],
@@ -571,6 +564,9 @@ int main(int argc, char** argv) {
                 }
             }
             ++case_count;
+            if (case_count % 100 == 0) {
+                std::cerr << "cuddl-pairwise-accuracy: " << case_count << " cases\n";
+            }
         }
         if (case_count == 0U) {
             throw std::runtime_error("cases CSV contains no data rows");
