@@ -53,6 +53,10 @@ struct sketch_scratch {
  * The device allocation holds `BucketCount` packed `uint32_t` registers and one aligned
  * `uint32_t` saturation flag. A separate mapped pinned-host scratch area receives small
  * synchronous results without a device-to-host copy.
+ *
+ * The sketch also counts the k-mers offered through its own add paths, and @ref cardinality and
+ * @ref hybrid_cardinality cap their estimates at that count: a sketch never reports more distinct
+ * k-mers than it was given.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch {
@@ -82,7 +86,11 @@ class sketch {
     sketch& operator=(sketch&&) noexcept = default;
 
     /// @brief Packed device registers.
+    ///
+    /// Writing through this span bypasses the add paths, so the sketch can no longer relate its
+    /// registers to an element count and forgets it.
     [[nodiscard]] device_span<register_type> data() noexcept {
+        added_ = std::nullopt;
         return {storage_.data(), BucketCount};
     }
 
@@ -101,8 +109,23 @@ class sketch {
         return K;
     }
 
+    /// @brief k-mers offered through this sketch's own add paths since the last clear.
+    ///
+    /// Every k-mer handed to @ref add_async or @ref add_sequence_async counts, duplicates
+    /// included, so this is an upper bound on the distinct k-mer count rather than an estimate of
+    /// it, and @ref cardinality caps its estimate at it. `std::nullopt` means the registers
+    /// arrived outside those paths, through @ref assign_async or a write to @ref data, so no
+    /// count describes them and the estimate stays uncapped.
+    [[nodiscard]] std::optional<uint64_t> added() const noexcept {
+        return added_;
+    }
+
     [[nodiscard]] Result<void> clear_async(cuda::stream_ref stream) const noexcept {
-        return view().clear_async(stream);
+        if (auto const result = view().clear_async(stream); !result) {
+            return result;
+        }
+        added_ = 0;
+        return {};
     }
 
     [[nodiscard]] Result<void> clear(cuda::stream_ref stream) const noexcept {
@@ -117,9 +140,11 @@ class sketch {
     /// Loads a sketch from registers produced elsewhere, for example a saved reference database or
     /// a streamed tile build. @p registers holds c BucketCount packed registers followed by the
     /// saturation word, so one copy replaces both. Nothing is cleared or merged; the sketch's
-    /// contents become exactly @p registers.
+    /// contents become exactly @p registers. The stored words carry no element count, so the
+    /// sketch forgets its own and stops capping estimates.
     [[nodiscard]] Result<void> assign_async(
-        device_span<register_type const> registers, cuda::stream_ref stream
+        device_span<register_type const> registers,
+        cuda::stream_ref stream
     ) const noexcept {
         if (registers.size() != BucketCount + 1U) {
             return Err(
@@ -127,13 +152,18 @@ class sketch {
             );
         }
         auto* const destination = storage_.data();
-        return cuda_try([&] {
-            cuda::copy_bytes(
-                stream,
-                cuda::std::span{registers.data(), registers.size()},
-                cuda::std::span{destination, BucketCount + 1U}
-            );
-        });
+        if (auto const result = cuda_try([&] {
+                cuda::copy_bytes(
+                    stream,
+                    cuda::std::span{registers.data(), registers.size()},
+                    cuda::std::span{destination, BucketCount + 1U}
+                );
+            });
+            !result) {
+            return result;
+        }
+        added_ = std::nullopt;
+        return {};
     }
 
     /// @brief Adds packed device k-mers to the existing sketch without clearing it.
@@ -141,10 +171,17 @@ class sketch {
     /// Call repeatedly to accumulate successive chunks. Empty input is a
     /// no-op. Keep input alive and unchanged until the stream completes. Use clear() to reset.
     /// When chunking raw sequence before packing, preserve the K-1 boundary bases and emit
-    /// each k-mer window exactly once; this API receives already-packed k-mers.
+    /// each k-mer window exactly once; this API receives already-packed k-mers. Every accepted
+    /// k-mer raises @ref added, unless the registers arrived outside these paths.
     [[nodiscard]] Result<void>
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
-        return view().add_async(input, stream);
+        if (auto const result = view().add_async(input, stream); !result) {
+            return result;
+        }
+        if (added_.has_value()) {
+            *added_ += input.size();
+        }
+        return {};
     }
 
     /// @brief Adds packed device k-mers without clearing, then synchronizes the stream.
@@ -165,10 +202,17 @@ class sketch {
     /// are capped at UINT32_MAX, so size must not exceed UINT32_MAX + K - 1. No hidden carry:
     /// callers supply the K-1 overlap within one record and no overlap between distinct
     /// records. No host copies. Keep input alive and unchanged until the stream completes. Use
-    /// clear() to reset.
+    /// clear() to reset. Every window the call offers raises @ref added, whether or not an
+    /// ambiguous base makes the kernel drop it, so the count stays an upper bound.
     [[nodiscard]] Result<void>
     add_sequence_async(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
-        return view().add_sequence_async(sequence, stream);
+        if (auto const result = view().add_sequence_async(sequence, stream); !result) {
+            return result;
+        }
+        if (added_.has_value() && sequence.size() >= K) {
+            *added_ += sequence.size() - K + 1;
+        }
+        return {};
     }
 
     /// @brief Adds device-resident raw ASCII bases without clearing, then synchronizes.
@@ -277,6 +321,9 @@ class sketch {
     }
 
     /// @brief Computes this sketch's hybridDDL cardinality reduction on the GPU.
+    ///
+    /// The raw estimator value, without the @ref added cap: @ref cardinality is the capped form,
+    /// and this is what a caller comparing against the estimator itself wants.
     [[nodiscard]] Result<void> cardinality_async(
         uint64_t* empty_out,
         double* estimate_out,
@@ -285,7 +332,7 @@ class sketch {
         return view().cardinality_async(empty_out, estimate_out, stream);
     }
 
-    /// @brief Host-side cardinality estimate for this sketch.
+    /// @brief Host-side cardinality estimate for this sketch, capped at @ref added.
     [[nodiscard]] Result<double> cardinality(cuda::stream_ref stream) const {
         auto* const output = &mapped_scratch_.data()->cardinality;
         if (auto const result = view().cardinality_async(&output->empty, &output->estimate, stream);
@@ -295,10 +342,13 @@ class sketch {
         if (auto const result = cuda_try([&] { stream.sync(); }); !result) {
             return Err(result.error());
         }
-        return mapped_scratch_.data()->cardinality.estimate;
+        return capped(mapped_scratch_.data()->cardinality.estimate);
     }
 
     /// @brief Experimental BBTools and paper-style HybridDDL estimates for comparison.
+    ///
+    /// `bbtools` and `paper` are the estimates and are capped at @ref added; the remaining
+    /// members are the blend's raw inputs and keep the estimator's own values.
     [[nodiscard]] Result<hybrid_cardinality_estimates> hybrid_cardinality(
         cuda::stream_ref stream
     ) const {
@@ -309,7 +359,10 @@ class sketch {
         if (auto const result = cuda_try([&] { stream.sync(); }); !result) {
             return Err(result.error());
         }
-        return mapped_scratch_.data()->hybrid;
+        auto estimates = mapped_scratch_.data()->hybrid;
+        estimates.bbtools = capped(estimates.bbtools);
+        estimates.paper = capped(estimates.paper);
+        return estimates;
     }
 
     /// @brief Watches the winner-count extraction on the GPU (caller-owned outputs).
@@ -350,6 +403,11 @@ class sketch {
         return view_type({storage_.data(), BucketCount}, storage_.data()[BucketCount]);
     }
 
+    /// @brief Caps @p estimate at @ref added, which only describes registers the add paths built.
+    [[nodiscard]] double capped(double estimate) const noexcept {
+        return added_.has_value() ? std::min(estimate, static_cast<double>(*added_)) : estimate;
+    }
+
     /// @brief One pad register after the saturation flag keeps the next allocation aligned.
     static constexpr size_t padded_prefix_words_ = BucketCount + 2U;
     static constexpr size_t allocation_words_ = padded_prefix_words_;
@@ -358,6 +416,9 @@ class sketch {
     mutable cuda::
         buffer<detail::sketch_scratch, cuda::mr::host_accessible, cuda::mr::device_accessible>
             mapped_scratch_;
+    /// k-mers this sketch's own add paths were given, absent once the registers arrive another
+    /// way; see @ref added.
+    mutable std::optional<uint64_t> added_ = 0;
 };
 
 }  // namespace cuddl

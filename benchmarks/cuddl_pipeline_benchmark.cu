@@ -1562,11 +1562,12 @@ json run(options const& opts) {
     gpu("pairwise_summary", [&](cuda::stream_ref s) { compare(s, false); });
     gpu("pairwise_summary_with_cardinality", [&](cuda::stream_ref s) { compare(s, true); });
     auto const fused = download(pair_output, stream).front();
+    // The fused summary is the raw reduction, and the sketch's own estimate is capped at the
+    // element count, so compare against the raw reduction the collection already downloaded.
+    auto const raw_cardinality = download(queries.cardinalities, stream).front();
     // The standalone reduction uses FP32; the fused summary retains FP64 accumulation.
-    if (!(fused.counts == summary.counts &&
-          std::abs(
-              fused.cardinality - CUDDL_UNWRAP(queries.sketches.front().cardinality(stream))
-          ) <= 2e-6 * std::max(1.0, fused.cardinality))) {
+    if (!(fused.counts == summary.counts && std::abs(fused.cardinality - raw_cardinality) <=
+                                                2e-6 * std::max(1.0, fused.cardinality))) {
         throw std::runtime_error("fused summary differs from separate reductions");
     }
     auto pair_metrics = metrics(fused);

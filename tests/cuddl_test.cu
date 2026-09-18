@@ -246,11 +246,29 @@ TEST(SketchTest, AssignLoadsStoredRowsAndSaturation) {
     ASSERT_TRUE(counts);
     EXPECT_EQ(counts->first, expected->first);
     EXPECT_EQ(counts->second, expected->second);
-    auto const cardinality = assigned.cardinality(stream);
-    ASSERT_TRUE(cardinality);
-    auto const original_cardinality = original.cardinality(stream);
-    ASSERT_TRUE(original_cardinality);
-    EXPECT_DOUBLE_EQ(*cardinality, *original_cardinality);
+    // The stored words carry no element count, so assign forgets it and stops capping estimates.
+    // The raw reductions are what the round-tripped registers themselves say.
+    auto assigned_raw = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
+    auto original_raw = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
+    auto empty = cuda::make_device_buffer<uint64_t>(stream, stream.device(), 2, cuda::no_init);
+    ASSERT_TRUE(assigned.cardinality_async(empty.data(), assigned_raw.data(), stream));
+    ASSERT_TRUE(original.cardinality_async(empty.data() + 1, original_raw.data(), stream));
+    std::vector<double> assigned_values;
+    std::vector<double> original_values;
+    ASSERT_TRUE(copy_device_buffer(assigned_raw, assigned_values));
+    ASSERT_TRUE(copy_device_buffer(original_raw, original_values));
+    EXPECT_DOUBLE_EQ(assigned_values.front(), original_values.front());
+    EXPECT_EQ(assigned.added(), std::nullopt);
+
+    // A sketch that took the same registers by assign and is then given one k-mer keeps no count:
+    // capping at that single addition would crush an estimate built from the assigned registers.
+    sketch_type appended(stream);
+    ASSERT_TRUE(appended.assign_async({device_words.data(), words.size()}, stream));
+    ASSERT_TRUE(appended.add(cuddl::device_span<uint64_t const>{input.data(), 1U}, stream));
+    EXPECT_EQ(appended.added(), std::nullopt);
+    auto const appended_cardinality = appended.cardinality(stream);
+    ASSERT_TRUE(appended_cardinality.has_value());
+    EXPECT_GT(*appended_cardinality, 1000.0);
 
     // A span without the trailing saturation word is rejected without touching the sketch.
     EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default}, stream));
@@ -3368,20 +3386,88 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
         if (n > 0) {
             ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
         }
-        auto const gpu_cardinality = gpu.cardinality(stream);
-        ASSERT_TRUE(gpu_cardinality.has_value());
+        // The raw reduction, not the capped estimate: this pins the estimator formula, which the
+        // oracle shares. The cap is covered by its own test.
+        auto empty = cuda::make_device_buffer<uint64_t>(stream, stream.device(), 1, cuda::no_init);
+        auto raw = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
+        ASSERT_TRUE(gpu.cardinality_async(empty.data(), raw.data(), stream).has_value());
+        std::vector<double> raw_values;
+        ASSERT_TRUE(copy_device_buffer(raw, raw_values));
+        auto const gpu_cardinality = raw_values.front();
 
         scalar_sketch<b_default> oracle;
         oracle.add(inputs);
         oracle.pack_registers();
         auto const oracle_cardinality = oracle.cardinality();
 
-        EXPECT_TRUE(std::isfinite(*gpu_cardinality));
+        EXPECT_TRUE(std::isfinite(gpu_cardinality));
         if (n == 0) {
-            EXPECT_EQ(*gpu_cardinality, 0.0);
+            EXPECT_EQ(gpu_cardinality, 0.0);
         }
-        EXPECT_NEAR(*gpu_cardinality, oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality));
+        EXPECT_NEAR(gpu_cardinality, oracle_cardinality, 1e-6 * std::max(1.0, oracle_cardinality));
     }
+}
+
+// The cap is what stops a sketch from reporting more distinct k-mers than it was given: one
+// element lands the estimator at 1.0002, and only the added count brings that back to one.
+TEST(SketchTest, CardinalityNeverExceedsTheAddedElementCount) {
+    cuda::stream stream{cuda::devices[0]};
+    auto const inputs = make_inputs(1, 0x2222'2222'2222'2222ULL);
+    auto device_inputs = cuda::make_device_buffer<uint64_t>(
+        stream, stream.device(), cuda::std::span{inputs.begin(), inputs.end()}
+    );
+    cuddl::sketch<k_default, b_default> gpu(stream);
+    EXPECT_EQ(gpu.added(), 0U);
+    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
+    EXPECT_EQ(gpu.added(), 1U);
+
+    auto empty = cuda::make_device_buffer<uint64_t>(stream, stream.device(), 1, cuda::no_init);
+    auto raw = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
+    ASSERT_TRUE(gpu.cardinality_async(empty.data(), raw.data(), stream).has_value());
+    std::vector<double> raw_values;
+    ASSERT_TRUE(copy_device_buffer(raw, raw_values));
+    EXPECT_GT(raw_values.front(), 1.0);
+
+    auto const capped = gpu.cardinality(stream);
+    ASSERT_TRUE(capped.has_value());
+    EXPECT_DOUBLE_EQ(*capped, 1.0);
+
+    // Repeating the same k-mer offers another element and no new distinct one.
+    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
+    EXPECT_EQ(gpu.added(), 2U);
+    auto const repeated = gpu.cardinality(stream);
+    ASSERT_TRUE(repeated.has_value());
+    EXPECT_LE(*repeated, 2.0);
+
+    auto const hybrids = gpu.hybrid_cardinality(stream);
+    ASSERT_TRUE(hybrids.has_value());
+    EXPECT_LE(hybrids->bbtools, 2.0);
+    EXPECT_LE(hybrids->paper, 2.0);
+
+    ASSERT_TRUE(gpu.clear(stream).has_value());
+    EXPECT_EQ(gpu.added(), 0U);
+}
+
+// A sequence add offers one window per base past the first K-1, so that is what it counts.
+TEST(SketchTest, SequenceAddsCountEveryWindowOffered) {
+    cuda::stream stream{cuda::devices[0]};
+    std::string bases;
+    while (bases.size() < 8U * k_default) bases += "ACGT";
+    auto sequence = cuda::make_device_buffer<char>(stream, stream.device(), bases);
+    cuddl::sketch<k_default, b_default> gpu(stream);
+    ASSERT_TRUE(gpu.add_sequence(sequence, stream).has_value());
+    EXPECT_EQ(gpu.added(), bases.size() - k_default + 1U);
+    auto const estimate = gpu.cardinality(stream);
+    ASSERT_TRUE(estimate.has_value());
+    ASSERT_TRUE(gpu.added().has_value());
+    EXPECT_LE(*estimate, static_cast<double>(*gpu.added()));
+    // A span shorter than one window offers nothing.
+    ASSERT_TRUE(gpu.clear(stream).has_value());
+    ASSERT_TRUE(
+        gpu.add_sequence(cuddl::device_span<char const>{sequence.data(), k_default - 1U}, stream)
+            .has_value()
+    );
+    EXPECT_EQ(gpu.added(), 0U);
 }
 
 // Truth-anchored check: the estimator's absolute value must approach the true distinct cardinality,
@@ -3794,7 +3880,11 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
     };
     for (size_t const staging : {size_t{64}, size_t{512}, size_t{4096}}) {
         auto built = cuddl::reference_database_file::build<25, buckets>(
-            paths, stream, {.parser_workers = 4, .staging_bytes = staging, .transfer = cuddl::transfer_mode::pinned}
+            paths,
+            stream,
+            {.parser_workers = 4,
+             .staging_bytes = staging,
+             .transfer = cuddl::transfer_mode::pinned}
         );
         ASSERT_TRUE(built) << built.error().message() << " staging=" << staging;
         ASSERT_EQ(built->rows().size(), paths.size() * buckets);
@@ -3835,7 +3925,9 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
             auto built = cuddl::reference_database_file::build<k, 2048>(
                 std::vector<std::filesystem::path>{path},
                 stream,
-                {.parser_workers = 1, .staging_bytes = staging, .transfer = cuddl::transfer_mode::pinned}
+                {.parser_workers = 1,
+                 .staging_bytes = staging,
+                 .transfer = cuddl::transfer_mode::pinned}
             );
             ASSERT_TRUE(built) << built.error().message() << " k=" << k;
             EXPECT_EQ(oracle.saturated, built->saturation().front()) << "k=" << k;
