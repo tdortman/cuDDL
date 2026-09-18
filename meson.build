@@ -1,7 +1,7 @@
 project(
     'cuDDL',
     ['cuda', 'cpp'],
-    version: '0.42.1',
+    version: '0.43.0',
     meson_version: '>= 1.3.0',
     default_options: [
         'warning_level=2',
