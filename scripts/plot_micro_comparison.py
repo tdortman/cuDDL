@@ -5,12 +5,11 @@
 # ///
 """Figures for micro-benchmark comparisons (operation=micro).
 
-Time figure: per-genome SKETCH wall and per-pair COMPARE wall, log scale,
-one panel each. Error figure: estimate error versus compare time, one
-panel per scored metric (Jaccard MAE against the exact lane, ANI MAE
-against skani). Tools without a metric for a panel are absent from it,
-which is itself information. Exact-zero errors plot at the floor with an
-"exact" tag.
+Nine single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+Jaccard MAE vs exact, ANI MAE vs skani, SEARCH recall and top-1, COMPARE
+truth coverage, Jaccard max error, ANI max error. Tools without a metric
+for a panel are absent from it, which is itself information. Exact-zero
+errors plot at the floor with an "exact" tag.
 """
 
 from pathlib import Path
@@ -74,7 +73,8 @@ def read_micro(path: Path) -> list[dict]:
 
 def label(row: dict) -> str:
     name = f"{row['tool']}\n{row['variant']}" if row["variant"] else row["tool"]
-    return f"{name}\nk={row['k']}"
+    key = "topk" if row["op"] == "search" else "k"
+    return f"{name}\n{key}={row['k']}"
 
 
 def main(
@@ -100,80 +100,138 @@ def main(
         if not sketch or not compare:
             raise ValueError("need both micro-sketch and micro-compare rows")
         output_dir.mkdir(parents=True, exist_ok=True)
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-        for ax, subset, title in (
-            (axes[0], sketch, "SKETCH wall total"),
-            (axes[1], compare, "COMPARE wall total"),
-            (axes[2], search, "SEARCH query wall total"),
-        ):
+
+        def save_both(fig: plt.Figure, stem: str) -> None:
+            fig.tight_layout()
+            fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
+            pu.save_figure(fig, output_dir / f"{stem}.pdf")
+
+        def time_panel(subset: list[dict], title: str, stem: str) -> None:
+            fig, ax = plt.subplots(figsize=(5.5, 4))
             if not subset:
                 ax.set_title(title + " (none)")
-                continue
-            names = [label(r) for r in subset]
-            medians = [r["wall_ms"] for r in subset]
-            lower = [max(0.0, r["wall_ms"] - r["lo_ms"]) for r in subset]
-            upper = [max(0.0, r["hi_ms"] - r["wall_ms"]) for r in subset]
-            ax.bar(names, medians, yerr=[lower, upper], capsize=3)
-            ax.set_yscale("log")
-            ax.set_ylabel("Median ms, log scale")
-            ax.set_title(title)
-            ax.tick_params(axis="x", labelrotation=20)
-        fig.tight_layout()
-        fig.savefig(output_dir / "micro_time.png", dpi=200, bbox_inches="tight")
-        pu.save_figure(fig, output_dir / "micro_time.pdf")
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-        for ax, metric, title in (
-            (axes[0], "jaccard_mae_vs_exact", "Jaccard MAE vs exact"),
-            (axes[1], "ani_mae_vs_skani", "ANI MAE vs skani"),
-        ):
+            else:
+                names = [label(r) for r in subset]
+                medians = [r["wall_ms"] for r in subset]
+                lower = [max(0.0, r["wall_ms"] - r["lo_ms"]) for r in subset]
+                upper = [max(0.0, r["hi_ms"] - r["wall_ms"]) for r in subset]
+                ax.bar(names, medians, yerr=[lower, upper], capsize=3)
+                ax.set_yscale("log")
+                ax.set_ylabel("Median ms, log scale")
+                ax.set_title(title)
+                ax.tick_params(axis="x", labelrotation=20)
+            save_both(fig, stem)
+
+        time_panel(sketch, "SKETCH wall total", "micro_time_sketch")
+        time_panel(compare, "COMPARE wall total", "micro_time_compare")
+        time_panel(search, "SEARCH query wall total", "micro_time_search")
+        def scatter_panel(metric: str, title: str, ylabel: str, stem: str) -> None:
+            fig, ax = plt.subplots(figsize=(5.5, 4.5))
             scored = [r for r in compare if r["metrics"].get(metric) is not None]
             if not scored:
                 ax.set_title(f"{title} (no tool reports it)")
-                continue
-            for row in scored:
-                value = row["metrics"][metric]
-                timed = row["metrics"].get(
-                    "per_pair_ms",
-                    row["wall_ms"] / max(row["metrics"].get("pairs", 1), 1),
-                )
-                ax.scatter(
-                    [timed],
-                    [max(value, ERROR_FLOOR)],
-                    label=f"{row['tool']} {row['variant']}".strip(),
-                    s=60,
-                )
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-            ax.set_xlabel("Compare ms per pair")
-            ax.set_ylabel("MAE, log scale (floor = exact)")
-            ax.set_title(title)
-            ax.legend(fontsize=8)
+            else:
+                for row in scored:
+                    value = row["metrics"][metric]
+                    timed = row["metrics"].get(
+                        "per_pair_ms",
+                        row["wall_ms"] / max(row["metrics"].get("pairs", 1), 1),
+                    )
+                    reported = row["metrics"].get("skani_reported_pairs")
+                    count = (
+                        f"n={reported}" if reported is not None
+                        else f"n={row['metrics'].get('pairs', 0)}"
+                    )
+                    ax.scatter(
+                        [timed],
+                        [max(value, ERROR_FLOOR)],
+                        label=f"{row['tool']} {row['variant']} {count}".strip(),
+                        s=60,
+                    )
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                ax.set_xlabel("Compare ms per pair")
+                ax.set_ylabel(ylabel)
+                ax.set_title(title)
+                ax.legend(fontsize=8)
+            save_both(fig, stem)
+
+        scatter_panel(
+            "jaccard_mae_vs_exact", "Jaccard MAE vs exact",
+            "MAE, log scale (floor = exact)", "micro_error_jaccard",
+        )
+        scatter_panel(
+            "ani_mae_vs_skani", "ANI MAE vs skani",
+            "MAE, log scale (floor = exact)", "micro_error_ani",
+        )
+
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
         if search:
-            names = [label(r) for r in search]
+            names = [
+                f"{label(r)}\nn={r['metrics'].get('queries_scored', 0)}" for r in search
+            ]
             x = range(len(search))
             width = 0.35
-            axes[2].bar(
+            ax.bar(
                 [i - width / 2 for i in x],
                 [r["metrics"].get("recall_at_k", 0.0) for r in search],
                 width,
                 label="recall@k",
             )
-            axes[2].bar(
+            ax.bar(
                 [i + width / 2 for i in x],
                 [r["metrics"].get("top1_rate", 0.0) for r in search],
                 width,
                 label="top-1",
             )
-            axes[2].set_xticks(list(x))
-            axes[2].set_xticklabels(names, rotation=20)
-            axes[2].set_ylim(0, 1.05)
-            axes[2].set_title("SEARCH recall and top-1 vs exact ranking")
-            axes[2].legend(fontsize=8)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(names, rotation=20)
+            ax.set_ylim(0, 1.05)
+            ax.set_title("SEARCH recall and top-1 vs exact ranking")
+            ax.legend(fontsize=8)
         else:
-            axes[2].set_title("SEARCH recall (no tool reports it)")
-        fig.tight_layout()
-        fig.savefig(output_dir / "micro_error.png", dpi=200, bbox_inches="tight")
-        pu.save_figure(fig, output_dir / "micro_error.pdf")
+            ax.set_title("SEARCH recall (no tool reports it)")
+        save_both(fig, "micro_search_recall")
+
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        cover_names = [label(r) for r in compare]
+        cover_x = range(len(compare))
+        cover_width = 0.35
+        ax.bar(
+            [i - cover_width / 2 for i in cover_x],
+            [
+                r["metrics"].get("skani_reported_pairs", 0)
+                / max(r["metrics"].get("pairs", 1), 1)
+                for r in compare
+            ],
+            cover_width,
+            label="ANI scored vs skani",
+        )
+        ax.bar(
+            [i + cover_width / 2 for i in cover_x],
+            [
+                (r["metrics"].get("pairs", 0) or 0)
+                / max(max(c["metrics"].get("pairs", 1) for c in compare), 1)
+                for r in compare
+            ],
+            cover_width,
+            label="pairs vs largest lane",
+        )
+        ax.set_xticks(list(cover_x))
+        ax.set_xticklabels(cover_names, rotation=20)
+        ax.set_ylim(0, 1.05)
+        ax.set_title("COMPARE truth coverage")
+        ax.legend(fontsize=8)
+        save_both(fig, "micro_compare_coverage")
+
+        scatter_panel(
+            "jaccard_max_err_vs_exact", "Jaccard max error vs exact",
+            "Max error, log scale (floor = exact)", "micro_maxerr_jaccard",
+        )
+        scatter_panel(
+            "ani_max_err_vs_skani", "ANI max error vs skani",
+            "Max error, log scale (floor = exact)", "micro_maxerr_ani",
+        )
 
         typer.echo(
             f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/skani':>10}"

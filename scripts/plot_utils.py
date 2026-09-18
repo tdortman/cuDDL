@@ -346,6 +346,21 @@ def create_legend(ax: plt.Axes, **kwargs):
     defaults.update(kwargs)
     return ax.legend(**defaults)
 
+def add_top_legend(fig, ax, *, ncol: int) -> None:
+    """Place a figure's legend above its single plot."""
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    axes_box = ax.get_position()
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        fontsize=LEGEND_FONT_SIZE,
+        loc="lower center",
+        bbox_to_anchor=((axes_box.x0 + axes_box.x1) / 2, axes_box.y1 + 0.06),
+        ncol=ncol,
+        framealpha=LEGEND_FRAME_ALPHA,
+    )
+
 
 def normalize_benchmark_name(name: str) -> str:
     """Convert benchmark name to standardized format.

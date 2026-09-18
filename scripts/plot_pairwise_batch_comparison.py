@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
 # ///
-"""Plot pairwise quality, throughput, runtime composition, and speedup separately."""
+"""Plot pairwise batched throughput, runtime composition, and speedup separately."""
 
 import math
 from pathlib import Path
@@ -14,13 +14,6 @@ import plot_utils as pu
 import typer
 from benchmark_schema import flatten_measurements, load_result
 
-QUALITY_METRICS = (
-    ("containment_absolute_error", "Containment"),
-    ("completeness_absolute_error", "Completeness"),
-    ("wkid_absolute_error", "WKID"),
-    ("ani_absolute_error", "ANI"),
-)
-SYMMETRIC_METRICS = {"wkid_absolute_error", "ani_absolute_error"}
 CUDDL = pu.FILTER_STYLES["cuddl"]
 BBTOOLS = pu.FILTER_STYLES["cuco_hll"]
 
@@ -31,29 +24,7 @@ def require(data: pd.DataFrame, columns: set[str], name: str) -> None:
         raise typer.BadParameter(f"{name} is missing columns: {', '.join(missing)}")
 
 
-def add_top_legend(fig, ax, *, ncol: int) -> None:
-    """Place this figure's legend above its single plot."""
-    fig.tight_layout(rect=(0, 0, 1, 0.88))
-    axes_box = ax.get_position()
-    handles, labels = ax.get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        fontsize=pu.LEGEND_FONT_SIZE,
-        loc="lower center",
-        bbox_to_anchor=((axes_box.x0 + axes_box.x1) / 2, axes_box.y1 + 0.06),
-        ncol=ncol,
-        framealpha=pu.LEGEND_FRAME_ALPHA,
-    )
-
-
 def main(
-    quality_json: Annotated[
-        Path,
-        typer.Argument(
-            exists=True, dir_okay=False, help="Pairwise accuracy benchmark result JSON"
-        ),
-    ],
     batch_json: Annotated[
         Path,
         typer.Argument(
@@ -64,18 +35,8 @@ def main(
         Path, typer.Option(file_okay=False, help="Figure output directory")
     ] = Path("results/pairwise-batch-comparison"),
 ) -> None:
-    """Render four standalone comparison figures from shared JSON results."""
+    """Render three standalone throughput figures from batch JSON results."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        quality_result = load_result(quality_json, "pairwise_accuracy")
-    except ValueError as error:
-        raise typer.BadParameter(f"{quality_json}: {error}") from error
-    quality = pd.DataFrame(flatten_measurements(quality_result))
-    require(
-        quality,
-        {"implementation", "orientation", *(column for column, _ in QUALITY_METRICS)},
-        "quality JSON",
-    )
     try:
         batch_result = load_result(batch_json, "pairwise_batch")
     except ValueError as error:
@@ -124,77 +85,6 @@ def main(
         thread_counts[mode] = values[0]
     thread_count = thread_counts["parallel"]
 
-    missing_implementations = {"cuddl", "bbtools"} - set(quality["implementation"])
-    if missing_implementations:
-        raise typer.BadParameter(
-            "quality JSON is missing implementations: "
-            + ", ".join(sorted(missing_implementations))
-        )
-    quality_metrics = list(QUALITY_METRICS)
-    if "cardinality_absolute_relative_error" in quality:
-        quality_metrics.insert(
-            0, ("cardinality_absolute_relative_error", "Cardinality")
-        )
-    implementations = [
-        ("cuddl", "cuDDL", CUDDL),
-        ("bbtools", "BBTools DDL", BBTOOLS),
-    ]
-    if "rabbitsketch" in set(quality["implementation"]):
-        implementations.append(
-            ("rabbitsketch", "RabbitSketch FastKMV", {"color": "#009E73"})
-        )
-    if "cuco_hll" in set(quality["implementation"]):
-        implementations.append(("cuco_hll", "cuco HLL", {"color": "#E69F00"}))
-    positions = list(range(len(quality_metrics)))
-    width = 0.8 / len(implementations)
-    fig, quality_ax = pu.setup_figure()
-    for index, (implementation, label, style) in enumerate(implementations):
-        offset = index - (len(implementations) - 1) / 2
-        selected = quality[quality["implementation"] == implementation]
-        values = [
-            (
-                selected[selected["orientation"] == "query_to_reference"]
-                if column in SYMMETRIC_METRICS
-                else selected
-            )[column].quantile(0.95)
-            * 100
-            for column, _ in quality_metrics
-        ]
-        bars = quality_ax.bar(
-            [position + offset * width for position in positions],
-            values,
-            width,
-            color=style["color"],
-            edgecolor="black",
-            linewidth=pu.BAR_EDGE_WIDTH,
-            label=label,
-        )
-        quality_ax.bar_label(
-            bars,
-            fmt="%.2f",
-            fontsize=pu.BAR_FONT_SIZE,
-            fontweight="bold",
-            padding=3,
-        )
-    quality_ax.set_xticks(
-        positions,
-        [label for _, label in quality_metrics],
-    )
-    quality_ax.set_ylim(0, quality_ax.get_ylim()[1] * 1.15)
-    pu.format_axis(
-        quality_ax,
-        xlabel="",
-        ylabel="P95 error (%)",
-        title="Estimation quality",
-        xscale=None,
-        grid=False,
-    )
-    quality_ax.tick_params(axis="both", labelsize=pu.TICK_LABEL_FONT_SIZE)
-    quality_ax.grid(axis="y", linestyle="--", alpha=pu.GRID_ALPHA)
-    add_top_legend(
-        fig, quality_ax, ncol=2 if len(implementations) == 4 else len(implementations)
-    )
-    pu.save_figure(fig, output_dir / "estimation_quality.pdf")
 
     fig, throughput_ax = pu.setup_figure()
     throughput_ax.plot(
@@ -245,7 +135,7 @@ def main(
         yscale="log",
     )
     throughput_ax.tick_params(axis="both", labelsize=pu.TICK_LABEL_FONT_SIZE)
-    add_top_legend(fig, throughput_ax, ncol=2)
+    pu.add_top_legend(fig, throughput_ax, ncol=2)
     pu.save_figure(fig, output_dir / "batched_throughput.pdf")
 
     components = pd.DataFrame(
@@ -339,7 +229,7 @@ def main(
         yscale="log",
     )
     speedup_ax.tick_params(axis="both", labelsize=pu.TICK_LABEL_FONT_SIZE)
-    add_top_legend(fig, speedup_ax, ncol=2)
+    pu.add_top_legend(fig, speedup_ax, ncol=2)
     pu.save_figure(fig, output_dir / "relative_throughput.pdf")
 
     typer.echo(

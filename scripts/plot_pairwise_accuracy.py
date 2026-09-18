@@ -25,10 +25,16 @@ METRICS = (
 def plot_comparison(data: pd.DataFrame, output_dir: Path) -> None:
     """Keep each implementation separate with common scales for each metric."""
     labels = {
-        "cuddl": "cuDDL",
+        "cuddl": "cuDDL min-MLE",
+        "cuddl_bbtools": "cuDDL BBTools",
+        "cuddl_paper": "cuDDL paper",
         "bbtools": "BBTools DDL",
         "rabbitsketch": "RabbitSketch FastKMV",
         "cuco_hll": "cuco HLL",
+        "dashing2": "Dashing2 FullSetSketch",
+        "skani": "skani",
+        "hypergen": "HyperGen",
+        "cub-exact": "cub-exact",
     }
     unknown = set(data["implementation"]) - labels.keys()
     if unknown:
@@ -55,11 +61,24 @@ def plot_comparison(data: pd.DataFrame, output_dir: Path) -> None:
         for row, name in enumerate(implementations):
             for column_index, (column, title) in enumerate(metrics):
                 ax = axes[row, column_index]
-                values = (
-                    medians.loc[(name, ratio), column]
-                    .unstack("power")
-                    .reindex(index=anis, columns=powers)
-                )
+                try:
+                    values = (
+                        medians.loc[(name, ratio), column]
+                        .unstack("power")
+                        .reindex(index=anis, columns=powers)
+                    )
+                except KeyError:
+                    values = None
+                if values is None or values.isna().all().all():
+                    ax.text(0.5, 0.5, pu.paper_text("no data"),
+                            ha="center", va="center", transform=ax.transAxes)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    if row == 0:
+                        ax.set_title(pu.paper_text(title, bold=True))
+                    if column_index == 0:
+                        ax.set_ylabel(pu.paper_text(labels[name] + "\nTarget ANI"))
+                    continue
                 if values.isna().any().any():
                     raise typer.BadParameter(
                         f"Incomplete accuracy grid for {name}, ratio {ratio}"
