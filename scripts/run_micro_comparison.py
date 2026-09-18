@@ -1645,8 +1645,10 @@ def main(
                     }
                 )
             query_wall = pipe["timings"]["query_output_wall"]
+            evaluated = pipe["metrics"].get("match_rows_total")
             record_compare(
-                "cuddl", "gpu", [query_wall["median_ms"]] * max(samples, 1), rows
+                "cuddl", "gpu", [query_wall["median_ms"]] * max(samples, 1), rows,
+                evaluated=evaluated,
             )
 
         if "rabbitsketch" in selected:
@@ -1665,7 +1667,8 @@ def main(
                     )
             query_wall = rabbit_rows["timings"]["query_output_wall"]
             marks = [query_wall["median_ms"]] * max(samples, 1)
-            record_compare("rabbitsketch", "FastKMV", marks, rows)
+            evaluated = rabbit_rows["metrics"].get("match_rows_total")
+            record_compare("rabbitsketch", "FastKMV", marks, rows, evaluated=evaluated)
 
         if "cub-exact" in selected:
             rows = [
@@ -1678,7 +1681,11 @@ def main(
                 for row in jsonlib.loads(cub_rep.read_text())["pairs"]
             ]
             record_compare(
-                "cub-exact", "gpu-exact", [cub_phases["compare"]["median_ms"]], rows
+                "cub-exact",
+                "gpu-exact",
+                [cub_phases["compare"]["median_ms"]],
+                rows,
+                evaluated=cub_compare["case"]["pairs_evaluated"],
             )
             measurements[-1]["metrics"].update(autoscale_case)
             # Report what cub kept resident, so a bounded run says whether the budget bit.
