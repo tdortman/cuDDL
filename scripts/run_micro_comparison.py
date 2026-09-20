@@ -6,7 +6,7 @@
 """Micro-benchmarks over shared fused operations (SKETCH, COMPARE).
 
 Each tool runs its native fused path and reports wall time plus native
-outputs; accuracy joins against exact oracles afterwards:
+outputs; accuracy joins against exact oracles afterwards unless --performance-only is set:
 
 - SKETCH: FASTA files to queryable sketch state. CLI tools time their
   sketch command; cuDDL times reference-database build; RabbitSketch
@@ -409,9 +409,15 @@ def main(
         str,
         typer.Option(
             help="Comma-separated tools to measure: cuddl, rabbitsketch, hypergen, skani, "
-            "dashing2, cub-exact. skani always runs, because it is the ANI truth.",
+            "dashing2, cub-exact."
         ),
     ] = DEFAULT_TOOLS,
+    performance_only: Annotated[
+        bool,
+        typer.Option(
+            help="Run only the selected tools for timings; skip truth oracles and accuracy metrics."
+        ),
+    ] = False,
     samples: Annotated[
         int,
         typer.Option(
@@ -547,6 +553,8 @@ def main(
     ] = CuddlTransfer.AUTOMATIC,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
+    if performance_only:
+        skani_truth = False
     selected = [t.strip() for t in tools.split(",") if t.strip()]
     unknown = sorted({t for t in selected if t not in TOOLS})
     if unknown:
@@ -754,7 +762,9 @@ def main(
             # the pairs, and cub-exact sorts and deduplicates each genome before any pair runs.
             # Measured that way the rate was 8.5 ms a pair where the pair phase is 0.17 ms, which
             # inflated every estimate and shrank the oracle cap to match.
-            phases = jsonlib_probe.loads((work / "probe2.json").read_text())["phases_ms"]
+            phases = jsonlib_probe.loads((work / "probe2.json").read_text())[
+                "phases_ms"
+            ]
             if probe_eval2 > 0 and "compare" in phases:
                 return phases["compare"]["median_ms"] / probe_eval2
             probe_per_pair_ms = 0.0
@@ -838,7 +848,9 @@ def main(
                     for tool, value in sorted(rates.items())
                 )
                 capacity = int(
-                    budget_secs * 1000 / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
+                    budget_secs
+                    * 1000
+                    / (samples * probe_per_pair_ms * _PAIR_BUDGET_MARGIN)
                 )
                 # An explicit query count is a decision, not a request to be second-guessed: the
                 # pairs it implies are reported below instead of being trimmed away silently.
@@ -872,7 +884,8 @@ def main(
             if capacity_pairs is not None:
                 oracle_pairs = min(oracle_pairs, capacity_pairs)
             all_pairs = 0
-            typer.echo(f"exact oracle: {oracle_pairs} of {total_pairs} pairs")
+            if need_cub and not performance_only:
+                typer.echo(f"exact oracle: {oracle_pairs} of {total_pairs} pairs")
         else:
             oracle_pairs = max_pairs
             all_pairs = max_pairs
@@ -911,7 +924,7 @@ def main(
             str(p) for p in sketch_queries if p not in sketch_references
         ]
 
-        if need_cub:
+        if need_cub and not performance_only:
             cub_oracle = work / "oracle.json"
             oracle_cmd = [str(cub), "--topology", topology, "--samples", "1"]
             oracle_cmd += cub_stash
@@ -1009,7 +1022,9 @@ def main(
                         "--separate-sketches",
                         "-l",
                         str(
-                            skani_list(work, "truth-queries", [str(p) for p in query_list])
+                            skani_list(
+                                work, "truth-queries", [str(p) for p in query_list]
+                            )
                         ),
                         "-o",
                         str(query_db),
@@ -1572,7 +1587,9 @@ def main(
             # skani compares each query against each reference. A batch run's query side is the
             # query set, not every file: putting file_args on both sides made this lane square the
             # corpus, 50256 x 50256 pairs across 4024 invocations instead of 256 x 50000.
-            compare_queries = query_list if topology == "batch" and query_list else file_args
+            compare_queries = (
+                query_list if topology == "batch" and query_list else file_args
+            )
             for ref_base in range(0, len(file_args), skani_refs):
                 ref_chunk = file_args[ref_base : ref_base + skani_refs]
                 ref_list = skani_list(work, f"compare-r-{ref_base}", ref_chunk)
@@ -1688,10 +1705,15 @@ def main(
             # Search and download is the index scan, the refinement and the copy of every result
             # row to the host, which is the pairwise work a caller of the search sees. The device
             # phase alone is the comparison; the difference is the result transfer.
-            phases = retrieval_phases(pipe, "search_and_download", _CUDDL_DEVICE_PHASES[topology])
+            phases = retrieval_phases(
+                pipe, "search_and_download", _CUDDL_DEVICE_PHASES[topology]
+            )
             evaluated = pipe["metrics"].get("match_rows_total")
             record_compare(
-                "cuddl", "gpu", [phases["retrieval_ms"]] * max(samples, 1), rows,
+                "cuddl",
+                "gpu",
+                [phases["retrieval_ms"]] * max(samples, 1),
+                rows,
                 evaluated=evaluated,
             )
             measurements[-1]["metrics"].update(phases)
@@ -1729,7 +1751,7 @@ def main(
                     "jaccard": row["jaccard"],
                     "ani": row["mash_ani"],
                 }
-                for row in jsonlib.loads(cub_rep.read_text())["pairs"]
+                for row in cub_compare["pairs"]
             ]
             record_compare(
                 "cub-exact",
@@ -1757,10 +1779,11 @@ def main(
         # exact ranking uses.
         reference_names = sorted({str(r) for r in references})
         candidates: dict[str, list[str]] = {}
-        for query in query_set:
+        for query in query_set if not performance_only else []:
             name = str(query)
             candidates[name] = [entry for entry in reference_names if entry != name]
-        n_cand = min(len(v) for v in candidates.values())
+        reference_set = set(references)
+        n_cand = min(len(references) - (q in reference_set) for q in query_set)
         if n_cand < 1:
             raise typer.BadParameter("SEARCH needs at least one candidate per query")
         k = min(recall_k, n_cand)
@@ -1968,7 +1991,7 @@ def main(
                     "case": {
                         "measurement": "micro-search",
                         "topology": topology,
-                        "queries": len(candidates),
+                        "queries": len(query_set),
                         "k": k,
                         "threads": threads,
                     },
@@ -1977,11 +2000,20 @@ def main(
                         "query": summarize(search_query_ms[tool]),
                     },
                     "metrics": {
-                        "recall_at_k": sum(recalls) / len(recalls) if recalls else 0.0,
-                        "top1_rate": top1 / counted if counted else 0.0,
-                        "queries_scored": counted,
+                        **(
+                            {
+                                "recall_at_k": sum(recalls) / len(recalls)
+                                if recalls
+                                else 0.0,
+                                "top1_rate": top1 / counted if counted else 0.0,
+                                "queries_scored": counted,
+                            }
+                            if not performance_only
+                            else {}
+                        ),
                         "per_query_ms": (
-                            statistics.median(search_query_ms[tool]) / max(counted, 1)
+                            statistics.median(search_query_ms[tool])
+                            / max(len(query_set) if performance_only else counted, 1)
                         ),
                         **(extra or {}),
                     },
