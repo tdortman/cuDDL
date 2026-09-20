@@ -1314,18 +1314,16 @@ def main(
                 d2_runs.insert(0, ("-full", sketch_file_args))
             d2_marks = {}
             d2_resident = []
-            d2_subset_rep = 0
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
                 # As with hypergen: the subset sketch only feeds cmp, so it runs once.
                 d2_reps = warmups + samples if suffix == d2_timed else 1
                 rep_marks = []
+                out_dir = work / f"d2{suffix}"
                 for rep in range(d2_reps):
-                    if rep:
-                        shutil.rmtree(work / f"d2{suffix}_{rep - 1}")
-                    out_dir = work / f"d2{suffix}_{rep}"
-                    out_dir.mkdir(exist_ok=True)
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    out_dir.mkdir()
                     tick = time.perf_counter()
                     run(
                         [
@@ -1341,6 +1339,7 @@ def main(
                             str(list_path),
                         ],
                         quiet=True,
+                        log_tail=True,
                         resident=d2_resident
                         if suffix == d2_timed and rep >= warmups
                         else [],
@@ -1636,7 +1635,7 @@ def main(
             # rectangular panel holds one row per reference and one column per query, which is
             # the same asymmetric comparison bounded by the query count. It reuses the sketch
             # cache the sketch lane filled, so the timed passes compare only.
-            d2_dir = work / f"d2_{d2_subset_rep}"
+            d2_dir = work / "d2"
             d2_dir.mkdir(exist_ok=True)
             panel_queries = query_list or references
             reference_list = work / "d2refs.txt"
