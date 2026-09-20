@@ -60,7 +60,7 @@ def main() -> None:
                 "--warmups",
                 "0",
                 "--threads",
-                "2",
+                "72" if tool == "cuddl" and topology == "all-to-all" else "2",
                 "--max-kmers",
                 "100000",
                 "--output",
@@ -71,6 +71,8 @@ def main() -> None:
                 command += ["--performance-only", "--skani-truth"]
             if topology == "batch":
                 command += ["--topology", "batch", "--query-count", "2"]
+                if tool == "cuddl":
+                    command += ["--cuddl-workers", "72"]
             result = subprocess.run(
                 command, capture_output=True, text=True, check=False
             )

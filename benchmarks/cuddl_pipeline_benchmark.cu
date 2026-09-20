@@ -1885,11 +1885,9 @@ int main(int argc, char** argv) try {
     )
         ->check(CLI::IsMember({"packed", "sequence"}));
     app.add_option(
-           "--workers",
-           opts.workers,
-           "File loading workers for --ingest sequence (leave unset for automatic)"
+           "--workers", opts.workers, "File loading workers for --ingest sequence (default: 8)"
     )
-        ->check(CLI::Range(1u, 64u));
+        ->check(CLI::PositiveNumber);
     app.add_option(
            "--resident-bytes",
            opts.resident_bytes,

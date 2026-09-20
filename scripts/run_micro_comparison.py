@@ -531,7 +531,7 @@ def main(
         int | None,
         typer.Option(
             min=1,
-            help="Loader workers for the cuDDL reference build. Unset uses the thread count, "
+            help="Loader workers for all cuDDL stages. Unset uses the thread count, "
             "which past the machine's decompression bandwidth costs instead of saving: on a "
             "24 thread desktop 8 workers built the 5000 genome corpus 18 percent faster.",
         ),
@@ -558,6 +558,8 @@ def main(
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if performance_only:
         skani_truth = False
+    if cuddl_workers is None:
+        cuddl_workers = threads
     selected = [t.strip() for t in tools.split(",") if t.strip()]
     unknown = sorted({t for t in selected if t not in TOOLS})
     if unknown:
@@ -1277,7 +1279,7 @@ def main(
                 ref_cmd += ["--reference", *file_args]
             stdout = run_timed(
                 f"cuddl sketch: reference database for {len(sketch_file_args)} genomes "
-                f"({max(samples, 2)} samples, {threads} loaders)",
+                f"({max(samples, 2)} samples, {cuddl_workers} loaders)",
                 ref_cmd
                 + [
                     "--database",
@@ -1287,7 +1289,7 @@ def main(
                     # The benchmark defaults to one loader, which gunzips and
                     # parses every genome on the calling thread.
                     "--workers",
-                    str(cuddl_workers if cuddl_workers is not None else threads),
+                    str(cuddl_workers),
                     "--transfer",
                     cuddl_transfer,
                 ],
@@ -1679,6 +1681,8 @@ def main(
                     "sparse",
                     "--minimum-matches",
                     "0",
+                    "--workers",
+                    str(cuddl_workers),
                     "--config",
                     str(cfg),
                     "--output",
@@ -1850,6 +1854,8 @@ def main(
                     "sparse",
                     "--minimum-matches",
                     str(min_matches),
+                    "--workers",
+                    str(cuddl_workers),
                     "--config",
                     str(cfg),
                     "--output",
