@@ -1,0 +1,132 @@
+diff --git a/src/emitrect.cpp b/src/emitrect.cpp
+index 0285c3d..f515fe4 100644
+--- a/src/emitrect.cpp
++++ b/src/emitrect.cpp
+@@ -1,4 +1,5 @@
+ #include "cmp_main.h"
++#include "resident.h"
+ #include "fmt/format.h"
+ #include "fmt/os.h"
+ #include <optional>
+@@ -218,6 +219,7 @@ void emit_rectangular(const Dashing2DistOptions &opts, const SketchingResult &re
+                 if(verbosity >= Verbosity::DEBUG) {
+                     std::fprintf(stderr, "Panel comparing %zd against %zd->%zd\n", i, nf, nf + nq);
+                 }
++                cuddl_resident_compare_interval resident;
+                 OMP_PFOR_DYN
+                 for(size_t j = 0; j < nq; ++j) {
+                     dat[j] = compare(opts, result, i, j + nf);
+@@ -236,6 +238,7 @@ void emit_rectangular(const Dashing2DistOptions &opts, const SketchingResult &re
+ #ifndef NDEBUG
+                 std::fill_n(dat.get(), nwritten, EMPTY);
+ #endif
++                cuddl_resident_compare_interval resident;
+                 OMP_PFOR_DYN
+                 for(size_t i = 0; i < nrow; ++i) {
+                     for(size_t j = 0; j < nq; ++j)
+diff --git a/src/resident.h b/src/resident.h
+new file mode 100644
+--- /dev/null
++++ b/src/resident.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <chrono>
++
++namespace dashing2 {
++
++void cuddl_resident_compare_add(double milliseconds);
++
++class cuddl_resident_compare_interval {
++    std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
++
++   public:
++    ~cuddl_resident_compare_interval() {
++        cuddl_resident_compare_add(
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_)
++                .count()
++        );
++    }
++};
++
++}  // namespace dashing2
+diff --git a/src/resident.cpp b/src/resident.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/resident.cpp
+@@ -0,0 +1,75 @@
++#include "resident.h"
++
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++
++namespace {
++
++class resident_timings {
++    using clock = std::chrono::steady_clock;
++
++    std::mutex mutex_;
++    size_t active_ = 0;
++    clock::time_point started_{};
++    clock::duration sketch_elapsed_{};
++    double compare_ms_ = 0;
++    bool enabled_ = false;
++    const char* path_ = nullptr;
++
++   public:
++    resident_timings() {
++        path_ = std::getenv("CUDDL_RESIDENT_TIMINGS");
++        enabled_ = path_ != nullptr && *path_ != '\0';
++    }
++
++    ~resident_timings() {
++        if (!enabled_) return;
++        std::ofstream output(path_, std::ios::trunc);
++        bool const compare = compare_ms_ > 0;
++        output << "{\"resident_ms\":"
++               << (compare ? compare_ms_
++                           : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
++               << ",\"source\":\"steady_clock_cpu_wall\",\"device\":\"cpu\",\"input\":\""
++               << (compare ? "sketches" : "sequence_ascii") << "\"}";
++    }
++
++    void enter() {
++        if (!enabled_) return;
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (active_++ == 0) started_ = clock::now();
++    }
++
++    void leave() {
++        if (!enabled_) return;
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (--active_ == 0) sketch_elapsed_ += clock::now() - started_;
++    }
++
++    void add_compare(double milliseconds) {
++        if (enabled_) compare_ms_ += milliseconds;
++    }
++};
++
++resident_timings timings;
++
++}  // namespace
++
++namespace bns {
++
++void cuddl_resident_begin() {
++    timings.enter();
++}
++void cuddl_resident_end() {
++    timings.leave();
++}
++
++}  // namespace bns
++
++namespace dashing2 {
++
++void cuddl_resident_compare_add(double milliseconds) {
++    timings.add_compare(milliseconds);
++}
++
++}  // namespace dashing2

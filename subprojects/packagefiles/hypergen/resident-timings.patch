@@ -1,0 +1,505 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,6 +2,7 @@
+ pub mod fastx_reader;
+ pub mod hd;
+ pub mod params;
++pub mod resident;
+ pub mod sketch;
+ pub mod sketch_cuda;
+ pub mod types;
+--- a/src/sketch.rs
++++ b/src/sketch.rs
+@@ -5,6 +5,7 @@
+ use needletail::{parse_fastx_file, Sequence};
+ use rayon::prelude::*;
+ 
++use crate::resident::{emit_resident_ms, ResidentClock};
+ use crate::types::*;
+ use crate::{dist, hd, utils};
+ 
+@@ -14,6 +15,7 @@
+ 
+     info!("Start sketching...");
+     let pb = utils::get_progress_bar(n_file);
++    let compute = ResidentClock::new();
+ 
+     let mut all_filesketch: Vec<FileSketch> = (0..n_file)
+         .into_iter()
+@@ -30,24 +32,32 @@
+         })
+         .collect();
+ 
+-    // Parallel sketching
++    // Parallel sketching. Input parsing stays outside the resident clock;
++    // the timed span is hash/canonicalisation over parsed bytes plus HV
++    // encode and norm. Compression and dump are storage output, untimed.
+     all_filesketch.par_iter_mut().for_each(|sketch| {
+-        // Extract kmer set from genome sequence
+-        let kmer_hash_set = extract_kmer_hash(&sketch);
++        let seqs = read_record_seqs(sketch);
+ 
+-        // Encode extracted kmer hash into sketch HV
+-        #[cfg(target_arch = "x86_64")]
+-        let hv = if is_x86_feature_detected!("avx2") {
+-            unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+-        } else {
+-            hd::encode_hash_hd(&kmer_hash_set, &sketch)
+-        };
+-        #[cfg(not(target_arch = "x86_64"))]
+-        let hv = hd::encode_hash_hd(&kmer_hash_set, &sketch);
++        let (hv, norm_2) = {
++            let _active = compute.interval();
++            let kmer_hash_set = hash_parsed_seqs(&seqs, sketch);
+ 
+-        // Pre-compute HV's norm
+-        sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
++            // Encode extracted kmer hash into sketch HV
++            #[cfg(target_arch = "x86_64")]
++            let hv = if is_x86_feature_detected!("avx2") {
++                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, sketch) }
++            } else {
++                hd::encode_hash_hd(&kmer_hash_set, sketch)
++            };
++            #[cfg(not(target_arch = "x86_64"))]
++            let hv = hd::encode_hash_hd(&kmer_hash_set, sketch);
+ 
++            // Pre-compute HV's norm
++            let norm_2 = dist::compute_hv_l2_norm(&hv);
++            (hv, norm_2)
++        };
++        sketch.hv_norm_2 = norm_2;
++
+         // Sketch HV compression
+         if params.if_compressed {
+             sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(sketch, &hv) };
+@@ -58,6 +68,12 @@
+     });
+ 
+     pb.finish_and_clear();
++    emit_resident_ms(
++        "steady_clock_cpu_wall",
++        "cpu",
++        "sequence_ascii",
++        compute.elapsed_ms(),
++    );
+ 
+     info!(
+         "Sketching {} files took {:.2}s - Speed: {:.1} files/s",
+@@ -70,20 +86,30 @@
+     utils::dump_sketch(&all_filesketch, &params.out_file);
+ }
+ 
+-fn extract_kmer_hash(sketch: &FileSketch) -> HashSet<u64> {
++// Parsed sequence bytes per record. Parsing and newline stripping live here,
++// outside the resident clock; case normalisation runs in the timed span.
++fn read_record_seqs(sketch: &FileSketch) -> Vec<Vec<u8>> {
++    let mut fastx_reader = parse_fastx_file(PathBuf::from(sketch.file_str.clone()))
++        .expect("genome file must open and parse");
++
++    let mut seqs = Vec::new();
++    while let Some(record) = fastx_reader.next() {
++        let seqrec: needletail::parser::SequenceRecord<'_> =
++            record.expect("invalid record in genome file");
++        seqs.push(seqrec.seq().into_owned());
++    }
++    seqs
++}
++
++fn hash_parsed_seqs(seqs: &[Vec<u8>], sketch: &FileSketch) -> HashSet<u64> {
+     let ksize = sketch.ksize;
+     let threshold = u64::MAX / sketch.scaled;
+     let seed = sketch.seed;
+ 
+-    let mut fastx_reader = parse_fastx_file(PathBuf::from(sketch.file_str.clone()))
+-        .expect("Opening .fna files failed");
+-
+     let mut hash_set = HashSet::<u64>::new();
+-    while let Some(record) = fastx_reader.next() {
+-        let seqrec: needletail::parser::SequenceRecord<'_> = record.expect("invalid record");
+-
++    for seq in seqs {
+         // normalize to make sure all the bases are consistently capitalized
+-        let norm_seq = seqrec.normalize(false);
++        let norm_seq = seq.as_slice().normalize(false);
+ 
+         // we make a reverse complemented copy of the sequence
+         let rc = norm_seq.reverse_complement();
+@@ -99,6 +125,7 @@
+     hash_set
+ }
+ 
++
+ // #[cfg(target_arch = "x86_64")]
+ // unsafe fn extract_kmer_hash_avx2(file: PathBuf, sketch: &mut Sketch) {
+ //     let mut fastx_reader = parse_fastx_file(&file).expect("Opening .fna files failed");
+--- a/src/sketch_cuda.rs
++++ b/src/sketch_cuda.rs
+@@ -1,8 +1,9 @@
+ use crate::types::*;
++use std::sync::Mutex;
+ 
+ #[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ use {
+-    crate::{dist, fastx_reader, hd, utils},
++    crate::{dist, fastx_reader, hd, resident::{emit_resident_ms, ResidentClock}, utils},
+     cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig},
+     cudarc::nvrtc::Ptx,
+     glob::glob,
+@@ -47,9 +48,11 @@
+ 
+     info!("Start GPU sketching...");
+     let pb = utils::get_progress_bar(n_file);
++    let compute = ResidentClock::new();
++    let gpu_submission = Mutex::new(());
+ 
+     // setup GPU device
+-    let gpu = CudaDevice::new(0).unwrap();
++    let gpu = CudaDevice::new(0).expect("CUDA device 0 must open");
+     // compile ptx
+     let ptx = Ptx::from_src(CUDA_KERNEL_MY_STRUCT);
+     gpu.load_ptx(
+@@ -57,7 +60,7 @@
+         "cuda_kernel",
+         &["cuda_kmer_bit_pack_mmhash", "cuda_kmer_t1ha2"],
+     )
+-    .unwrap();
++    .expect("hypergen PTX must load");
+     let gpu = &gpu;
+ 
+     let mut all_filesketch: Vec<FileSketch> = (0..n_file)
+@@ -75,28 +78,57 @@
+         })
+         .collect();
+ 
+-    // start cuda sketching
++    // HYBRID: GPU hashes raw sequence, CPU dedups + HV encodes. Parsing and
++    // transfers stay outside the resident clock; the timed span is GPU kernel
++    // execution plus CPU HashSet insert, HV encode, and norm. The host wall
++    // interval union covers overlap across parallel workers.
+     all_filesketch.par_iter_mut().for_each(|sketch| {
+         // NOTE: this is the important call to have
+         // without this, you'll get a CUDA_ERROR_INVALID_CONTEXT
+-        gpu.bind_to_thread().unwrap();
++        gpu.bind_to_thread().expect("CUDA context must bind to worker thread");
+ 
+-        // Extract kmer set from genome sequence
+-        let kmer_hash_set = extract_kmer_t1ha2_cuda(&sketch, gpu);
++        // Parse input outside the timed span.
++        let fna_file = PathBuf::from(sketch.file_str.clone());
++        let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
++        let host_kmer_hash = {
++            // One worker owns the shared stream from upload through download, so
++            // transfers from another worker cannot enter the timed kernel span.
++            let _gpu_submission = gpu_submission
++                .lock()
++                .expect("GPU submission mutex poisoned by panicked worker");
++            let staged = stage_gpu_hash_input(sketch, &fna_seqs, gpu);
++            let _active = compute.interval();
++            run_gpu_hash_kernel(&staged, gpu);
++            drop(_active);
++            gpu.dtoh_sync_copy(&staged.gpu_kmer_hash)
++                .expect("hash output must return to host")
++        };
++        let kmer_hash_set = {
++            let _active = compute.interval();
++            host_kmer_hash
++                .into_iter()
++                .filter(|hash| *hash != 0)
++                .collect::<HashSet<_>>()
++        };
+ 
+         // Encode extracted kmer hash into sketch HV
+-        #[cfg(target_arch = "x86_64")]
+-        let hv = if is_x86_feature_detected!("avx2") {
+-            unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+-        } else {
+-            hd::encode_hash_hd(&kmer_hash_set, &sketch)
++        let (hv, norm_2) = {
++            let _active = compute.interval();
++            #[cfg(target_arch = "x86_64")]
++            let hv = if is_x86_feature_detected!("avx2") {
++                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, sketch) }
++            } else {
++                hd::encode_hash_hd(&kmer_hash_set, sketch)
++            };
++            #[cfg(not(target_arch = "x86_64"))]
++            let hv = hd::encode_hash_hd(&kmer_hash_set, sketch);
++
++            // Pre-compute HV's norm
++            let norm_2 = dist::compute_hv_l2_norm(&hv);
++            (hv, norm_2)
+         };
+-        #[cfg(not(target_arch = "x86_64"))]
+-        let hv = hd::encode_hash_hd(&kmer_hash_set, &sketch);
++        sketch.hv_norm_2 = norm_2;
+ 
+-        // Pre-compute HV's norm
+-        sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
+-
+         // Sketch HV compression
+         if params.if_compressed {
+             sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(sketch, &hv) };
+@@ -107,6 +139,12 @@
+     });
+ 
+     pb.finish_and_clear();
++    emit_resident_ms(
++        "steady_clock_hybrid_wall",
++        "hybrid",
++        "sequence_ascii",
++        compute.elapsed_ms(),
++    );
+ 
+     info!(
+         "Sketching {} files took {:.2}s - Speed: {:.1} files/s",
+@@ -119,11 +157,25 @@
+     utils::dump_sketch(&all_filesketch, &params.out_file);
+ }
+ 
++struct StagedGpuHashInput {
++    n_bps: usize,
++    kmer_per_thread: usize,
++    n_hash_per_thread: usize,
++    n_threads: usize,
++    ksize: usize,
++    threshold: u64,
++    seed: u64,
++    canonical: bool,
++    gpu_seq: cudarc::driver::CudaSlice<u8>,
++    gpu_kmer_hash: cudarc::driver::CudaSlice<u64>,
++}
++
+ #[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+-fn extract_kmer_t1ha2_cuda(sketch: &FileSketch, gpu: &Arc<CudaDevice>) -> HashSet<u64> {
+-    let fna_file = PathBuf::from(sketch.file_str.clone());
+-    let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
+-
++fn stage_gpu_hash_input(
++    sketch: &FileSketch,
++    fna_seqs: &[u8],
++    gpu: &Arc<CudaDevice>,
++) -> StagedGpuHashInput {
+     let n_bps = fna_seqs.len();
+     let ksize = sketch.ksize as usize;
+     let canonical = sketch.canonical;
+@@ -134,38 +186,56 @@
+     let n_threads = (n_kmers + kmer_per_thread - 1) / kmer_per_thread;
+ 
+     // copy to GPU
+-    let gpu_seq = gpu.htod_copy(fna_seqs).unwrap();
++    let gpu_seq = gpu
++        .htod_copy(fna_seqs.to_vec())
++        .expect("sequence bytes must reach the device");
+     // allocate 4x more space that expected
+     let n_hash_per_thread = max(kmer_per_thread / sketch.scaled as usize * 4, 8);
+     let n_hash_array = n_hash_per_thread * n_threads;
+-    let gpu_kmer_hash = gpu.alloc_zeros::<u64>(n_hash_array).unwrap();
++    let gpu_kmer_hash = gpu
++        .alloc_zeros::<u64>(n_hash_array)
++        .expect("hash output must allocate on the device");
++    gpu.synchronize()
++        .expect("staged upload must complete before the timed span");
+ 
+-    // execute kernel
+-    let config = LaunchConfig::for_num_elems(n_threads as u32);
+-    let params = (
+-        &gpu_seq,
++    StagedGpuHashInput {
+         n_bps,
+         kmer_per_thread,
+         n_hash_per_thread,
++        n_threads,
+         ksize,
+-        u64::MAX / scaled,
++        threshold: u64::MAX / scaled,
+         seed,
+         canonical,
+-        &gpu_kmer_hash,
+-    );
+-    let f = gpu.get_func("cuda_kernel", "cuda_kmer_t1ha2").unwrap();
+-    unsafe { f.launch(config, params) }.unwrap();
+-
+-    let host_kmer_hash = gpu.sync_reclaim(gpu_kmer_hash).unwrap();
+-
+-    let mut kmer_hash_set = HashSet::<u64>::new();
+-    for h in host_kmer_hash {
+-        if h != 0 {
+-            kmer_hash_set.insert(h);
+-        }
++        gpu_seq,
++        gpu_kmer_hash,
+     }
++}
+ 
+-    kmer_hash_set
++#[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
++fn run_gpu_hash_kernel(
++    staged: &StagedGpuHashInput,
++    gpu: &Arc<CudaDevice>,
++) {
++    // execute kernel
++    let config = LaunchConfig::for_num_elems(staged.n_threads as u32);
++    let params = (
++        &staged.gpu_seq,
++        staged.n_bps,
++        staged.kmer_per_thread,
++        staged.n_hash_per_thread,
++        staged.ksize,
++        staged.threshold,
++        staged.seed,
++        staged.canonical,
++        &staged.gpu_kmer_hash,
++    );
++    let f = gpu
++        .get_func("cuda_kernel", "cuda_kmer_t1ha2")
++        .expect("t1ha2 kernel must be loaded");
++    unsafe { f.launch(config, params) }.expect("t1ha2 kernel must launch");
++    gpu.synchronize()
++        .expect("kernel must complete inside the timed span");
+ }
+ 
+ #[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+--- a/src/dist.rs
++++ b/src/dist.rs
+@@ -1,11 +1,11 @@
+ use crate::hd;
++use crate::resident::{emit_resident_ms, ResidentClock};
+ use crate::types::*;
+ use crate::utils;
+ use std::time::Instant;
+ 
+ use log::info;
+ use rayon::prelude::*;
+-
+ #[cfg(target_arch = "x86_64")]
+ use std::arch::x86_64::*;
+ 
+@@ -249,6 +249,7 @@
+     };
+ 
+     let pb = utils::get_progress_bar(num_dists);
++    let compute = ResidentClock::new();
+ 
+     let mut cnt = 0;
+     let mut index_dist = vec![(0, 0); num_dists];
+@@ -272,13 +273,16 @@
+         .par_iter_mut()
+         .zip(index_dist)
+         .for_each(|(file_ani_pair, ind)| {
+-            let ani = compute_pairwise_ani(
+-                &ref_filesketch[ind.0].hv,
+-                ref_filesketch[ind.0].hv_norm_2,
+-                &query_filesketch[ind.1].hv,
+-                query_filesketch[ind.1].hv_norm_2,
+-                ksize,
+-            );
++            let ani = {
++                let _active = compute.interval();
++                compute_pairwise_ani(
++                    &ref_filesketch[ind.0].hv,
++                    ref_filesketch[ind.0].hv_norm_2,
++                    &query_filesketch[ind.1].hv,
++                    query_filesketch[ind.1].hv_norm_2,
++                    ksize,
++                )
++            };
+ 
+             *file_ani_pair = (
+                 (
+@@ -293,4 +297,10 @@
+         });
+ 
+     pb.finish_and_clear();
++    emit_resident_ms(
++        "steady_clock_cpu_wall",
++        "cpu",
++        "sketches",
++        compute.elapsed_ms(),
++    );
+ }
+--- /dev/null
++++ b/src/resident.rs
+@@ -0,0 +1,82 @@
++use std::fs;
++use std::sync::Mutex;
++use std::time::Instant;
++
++/// Union of active compute intervals across parallel workers.
++///
++/// Wall time, never summed thread-seconds: the clock runs while at least one
++/// worker holds an interval and banks the span when the last holder drops.
++pub struct ResidentClock {
++    inner: Mutex<ResidentInner>,
++}
++
++struct ResidentInner {
++    active: usize,
++    started: Option<Instant>,
++    elapsed_ms: f64,
++}
++
++/// RAII guard banking one active compute span on drop.
++pub struct ResidentInterval<'a> {
++    clock: &'a ResidentClock,
++}
++
++impl ResidentClock {
++    pub fn new() -> Self {
++        Self {
++            inner: Mutex::new(ResidentInner {
++                active: 0,
++                started: None,
++                elapsed_ms: 0.0,
++            }),
++        }
++    }
++
++    pub fn interval(&self) -> ResidentInterval<'_> {
++        let mut inner = self
++            .inner
++            .lock()
++            .expect("resident clock mutex poisoned by panicked worker");
++        if inner.active == 0 {
++            inner.started = Some(Instant::now());
++        }
++        inner.active += 1;
++        ResidentInterval { clock: self }
++    }
++
++    pub fn elapsed_ms(&self) -> f64 {
++        self.inner
++            .lock()
++            .expect("resident clock mutex poisoned by panicked worker")
++            .elapsed_ms
++    }
++}
++
++impl<'a> Drop for ResidentInterval<'a> {
++    fn drop(&mut self) {
++        let mut inner = self
++            .clock
++            .inner
++            .lock()
++            .expect("resident clock mutex poisoned by panicked worker");
++        inner.active -= 1;
++        if inner.active == 0 {
++            if let Some(started) = inner.started.take() {
++                inner.elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
++            }
++        }
++    }
++}
++
++/// Best-effort resident timing report for the micro-benchmark runner.
++/// No-op unless CUDDL_RESIDENT_TIMINGS names an output path.
++pub fn emit_resident_ms(source: &str, device: &str, input: &str, resident_ms: f64) {
++    let path = match std::env::var("CUDDL_RESIDENT_TIMINGS") {
++        Ok(path) if !path.is_empty() => path,
++        _ => return,
++    };
++    let payload = format!(
++        "{{\"resident_ms\":{resident_ms},\"source\":\"{source}\",\"device\":\"{device}\",\"input\":\"{input}\"}}"
++    );
++    fs::write(path, payload).expect("resident timing sidecar must write");
++}

@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <nvbench/nvbench.cuh>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -65,6 +66,8 @@ int main(int argc, char** argv) try {
     }
     cuda::stream stream{cuda::devices[0]};
     cuddl::reference_build_statistics statistics;
+    std::vector<double> resident_ms;
+    int invocation = -1;
     auto run = [&](nvbench::state& state, nvbench::type_list<>) {
         state.exec(nvbench::exec_tag::timer, [&](nvbench::launch&, auto& timer) {
             timer.start();
@@ -76,6 +79,8 @@ int main(int argc, char** argv) try {
                     }
                 }
             } else {
+                statistics = {};
+                statistics.measure_resident = true;
                 auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(
                     paths,
                     stream,
@@ -87,6 +92,9 @@ int main(int argc, char** argv) try {
                 CUDDL_UNWRAP(file.save(output));
             }
             timer.stop();
+            if (invocation++ >= 0) {
+                if (!parse_only) resident_ms.push_back(statistics.resident_compute_ms);
+            }
         });
     };
     nvbench::benchmark<decltype(run)> benchmark(run);
@@ -107,12 +115,33 @@ int main(int argc, char** argv) try {
         }
     }
     auto const median = state.get_summary("nv/cpu_only/time/cpu/median").get_float64("value");
-    std::cout << nlohmann::json{
+    auto const minimum = state.get_summary("nv/cpu_only/time/cpu/min").get_float64("value");
+    auto const maximum = state.get_summary("nv/cpu_only/time/cpu/max").get_float64("value");
+    auto summarize = [](std::vector<double> values, std::string const& source) {
+        std::sort(values.begin(), values.end());
+        auto const middle = values.size() / 2;
+        auto const median_ms =
+            values.size() % 2 != 0 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+        return nlohmann::json{
+            {"samples", values.size()},
+            {"median_ms", median_ms},
+            {"min_ms", values.front()},
+            {"max_ms", values.back()},
+            {"source", source},
+        };
+    };
+    nlohmann::json report{
         {"stage", parse_only ? "parse" : "build-and-save"},
         {"source", "nvbench_cpu_wall"},
-        {"references", paths.size()}, {"input_paths", references}, {"copies", copies},
-        {"input_bytes", bytes}, {"parser_threads", threads}, {"parser_workers", workers}, {"samples", samples},
-        {"median_seconds", median}, {"input_MB_per_second", bytes / median / 1e6},
+        {"references", paths.size()},
+        {"input_paths", references},
+        {"copies", copies},
+        {"input_bytes", bytes},
+        {"parser_threads", threads},
+        {"parser_workers", workers},
+        {"samples", samples},
+        {"median_seconds", median},
+        {"input_MB_per_second", bytes / median / 1e6},
         {"direct_bytes", statistics.direct_bytes},
         {"staged_bytes", statistics.staged_bytes},
         {"direct_chunks", statistics.direct_chunks},
@@ -124,7 +153,16 @@ int main(int argc, char** argv) try {
         {"staging_bytes", statistics.staging_bytes},
         {"batches", statistics.batches},
         {"transfers", statistics.transfers}
-    }.dump(2) << '\n';
+    };
+    report["wall"] = {
+        {"samples", samples},
+        {"median_ms", median * 1000},
+        {"min_ms", minimum * 1000},
+        {"max_ms", maximum * 1000},
+        {"source", "nvbench_cpu_wall"},
+    };
+    if (!parse_only) report["resident"] = summarize(resident_ms, "cuda_events");
+    std::cout << report.dump(2) << '\n';
 } catch (std::exception const& error) {
     std::cerr << "Error: " << error.what() << '\n';
     return 1;

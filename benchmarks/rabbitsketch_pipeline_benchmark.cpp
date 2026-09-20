@@ -14,10 +14,12 @@
 #include <utility>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <vector>
 
@@ -162,11 +164,58 @@ collection construct(records const& files, api::SketchConfig const& cfg) {
     });
 }
 
-collection build_files(std::vector<std::string> const& paths, api::SketchConfig const& cfg) {
-    return build_parallel(paths.size(), [&](size_t i) {
-        auto built = api::buildFastxFiles({paths[i]}, {cfg});
+// The union of worker compute intervals is wall time, not summed thread-seconds.
+struct resident_compute_clock {
+    using clock = std::chrono::steady_clock;
+    std::mutex mutex;
+    size_t active = 0;
+    clock::time_point started;
+    clock::duration elapsed{};
+
+    struct interval {
+        resident_compute_clock& owner;
+        explicit interval(resident_compute_clock& value) : owner(value) {
+            std::scoped_lock lock{owner.mutex};
+            if (owner.active++ == 0) owner.started = clock::now();
+        }
+        ~interval() {
+            std::scoped_lock lock{owner.mutex};
+            if (--owner.active == 0) owner.elapsed += clock::now() - owner.started;
+        }
+    };
+};
+
+collection build_files(
+    std::vector<std::string> const& paths,
+    api::SketchConfig const& cfg,
+    double& resident_ms
+) {
+    resident_compute_clock compute;
+    auto result = build_parallel(paths.size(), [&](size_t i) {
+        std::optional<api::MultiSketchBuilder> builder;
+        {
+            resident_compute_clock::interval interval{compute};
+            builder.emplace(std::vector<api::SketchConfig>{cfg});
+        }
+        Sketch::IO::FastxReader reader(paths[i]);
+        Sketch::IO::FastxRecord record;
+        while (reader.next(record)) {
+            resident_compute_clock::interval interval{compute};
+            builder->update(record);
+        }
+        auto label = paths[i].substr(paths[i].find_last_of("/\\") + 1);
+        std::replace_if(
+            label.begin(),
+            label.end(),
+            [](char c) { return c == '\t' || c == '\r' || c == '\n' || c == '\0'; },
+            '_'
+        );
+        resident_compute_clock::interval interval{compute};
+        auto built = builder->finish(label, paths[i], std::string{});
         return std::move(built.at(0));
     });
+    resident_ms += std::chrono::duration<double, std::milli>(compute.elapsed).count();
+    return result;
 }
 
 struct match {
@@ -816,12 +865,10 @@ json run(options const& opts) {
     uint64_t const all_to_all_pairs =
         reference_count > 1 ? uint64_t{reference_count} * (reference_count - 1) / 2 : 0;
 
-    auto build_queries = [&] {
-        return build_files(opts.queries, cfg);
-    };
     // The untimed run warms input caches and checks file ingest against record construction.
-    auto refs = build_files(opts.references, cfg);
-    auto queries = build_queries();
+    double setup_resident_ms = 0;
+    auto refs = build_files(opts.references, cfg, setup_resident_ms);
+    auto queries = build_files(opts.queries, cfg, setup_resident_ms);
     auto const searched = search(refs, queries, all, opts.match_rows);
     auto const& matches = searched.matches;
     size_t const match_rows_emitted = matches.size();
@@ -848,15 +895,22 @@ json run(options const& opts) {
         }
     }
 
+    std::vector<double> resident_sketch_ms;
+    resident_sketch_ms.reserve(opts.samples);
+    int prepare_sample = -opts.warmups;
     json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
-        auto r = build_files(opts.references, cfg);
-        auto q = build_queries();
+        double resident_ms = 0;
+        auto r = build_files(opts.references, cfg, resident_ms);
+        auto q = build_files(opts.queries, cfg, resident_ms);
         mark();
         auto hits = search(r, q, all, opts.match_rows);
         auto output = measurements(r, q, hits.matches).dump();
         consumed_size = output.size();
         mark();
+        if (prepare_sample++ >= 0) resident_sketch_ms.push_back(resident_ms);
     });
+    timings["resident_sketch"] = summarize_replays(std::move(resident_sketch_ms));
+    timings["resident_sketch"]["source"] = "steady_clock_cpu_wall";
     // The record and packed-input stages materialize the whole corpus, so a streamed run skips
     // them. RabbitSketch's own file ingest is the bounded path.
     if (!streamed) {
@@ -874,6 +928,8 @@ json run(options const& opts) {
         auto hits = search(refs, queries, all, opts.match_rows);
         consumed_size = hits.matches.size();
     });
+    timings["resident_compare"] =
+        timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"];
     timings["metrics_and_serialize"] = measure(opts, [&] {
         auto output = measurements(refs, queries, matches).dump();
         consumed_size = output.size();

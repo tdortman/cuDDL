@@ -1,0 +1,66 @@
+diff --git a/include/bonsai/encoder.h b/include/bonsai/encoder.h
+--- a/include/bonsai/encoder.h
++++ b/include/bonsai/encoder.h
+@@ -25,4 +25,16 @@
+ namespace bns {
+ using namespace sketch;
+ 
++void cuddl_resident_begin();
++void cuddl_resident_end();
++
++struct cuddl_resident_scope {
++    cuddl_resident_scope() {
++        cuddl_resident_begin();
++    }
++    ~cuddl_resident_scope() {
++        cuddl_resident_end();
++    }
++};
++
+ 
+@@ -394,7 +406,11 @@ public:
+     }
+     template<typename Functor>
+     INLINE void for_each_hash(const Functor &func, kseq_t *ks) {
+-        while(kseq_read(ks) >= 0) assign(ks), for_each_hash<Functor>(func, ks->seq.s, ks->seq.l);
++        while(kseq_read(ks) >= 0) {
++            cuddl_resident_scope resident;
++            assign(ks);
++            for_each_hash<Functor>(func, ks->seq.s, ks->seq.l);
++        }
+     }
+     template<typename Functor>
+     void for_each_hash(const Functor &func, gzFile fp, kseq_t *ks=nullptr) {
+@@ -442,17 +458,29 @@ public:
+     }
+     template<typename Functor>
+     INLINE void for_each(const Functor &func, kseq_t *ks) {
+-        while(kseq_read(ks) >= 0) assign(ks), for_each<Functor>(func, ks->seq.s, ks->seq.l);
++        while(kseq_read(ks) >= 0) {
++            cuddl_resident_scope resident;
++            assign(ks);
++            for_each<Functor>(func, ks->seq.s, ks->seq.l);
++        }
+     }
+     template<typename Functor>
+     INLINE void for_each_canon(const Functor &func, kseq_t *ks) {
+-        if(sp_.unwindowed()) while(kseq_read(ks) >= 0) assign(ks), for_each_canon_unwindowed<Functor>(func);
+-        else                 while(kseq_read(ks) >= 0) assign(ks), for_each_canon_windowed<Functor>(func);
++        if(sp_.unwindowed()) while(kseq_read(ks) >= 0) {
++            cuddl_resident_scope resident;
++            assign(ks);
++            for_each_canon_unwindowed<Functor>(func);
++        } else while(kseq_read(ks) >= 0) {
++            cuddl_resident_scope resident;
++            assign(ks);
++            for_each_canon_windowed<Functor>(func);
++        }
+     }
+     template<typename Functor>
+     INLINE void for_each_uncanon(const Functor &func, kseq_t *ks) {
+         const bool us = sp_.unspaced(), spu = sp_.unwindowed();
+         while(kseq_read(ks) >= 0) {
++            cuddl_resident_scope resident;
+             assign(ks);
+             if(us) {
+                 if(spu) for_each_uncanon_unspaced_unwindowed(func);

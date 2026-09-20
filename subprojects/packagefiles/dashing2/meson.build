@@ -5,6 +5,24 @@ project(
 )
 
 make = find_program('make')
+sh = find_program('sh')
+
+# bonsai is an upstream git submodule, so Meson cannot apply its patch through
+# the parent wrap's diff_files. Apply it here after patch_directory populated it.
+run_command(
+    sh,
+    '-c',
+    '''
+patch_file="$1/resident-timings-bonsai.patch"
+marker="$1/.resident-timings-bonsai.patched"
+if [ ! -e "$marker" ]; then
+    patch --silent -d "$1/bonsai" -p1 < "$patch_file" && touch "$marker"
+fi
+''',
+    '_',
+    meson.current_source_dir(),
+    check: true,
+)
 
 # Upstream is Makefile-only. Sources plus all recursive submodules except
 # fmt ship in this overlay; fmt is replaced by 11.2.0 because pinned

@@ -2,12 +2,12 @@
 
 #include <libdeflate.h>
 
-#include <cstring>
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -703,10 +703,10 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
 }
 
 #if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#include <tmmintrin.h>
+    #include <immintrin.h>
+    #include <tmmintrin.h>
 #elif defined(__ARM_NEON)
-#include <arm_neon.h>
+    #include <arm_neon.h>
 #endif
 
 namespace compact_impl {
@@ -766,7 +766,8 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
         auto const low = flags & 0xFFU;
         auto const high = (flags >> 8U) & 0xFFU;
         auto const packed_low = vqtbl1q_u8(block, vld1q_u8(table.control[low]));
-        auto const packed_high = vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
+        auto const packed_high =
+            vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
         vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_low);
         out += table.kept[low];
         vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_high);
@@ -785,9 +786,8 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
 ///
 /// Measured level with the sixteen byte path on a desktop whose store bandwidth saturates first,
 /// and ahead of it where the machine has the width to spend.
-__attribute__((target("avx2"))) inline char* compact_sequence_whitespace_avx2(
-    char const* first, char const* last, char* out
-) {
+__attribute__((target("avx2"))) inline char*
+compact_sequence_whitespace_avx2(char const* first, char const* last, char* out) {
     auto const& table = compact_impl::compact_shuffle();
     auto const newline = _mm256_set1_epi8('\n');
     auto const carriage = _mm256_set1_epi8('\r');
@@ -814,7 +814,8 @@ __attribute__((target("avx2"))) inline char* compact_sequence_whitespace_avx2(
             _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_second]))
         );
         auto const packed_first = _mm256_shuffle_epi8(block, control_first);
-        auto const packed_second = _mm256_shuffle_epi8(_mm256_bsrli_epi128(block, 8), control_second);
+        auto const packed_second =
+            _mm256_shuffle_epi8(_mm256_bsrli_epi128(block, 8), control_second);
         // A lane holds the kept bytes of two halves, which are eight bytes apart in the vector and
         // adjacent in the output, so each half is stored where its own count puts it.
         // The halves leave the vector in the order 0-7, 16-23, 8-15, 24-31, and the output wants
@@ -823,9 +824,13 @@ __attribute__((target("avx2"))) inline char* compact_sequence_whitespace_avx2(
         out += table.kept[low_first];
         _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_second));
         out += table.kept[low_second];
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_first, 1));
+        _mm_storel_epi64(
+            reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_first, 1)
+        );
         out += table.kept[high_first];
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_second, 1));
+        _mm_storel_epi64(
+            reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_second, 1)
+        );
         out += table.kept[high_second];
         at += 32;
     }
@@ -908,7 +913,8 @@ inline void compact_fastx_sequence_extents(fastx_sequence_file& result) {
         });
     };
     size_t raw_total = 0;
-    for (auto const& extent : result.extents) raw_total += static_cast<size_t>(extent.end - extent.begin);
+    for (auto const& extent : result.extents)
+        raw_total += static_cast<size_t>(extent.end - extent.begin);
     // Reserved up front so appending cannot move the buffer the extents are about to point at.
     std::string copied;
     copied.reserve(raw_total);
@@ -926,9 +932,8 @@ inline void compact_fastx_sequence_extents(fastx_sequence_file& result) {
             auto const begin = copied.size();
             // Sized before the copy so the write needs no bounds check per byte.
             copied.resize(begin + size);
-            auto* const write = compact_sequence_whitespace(
-                extent.begin, extent.end, copied.data() + begin
-            );
+            auto* const write =
+                compact_sequence_whitespace(extent.begin, extent.end, copied.data() + begin);
             copied.resize(static_cast<size_t>(write - copied.data()));
             offsets.emplace_back(index, std::pair{begin, copied.size()});
         }
@@ -1109,7 +1114,6 @@ class fastx_load_pool {
 
 namespace cuddl {
 
-
 /// @brief How a build moved sequence bytes to the device.
 ///
 /// A run that reports every byte as `direct` is reading the decompressed genome in place; a
@@ -1121,10 +1125,13 @@ struct reference_build_statistics {
     size_t direct_chunks = 0;
     size_t staged_chunks = 0;
     size_t pinned_buffers = 0;
-    unsigned workers = 0;  // loaders the build ran, after its own defaulting
+    unsigned workers = 0;   // loaders the build ran, after its own defaulting
     bool in_place = false;  // the kernels read the loader's own buffers, so nothing was copied
     size_t staging_bytes = 0;
     size_t batches = 0;
     size_t transfers = 0;  // runs copied in one piece, plus records split across pieces
+    /// Measure GPU row reset and sketch construction, excluding input transfers and readback.
+    bool measure_resident = false;
+    double resident_compute_ms = 0;
 };
-}  // namespace cuddl::detail
+}  // namespace cuddl

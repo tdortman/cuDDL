@@ -3,15 +3,16 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <limits>
 #include <memory>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -53,7 +54,8 @@ enum class transfer_mode {
 /// and what lets a kernel read the loader's buffer instead of a copy of it.
 [[nodiscard]] inline bool device_reads_pageable_memory(cuda::device_ref device) noexcept {
     return device.attribute(cuda::device_attributes::pageable_memory_access) != 0 &&
-           device.attribute(cuda::device_attributes::pageable_memory_access_uses_host_page_tables
+           device.attribute(
+               cuda::device_attributes::pageable_memory_access_uses_host_page_tables
            ) != 0;
 }
 
@@ -165,6 +167,30 @@ template <uint32_t K, size_t BucketCount>
 /// device makes from them.
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class database_stager {
+    struct resident_event_span {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+
+        resident_event_span() = default;
+        resident_event_span(resident_event_span const&) = delete;
+        resident_event_span& operator=(resident_event_span const&) = delete;
+        resident_event_span(resident_event_span&& other) noexcept
+            : start(std::exchange(other.start, nullptr)),
+              stop(std::exchange(other.stop, nullptr)) {}
+        resident_event_span& operator=(resident_event_span&& other) noexcept {
+            if (this == &other) return *this;
+            if (start != nullptr) CUDDL_CUDA_ABORT(cudaEventDestroy(start));
+            if (stop != nullptr) CUDDL_CUDA_ABORT(cudaEventDestroy(stop));
+            start = std::exchange(other.start, nullptr);
+            stop = std::exchange(other.stop, nullptr);
+            return *this;
+        }
+        ~resident_event_span() {
+            if (start != nullptr) CUDDL_CUDA_ABORT(cudaEventDestroy(start));
+            if (stop != nullptr) CUDDL_CUDA_ABORT(cudaEventDestroy(stop));
+        }
+    };
+
    public:
     /// Host memory the device still has to read must stay alive: the transfer engine's read of a
     /// pageable buffer is not ordered with the host writes that follow it. Sixteen slots take the
@@ -245,8 +271,8 @@ class database_stager {
         size_t record = 0;
         while (record < records.size()) {
             // Staged in place, the arena is not the limit; the descriptors and the piece size are.
-            auto const room = direct_ ? std::numeric_limits<size_t>::max()
-                                      : bounds_.staging - arena_used_;
+            auto const room =
+                direct_ ? std::numeric_limits<size_t>::max() : bounds_.staging - arena_used_;
             size_t run = record;
             while (run < records.size()) {
                 auto const run_bytes =
@@ -332,11 +358,13 @@ class database_stager {
 
     /// @brief Clears the register rows of the next group of genomes.
     [[nodiscard]] Result<void> begin_group(size_t genomes) {
+        auto const resident = CUDDL_TRY(begin_resident());
         CUDDL_CUDA_TRY(
             cuda::fill_bytes(
                 stream_, cuda::std::span{rows_.data(), genomes * row_words()}, uint32_t{0}
             )
         );
+        CUDDL_TRY(end_resident(resident));
         return Ok();
     }
 
@@ -363,11 +391,34 @@ class database_stager {
             statistics_->staging_bytes = bounds_.staging;
             statistics_->batches = batches_;
             statistics_->transfers = transfers_;
+            for (auto const& span : resident_spans_) {
+                float elapsed_ms = 0;
+                CUDDL_CUDA_TRY(cudaEventElapsedTime(&elapsed_ms, span.start, span.stop));
+                statistics_->resident_compute_ms += elapsed_ms;
+            }
         }
         return std::move(host_rows_);
     }
 
    private:
+    [[nodiscard]] Result<size_t> begin_resident() {
+        if (statistics_ == nullptr || !statistics_->measure_resident) {
+            return std::numeric_limits<size_t>::max();
+        }
+        resident_event_span span;
+        CUDDL_CUDA_TRY(cudaEventCreate(&span.start));
+        CUDDL_CUDA_TRY(cudaEventCreate(&span.stop));
+        CUDDL_CUDA_TRY(cudaEventRecord(span.start, stream_.get()));
+        resident_spans_.push_back(std::move(span));
+        return resident_spans_.size() - 1;
+    }
+
+    [[nodiscard]] Result<void> end_resident(size_t index) {
+        if (index == std::numeric_limits<size_t>::max()) return Ok();
+        CUDDL_CUDA_TRY(cudaEventRecord(resident_spans_[index].stop, stream_.get()));
+        return Ok();
+    }
+
     /// @brief Records one piece of sequence for the kernel, naming its bytes.
     void describe(char const* bases, uint32_t windows, size_t genome) {
         auto const blocks = std::min(sm_ * 2, (static_cast<size_t>(windows) + 2047) / 2048);
@@ -445,15 +496,13 @@ class database_stager {
         copied_consumed_.record(stream_);
         auto const grid = std::min(block_end_, max_grid_);
         if (grid != 0) {
+            auto const resident = CUDDL_TRY(begin_resident());
             add_sequence_batch_kernel<BucketCount, Layout>
                 <<<static_cast<uint32_t>(grid), 256, 0, stream_.get()>>>(
-                    descriptors_.data(),
-                    copied_chunks_.size(),
-                    block_end_,
-                    K,
-                    rows_.data()
+                    descriptors_.data(), copied_chunks_.size(), block_end_, K, rows_.data()
                 );
             CUDDL_CUDA_TRY(cudaGetLastError());
+            CUDDL_TRY(end_resident(resident));
         }
         if (direct_ && !batch_files_.empty()) {
             // The launch above is what reads those buffers, so they wait on this batch's event.
@@ -509,6 +558,7 @@ class database_stager {
     std::vector<cuda::event> held_consumed_;
     cuda::event copied_consumed_{stream_};
     std::vector<sequence_batch_chunk> staged_chunks_, copied_chunks_;
+    std::vector<resident_event_span> resident_spans_;
     size_t const sm_, max_grid_;
     size_t arena_used_ = 0, block_end_ = 0, batches_ = 0, transfers_ = 0, held_count_ = 0;
     size_t held_bytes_ = 0;
@@ -772,9 +822,11 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         return Err(Error::invalid_argument("a path build needs at least one loader"));
     }
     if (transfer == transfer_mode::in_place && !device_reads_pageable_memory(stream.device())) {
-        return Err(Error::invalid_argument(
-            "in-place staging needs a device that reads pageable host memory"
-        ));
+        return Err(
+            Error::invalid_argument(
+                "in-place staging needs a device that reads pageable host memory"
+            )
+        );
     }
     if (paths.empty()) return std::vector<uint32_t>{};
     auto const in_place = stages_in_place(transfer, stream.device());
@@ -845,8 +897,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         staging_bytes,
         stream,
         statistics,
-        [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
-            -> Result<void> {
+        [&](database_stager<K, BucketCount, Layout>& stager,
+            size_t base,
+            size_t count) -> Result<void> {
             for (size_t id = base; id < base + count; ++id) {
                 auto const& genome = genomes[id];
                 records.clear();

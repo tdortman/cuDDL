@@ -45,6 +45,8 @@ def main() -> None:
         for tool, performance_only, topology in [
             ("cub-exact", True, "all-to-all"),
             ("skani", True, "all-to-all"),
+            ("dashing2", True, "all-to-all"),
+            ("hypergen", True, "all-to-all"),
             ("cuddl", True, "all-to-all"),
             ("cuddl", True, "batch"),
             ("rabbitsketch", True, "all-to-all"),
@@ -85,6 +87,17 @@ def main() -> None:
                 "micro-compare",
                 "micro-search",
             }
+            for measurement in measurements:
+                operation = measurement["case"]["measurement"]
+                wall = measurement["timings"][
+                    "query" if operation == "micro-search" else "wall"
+                ]
+                resident = measurement["timings"]["resident"]
+                assert resident["median_ms"] > 0, measurement
+                # cuDDL query GPU phases and retrieval phases use independent NVBench samples.
+                if tool != "cuddl" or operation == "micro-sketch":
+                    assert resident["median_ms"] <= wall["median_ms"], measurement
+                assert resident["min_ms"] <= resident["median_ms"] <= resident["max_ms"]
             search = next(
                 m for m in measurements if m["case"]["measurement"] == "micro-search"
             )
@@ -119,8 +132,6 @@ def main() -> None:
                             else "dense"
                         )
             if performance_only:
-                assert "truth oracle" not in result.stdout
-                assert "skani truth:" not in result.stdout
                 for measurement in measurements:
                     metrics = measurement["metrics"]
                     assert (
@@ -140,7 +151,6 @@ def main() -> None:
                     == search["timings"]["query"]["median_ms"] / queries
                 )
             else:
-                assert "truth oracle" in result.stdout
                 assert "recall_at_k" in search["metrics"]
             print(
                 f"{tool} {topology}: {'performance-only' if performance_only else 'accuracy'} passed"

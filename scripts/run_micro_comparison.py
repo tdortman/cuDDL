@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["jsonschema", "typer"]
 # ///
-"""Micro-benchmarks over shared fused operations (SKETCH, COMPARE).
+"""Micro-benchmarks over shared fused operations (SKETCH, COMPARE, SEARCH).
 
 Each tool runs its native fused path and reports wall time plus native
 outputs; accuracy joins against exact oracles afterwards unless --performance-only is set:
@@ -22,6 +22,8 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
 per-genome statistics and per-pair JSON rows are not generated.
+Resident processing timings are recorded alongside wall timings in the same run.
+They exclude parsing, transfers, and output serialization.
 
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
 verified bit-identical against a Python oracle) and, when --skani-truth is
@@ -39,6 +41,7 @@ fits the budget; every lane runs the same files.
 """
 
 import gzip
+import json
 import math
 import os
 import shutil
@@ -47,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -98,6 +102,7 @@ def run(
     capture: bool = False,
     quiet: bool = False,
     log_tail: bool = False,
+    resident: list[dict] | None = None,
 ) -> str:
     """Runs @p cmd and returns its output when @p capture is set.
 
@@ -106,42 +111,67 @@ def run(
     would otherwise bury the runner's own report. With @p log_tail, quiet commands retain
     stdout and stderr in a temporary file and report the last 15 lines on failure.
     """
-    log = None
-    if capture:
-        stdout: object = subprocess.PIPE
-        stderr: object = None
-    elif quiet and log_tail:
-        # Kept off the terminal but still kept: these tools explain a failure only on stderr, and
-        # discarding it turns a one line answer into a bisect. Only calls whose output is a short
-        # log ask for this, because the dashing2 matrix alone is quadratic in the corpus.
-        log = tempfile.TemporaryFile(mode="w+")
-        stdout = log
-        stderr = subprocess.STDOUT
-    elif quiet:
-        # Some tools print a per-sequence log or a whole similarity matrix on stderr as well,
-        # and capturing those to report only on failure is not an option: the dashing2 matrix
-        # alone is quadratic in the corpus.
-        stdout = subprocess.DEVNULL
-        stderr = subprocess.DEVNULL
-    else:
-        stdout = None
-        stderr = None
-    try:
-        proc = subprocess.run(
-            cmd, cwd=ROOT, check=True, stdout=stdout, stderr=stderr, text=True
+    with ExitStack() as files:
+        log = None
+        if capture:
+            stdout: object = subprocess.PIPE
+            stderr: object = None
+        elif quiet and log_tail:
+            # Retain short diagnostic logs, not potentially quadratic similarity matrices.
+            log = files.enter_context(tempfile.TemporaryFile(mode="w+"))
+            stdout = log
+            stderr = subprocess.STDOUT
+        elif quiet:
+            stdout = subprocess.DEVNULL
+            stderr = subprocess.DEVNULL
+        else:
+            stdout = None
+            stderr = None
+        timing_file = (
+            files.enter_context(tempfile.NamedTemporaryFile(mode="w+", suffix=".json"))
+            if resident is not None
+            else None
         )
-    except subprocess.CalledProcessError as error:
-        captured = error.stdout if error.stdout else error.stderr
-        if log is not None and not captured:
-            log.seek(0)
-            captured = log.read()
-        detail = "\n".join(line for line in (captured or "").splitlines()[-15:])
-        raise typer.BadParameter(
-            f"command exited {error.returncode}: {' '.join(cmd)}\n{detail}"
-        ) from error
-    finally:
-        if log is not None:
-            log.close()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                check=True,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                env={**os.environ, "CUDDL_RESIDENT_TIMINGS": timing_file.name}
+                if timing_file
+                else None,
+            )
+            if timing_file is not None:
+                native = json.load(timing_file)
+                elapsed = native["resident_ms"]
+                if (
+                    type(elapsed) not in (int, float)
+                    or not math.isfinite(elapsed)
+                    or elapsed < 0
+                ):
+                    raise ValueError(
+                        f"invalid resident timing from {cmd[0]}: {elapsed!r}"
+                    )
+                if any(
+                    not isinstance(native[key], str) or not native[key]
+                    for key in ("source", "device", "input")
+                ):
+                    raise ValueError(
+                        f"invalid resident timing provenance from {cmd[0]}"
+                    )
+                resident.append(native)
+        except subprocess.CalledProcessError as error:
+            captured = error.stdout if error.stdout else error.stderr
+            if log is not None and not captured:
+                log.seek(0)
+                captured = log.read()
+            detail = "\n".join(line for line in (captured or "").splitlines()[-15:])
+            raise typer.BadParameter(
+                f"command exited {error.returncode}: {' '.join(cmd)}\n{detail}"
+            ) from error
     return proc.stdout if capture else ""
 
 
@@ -192,17 +222,35 @@ def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
 
 
 def wall_of(
-    command: list[str] | list[list[str]], samples: int, warmups: int
+    command: list[str] | list[list[str]],
+    samples: int,
+    warmups: int,
+    resident: list[dict] | None = None,
 ) -> list[float]:
     groups = command if command and isinstance(command[0], list) else [command]
     marks: list[float] = []
     for rep in range(warmups + samples):
+        resident_parts = [] if resident is not None else None
         tick = time.perf_counter()
         for item in groups:
-            run(item, quiet=True)
+            run(item, quiet=True, resident=resident_parts)
         done = time.perf_counter()
         if rep >= warmups:
             marks.append((done - tick) * 1000)
+            if resident is not None:
+                first = resident_parts[0]
+                if any(
+                    part[key] != first[key]
+                    for part in resident_parts
+                    for key in ("source", "device", "input")
+                ):
+                    raise ValueError("cannot combine different resident timing scopes")
+                resident.append(
+                    {
+                        **first,
+                        "resident_ms": sum(p["resident_ms"] for p in resident_parts),
+                    }
+                )
     return marks
 
 
@@ -299,9 +347,6 @@ _CUDDL_DEVICE_PHASES = {
 _CUB_BYTES_PER_KEY = 32.0  # device bytes per pair key, measured ~28 on RTX 5070 Ti
 _VRAM_FRACTION = 0.7  # share of free VRAM cub may size its buffers against
 _PAIR_BUDGET_MARGIN = 1.5  # probe-to-full-run cost safety factor
-_RABBIT_RESIDENT_FRACTION = (
-    4  # share of host memory RabbitSketch may hold as staged input
-)
 _ARGV_PATH_LIMIT = (
     8192  # genome paths cub may take on one command line; beyond it, a config
 )
@@ -662,6 +707,28 @@ def main(
             raise typer.BadParameter(f"missing binary, build first: {binary}")
 
     measurements: list[dict] = []
+    resident_timings: dict[tuple[str, str], dict] = {}
+    native_timings: dict[tuple[str, str], dict[str, dict]] = {}
+    resident_metadata: dict[tuple[str, str], dict] = {}
+
+    def record_native_resident(tool: str, operation: str, records: list[dict]) -> None:
+        first = records[0]
+        if any(
+            record[key] != first[key]
+            for record in records
+            for key in ("source", "device", "input")
+        ):
+            raise ValueError(
+                f"inconsistent resident timing scope for {tool} {operation}"
+            )
+        timing = summarize([record["resident_ms"] for record in records])
+        timing["source"] = first["source"]
+        resident_timings[(tool, operation)] = timing
+        resident_metadata[(tool, operation)] = {
+            "resident_device": first["device"],
+            "resident_input": first["input"],
+        }
+
     pair_table: list[dict] = []
     sketch_times: dict[str, list[float]] = {}
     sketch_bytes: dict[str, int] = {}
@@ -1119,6 +1186,9 @@ def main(
                     },
                 }
             )
+            native_timings.setdefault(
+                (tool, "sketch"), {"wall": measurements[-1]["timings"]["wall"]}
+            )
 
         if "hypergen" in selected:
             staged_to_real = {}
@@ -1129,10 +1199,11 @@ def main(
             if sketch_all:
                 hg_runs.insert(0, ("-full", sketch_references, sketch_queries))
             hg_marks = {}
-            for suffix, refs, queries in hg_runs:
+            hg_resident = {}
+            for suffix, refs, run_queries in hg_runs:
                 for role, files in (
                     (f"hgrefs{suffix}", refs),
-                    (f"hgqueries{suffix}", queries),
+                    (f"hgqueries{suffix}", run_queries),
                 ):
                     role_dir = work / role
                     role_dir.mkdir(exist_ok=True)
@@ -1177,8 +1248,12 @@ def main(
                 # The subset sketch only feeds dist; its timing is the full run's. One pass is
                 # enough, and repeating it four times just clutters the log.
                 reps = (samples, warmups) if suffix == timed_suffix else (1, 0)
-                hg_marks[suffix] = wall_of(sketch_cmds, reps[0], reps[1])
+                hg_resident[suffix] = []
+                hg_marks[suffix] = wall_of(
+                    sketch_cmds, reps[0], reps[1], resident=hg_resident[suffix]
+                )
             marks = hg_marks[timed_suffix]
+            record_native_resident("hypergen", "sketch", hg_resident[timed_suffix])
             sketch_times["hypergen"] = marks
             sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
             if topology == "batch":
@@ -1193,6 +1268,7 @@ def main(
             )
         if "skani" in selected:
             marks = []
+            skani_resident = []
             sketch_list = work / "skani-list.txt"
             sketch_list.write_text("".join(p + "\n" for p in sketch_file_args))
             out_dir = work / "skdb"
@@ -1215,11 +1291,13 @@ def main(
                     ],
                     quiet=True,
                     log_tail=True,
+                    resident=skani_resident if rep >= warmups else [],
                 )
                 done = time.perf_counter()
                 if rep >= warmups:
                     marks.append((done - tick) * 1000)
             sketch_times["skani"] = marks
+            record_native_resident("skani", "sketch", skani_resident)
             sketch_bytes["skani"] = sum(
                 p.stat().st_size for p in out_dir.rglob("*") if p.is_file()
             )
@@ -1235,16 +1313,17 @@ def main(
             if sketch_all:
                 d2_runs.insert(0, ("-full", sketch_file_args))
             d2_marks = {}
+            d2_resident = []
             d2_subset_rep = 0
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
                 # As with hypergen: the subset sketch only feeds cmp, so it runs once.
                 d2_reps = warmups + samples if suffix == d2_timed else 1
-                if suffix == d2_timed:
-                    d2_timed_rep = d2_reps - 1
                 rep_marks = []
                 for rep in range(d2_reps):
+                    if rep:
+                        shutil.rmtree(work / f"d2{suffix}_{rep - 1}")
                     out_dir = work / f"d2{suffix}_{rep}"
                     out_dir.mkdir(exist_ok=True)
                     tick = time.perf_counter()
@@ -1262,18 +1341,24 @@ def main(
                             str(list_path),
                         ],
                         quiet=True,
+                        resident=d2_resident
+                        if suffix == d2_timed and rep >= warmups
+                        else [],
                     )
                     done = time.perf_counter()
                     if rep >= warmups:
                         rep_marks.append((done - tick) * 1000)
                 d2_marks[suffix] = rep_marks
+                if suffix == d2_timed:
+                    d2_sketch_bytes = sum(
+                        path.stat().st_size for path in out_dir.rglob("*") if path.is_file()
+                    )
+                    if sketch_all:
+                        shutil.rmtree(out_dir)
             marks = d2_marks[d2_timed]
+            record_native_resident("dashing2", "sketch", d2_resident)
             sketch_times["dashing2"] = marks
-            sketch_bytes["dashing2"] = sum(
-                p.stat().st_size
-                for p in (work / f"d2{d2_timed}_{d2_timed_rep}").rglob("*")
-                if p.is_file()
-            )
+            sketch_bytes["dashing2"] = d2_sketch_bytes
             record_sketch(
                 "dashing2",
                 "SetSketch",
@@ -1319,6 +1404,8 @@ def main(
             import json as jsonlib2
 
             payload = jsonlib2.loads(stdout[stdout.index("{") :])
+            resident_timings[("cuddl", "sketch")] = payload["resident"]
+            native_timings[("cuddl", "sketch")] = {"wall": payload["wall"]}
             marks = [payload["median_seconds"] * 1000] * max(samples, 1)
             sketch_times["cuddl"] = marks
             sketch_bytes["cuddl"] = db_out.stat().st_size
@@ -1342,19 +1429,17 @@ def main(
             )
             rep = work / "rabbit.json"
             rabbit_samples = max(samples, 2)
-            # The packed ingest path keeps every input sequence resident, which the benchmark
-            # reserves for small corpora. Past a share of host memory, stream ASCII instead and
-            # cap the staging; its sketches stay corpus-sized either way.
+            # Time canonicalisation as part of sketching, using bounded ASCII batches.
             staged_bytes = sum(sizes.get(p, 0) for p in (*references, *query_list))
-            stream_input = staged_bytes > _host_ram_bytes() // _RABBIT_RESIDENT_FRACTION
             resident_cap = max(1 << 20, _host_ram_bytes() // 16)
             typer.echo(
-                f"  rabbitsketch: {'streaming' if stream_input else 'resident'} ingest, "
-                f"{staged_bytes >> 30} GiB of input"
+                f"  rabbitsketch: sequence ingest, {staged_bytes >> 30} GiB of input"
             )
             run(
                 [
                     str(rabbit),
+                    "--threads",
+                    str(threads),
                     "--topology",
                     topology,
                     "--samples",
@@ -1364,7 +1449,7 @@ def main(
                     "--k",
                     "25",
                     "--ingest",
-                    "sequence" if stream_input else "packed",
+                    "sequence",
                     "--resident-bytes",
                     str(resident_cap),
                     "--sketch-size",
@@ -1383,6 +1468,13 @@ def main(
                 if m["case"].get("measurement") == "pipeline"
             )
             prepare = pipe["timings"]["prepare_wall"]
+            native_timings[("rabbitsketch", "sketch")] = {"wall": prepare}
+            resident_timings[("rabbitsketch", "sketch")] = pipe["timings"][
+                "resident_sketch"
+            ]
+            resident_timings[("rabbitsketch", "compare")] = pipe["timings"][
+                "resident_compare"
+            ]
             marks = [prepare["median_ms"]] * max(samples, 1)
             sketch_times["rabbitsketch"] = marks
             record_sketch("rabbitsketch", "FastKMV", marks, {})
@@ -1453,6 +1545,12 @@ def main(
             if sketch_all:
                 payload = sketch_payload
             sketch_times["cub-exact"] = [payload["phases_ms"]["sketch"]["median_ms"]]
+            native_timings[("cub-exact", "sketch")] = {
+                "wall": payload["phases_ms"]["sketch"]
+            }
+            resident_timings[("cub-exact", "sketch")] = payload["phases_ms"][
+                "resident_sketch"
+            ]
             record_sketch(
                 "cub-exact",
                 "gpu-exact",
@@ -1466,6 +1564,8 @@ def main(
             )
             cub_compare = jsonlib4.loads(cub_rep.read_text())
             cub_phases = cub_compare["phases_ms"]
+            native_timings[("cub-exact", "compare")] = {"wall": cub_phases["compare"]}
+            resident_timings[("cub-exact", "compare")] = cub_phases["resident_compare"]
 
         # COMPARE op per tool; errors join cub-exact Jaccard and skani ANI.
         def record_compare(
@@ -1526,6 +1626,9 @@ def main(
                     "metrics": metrics,
                 }
             )
+            native_timings.setdefault(
+                (tool, "compare"), {"wall": measurements[-1]["timings"]["wall"]}
+            )
 
         if "dashing2" in selected:
             # `cmp` writes a value per pair. A square matrix over a full corpus is about ten
@@ -1557,7 +1660,9 @@ def main(
                 "--cmpout",
                 str(panel),
             ]
-            marks = wall_of([cmp_cmd], samples, warmups)
+            d2_compare_resident = []
+            marks = wall_of([cmp_cmd], samples, warmups, resident=d2_compare_resident)
+            record_native_resident("dashing2", "compare", d2_compare_resident)
             # One sample row per `pair_stride` pairs, the same rule the other tools' rows use.
             panel_stride = max(
                 1, (len(references) * len(panel_queries)) // max(match_rows or 1, 1)
@@ -1570,6 +1675,7 @@ def main(
             query_sketch = (
                 str(work / "hgq.sk") if topology == "batch" else str(work / "hgr.sk")
             )
+            hg_compare_resident = []
             marks = wall_of(
                 [
                     str(hypergen),
@@ -1587,7 +1693,9 @@ def main(
                 ],
                 samples,
                 warmups,
+                resident=hg_compare_resident,
             )
+            record_native_resident("hypergen", "compare", hg_compare_resident)
             rows = []
             for line in dist_out.read_text().splitlines():
                 fields = line.split("\t")
@@ -1641,7 +1749,11 @@ def main(
                             str(threads),
                         ]
                     )
-            marks = wall_of(compare_commands, samples, warmups)
+            skani_compare_resident = []
+            marks = wall_of(
+                compare_commands, samples, warmups, resident=skani_compare_resident
+            )
+            record_native_resident("skani", "compare", skani_compare_resident)
             rows = []
             for dist_out in compare_outs:
                 for line in dist_out.read_text().splitlines():
@@ -1735,6 +1847,12 @@ def main(
                 "search_and_download",
                 f"{_CUDDL_DEVICE_PHASES[topology]}_exhaustive",
             )
+            resident_timings[("cuddl", "compare")] = pipe["timings"][
+                f"{_CUDDL_DEVICE_PHASES[topology]}_exhaustive"
+            ]
+            native_timings[("cuddl", "compare")] = {
+                "wall": pipe["timings"]["search_and_download"]
+            }
             evaluated = pipe["metrics"].get("match_rows_total")
             record_compare(
                 "cuddl",
@@ -1760,6 +1878,9 @@ def main(
                         }
                     )
             phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
+            native_timings[("rabbitsketch", "compare")] = {
+                "wall": rabbit_rows["timings"][_RABBITS_RESULT_PHASES[topology]]
+            }
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
             record_compare(
                 "rabbitsketch",
@@ -1897,6 +2018,13 @@ def main(
                 f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed",
             )
             search_phases["cuddl"] = phases
+            resident_timings[("cuddl", "search")] = pipe["timings"][
+                f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed"
+            ]
+            native_timings[("cuddl", "search")] = {
+                "query": pipe["timings"]["search_and_download"],
+                "index_build": pipe["timings"]["prepare_wall"],
+            }
             search_index_ms["cuddl"] = [pipe["timings"]["prepare_wall"]["median_ms"]]
             search_query_ms["cuddl"] = [phases["retrieval_ms"]]
             for m in payload["measurements"]:
@@ -1919,6 +2047,7 @@ def main(
         if "skani" in selected:
             skdb = work / "skdb"
             search_out = work / "skani-search.tsv"
+            skani_search_resident = []
             marks = wall_of(
                 [
                     str(skani),
@@ -1936,7 +2065,9 @@ def main(
                 ],
                 samples,
                 warmups,
+                resident=skani_search_resident,
             )
+            record_native_resident("skani", "search", skani_search_resident)
             search_index_ms["skani"] = sketch_times["skani"]
             search_query_ms["skani"] = marks
             for line in search_out.read_text().splitlines():
@@ -2063,8 +2194,39 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
+                if tool in {"hypergen", "dashing2", "rabbitsketch", "cub-exact"}:
+                    resident_timings[(tool, "search")] = resident_timings[
+                        (tool, "compare")
+                    ]
+                    if (tool, "compare") in resident_metadata:
+                        resident_metadata[(tool, "search")] = resident_metadata[
+                            (tool, "compare")
+                        ]
+                    measurements[-1]["case"]["resident_reuses_compare"] = True
+                    if (tool, "compare") in native_timings:
+                        native_timings[(tool, "search")] = {
+                            "query": native_timings[(tool, "compare")]["wall"],
+                            "index_build": native_timings[(tool, "sketch")]["wall"],
+                        }
 
     for measurement in measurements:
+        tool = measurement["implementation"]["name"]
+        operation = measurement["case"]["measurement"].removeprefix("micro-")
+        measurement["timings"].update(native_timings.get((tool, operation), {}))
+        measurement["timings"]["resident"] = resident_timings[(tool, operation)]
+        measurement["case"]["resident_device"] = (
+            "cuda" if tool in {"cuddl", "cub-exact"} else "cpu"
+        )
+        measurement["case"]["resident_input"] = (
+            "sequence_ascii"
+            if operation == "sketch"
+            else "sorted_kmer_sets"
+            if tool == "cub-exact"
+            else "indexed_sketches"
+            if operation == "search" and tool in {"cuddl", "skani"}
+            else "sketches"
+        )
+        measurement["case"].update(resident_metadata.get((tool, operation), {}))
         if measurement["implementation"]["name"] == "cuddl" and measurement["case"][
             "measurement"
         ] in {"micro-compare", "micro-search"}:

@@ -13,8 +13,10 @@
 // way; 0 disables either cap. --sketch-only skips pair intersection for
 // full-corpus parse timing; pair metrics come from the subset run instead.
 // matching the CLI tools, with the parse subtotal reported separately.
+// phases_ms.resident_sketch sums per-batch device spans for sequence packing, compaction,
+// sorting and dedup on staged bytes; phases_ms.resident_compare sums the pair kernels only.
+// Compare rebuilds stay untimed, and transfers and host parsing stay in the wall phases.
 // Allocation and temp-storage sizing stay outside timing; the report carries
-// buffer sizes instead.
 #include <vector_types.h>
 #include <cuddl/cuda_error.hpp>
 #include <cuddl/error.hpp>
@@ -94,6 +96,63 @@ struct device_buffer {
     }
     ~device_buffer() {
         if (data) CUDDL_CUDA_ABORT(cudaFree(data));
+    }
+};
+struct event_span {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+};
+
+// Device-only time on one stream. Each span brackets device work while transfers and host
+// work stay outside; elapsed times are read only at stream syncs the workload already
+// performs, so timing adds no synchronization. Bounded spans are summed per replicate.
+struct event_accum {
+    cudaStream_t stream = nullptr;
+    std::vector<event_span> pool;
+    std::vector<size_t> pending;
+    size_t cursor = 0;
+    double ms = 0;
+
+    event_accum() = default;
+
+    explicit event_accum(cudaStream_t s) : stream(s) {}
+
+    size_t begin() {
+        if (cursor >= pool.size()) {
+            event_span span;
+            CUDDL_CUDA_CALL(cudaEventCreate(&span.start));
+            CUDDL_CUDA_CALL(cudaEventCreate(&span.stop));
+            pool.push_back(span);
+        }
+        CUDDL_CUDA_CALL(cudaEventRecord(pool[cursor].start, stream));
+        pending.push_back(cursor);
+        return cursor++;
+    }
+
+    void end(size_t idx) {
+        CUDDL_CUDA_CALL(cudaEventRecord(pool[idx].stop, stream));
+    }
+
+    void resolve() {
+        for (size_t idx : pending) {
+            float span_ms = 0;
+            CUDDL_CUDA_CALL(cudaEventElapsedTime(&span_ms, pool[idx].start, pool[idx].stop));
+            ms += span_ms;
+        }
+        pending.clear();
+    }
+
+    void reset_sample() {
+        cursor = 0;
+        pending.clear();
+        ms = 0;
+    }
+
+    ~event_accum() {
+        for (auto& span : pool) {
+            if (span.start) CUDDL_CUDA_ABORT(cudaEventDestroy(span.start));
+            if (span.stop) CUDDL_CUDA_ABORT(cudaEventDestroy(span.stop));
+        }
     }
 };
 
@@ -341,6 +400,8 @@ int run_main(
 ) {
     cudaStream_t stream = nullptr;
     CUDDL_CUDA_CALL(cudaStreamCreate(&stream));
+    event_accum sketch_device{stream};
+    event_accum compare_device{stream};
     struct stream_guard {
         cudaStream_t stream;
         ~stream_guard() {
@@ -456,7 +517,8 @@ int run_main(
     // through here, so a rebuild returns to bytes rather than to the host parser.
     auto stage_and_compact = [&](std::vector<char> const& bases,
                                  std::vector<staged_chunk> const& pieces,
-                                 size_t windows_total) {
+                                 size_t windows_total,
+                                 event_accum* timed) {
         staged_bases.reset(bases.size());
         CUDDL_CUDA_CALL(cudaMemcpyAsync(
             staged_bases.data, bases.data(), bases.size(), cudaMemcpyHostToDevice, stream
@@ -475,6 +537,8 @@ int run_main(
         compacted_keys.reset(windows_total * sizeof(uint64_t));
         temp_bytes = std::max(temp_bytes, select_temp_bytes(windows_total));
         temp.reset(temp_bytes);
+        size_t emit_span = std::numeric_limits<size_t>::max();
+        if (timed) emit_span = timed->begin();
         emit_chunk_kmers<<<static_cast<uint32_t>(pieces.size()), 256, 0, stream>>>(
             static_cast<char const*>(staged_bases.data),
             static_cast<staged_chunk const*>(staged_chunks.data),
@@ -484,6 +548,9 @@ int run_main(
             static_cast<uint32_t*>(chunk_valid.data)
         );
         CUDDL_CUDA_CALL(cudaGetLastError());
+        if (timed) timed->end(emit_span);
+        size_t compact_span = std::numeric_limits<size_t>::max();
+        if (timed) compact_span = timed->begin();
         CUDDL_CUDA_CALL(
             cub::DeviceSelect::Flagged(
                 temp.data,
@@ -496,10 +563,12 @@ int run_main(
                 stream
             )
         );
+        if (timed) timed->end(compact_span);
     };
 
     std::vector<size_t> kmers_of(genomes, 0), distinct(genomes, 0);
-    std::vector<double> parse_ms, sketch_ms, compare_ms, end_to_end_ms;
+    std::vector<double> parse_ms, sketch_ms, compare_ms, end_to_end_ms, resident_sketch_ms,
+        resident_compare_ms;
     // Emitted rows stride-sample the evaluated pairs, first and last always kept. Applying the
     // stride as rows are produced keeps only what will be reported: a full corpus evaluates
     // hundreds of millions of pairs, and holding one JSON object each needs far more memory
@@ -510,6 +579,8 @@ int run_main(
                                    : 1;
 
     for (int rep = -warmups; rep < samples; ++rep) {
+        sketch_device.reset_sample();
+        compare_device.reset_sample();
         auto const sample_tick = clock_type::now();
         auto parse_tick = clock_type::now();
         sorted_bytes = 0;
@@ -563,7 +634,7 @@ int run_main(
                     windows_total += windows;
                 }
                 if (chunk_host.empty() || !windows_total) return;
-                stage_and_compact(batch.bases, chunk_host, windows_total);
+                stage_and_compact(batch.bases, chunk_host, windows_total, &sketch_device);
                 chunk_valid_host.resize(chunk_host.size());
                 CUDDL_CUDA_CALL(cudaMemcpyAsync(
                     chunk_valid_host.data(),
@@ -573,6 +644,7 @@ int run_main(
                     stream
                 ));
                 CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+                sketch_device.resolve();
                 // One genome can arrive as several pieces; the loader emits them in genome order,
                 // so their valid windows add up in order and each genome's keys stay together for
                 // the sort that follows.
@@ -643,11 +715,14 @@ int run_main(
                         (i + 1 < segments ? batch_offsets[i + 1] : elements) - batch_offsets[i];
                     if (!count) continue;
                     auto* keys = static_cast<uint64_t*>(compacted_keys.data) + batch_offsets[i];
+                    auto const sort_span = sketch_device.begin();
                     CUDDL_CUDA_CALL(
                         cub::DeviceRadixSort::SortKeys(
                             temp.data, temp.bytes, keys, keys, count, 0, 64, stream
                         )
                     );
+                    sketch_device.end(sort_span);
+                    auto const encode_span = sketch_device.begin();
                     CUDDL_CUDA_CALL(
                         cub::DeviceRunLengthEncode::Encode(
                             temp.data,
@@ -660,6 +735,7 @@ int run_main(
                             stream
                         )
                     );
+                    sketch_device.end(encode_span);
                 }
                 batch_runs.assign(segments, 0);
                 CUDDL_CUDA_CALL(cudaMemcpyAsync(
@@ -670,6 +746,7 @@ int run_main(
                     stream
                 ));
                 CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+                sketch_device.resolve();
                 for (size_t i = 0; i < segments; ++i) {
                     distinct[sketch_order[batch_genomes[i]]] = static_cast<size_t>(batch_runs[i]);
                 }
@@ -730,10 +807,12 @@ int run_main(
                 cudaMemcpyHostToDevice,
                 stream
             ));
+            auto const kernel_span = compare_device.begin();
             exact_intersection_kernel<<<static_cast<uint32_t>(jobs.size()), 256, 0, stream>>>(
                 static_cast<pair_job const*>(jobs_dev.data), static_cast<uint32_t*>(counts_dev.data)
             );
             CUDDL_CUDA_CALL(cudaGetLastError());
+            compare_device.end(kernel_span);
             intersections.resize(jobs.size());
             CUDDL_CUDA_CALL(cudaMemcpyAsync(
                 intersections.data(),
@@ -743,6 +822,7 @@ int run_main(
                 stream
             ));
             CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
+            compare_device.resolve();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 if (!job_rows[i].emit) continue;
                 auto const qa = job_rows[i].a, rb = job_rows[i].r;
@@ -804,7 +884,7 @@ int run_main(
                     // valid ones behind.
                     size_t windows = 0;
                     for (auto const& piece : stashed[g].pieces) windows += piece.windows;
-                    stage_and_compact(stashed[g].bases, stashed[g].pieces, windows);
+                    stage_and_compact(stashed[g].bases, stashed[g].pieces, windows, nullptr);
                     count = kmers_of[g];
                     keys = static_cast<uint64_t*>(compacted_keys.data);
                 } else {
@@ -896,6 +976,8 @@ int run_main(
             sketch_ms.push_back(ms(compare_tick - sample_tick).count());
             compare_ms.push_back(ms(done - compare_tick).count());
             end_to_end_ms.push_back(ms(done - sample_tick).count());
+            resident_sketch_ms.push_back(sketch_device.ms);
+            resident_compare_ms.push_back(compare_device.ms);
         }
     }
 
@@ -912,6 +994,17 @@ int run_main(
             {"min_ms", *std::min_element(values.begin(), values.end())},
             {"max_ms", *std::max_element(values.begin(), values.end())},
             {"source", "steady_clock_cpu_wall"},
+        };
+    };
+    // Bounded per-batch device spans are summed per replicate, so the resident summary is a
+    // measured total, never wall time or a difference of medians.
+    auto summarize_device = [](std::vector<double> const& values) {
+        return json{
+            {"samples", values.size()},
+            {"median_ms", median_of(values)},
+            {"min_ms", *std::min_element(values.begin(), values.end())},
+            {"max_ms", *std::max_element(values.begin(), values.end())},
+            {"source", "cuda_events"},
         };
     };
     report = {
@@ -941,7 +1034,9 @@ int run_main(
             {"pair_runs", max_pair * (sizeof(uint64_t) + sizeof(int))},
             {"temp", temp.bytes}}},
           {"sketch", summarize(sketch_ms)},
+          {"resident_sketch", summarize_device(resident_sketch_ms)},
           {"compare", summarize(compare_ms)},
+          {"resident_compare", summarize_device(resident_compare_ms)},
           {"end_to_end", summarize(end_to_end_ms)}}},
         {"pairs", emitted},
     };

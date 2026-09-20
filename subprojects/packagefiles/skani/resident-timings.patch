@@ -1,0 +1,274 @@
+diff --git a/src/dist.rs b/src/dist.rs
+index b3d854d..ae32f15 100644
+--- a/src/dist.rs
++++ b/src/dist.rs
+@@ -2,6 +2,7 @@ use crate::chain;
+ use crate::regression;
+ use crate::file_io;
+ use crate::params::*;
++use crate::resident;
+ use crate::screen;
+ use crate::types::*;
+ use log::*;
+@@ -95,11 +96,13 @@ pub fn dist(command_params: CommandParams, mut sketch_params: SketchParams) {
+     let anis: Mutex<Vec<AniEstResult>> = Mutex::new(vec![]);
+     let counter: Mutex<usize> = Mutex::new(0);
+     let first_write: Mutex<bool> = Mutex::new(true);
++    let resident = resident::ResidentClock::new();
+     js.into_par_iter().for_each(|j| {
+         let query_sketch = &query_sketches[j];
+         if !command_params.screen {
+             let is = (0..ref_sketches.len()).into_iter().collect::<Vec<usize>>();
+             is.into_par_iter().for_each(|i| {
++                let _interval = resident.enter();
+                 let ref_sketch = &ref_sketches[i];
+                 let passed_screen =
+                     screen::check_markers_quickly(query_sketch, ref_sketch, screen_val, command_params.rescue_small);
+@@ -128,6 +131,7 @@ pub fn dist(command_params: CommandParams, mut sketch_params: SketchParams) {
+                 command_params.rescue_small
+             );
+             refs_passing_screen_table.into_par_iter().for_each(|i| {
++                let _interval = resident.enter();
+                 let ref_sketch = &ref_sketches[i];
+                 let map_params = chain::map_params_from_sketch(
+                     ref_sketch,
+@@ -187,4 +191,5 @@ pub fn dist(command_params: CommandParams, mut sketch_params: SketchParams) {
+         command_params.short_header,
+     );
+     info!("ANI calculation time: {}", now.elapsed().as_secs_f32());
++    resident::emit("sketches", resident.elapsed_ms());
+ }
+diff --git a/src/file_io.rs b/src/file_io.rs
+index 0344c54..0ba1a3f 100644
+--- a/src/file_io.rs
++++ b/src/file_io.rs
+@@ -174,6 +174,7 @@ pub fn fastx_to_sketches(
+                     let contig = record.id();
+                     let seq = record.seq();
+                     if seq.len() >= MIN_LENGTH_CONTIG {
++                        let _resident = crate::resident::sketch_clock().enter();
+                         new_sketch
+                             .contigs
+                             .push(String::from_utf8(contig.to_vec()).unwrap());
+@@ -275,6 +276,7 @@ pub fn fastx_to_multiple_sketch_rewrite(
+                     let contig = record.id();
+                     let seq = record.seq();
+                     if seq.len() >= MIN_LENGTH_CONTIG {
++                        let _resident = crate::resident::sketch_clock().enter();
+                         let mut new_sketch = Sketch::new(
+                             sketch_params.marker_c,
+                             sketch_params.c,
+diff --git a/src/lib.rs b/src/lib.rs
+index c867908..b5fea8e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,7 +11,7 @@ pub mod triangle;
+ pub mod cmd_line;
+ pub mod model;
+ pub mod regression;
+-
++pub mod resident;
+ #[cfg(target_arch = "x86_64")]
+ pub mod avx2_seeding;
+ #[cfg(feature = "cli")]
+diff --git a/src/search.rs b/src/search.rs
+index 5613b5e..38acd77 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -2,6 +2,7 @@ use crate::chain;
+ use crate::regression;
+ use crate::file_io;
+ use crate::params::*;
++use crate::resident;
+ use crate::screen;
+ use crate::sketch_db::{SketchDbReader, is_consolidated_db, has_separate_sketches};
+ use crate::types::*;
+@@ -69,6 +70,7 @@ pub fn search(command_params: CommandParams) {
+     let ref_sketches_used: RwLock<FxHashMap<_, _>> = RwLock::new(FxHashMap::default());
+ 
+     let now = Instant::now();
++    let resident = resident::ResidentClock::new();
+     //assert!(ref_sketches.len() == ref_marker_files.len());
+     let anis: Mutex<Vec<AniEstResult>> = Mutex::new(vec![]);
+     let counter: Mutex<usize> = Mutex::new(0);
+@@ -123,6 +125,7 @@ pub fn search(command_params: CommandParams) {
+                     let refs_to_try_mutex: Mutex<Vec<usize>> = Mutex::new(vec![]);
+                     let js = 0..ref_sketches.len();
+                     js.into_par_iter().for_each(|j| {
++                        let _screen = resident.enter();
+                         let ref_sketch = &ref_sketches[j];
+                         if screen::check_markers_quickly(query_sketch, ref_sketch, screen_val, false) {
+                             let mut lock = refs_to_try_mutex.lock().unwrap();
+@@ -131,6 +134,7 @@ pub fn search(command_params: CommandParams) {
+                     });
+                     ref_indices_to_try = refs_to_try_mutex.into_inner().unwrap();
+                 } else {
++                    let _screen = resident.enter();
+                     ref_indices_to_try = screen::screen_refs_indices(
+                         screen_val,
+                         &kmer_to_sketch,
+@@ -172,7 +176,10 @@ pub fn search(command_params: CommandParams) {
+                             &model_opt
+                         );
+                         let ani_res;
+-                        ani_res = chain::chain_seeds(&ref_sketch[0], query_sketch, map_params);
++                        {
++                            let _interval = resident.enter();
++                            ani_res = chain::chain_seeds(&ref_sketch[0], query_sketch, map_params);
++                        }
+                         if ani_res.ani > 0.5 {
+                             let mut locked = anis.lock().unwrap();
+                             locked.push(ani_res);
+@@ -195,7 +202,10 @@ pub fn search(command_params: CommandParams) {
+                                 &model_opt
+                             );
+                             let ani_res;
++                            {
++                                let _interval = resident.enter();
+                                 ani_res = chain::chain_seeds(&ref_sketch[0], query_sketch, map_params);
++                            }
+                             if ani_res.ani > 0.5 {
+                                 let mut locked = anis.lock().unwrap();
+                                 locked.push(ani_res);
+@@ -230,7 +240,10 @@ pub fn search(command_params: CommandParams) {
+                                 &model_opt
+                             );
+                             let ani_res;
+-                            ani_res = chain::chain_seeds(&ref_sketch[0], query_sketch, map_params);
++                            {
++                                let _interval = resident.enter();
++                                ani_res = chain::chain_seeds(&ref_sketch[0], query_sketch, map_params);
++                            }
+                             {
+                                 let mut write_table = ref_sketches_used.write().unwrap();
+                                 write_table.insert(original_file.clone(), ref_sketch);
+@@ -297,4 +310,5 @@ pub fn search(command_params: CommandParams) {
+         command_params.short_header,
+     );
+     info!("Searching time: {}", now.elapsed().as_secs_f32());
++    resident::emit("indexed_sketches", resident.elapsed_ms());
+ }
+diff --git a/src/sketch.rs b/src/sketch.rs
+index abf850a..ac71063 100644
+--- a/src/sketch.rs
++++ b/src/sketch.rs
+@@ -1,5 +1,6 @@
+ use crate::file_io;
+ use crate::params::*;
++use crate::resident;
+ use crate::sketch_db::{SketchDbWriter};
+ use crate::types::*;
+ use log::*;
+@@ -22,6 +23,7 @@ pub fn sketch(command_params: CommandParams, sketch_params: SketchParams) {
+     }
+     std::fs::create_dir_all(&p).unwrap();
+ 
++    resident::sketch_clock().reset();
+     if command_params.separate_sketches {
+         if command_params.individual_contig_r {
+             warn!("WARNING: --separate-sketches combined with -i (individual contigs) is NOT compatible with `skani search`. Use the default consolidated database format for search functionality with individual contigs.");
+@@ -32,6 +34,7 @@ pub fn sketch(command_params: CommandParams, sketch_params: SketchParams) {
+     }
+     
+     info!("Sketching time: {}", now.elapsed().as_secs_f32());
++    resident::emit("sequence_ascii", resident::sketch_clock().elapsed_ms());
+ }
+ 
+ /// Create separate .sketch files (legacy format)
+--- /dev/null
++++ b/src/resident.rs
+@@ -0,0 +1,94 @@
++use std::sync::LazyLock;
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::time::Instant;
++
++const TIMINGS_ENV_VAR: &str = "CUDDL_RESIDENT_TIMINGS";
++
++pub struct ResidentClock {
++    base: Instant,
++    active: AtomicU32,
++    started_ns: AtomicU64,
++    elapsed_ns: AtomicU64,
++}
++
++impl ResidentClock {
++    pub fn new() -> Self {
++        ResidentClock {
++            base: Instant::now(),
++            active: AtomicU32::new(0),
++            started_ns: AtomicU64::new(0),
++            elapsed_ns: AtomicU64::new(0),
++        }
++    }
++
++    fn now_ns(&self) -> u64 {
++        self.base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
++    }
++
++    pub fn enter(&self) -> ResidentGuard<'_> {
++        let now = self.now_ns();
++        if self.active.fetch_add(1, Ordering::SeqCst) == 0 {
++            self.started_ns.store(now, Ordering::SeqCst);
++        }
++        ResidentGuard { owner: self }
++    }
++
++    pub fn elapsed_ms(&self) -> f64 {
++        self.elapsed_ns.load(Ordering::SeqCst) as f64 / 1_000_000.0
++    }
++
++    pub fn reset(&self) {
++        self.active.store(0, Ordering::SeqCst);
++        self.started_ns.store(0, Ordering::SeqCst);
++        self.elapsed_ns.store(0, Ordering::SeqCst);
++    }
++}
++
++impl Default for ResidentClock {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++pub struct ResidentGuard<'a> {
++    owner: &'a ResidentClock,
++}
++
++impl Drop for ResidentGuard<'_> {
++    fn drop(&mut self) {
++        let now = self.owner.now_ns();
++        if self.owner.active.fetch_sub(1, Ordering::SeqCst) == 1 {
++            let start = self.owner.started_ns.load(Ordering::SeqCst);
++            let delta = now.saturating_sub(start);
++            self.owner.elapsed_ns.fetch_add(delta, Ordering::SeqCst);
++        }
++    }
++}
++
++static SKETCH_CLOCK: LazyLock<ResidentClock> = LazyLock::new(ResidentClock::new);
++
++pub fn sketch_clock() -> &'static ResidentClock {
++    &SKETCH_CLOCK
++}
++
++pub fn emit(input: &'static str, resident_ms: f64) {
++    let path = match std::env::var(TIMINGS_ENV_VAR) {
++        Ok(path) => path,
++        Err(_) => return,
++    };
++    if path.is_empty() {
++        return;
++    }
++    let ms = if resident_ms.is_finite() && resident_ms >= 0.0 {
++        resident_ms
++    } else {
++        0.0
++    };
++    let payload = serde_json::json!({
++        "resident_ms": ms,
++        "source": "steady_clock_cpu_wall",
++        "device": "cpu",
++        "input": input,
++    });
++    std::fs::write(&path, payload.to_string()).expect("resident timing sidecar must write");
++}

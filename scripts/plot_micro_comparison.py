@@ -5,11 +5,14 @@
 # ///
 """Figures for micro-benchmark comparisons (operation=micro).
 
-Nine single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+Twelve single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+resident processing time for each of those operations,
 Jaccard MAE vs exact, ANI MAE vs skani, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
 for a panel are absent from it, which is itself information. Exact-zero
 errors plot at the floor with an "exact" tag.
+Resident-only bars show measured CPU, GPU, or hybrid processing with min/max
+error bars. Missing resident measurements are omitted, never inferred from wall time.
 """
 
 from pathlib import Path
@@ -28,6 +31,7 @@ def read_micro(path: Path) -> list[dict]:
     rows = []
     for m in report["measurements"]:
         case = m["case"]
+        resident = m.get("timings", {}).get("resident")
         if case.get("measurement") not in (
             "micro-sketch",
             "micro-compare",
@@ -47,6 +51,11 @@ def read_micro(path: Path) -> list[dict]:
                     "lo_ms": query["min_ms"],
                     "hi_ms": query["max_ms"],
                     "index_ms": index["median_ms"],
+                    "resident": resident,
+                    "resident_device": case.get("resident_device"),
+                    "resident_reuses_compare": case.get(
+                        "resident_reuses_compare", False
+                    ),
                     "index_lo_ms": index["min_ms"],
                     "index_hi_ms": index["max_ms"],
                     "metrics": m.get("metrics", {}),
@@ -63,6 +72,9 @@ def read_micro(path: Path) -> list[dict]:
                 "wall_ms": wall["median_ms"],
                 "lo_ms": wall["min_ms"],
                 "hi_ms": wall["max_ms"],
+                "resident": resident,
+                "resident_device": case.get("resident_device"),
+                "resident_reuses_compare": case.get("resident_reuses_compare", False),
                 "metrics": m.get("metrics", {}),
             }
         )
@@ -73,8 +85,7 @@ def read_micro(path: Path) -> list[dict]:
 
 def label(row: dict) -> str:
     name = f"{row['tool']}\n{row['variant']}" if row["variant"] else row["tool"]
-    key = "topk" if row["op"] == "search" else "k"
-    return f"{name}\n{key}={row['k']}"
+    return name if row["op"] == "search" else f"{name}\nk={row['k']}"
 
 
 def main(
@@ -106,18 +117,39 @@ def main(
             fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
             pu.save_figure(fig, output_dir / f"{stem}.pdf")
 
-        def time_panel(subset: list[dict], title: str, stem: str) -> None:
-            fig, ax = plt.subplots(figsize=(5.5, 4))
+        def time_panel(
+            subset: list[dict], title: str, stem: str, *, resident: bool = False
+        ) -> None:
+            fig, ax = plt.subplots(
+                figsize=(max(5.5, len(subset) * 1.15) if resident else 5.5, 4)
+            )
             if not subset:
-                ax.set_title(title + " (none)")
+                ax.set_title(title + (" (not recorded)" if resident else " (none)"))
+                if resident:
+                    ax.set_axis_off()
             else:
                 names = [label(r) for r in subset]
+                if resident:
+                    for index, row in enumerate(subset):
+                        device = {
+                            "cuda": "GPU",
+                            "cpu": "CPU",
+                            "hybrid": "CPU + GPU",
+                        }.get(row["resident_device"])
+                        if device:
+                            names[index] += f"\n{device}"
+                        if row["resident_reuses_compare"]:
+                            names[index] += " (exhaustive)"
                 medians = [r["wall_ms"] for r in subset]
                 lower = [max(0.0, r["wall_ms"] - r["lo_ms"]) for r in subset]
                 upper = [max(0.0, r["hi_ms"] - r["wall_ms"]) for r in subset]
                 ax.bar(names, medians, yerr=[lower, upper], capsize=3)
-                ax.set_yscale("log")
-                ax.set_ylabel("Median ms, log scale")
+                if resident:
+                    ax.set_ylim(bottom=0)
+                    ax.set_ylabel("Median processing time (ms)")
+                else:
+                    ax.set_yscale("log")
+                    ax.set_ylabel("Median ms, log scale")
                 ax.set_title(title)
                 ax.tick_params(axis="x", labelrotation=20)
             save_both(fig, stem)
@@ -125,6 +157,28 @@ def main(
         time_panel(sketch, "SKETCH wall total", "micro_time_sketch")
         time_panel(compare, "COMPARE wall total", "micro_time_compare")
         time_panel(search, "SEARCH query wall total", "micro_time_search")
+        for operation, subset in [
+            ("sketch", sketch),
+            ("compare", compare),
+            ("search", search),
+        ]:
+            resident_rows = [
+                {
+                    **row,
+                    "wall_ms": row["resident"]["median_ms"],
+                    "lo_ms": row["resident"]["min_ms"],
+                    "hi_ms": row["resident"]["max_ms"],
+                }
+                for row in subset
+                if row["resident"] is not None
+            ]
+            time_panel(
+                resident_rows,
+                f"{operation.upper()} resident processing",
+                f"micro_time_{operation}_resident",
+                resident=True,
+            )
+
         def scatter_panel(metric: str, title: str, ylabel: str, stem: str) -> None:
             fig, ax = plt.subplots(figsize=(5.5, 4.5))
             scored = [r for r in compare if r["metrics"].get(metric) is not None]
@@ -139,7 +193,8 @@ def main(
                     )
                     reported = row["metrics"].get("skani_reported_pairs")
                     count = (
-                        f"n={reported}" if reported is not None
+                        f"n={reported}"
+                        if reported is not None
                         else f"n={row['metrics'].get('pairs', 0)}"
                     )
                     ax.scatter(
@@ -157,12 +212,16 @@ def main(
             save_both(fig, stem)
 
         scatter_panel(
-            "jaccard_mae_vs_exact", "Jaccard MAE vs exact",
-            "MAE, log scale (floor = exact)", "micro_error_jaccard",
+            "jaccard_mae_vs_exact",
+            "Jaccard MAE vs exact",
+            "MAE, log scale (floor = exact)",
+            "micro_error_jaccard",
         )
         scatter_panel(
-            "ani_mae_vs_skani", "ANI MAE vs skani",
-            "MAE, log scale (floor = exact)", "micro_error_ani",
+            "ani_mae_vs_skani",
+            "ANI MAE vs skani",
+            "MAE, log scale (floor = exact)",
+            "micro_error_ani",
         )
 
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
@@ -225,12 +284,16 @@ def main(
         save_both(fig, "micro_compare_coverage")
 
         scatter_panel(
-            "jaccard_max_err_vs_exact", "Jaccard max error vs exact",
-            "Max error, log scale (floor = exact)", "micro_maxerr_jaccard",
+            "jaccard_max_err_vs_exact",
+            "Jaccard max error vs exact",
+            "Max error, log scale (floor = exact)",
+            "micro_maxerr_jaccard",
         )
         scatter_panel(
-            "ani_max_err_vs_skani", "ANI max error vs skani",
-            "Max error, log scale (floor = exact)", "micro_maxerr_ani",
+            "ani_max_err_vs_skani",
+            "ANI max error vs skani",
+            "Max error, log scale (floor = exact)",
+            "micro_maxerr_ani",
         )
 
         typer.echo(
