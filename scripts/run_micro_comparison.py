@@ -12,7 +12,7 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
   sketch command; cuDDL times reference-database build; RabbitSketch
   times pipeline prepare; cub-exact times its device sketch phase.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
-  cuDDL runs the pipeline benchmark with threshold zero (full refinement),
+  cuDDL runs exhaustive comparison without an index,
   RabbitSketch its pipeline query, cub-exact its device phase, and the CLI
   tools their native compare commands. Each lane's times cover producing the
   pairwise results; the pipeline benchmarks' own output phases (per-genome
@@ -86,8 +86,18 @@ class CuddlTransfer(StrEnum):
     IN_PLACE = "in-place"
 
 
+class CuddlIndex(StrEnum):
+    """Reference index used by cuDDL search."""
+
+    DENSE = "dense"
+    SPARSE = "sparse"
+
+
 def run(
-    cmd: list[str], capture: bool = False, quiet: bool = False, log_tail: bool = False
+    cmd: list[str],
+    capture: bool = False,
+    quiet: bool = False,
+    log_tail: bool = False,
 ) -> str:
     """Runs @p cmd and returns its output when @p capture is set.
 
@@ -281,8 +291,8 @@ _RABBITS_RESULT_PHASES = {
     "all-to-all": "search_all_to_all_exhaustive",
 }
 _CUDDL_DEVICE_PHASES = {
-    "batch": "search_batch_indexed",
-    "all-to-all": "search_all_to_all_indexed",
+    "batch": "search_batch",
+    "all-to-all": "search_all_to_all",
 }
 
 
@@ -534,6 +544,10 @@ def main(
         HypergenDevice,
         typer.Option(help="Device hypergen runs on."),
     ] = HypergenDevice.CPU,
+    cuddl_index: Annotated[
+        CuddlIndex,
+        typer.Option(help="Reference index for cuDDL SEARCH; COMPARE is exhaustive."),
+    ] = CuddlIndex.DENSE,
     cuddl_workers: Annotated[
         int | None,
         typer.Option(
@@ -1655,8 +1669,7 @@ def main(
             if not pipeline_bin.exists():
                 raise typer.BadParameter(f"missing binary, build first: {pipeline_bin}")
 
-            # One batched invocation; threshold zero refines every pair, so
-            # the index path returns the same summaries as exhaustive search.
+            # One exhaustive batched invocation, with no index construction or filtering.
             cfg = work / "cuddl-compare.toml"
             compare_queries = query_list or references[:1]
             cfg.write_text(
@@ -1685,8 +1698,7 @@ def main(
                     "0",
                     "--rows",
                     "compact",
-                    "--index",
-                    "sparse",
+                    "--exhaustive",
                     "--minimum-matches",
                     "0",
                     "--workers",
@@ -1717,11 +1729,11 @@ def main(
                         "ani": metrics.get("ani"),
                     }
                 )
-            # Search and download is the index scan, the refinement and the copy of every result
-            # row to the host, which is the pairwise work a caller of the search sees. The device
-            # phase alone is the comparison; the difference is the result transfer.
+            # Retrieval includes exhaustive comparison and every result's transfer to the host.
             phases = retrieval_phases(
-                pipe, "search_and_download", _CUDDL_DEVICE_PHASES[topology]
+                pipe,
+                "search_and_download",
+                f"{_CUDDL_DEVICE_PHASES[topology]}_exhaustive",
             )
             evaluated = pipe["metrics"].get("match_rows_total")
             record_compare(
@@ -1860,7 +1872,7 @@ def main(
                     "--rows",
                     "compact",
                     "--index",
-                    "sparse",
+                    cuddl_index,
                     "--minimum-matches",
                     str(min_matches),
                     "--workers",
@@ -1880,7 +1892,9 @@ def main(
             # Same counting rule as the compare lane: the query interval here also runs the
             # benchmark's output phase, which prunes nothing when the threshold drops pairs.
             phases = retrieval_phases(
-                pipe, "search_and_download", _CUDDL_DEVICE_PHASES[search_topology]
+                pipe,
+                "search_and_download",
+                f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed",
             )
             search_phases["cuddl"] = phases
             search_index_ms["cuddl"] = [pipe["timings"]["prepare_wall"]["median_ms"]]
@@ -2049,6 +2063,16 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
+
+    for measurement in measurements:
+        if measurement["implementation"]["name"] == "cuddl" and measurement["case"][
+            "measurement"
+        ] in {"micro-compare", "micro-search"}:
+            measurement["case"]["index"] = (
+                "none"
+                if measurement["case"]["measurement"] == "micro-compare"
+                else cuddl_index
+            )
 
     datasets = dataset_entries("reference", references, 8)
     datasets.update(dataset_entries("query", query_list, 8))

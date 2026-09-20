@@ -73,7 +73,7 @@ def main() -> None:
             if topology == "batch":
                 command += ["--topology", "batch", "--query-count", "2"]
                 if tool == "cuddl":
-                    command += ["--cuddl-workers", "72"]
+                    command += ["--cuddl-workers", "72", "--cuddl-index", "sparse"]
             result = subprocess.run(
                 command, capture_output=True, text=True, check=False
             )
@@ -111,6 +111,13 @@ def main() -> None:
                     assert "excluded_output_ms" in metrics
                     if tool == "cuddl":
                         assert metrics["excluded_output_ms"] == 0
+                        assert measurement["case"]["index"] == (
+                            "none"
+                            if operation == "micro-compare"
+                            else "sparse"
+                            if topology == "batch"
+                            else "dense"
+                        )
             if performance_only:
                 assert "truth oracle" not in result.stdout
                 assert "skani truth:" not in result.stdout
@@ -143,12 +150,16 @@ def main() -> None:
         pipeline_genome = work / "pipeline.fna"
         pipeline_genome.write_text(f">genome\n{sequence[:1000]}\n")
         genome = str(pipeline_genome)
-        for topology, ingest, performance, references, queries in [
-            ("batch", "sequence", True, 257, 259),
-            ("all-to-all", "sequence", True, 257, 1),
-            ("batch", "packed", True, 3, 2),
-            ("batch", "sequence", False, 3, 2),
-            ("batch", "sequence", False, 10001, 1),
+        for topology, ingest, performance, references, queries, exhaustive in [
+            ("batch", "sequence", True, 257, 259, False),
+            ("all-to-all", "sequence", True, 257, 1, False),
+            ("batch", "packed", True, 3, 2, False),
+            ("batch", "sequence", False, 3, 2, False),
+            ("batch", "sequence", False, 10001, 1, False),
+            ("batch", "sequence", True, 257, 259, True),
+            ("all-to-all", "sequence", True, 257, 1, True),
+            ("batch", "packed", True, 3, 2, True),
+            ("batch", "sequence", False, 3, 2, True),
         ]:
             config = work / "pipeline.toml"
             config.write_text(
@@ -179,6 +190,8 @@ def main() -> None:
             ]
             if performance:
                 command.append("--performance-only")
+            if exhaustive:
+                command.append("--exhaustive")
             result = subprocess.run(
                 command, capture_output=True, text=True, check=False
             )
@@ -200,18 +213,24 @@ def main() -> None:
                 assert all(m["case"]["measurement"] == "pipeline" for m in measurements)
                 phases = report["timings"]
                 requested = (
-                    "search_all_to_all_indexed"
+                    "search_all_to_all_"
                     if topology == "all-to-all"
-                    else "search_batch_indexed"
-                )
+                    else "search_batch_"
+                ) + ("exhaustive" if exhaustive else "indexed")
                 assert requested in phases and "search_and_download" in phases
                 assert not any(
-                    "exhaustive" in p or "single" in p or "resident" in p
+                    ("indexed" if exhaustive else "exhaustive") in p
+                    or "single" in p
+                    or "resident" in p
                     for p in phases
                 )
                 if topology == "batch":
                     assert not any("all_to_all" in p for p in phases)
                 memory = report["memory_bytes"]
+                if exhaustive:
+                    assert report["case"]["index"] == "none"
+                    assert memory["persistent_index"] == 0
+                    assert memory["search_workspace"] == 0
                 assert (
                     memory["host_result_capacity"]
                     <= memory["search_result_capacity"]
@@ -227,7 +246,8 @@ def main() -> None:
                     assert not report["metrics"]["all_to_all_suite"]
                     assert not any("all_to_all" in p for p in report["timings"])
             print(
-                f"pipeline {topology} {ingest}: {expected} rows, validation={not performance} passed"
+                f"pipeline {topology} {ingest}: {expected} rows, "
+                f"validation={not performance}, exhaustive={exhaustive} passed"
             )
 
 

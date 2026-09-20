@@ -43,13 +43,14 @@ using database = cuddl::reference_database<k, buckets>;
 struct options {
     std::vector<std::string> references, queries;
     std::string output, name = "cuDDL pipeline";
-    std::string rows = "compact", index = "sparse", topology = "batch";
+    std::string rows = "compact", index = "dense", topology = "batch";
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
     unsigned workers = cuddl::default_parser_workers;
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
     bool resident_plan = false;
     bool performance_only = false;
+    bool exhaustive = false;
     int samples = 20, warmups = 3;
     size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8,
            all_to_all_pairs = 50000000;
@@ -437,7 +438,8 @@ struct search_buffers {
         database const& db,
         uint32_t queries,
         cuda::stream_ref stream,
-        std::string const& topology = "both"
+        std::string const& topology = "both",
+        bool indexed = true
     )
         : workspace(stream, cuda::device_default_memory_pool(stream.device())),
           results(stream, cuda::device_default_memory_pool(stream.device())),
@@ -450,11 +452,15 @@ struct search_buffers {
             size = std::max(size, requirement.maximum_pair_count);
         };
         if (topology != "all-to-all") {
-            include(CUDDL_UNWRAP(db.indexed_batch_search_requirements(queries, stream)));
+            if (indexed) {
+                include(CUDDL_UNWRAP(db.indexed_batch_search_requirements(queries, stream)));
+            }
             include(CUDDL_UNWRAP(db.batch_search_requirements(queries, stream)));
         }
         if (topology != "batch") {
-            include(CUDDL_UNWRAP(db.indexed_all_to_all_search_requirements(stream)));
+            if (indexed) {
+                include(CUDDL_UNWRAP(db.indexed_all_to_all_search_requirements(stream)));
+            }
             include(CUDDL_UNWRAP(db.all_to_all_search_requirements(stream)));
         }
         workspace = cuda::make_device_buffer<uint8_t>(
@@ -556,7 +562,7 @@ void search(
         } else {
             CUDDL_UNWRAP(db.search_batch_async(
                 queries.scores,
-                compatibility(opts),
+                db.metadata().compatibility,
                 0,
                 buffers.workspace,
                 buffers.results,
@@ -1316,14 +1322,16 @@ void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     queries.add(stream);
     refs.extract(stream);
     queries.extract(stream);
-    auto db = build(refs, opts, stream, true);
+    auto db = build(refs, opts, stream, !opts.exhaustive);
     search_buffers buffers(
-        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
+        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology, !opts.exhaustive
     );
     host_results output;
     stream.sync();
     mark();
-    search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
+    search(
+        db, queries, buffers, opts, stream, !opts.exhaustive, opts.topology == "all-to-all", &output
+    );
     application_output(opts, refs, queries, output, stream);
     mark();
 }
@@ -1339,14 +1347,16 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     collection queries(query_rows, stream, true, false);
     refs.extract(stream);
     queries.extract(stream);
-    auto db = build(refs, opts, stream, true);
+    auto db = build(refs, opts, stream, !opts.exhaustive);
     search_buffers buffers(
-        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
+        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology, !opts.exhaustive
     );
     host_results output;
     stream.sync();
     mark();
-    search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
+    search(
+        db, queries, buffers, opts, stream, !opts.exhaustive, opts.topology == "all-to-all", &output
+    );
     application_output(opts, refs, queries, output, stream);
     mark();
 }
@@ -1410,19 +1420,26 @@ json run(options const& opts) {
     queries.extract(stream);
     stream.sync();
     if (opts.performance_only) {
-        auto db = build(refs, opts, stream, true);
+        auto db = build(refs, opts, stream, !opts.exhaustive);
         search_buffers buffers(
-            db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
+            db,
+            static_cast<uint32_t>(queries.sketches.size()),
+            stream,
+            opts.topology,
+            !opts.exhaustive
         );
         stream.sync();
         bool const all = opts.topology == "all-to-all";
-        auto const phase = all ? "search_all_to_all_indexed" : "search_batch_indexed";
+        auto const phase = std::string(all ? "search_all_to_all_" : "search_batch_") +
+                           (opts.exhaustive ? "exhaustive" : "indexed");
         json wall;
         timings[phase] = measure(
             opts,
             phase,
             false,
-            [&](cuda::stream_ref s) { search(db, queries, buffers, opts, s, true, all); },
+            [&](cuda::stream_ref s) {
+                search(db, queries, buffers, opts, s, !opts.exhaustive, all);
+            },
             {},
             &wall
         );
@@ -1432,7 +1449,7 @@ json run(options const& opts) {
         timings["search_and_download"] =
             measure(opts, "search_and_download", true, [&](cuda::stream_ref) {
                 host_results output;
-                search(db, queries, buffers, opts, stream, true, all, &output);
+                search(db, queries, buffers, opts, stream, !opts.exhaustive, all, &output);
                 downloaded = output.total_rows;
                 tiles = output.tiles;
                 host_bytes = output.rows.capacity() * sizeof(cuddl::batch_search_result) +
@@ -1443,14 +1460,14 @@ json run(options const& opts) {
             {"implementation",
              {{"name", "cuddl"},
               {"revision", command_output("git rev-parse HEAD")},
-              {"variant", opts.rows + "_" + opts.index}}},
+              {"variant", opts.rows + "_" + (opts.exhaustive ? "exhaustive" : opts.index)}}},
             {"case",
              {{"measurement", "pipeline"},
               {"performance_only", true},
               {"k", k},
               {"buckets", buckets},
               {"rows", opts.rows},
-              {"index", opts.index},
+              {"index", opts.exhaustive ? "none" : opts.index},
               {"topology", opts.topology},
               {"ingest", opts.ingest},
               {"minimum_matches", opts.minimum_matches},
@@ -1790,7 +1807,8 @@ json run(options const& opts) {
             if (all == (opts.topology == "all-to-all")) {
                 if (!indexed) {
                     exhaustive_pairs = output.rows.size();
-                } else {
+                }
+                if (indexed == !opts.exhaustive) {
                     selected = output.rows.size();
                     selected_validation = observed;
                     match_rows_total = output.rows.size();
@@ -1823,7 +1841,16 @@ json run(options const& opts) {
     }
     host("search_and_download", [&](cuda::stream_ref) {
         host_results output;
-        search(db, queries, buffers, opts, stream, true, opts.topology == "all-to-all", &output);
+        search(
+            db,
+            queries,
+            buffers,
+            opts,
+            stream,
+            !opts.exhaustive,
+            opts.topology == "all-to-all",
+            &output
+        );
         do_not_optimise(output);
     });
     for (auto const& [label, group] : std::vector<std::pair<std::string, collection*>>{
@@ -1871,13 +1898,13 @@ json run(options const& opts) {
             {"implementation",
              {{"name", "cuddl"},
               {"revision", command_output("git rev-parse HEAD")},
-              {"variant", opts.rows + "_" + opts.index}}},
+              {"variant", opts.rows + "_" + (opts.exhaustive ? "exhaustive" : opts.index)}}},
             {"case",
              {{"measurement", "pipeline"},
               {"k", k},
               {"buckets", buckets},
               {"rows", opts.rows},
-              {"index", opts.index},
+              {"index", opts.exhaustive ? "none" : opts.index},
               {"topology", opts.topology},
               {"ingest", opts.ingest},
               {"indexed_buckets", opts.indexed_buckets},
@@ -1956,6 +1983,11 @@ int main(int argc, char** argv) try {
     app.add_option("--name", opts.name);
     app.add_option("--rows", opts.rows)->check(CLI::IsMember({"compact", "packed"}));
     app.add_option("--index", opts.index)->check(CLI::IsMember({"dense", "sparse"}));
+    app.add_flag(
+        "--exhaustive",
+        opts.exhaustive,
+        "Compare every pair without an index; requires --minimum-matches 0"
+    );
     app.add_option("--topology", opts.topology, "Search used in the E2E total")
         ->check(CLI::IsMember({"batch", "all-to-all"}));
     app.add_option("--minimum-matches", opts.minimum_matches)->check(CLI::Range(0, int(buckets)));
@@ -2016,6 +2048,9 @@ int main(int argc, char** argv) try {
         ->check(CLI::Range(size_t{0}, size_t{1} << 20));
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
+    if (opts.exhaustive && opts.minimum_matches != 0U) {
+        throw std::runtime_error("--exhaustive requires --minimum-matches 0");
+    }
     if (opts.performance_only && opts.resident_plan) {
         throw std::runtime_error("--performance-only and --resident-plan are mutually exclusive");
     }
