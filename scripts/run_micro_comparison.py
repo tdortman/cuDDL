@@ -1445,6 +1445,7 @@ def main(
                     str(rabbit_samples),
                     "--warmups",
                     str(warmups),
+                    *(["--performance-only"] if performance_only else []),
                     "--k",
                     "25",
                     "--ingest",

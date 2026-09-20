@@ -37,6 +37,7 @@ struct options {
     std::string output, name = "RabbitSketch CPU pipeline", topology = "batch";
     std::string ingest = "packed";
     int k = 25, sketch_size = 4096, samples = 20, warmups = 3;
+    bool performance_only = false;
     uint64_t seed = 42;
     int threads = omp_get_num_procs();
     size_t match_rows = 20000, dataset_hashes = 8;
@@ -587,12 +588,17 @@ sequence_timings sequence_resident_timings(
     if (n && q > std::numeric_limits<size_t>::max() / n) {
         throw std::runtime_error("resident result size overflow");
     }
-    auto const reference = check_sequence_reference(genome_paths, opts);
+    std::optional<sequence_reference> reference;
+    if (!opts.performance_only) {
+        reference = check_sequence_reference(genome_paths, opts);
+    }
     uint32_t const k = static_cast<uint32_t>(opts.k);
     std::vector<Sketch::FastKMV> staged;
-    staged.reserve(genome_paths.size());
-    for (size_t i = 0; i < genome_paths.size(); ++i) {
-        staged.emplace_back(opts.sketch_size, opts.k, opts.seed);
+    if (!opts.performance_only) {
+        staged.reserve(genome_paths.size());
+        for (size_t i = 0; i < genome_paths.size(); ++i) {
+            staged.emplace_back(opts.sketch_size, opts.k, opts.seed);
+        }
     }
     // Untimed chunked build over the shared batch stream; register equality against the
     // whole-record reference proves the k-1 overlap loses and duplicates no window.
@@ -600,46 +606,57 @@ sequence_timings sequence_resident_timings(
     // multi-batch corpus keeps streaming so staging stays bounded by the cap.
     resident_sequence::batch retained;
     size_t seen = 0;
-    size_t const batches = resident_sequence::for_each_batch(
-        genome_paths, k, opts.resident_bytes, [&](resident_sequence::batch& batch) {
-            update_sequence_groups(staged, batch, group_sequence_batch(batch));
-            // consume() passes a nonconst batch; move the first one into retained
-            // storage. flush() clears the moved-from vectors safely.
-            if (seen++ == 0) {
-                retained = std::move(batch);
-            }
+    size_t batches = 0;
+    if (!opts.performance_only) {
+        batches = resident_sequence::for_each_batch(
+            genome_paths,
+            k,
+            opts.resident_bytes,
+            [&](resident_sequence::batch& batch) {
+                update_sequence_groups(staged, batch, group_sequence_batch(batch));
+                // consume() passes a nonconst batch; move the first one into retained
+                // storage. flush() clears the moved-from vectors safely.
+                if (seen++ == 0) {
+                    retained = std::move(batch);
+                }
+            },
+            static_cast<unsigned>(opts.threads)
+        );
+        if (batches != 1) {
+            retained = resident_sequence::batch{};
         }
-    );
-    if (batches != 1) {
-        retained = resident_sequence::batch{};
     }
     sequence_batch_groups retained_groups;
     if (batches == 1) {
         retained_groups = group_sequence_batch(retained);
     }
-    for (size_t i = 0; i < staged.size(); ++i) {
-        staged[i].finalize();
-        auto const* registers = staged[i].getRegisters();
-        if (staged[i].size() != reference.registers[i].size() ||
-            !std::equal(reference.registers[i].begin(), reference.registers[i].end(), registers)) {
-            throw std::runtime_error(
-                "batched ASCII chunks differ from whole-record sketch: " + genome_paths[i]
-            );
+    if (!opts.performance_only) {
+        for (size_t i = 0; i < staged.size(); ++i) {
+            staged[i].finalize();
+            auto const* registers = staged[i].getRegisters();
+            if (staged[i].size() != reference->registers[i].size() ||
+                !std::equal(
+                    reference->registers[i].begin(), reference->registers[i].end(), registers
+                )) {
+                throw std::runtime_error(
+                    "batched ASCII chunks differ from whole-record sketch: " + genome_paths[i]
+                );
+            }
         }
     }
     // Compact strict-upper-triangle layout for all-to-all (row-major q<r); batch stays n*q.
     // The n*q guard above keeps n*n representable, so divide-before-multiply below is safe.
     size_t const pair_count =
         all ? (n < 2 ? 0 : (n % 2 == 0 ? (n / 2) * (n - 1) : n * ((n - 1) / 2))) : n * q;
-    std::vector<double> expected(pair_count);
-    if (all) {
+    std::vector<double> expected(opts.performance_only ? 0 : pair_count);
+    if (!opts.performance_only && all) {
         parallel_for(n, [&](size_t i) {
             for (size_t j = i + 1; j < n; ++j) {
                 auto const position = i * (2 * n - i - 1) / 2 + j - i - 1;
                 expected[position] = staged[i].jaccard(staged[j]);
             }
         });
-    } else {
+    } else if (!opts.performance_only) {
         parallel_for(expected.size(), [&](size_t position) {
             auto const i = position / n, j = position % n;
             expected[position] = staged[n + i].jaccard(staged[j]);
@@ -686,27 +703,33 @@ sequence_timings sequence_resident_timings(
     for (int replay = -opts.warmups; replay < opts.samples; ++replay) {
         double const reset_time = measure_single_ms(opts, reset);
         double construct_time = 0;
-        if (batches == 1) {
+        if (!opts.performance_only && batches == 1) {
             construct_time += measure_single_ms(opts, [&] {
                 update_sequence_groups(sketches, retained, retained_groups);
             });
         } else {
             size_t const observed = resident_sequence::for_each_batch(
-                genome_paths, k, opts.resident_bytes, [&](resident_sequence::batch const& batch) {
+                genome_paths,
+                k,
+                opts.resident_bytes,
+                [&](resident_sequence::batch const& batch) {
                     auto const groups = group_sequence_batch(batch);
                     construct_time += measure_single_ms(opts, [&] {
                         update_sequence_groups(sketches, batch, groups);
                     });
-                }
+                },
+                static_cast<unsigned>(opts.threads)
             );
-            if (observed != batches) {
+            if (batches == 0) {
+                batches = observed;
+            } else if (observed != batches) {
                 throw std::runtime_error("resident batch plan changed between replays");
             }
         }
         double const finalize_time = measure_single_ms(opts, finalize);
         double const cardinality_time = measure_single_ms(opts, cardinality);
         double const search_time = measure_single_ms(opts, compare);
-        if (similarities != expected) {
+        if (!opts.performance_only && similarities != expected) {
             throw std::runtime_error("resident replay changed pair results");
         }
         if (replay >= 0) {
@@ -720,11 +743,15 @@ sequence_timings sequence_resident_timings(
             );
         }
     }
-    for (size_t i = 0; i < sketches.size(); ++i) {
-        auto const* registers = sketches[i].getRegisters();
-        if (sketches[i].size() != reference.registers[i].size() ||
-            !std::equal(reference.registers[i].begin(), reference.registers[i].end(), registers)) {
-            throw std::runtime_error("timed resident replay differs from untimed chunks");
+    if (!opts.performance_only) {
+        for (size_t i = 0; i < sketches.size(); ++i) {
+            auto const* registers = sketches[i].getRegisters();
+            if (sketches[i].size() != reference->registers[i].size() ||
+                !std::equal(
+                    reference->registers[i].begin(), reference->registers[i].end(), registers
+                )) {
+                throw std::runtime_error("timed resident replay differs from untimed chunks");
+            }
         }
     }
     json timings;
@@ -734,26 +761,28 @@ sequence_timings sequence_resident_timings(
     timings["resident_finalize_wall"] = summarize_replays(finalize_ms);
     timings["resident_cardinality_wall"] = summarize_replays(cardinality_ms);
     timings["resident_search_wall"] = summarize_replays(search_ms);
-    collection resident_refs, resident_queries;
-    resident_refs.reserve(reference_size);
-    if (!all) {
-        resident_queries.reserve(opts.queries.size());
-    }
-    for (size_t i = 0; i < genome_paths.size(); ++i) {
-        api::BuiltSketch sketch = api::BuiltSketch::fromFastKMV(std::move(sketches[i]));
-        api::BuildResult built(
-            std::move(sketch), "genome", cfg, reference.stats[i], genome_paths[i], ""
-        );
-        if (i < reference_size) {
-            resident_refs.push_back(std::move(built));
-        } else {
-            resident_queries.push_back(std::move(built));
+    if (!opts.performance_only) {
+        collection resident_refs, resident_queries;
+        resident_refs.reserve(reference_size);
+        if (!all) {
+            resident_queries.reserve(opts.queries.size());
         }
-    }
-    auto const resident = search(resident_refs, resident_queries, all, opts.match_rows);
-    if (resident.pairs != expected_pairs ||
-        measurements(resident_refs, resident_queries, resident.matches) != rows) {
-        throw std::runtime_error("resident sequence chunks differ from file ingest results");
+        for (size_t i = 0; i < genome_paths.size(); ++i) {
+            api::BuiltSketch sketch = api::BuiltSketch::fromFastKMV(std::move(sketches[i]));
+            api::BuildResult built(
+                std::move(sketch), "genome", cfg, reference->stats[i], genome_paths[i], ""
+            );
+            if (i < reference_size) {
+                resident_refs.push_back(std::move(built));
+            } else {
+                resident_queries.push_back(std::move(built));
+            }
+        }
+        auto const resident = search(resident_refs, resident_queries, all, opts.match_rows);
+        if (resident.pairs != expected_pairs ||
+            measurements(resident_refs, resident_queries, resident.matches) != rows) {
+            throw std::runtime_error("resident sequence chunks differ from file ingest results");
+        }
     }
     return {std::move(timings), batches};
 }
@@ -865,25 +894,32 @@ json run(options const& opts) {
     uint64_t const all_to_all_pairs =
         reference_count > 1 ? uint64_t{reference_count} * (reference_count - 1) / 2 : 0;
 
-    // The untimed run warms input caches and checks file ingest against record construction.
+    // The untimed build warms input caches and provides sketches for standalone compare timings.
     double setup_resident_ms = 0;
     auto refs = build_files(opts.references, cfg, setup_resident_ms);
     auto queries = build_files(opts.queries, cfg, setup_resident_ms);
-    auto const searched = search(refs, queries, all, opts.match_rows);
-    auto const& matches = searched.matches;
-    size_t const match_rows_emitted = matches.size();
-    auto rows = measurements(refs, queries, matches);
+    search_result searched;
+    if (opts.performance_only) {
+        searched.pairs = all ? all_to_all_pairs : uint64_t{refs.size()} * queries.size();
+    } else {
+        searched = search(refs, queries, all, opts.match_rows);
+    }
+    size_t const match_rows_emitted = searched.matches.size();
+    auto rows =
+        opts.performance_only ? json::array() : measurements(refs, queries, searched.matches);
     std::string resident_scope = "all_files";
-    bool sequence_oracle_equal = false;
+    json sequence_oracle_equal = nullptr;
     size_t resident_batches = 0;
     json chunked_timings = json::object();
     if (streamed) {
-        // Full-corpus check: bounded chunked resident sketches must match file ingest exactly.
+        // Checked runs also require bounded chunked resident sketches to match file ingest.
         auto resident = sequence_resident_timings(opts, cfg, searched.pairs, rows);
         chunked_timings = std::move(resident.timings);
         resident_batches = resident.batches;
-        sequence_oracle_equal = true;
-    } else {
+        if (!opts.performance_only) {
+            sequence_oracle_equal = true;
+        }
+    } else if (!opts.performance_only) {
         auto reference_records = parse(opts.references);
         auto query_records = parse(opts.queries);
         auto resident_refs = construct(reference_records, cfg);
@@ -904,8 +940,12 @@ json run(options const& opts) {
         auto q = build_files(opts.queries, cfg, resident_ms);
         mark();
         auto hits = search(r, q, all, opts.match_rows);
-        auto output = measurements(r, q, hits.matches).dump();
-        consumed_size = output.size();
+        if (opts.performance_only) {
+            consumed_size = hits.matches.size();
+        } else {
+            auto output = measurements(r, q, hits.matches).dump();
+            consumed_size = output.size();
+        }
         mark();
         if (prepare_sample++ >= 0) resident_sketch_ms.push_back(resident_ms);
     });
@@ -930,10 +970,12 @@ json run(options const& opts) {
     });
     timings["resident_compare"] =
         timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"];
-    timings["metrics_and_serialize"] = measure(opts, [&] {
-        auto output = measurements(refs, queries, matches).dump();
-        consumed_size = output.size();
-    });
+    if (!opts.performance_only) {
+        timings["metrics_and_serialize"] = measure(opts, [&] {
+            auto output = measurements(refs, queries, searched.matches).dump();
+            consumed_size = output.size();
+        });
+    }
 
     auto const& runtime = Sketch::Runtime::runtimeInfo();
     if (!streamed) {
@@ -951,6 +993,7 @@ json run(options const& opts) {
               {"variant", "FastKMV"}}},
             {"case",
              {{"measurement", "pipeline"},
+              {"performance_only", opts.performance_only},
               {"k", opts.k},
               {"sketch_size", opts.sketch_size},
               {"hash_seed", opts.seed},
@@ -988,7 +1031,7 @@ json run(options const& opts) {
              {{"exhaustive_pairs", searched.pairs},
               {"match_rows_total", searched.pairs},
               {"match_rows_emitted", match_rows_emitted},
-              {"resident_streaming_equal", true},
+              {"resident_streaming_equal", opts.performance_only ? json(nullptr) : json(true)},
               {"resident_streaming_scope", resident_scope},
               {"resident_sequence_chunk_oracle_equal", sequence_oracle_equal},
               {"all_to_all_pairs", all_to_all_pairs}}},
@@ -1050,6 +1093,11 @@ int main(int argc, char** argv) try {
         ->check(CLI::Range(size_t{0}, size_t{1} << 40));
     app.add_option("--dataset-hashes", opts.dataset_hashes, "Per-file dataset digests")
         ->check(CLI::Range(size_t{0}, size_t{1} << 20));
+    app.add_flag(
+        "--performance-only",
+        opts.performance_only,
+        "Skip correctness oracles and result equivalence checks"
+    );
     app.add_option("--output", opts.output, "Shared-schema JSON output, stdout if omitted");
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
