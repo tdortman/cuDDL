@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import typer
+from benchmark_schema import load_result
 from run_micro_comparison import run_timed
 
 
@@ -108,6 +109,8 @@ def main() -> None:
                         == metrics["retrieval_ms"]
                     )
                     assert "excluded_output_ms" in metrics
+                    if tool == "cuddl":
+                        assert metrics["excluded_output_ms"] == 0
             if performance_only:
                 assert "truth oracle" not in result.stdout
                 assert "skani truth:" not in result.stdout
@@ -134,6 +137,97 @@ def main() -> None:
                 assert "recall_at_k" in search["metrics"]
             print(
                 f"{tool} {topology}: {'performance-only' if performance_only else 'accuracy'} passed"
+            )
+
+        pipeline = runner.parent.parent / "build/benchmarks/cuddl-pipeline-benchmark"
+        pipeline_genome = work / "pipeline.fna"
+        pipeline_genome.write_text(f">genome\n{sequence[:1000]}\n")
+        genome = str(pipeline_genome)
+        for topology, ingest, performance, references, queries in [
+            ("batch", "sequence", True, 257, 259),
+            ("all-to-all", "sequence", True, 257, 1),
+            ("batch", "packed", True, 3, 2),
+            ("batch", "sequence", False, 3, 2),
+            ("batch", "sequence", False, 10001, 1),
+        ]:
+            config = work / "pipeline.toml"
+            config.write_text(
+                "reference = "
+                + json.dumps([genome] * references)
+                + "\nquery = "
+                + json.dumps([genome] * queries)
+                + "\n"
+            )
+            command = [
+                str(pipeline),
+                "--config",
+                str(config),
+                "--output",
+                str(output),
+                "--topology",
+                topology,
+                "--ingest",
+                ingest,
+                "--minimum-matches",
+                "0",
+                "--samples",
+                "2",
+                "--warmups",
+                "0",
+                "--workers",
+                "2",
+            ]
+            if performance:
+                command.append("--performance-only")
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            measurements = load_result(output)["measurements"]
+            report = next(
+                m for m in measurements if m["case"]["measurement"] == "pipeline"
+            )
+            expected = (
+                references * (references - 1) // 2
+                if topology == "all-to-all"
+                else references * queries
+            )
+            assert report["metrics"]["match_rows_total"] == expected
+            if performance:
+                assert not report["metrics"]["validation_performed"]
+                assert "oracle_passed" not in report["metrics"]
+                assert not report["metrics"]["all_to_all_suite"]
+                assert all(m["case"]["measurement"] == "pipeline" for m in measurements)
+                phases = report["timings"]
+                requested = (
+                    "search_all_to_all_indexed"
+                    if topology == "all-to-all"
+                    else "search_batch_indexed"
+                )
+                assert requested in phases and "search_and_download" in phases
+                assert not any(
+                    "exhaustive" in p or "single" in p or "resident" in p
+                    for p in phases
+                )
+                if topology == "batch":
+                    assert not any("all_to_all" in p for p in phases)
+                memory = report["memory_bytes"]
+                assert (
+                    memory["host_result_capacity"]
+                    <= memory["search_result_capacity"]
+                    + memory["search_match_capacity"]
+                )
+                if references == 257:
+                    assert report["metrics"]["downloaded_tiles"] > 1
+                    assert memory["host_result_capacity"] < expected * 36
+            else:
+                assert report["metrics"]["oracle_passed"]
+                assert report["metrics"]["oracle_pairs_checked"] > 0
+                if references == 10001:
+                    assert not report["metrics"]["all_to_all_suite"]
+                    assert not any("all_to_all" in p for p in report["timings"])
+            print(
+                f"pipeline {topology} {ingest}: {expected} rows, validation={not performance} passed"
             )
 
 

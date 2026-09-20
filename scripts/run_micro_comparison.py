@@ -19,6 +19,10 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
   metrics and a JSON sample of match rows) are recorded beside them, never
   counted as comparison.
 
+With --performance-only, cuDDL also skips internal validation and auxiliary
+benchmark suites. Every result is downloaded through a reusable host tile;
+per-genome statistics and per-pair JSON rows are not generated.
+
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
 verified bit-identical against a Python oracle) and, when --skani-truth is
 passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
@@ -259,7 +263,9 @@ def retrieval_phases(
     interval = timings["query_output_wall"]["median_ms"]
     phases = {
         "retrieval_ms": retrieval,
-        "excluded_output_ms": interval - retrieval,
+        "excluded_output_ms": (
+            0.0 if payload["case"].get("performance_only") else interval - retrieval
+        ),
         "end_to_end_ms": timings["end_to_end_wall"]["median_ms"],
     }
     if device_phase is not None:
@@ -418,7 +424,8 @@ def main(
     performance_only: Annotated[
         bool,
         typer.Option(
-            help="Run only the selected tools for timings; skip truth oracles and accuracy metrics."
+            help="Run only the selected tools for timings; skip truth oracles and accuracy metrics. "
+            "cuDDL also skips internal validation, auxiliary suites, and per-pair JSON output."
         ),
     ] = False,
     samples: Annotated[
@@ -1667,6 +1674,7 @@ def main(
                     str(pipeline_bin),
                     "--topology",
                     topology,
+                    *(["--performance-only"] if performance_only else []),
                     "--samples",
                     str(max(samples, 2)),
                     "--warmups",
@@ -1840,6 +1848,7 @@ def main(
                     str(pipeline_bin),
                     "--topology",
                     search_topology,
+                    *(["--performance-only"] if performance_only else []),
                     "--samples",
                     str(max(samples, 2)),
                     "--warmups",

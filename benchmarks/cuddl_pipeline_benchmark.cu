@@ -49,6 +49,7 @@ struct options {
     unsigned workers = cuddl::default_parser_workers;
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
     bool resident_plan = false;
+    bool performance_only = false;
     int samples = 20, warmups = 3;
     size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8,
            all_to_all_pairs = 50000000;
@@ -469,6 +470,8 @@ struct search_buffers {
 struct host_results {
     std::vector<cuddl::batch_search_result> rows;
     std::vector<uint32_t> matches;
+    uint64_t total_rows = 0;
+    size_t tiles = 0;
 };
 
 void search(
@@ -482,6 +485,10 @@ void search(
     host_results* output = nullptr,
     std::function<void(uint32_t)> device_consume = {}
 ) {
+    if (output && opts.performance_only) {
+        output->rows.reserve(buffers.results.size());
+        output->matches.reserve(buffers.matches.size());
+    }
     auto consume = [&](uint32_t capacity) {
         if (device_consume) device_consume(capacity);
         if (!output) {
@@ -493,6 +500,12 @@ void search(
         }
         if (count == 0) {
             return;
+        }
+        output->total_rows += count;
+        ++output->tiles;
+        if (opts.performance_only) {
+            output->rows.clear();
+            output->matches.clear();
         }
         auto const offset = output->rows.size();
         output->rows.resize(offset + count);
@@ -1262,6 +1275,7 @@ void application_output(
     host_results const& output,
     cuda::stream_ref stream
 ) {
+    if (opts.performance_only) return;
     json result = {
         {"references", collection_metrics(refs, stream)},
         {"queries", collection_metrics(queries, stream)},
@@ -1342,7 +1356,7 @@ json run(options const& opts) {
     cuda::stream stream{cuda::devices[0]};
     // All-to-all result storage grows as N*(N-1)/2 rows. Refuse a corpus that cannot hold them
     // instead of failing inside the first timed sample.
-    if (opts.topology == "all-to-all") {
+    if (opts.topology == "all-to-all" && !opts.performance_only) {
         auto const count = opts.references.size();
         uint64_t const pairs = count > 1 ? uint64_t{count} * (count - 1) / 2 : 0;
         uint64_t const required = pairs * (sizeof(cuddl::batch_search_result) + sizeof(uint32_t));
@@ -1395,6 +1409,78 @@ json run(options const& opts) {
     refs.extract(stream);
     queries.extract(stream);
     stream.sync();
+    if (opts.performance_only) {
+        auto db = build(refs, opts, stream, true);
+        search_buffers buffers(
+            db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology
+        );
+        stream.sync();
+        bool const all = opts.topology == "all-to-all";
+        auto const phase = all ? "search_all_to_all_indexed" : "search_batch_indexed";
+        json wall;
+        timings[phase] = measure(
+            opts,
+            phase,
+            false,
+            [&](cuda::stream_ref s) { search(db, queries, buffers, opts, s, true, all); },
+            {},
+            &wall
+        );
+        timings[std::string(phase) + "_wall"] = std::move(wall);
+        uint64_t downloaded = 0;
+        size_t host_bytes = 0, tiles = 0;
+        timings["search_and_download"] =
+            measure(opts, "search_and_download", true, [&](cuda::stream_ref) {
+                host_results output;
+                search(db, queries, buffers, opts, stream, true, all, &output);
+                downloaded = output.total_rows;
+                tiles = output.tiles;
+                host_bytes = output.rows.capacity() * sizeof(cuddl::batch_search_result) +
+                             output.matches.capacity() * sizeof(uint32_t);
+                do_not_optimise(output);
+            });
+        json measurements = json::array({{
+            {"implementation",
+             {{"name", "cuddl"},
+              {"revision", command_output("git rev-parse HEAD")},
+              {"variant", opts.rows + "_" + opts.index}}},
+            {"case",
+             {{"measurement", "pipeline"},
+              {"performance_only", true},
+              {"k", k},
+              {"buckets", buckets},
+              {"rows", opts.rows},
+              {"index", opts.index},
+              {"topology", opts.topology},
+              {"ingest", opts.ingest},
+              {"minimum_matches", opts.minimum_matches},
+              {"parser_threads", streamed ? reference_rows.parser_workers : 0},
+              {"references", refs.sketches.size()},
+              {"queries", all ? refs.sketches.size() : queries.sketches.size()},
+              {"samples", opts.samples},
+              {"warmups", opts.warmups},
+              {"input_cache", "warm_os_cache"},
+              {"end_to_end_output", "host_result_tiles"}}},
+            {"metrics",
+             {{"match_rows_total", downloaded},
+              {"match_rows_emitted", 0},
+              {"downloaded_tiles", tiles},
+              {"all_to_all_suite", false},
+              {"validation_performed", false}}},
+            {"timings", timings},
+            {"memory_bytes",
+             {{"persistent_rows", db.persistent_row_bytes()},
+              {"persistent_index", db.persistent_index_bytes()},
+              {"search_workspace", buffers.workspace.size()},
+              {"search_result_capacity",
+               buffers.results.size() * sizeof(cuddl::batch_search_result)},
+              {"search_match_capacity", buffers.matches.size() * sizeof(uint32_t)},
+              {"host_result_capacity", host_bytes}}},
+        }});
+        auto datasets = dataset_entries("reference", opts.references, opts.dataset_hashes);
+        datasets.update(dataset_entries("query", opts.queries, opts.dataset_hashes));
+        return make_benchmark_result(opts.name, "pipeline", "end_to_end", measurements, datasets);
+    }
     auto const ref_scores = download(refs.scores, stream),
                query_scores = download(queries.scores, stream);
     if (!streamed) {
@@ -1666,11 +1752,12 @@ json run(options const& opts) {
         gpu(indexed ? "search_single_indexed" : "search_single_exhaustive",
             [&](cuda::stream_ref s) { single(s, indexed); });
     }
-    // The all-to-all suite is coverage for small corpora. A large collection needs more pair
-    // rows than the buffers hold, so it runs the selected topology only.
+    // Auxiliary all-to-all validation retains the full host result set, not just a GPU tile.
+    // Bound it by the full triangular pair count even when device buffers are tiled.
+    auto const reference_count = static_cast<uint64_t>(refs.sketches.size());
+    auto const all_pairs = reference_count > 1 ? reference_count * (reference_count - 1) / 2 : 0;
     auto const all_to_all_fits =
-        CUDDL_UNWRAP(db.all_to_all_search_requirements(stream)).maximum_pair_count <=
-        buffers.results.size();
+        opts.topology == "all-to-all" || all_pairs <= opts.all_to_all_pairs;
     uint64_t selected = 0, exhaustive_pairs = 0, match_rows_emitted = 0, match_rows_total = 0;
     validation selected_validation;
     auto emit_match = [&](cuddl::batch_search_result const& row) {
@@ -1877,6 +1964,11 @@ int main(int argc, char** argv) try {
     app.add_option("--key-bits", opts.key_bits)->check(CLI::IsMember({15, 16}));
     app.add_option("--samples", opts.samples)->check(CLI::Range(2, 10000));
     app.add_option("--warmups", opts.warmups)->check(CLI::Range(0, 1000));
+    app.add_flag(
+        "--performance-only",
+        opts.performance_only,
+        "Time only the requested search with tiled downloads, without validation or result JSON"
+    );
     app.add_option(
            "--ingest",
            opts.ingest,
@@ -1924,6 +2016,9 @@ int main(int argc, char** argv) try {
         ->check(CLI::Range(size_t{0}, size_t{1} << 20));
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
+    if (opts.performance_only && opts.resident_plan) {
+        throw std::runtime_error("--performance-only and --resident-plan are mutually exclusive");
+    }
     if (!(opts.topology != "all-to-all" || opts.references.size() >= 2)) {
         throw std::runtime_error("all-to-all E2E needs at least two reference genomes");
     }
