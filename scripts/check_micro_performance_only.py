@@ -1,20 +1,37 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["typer"]
+# dependencies = ["jsonschema", "typer"]
 # ///
 """Check real CLI tool selection and exclusion of benchmark output from query timings."""
 
 import json
 import random
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import typer
+from run_micro_comparison import run_timed
 
 
 def main() -> None:
+    diagnostic = "benchmark failure detail"
+    try:
+        run_timed(
+            "failure diagnostic",
+            [
+                sys.executable,
+                "-c",
+                f"import sys; sys.stderr.write({diagnostic!r}); sys.exit(1)",
+            ],
+        )
+    except typer.BadParameter as error:
+        assert diagnostic in str(error)
+        assert "command exited 1" in str(error)
+    else:
+        raise AssertionError("failed benchmark was accepted")
     runner = Path(__file__).with_name("run_micro_comparison.py")
     with tempfile.TemporaryDirectory(prefix="micro-performance-") as tmp:
         work = Path(tmp)

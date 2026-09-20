@@ -89,8 +89,8 @@ def run(
 
     @p quiet discards the command's stdout instead. A timed pass needs its time and nothing
     else, and some tools print a whole similarity matrix or a per-sequence log to stdout, which
-    would otherwise bury the runner's own report. Stderr stays connected so a failure is still
-    readable.
+    would otherwise bury the runner's own report. With @p log_tail, quiet commands retain
+    stdout and stderr in a temporary file and report the last 15 lines on failure.
     """
     log = None
     if capture:
@@ -125,6 +125,9 @@ def run(
         raise typer.BadParameter(
             f"command exited {error.returncode}: {' '.join(cmd)}\n{detail}"
         ) from error
+    finally:
+        if log is not None:
+            log.close()
     return proc.stdout if capture else ""
 
 
@@ -169,7 +172,7 @@ def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
     """
     typer.echo(f"  {label}: running {Path(cmd[0]).name} ...")
     tick = time.perf_counter()
-    stdout = run(cmd, capture=capture, quiet=not capture)
+    stdout = run(cmd, capture=capture, quiet=not capture, log_tail=True)
     typer.echo(f"  {label}: done in {time.perf_counter() - tick:.1f}s")
     return stdout
 
