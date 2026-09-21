@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -98,16 +99,23 @@ int main(int argc, char** argv) try {
         });
     };
     nvbench::benchmark<decltype(run)> benchmark(run);
+    // Corpus-sized samples must finish by count, not NVBench's default wall timeout.
     benchmark.set_name(parse_only ? "reference-parse" : "reference-build-and-save")
         .set_stopping_criterion("sample-count")
         .set_min_samples(samples)
         .set_criterion_param_int64("target-samples", samples)
+        .set_timeout(std::numeric_limits<double>::max())
         .set_cold_warmup_runs(1)
         .set_skip_batched(true)
         .set_is_cpu_only(true);
     benchmark.run();
     auto const& state = benchmark.get_states().front();
     if (state.is_skipped()) throw std::runtime_error(state.get_skip_reason());
+    auto const measured_samples = state.get_summary("nv/cpu_only/sample_size").get_int64("value");
+    if (measured_samples != samples ||
+        (!parse_only && resident_ms.size() != static_cast<size_t>(measured_samples))) {
+        throw std::runtime_error("reference build did not collect the requested timing samples");
+    }
     if (!parse_only) {
         auto file = CUDDL_UNWRAP(cuddl::reference_database_file::load(output));
         if (file.names().size() != paths.size()) {
@@ -139,7 +147,7 @@ int main(int argc, char** argv) try {
         {"input_bytes", bytes},
         {"parser_threads", threads},
         {"parser_workers", workers},
-        {"samples", samples},
+        {"samples", measured_samples},
         {"median_seconds", median},
         {"input_MB_per_second", bytes / median / 1e6},
         {"direct_bytes", statistics.direct_bytes},
@@ -155,7 +163,7 @@ int main(int argc, char** argv) try {
         {"transfers", statistics.transfers}
     };
     report["wall"] = {
-        {"samples", samples},
+        {"samples", measured_samples},
         {"median_ms", median * 1000},
         {"min_ms", minimum * 1000},
         {"max_ms", maximum * 1000},

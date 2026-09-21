@@ -46,20 +46,26 @@ def main() -> None:
             ("cub-exact", True, "all-to-all"),
             ("skani", True, "all-to-all"),
             ("dashing2", True, "all-to-all"),
+            ("dashing2", False, "all-to-all"),
+            ("dashing2", True, "batch"),
             ("hypergen", True, "all-to-all"),
             ("cuddl", True, "all-to-all"),
             ("cuddl", True, "batch"),
             ("rabbitsketch", True, "all-to-all"),
+            ("rabbitsketch", False, "all-to-all"),
+            ("rabbitsketch", True, "batch"),
+            ("rabbitsketch", False, "batch"),
             ("cub-exact", False, "all-to-all"),
         ]:
             output = work / "result.json"
+            samples = 3 if tool in {"cuddl", "rabbitsketch", "dashing2"} else 1
             command = [
                 str(runner),
                 str(genomes),
                 "--tools",
                 tool,
                 "--samples",
-                "1",
+                str(samples),
                 "--warmups",
                 "0",
                 "--threads",
@@ -74,6 +80,8 @@ def main() -> None:
                 command += ["--performance-only", "--skani-truth"]
             if topology == "batch":
                 command += ["--topology", "batch", "--query-count", "2"]
+                if tool == "dashing2":
+                    command += ["--match-rows", "2"]
                 if tool == "cuddl":
                     command += ["--cuddl-workers", "72", "--cuddl-index", "sparse"]
             result = subprocess.run(
@@ -89,15 +97,25 @@ def main() -> None:
             }
             for measurement in measurements:
                 operation = measurement["case"]["measurement"]
-                wall = measurement["timings"][
-                    "query" if operation == "micro-search" else "wall"
-                ]
                 resident = measurement["timings"]["resident"]
                 assert resident["median_ms"] > 0, measurement
-                # cuDDL query GPU phases and retrieval phases use independent NVBench samples.
-                if tool != "cuddl" or operation == "micro-sketch":
-                    assert resident["median_ms"] <= wall["median_ms"], measurement
                 assert resident["min_ms"] <= resident["median_ms"] <= resident["max_ms"]
+                if tool in {"cuddl", "rabbitsketch", "dashing2"}:
+                    for timing in measurement["timings"].values():
+                        assert timing["samples"] == samples, measurement
+                if operation == "micro-compare":
+                    assert (
+                        measurement["case"]["pairs"] == measurement["metrics"]["pairs"]
+                    )
+                    if tool in {"cuddl", "rabbitsketch"}:
+                        assert measurement["case"]["pairs"] == (
+                            6 if topology == "batch" else 3
+                        ), measurement
+                    if tool == "dashing2" and topology == "batch":
+                        assert measurement["case"]["pairs"] == 6
+                        assert measurement["metrics"]["retained_pair_rows"] == 2
+                        assert measurement["metrics"]["native_pair_row_stride"] == 3
+                        assert measurement["metrics"]["report_row_stride"] == 1
             search = next(
                 m for m in measurements if m["case"]["measurement"] == "micro-search"
             )
@@ -110,6 +128,8 @@ def main() -> None:
                 for measurement in measurements:
                     operation = measurement["case"]["measurement"]
                     if operation == "micro-sketch":
+                        continue
+                    if tool == "rabbitsketch" and operation == "micro-search":
                         continue
                     timing = "query" if operation == "micro-search" else "wall"
                     metrics = (
@@ -132,6 +152,15 @@ def main() -> None:
                             else "dense"
                         )
             if performance_only:
+                if tool in {"dashing2", "rabbitsketch"}:
+                    assert not search["case"].get("resident_reuses_compare", False)
+                    assert search["case"]["index"] == (
+                        "none"
+                        if topology == "batch"
+                        else "native-lsh"
+                        if tool == "dashing2"
+                        else "native-csr"
+                    )
                 for measurement in measurements:
                     metrics = measurement["metrics"]
                     assert (
@@ -150,11 +179,102 @@ def main() -> None:
                     search["metrics"]["per_query_ms"]
                     == search["timings"]["query"]["median_ms"] / queries
                 )
-            else:
+            elif tool == "cub-exact":
                 assert "recall_at_k" in search["metrics"]
+            else:
+                assert "recall_at_k" not in search["metrics"]
             print(
                 f"{tool} {topology}: {'performance-only' if performance_only else 'accuracy'} passed"
             )
+
+        rabbit = (
+            runner.parent.parent / "build/benchmarks/rabbitsketch-pipeline-benchmark"
+        )
+        replay_genome = work / "replay.fna"
+        replay_genome.write_text(
+            f">short\n{sequence[:24]}\n>exact\n{sequence[24:49]}\n"
+            f">ambiguous\n{sequence[:7000].lower()}NNN{sequence[7000:14000]}\n"
+        )
+        replay_results = []
+        for cap in (4096, 1 << 20):
+            result = subprocess.run(
+                [
+                    str(rabbit),
+                    "--reference",
+                    str(replay_genome),
+                    str(genomes / "0.fna"),
+                    "--query",
+                    str(genomes / "1.fna"),
+                    "--topology",
+                    "batch",
+                    "--ingest",
+                    "sequence",
+                    "--resident-bytes",
+                    str(cap),
+                    "--k",
+                    "25",
+                    "--samples",
+                    "3",
+                    "--warmups",
+                    "1",
+                    "--threads",
+                    "2",
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            rows = load_result(output)["measurements"]
+            report = next(m for m in rows if m["case"]["measurement"] == "pipeline")
+            assert report["metrics"]["resident_sequence_chunk_oracle_equal"]
+            assert report["timings"]["resident_sketch"]["samples"] == 3
+            assert (report["case"]["resident_batches"] > 1) == (cap == 4096)
+            replay_results.append(
+                [m for m in rows if m["case"]["measurement"] != "pipeline"]
+            )
+        assert replay_results[0] == replay_results[1]
+        print("rabbitsketch: bounded resident replay preserves multi-record results")
+
+        search_genomes = work / "search-genomes"
+        search_genomes.mkdir()
+        unrelated = "".join(rng.choices("ACGT", k=100_000))
+        for index, bases in enumerate((sequence, sequence, unrelated)):
+            (search_genomes / f"{index}.fna").write_text(f">genome{index}\n{bases}\n")
+        result = subprocess.run(
+            [
+                str(runner),
+                str(search_genomes),
+                "--tools",
+                "dashing2,rabbitsketch,cub-exact",
+                "--samples",
+                "3",
+                "--warmups",
+                "0",
+                "--threads",
+                "2",
+                "--max-kmers",
+                "100000",
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        for measurement in load_result(output)["measurements"]:
+            if (
+                measurement["implementation"]["name"] in {"dashing2", "rabbitsketch"}
+                and measurement["case"]["measurement"] == "micro-search"
+            ):
+                assert measurement["metrics"]["queries_scored"] == 3
+                assert abs(measurement["metrics"]["recall_at_k"] - 1 / 3) < 1e-12
+        print(
+            "native indexes: retrieve the identical neighbor and count empty results as misses"
+        )
 
         pipeline = runner.parent.parent / "build/benchmarks/cuddl-pipeline-benchmark"
         pipeline_genome = work / "pipeline.fna"

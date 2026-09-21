@@ -1,0 +1,111 @@
+--- a/src/resident.h
++++ b/src/resident.h
+@@ -5,6 +5,8 @@
+ namespace dashing2 {
+ 
+ void cuddl_resident_compare_add(double milliseconds);
++void cuddl_resident_index_add(double milliseconds);
++void cuddl_resident_search_add(double resident_ms, double wall_ms);
+ 
+ class cuddl_resident_compare_interval {
+     std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+--- a/src/resident.cpp
++++ b/src/resident.cpp
+@@ -14,6 +14,7 @@
+     clock::time_point started_{};
+     clock::duration sketch_elapsed_{};
+     double compare_ms_ = 0;
++    double index_ms_ = 0, search_ms_ = 0, search_wall_ms_ = 0;
+     bool enabled_ = false;
+     const char* path_ = nullptr;
+ 
+@@ -26,12 +27,18 @@
+     ~resident_timings() {
+         if (!enabled_) return;
+         std::ofstream output(path_, std::ios::trunc);
++        bool const searching = search_wall_ms_ > 0;
+         bool const compare = compare_ms_ > 0;
+         output << "{\"resident_ms\":"
+-               << (compare ? compare_ms_
+-                           : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
++               << (searching ? search_ms_ - index_ms_ : compare ? compare_ms_
++                   : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
+                << ",\"source\":\"steady_clock_cpu_wall\",\"device\":\"cpu\",\"input\":\""
+-               << (compare ? "sketches" : "sequence_ascii") << "\"}";
++               << (searching ? "indexed_sketches" : compare ? "sketches" : "sequence_ascii") << "\"";
++        if (searching) {
++            output << ",\"index_build_ms\":" << index_ms_
++                   << ",\"query_wall_ms\":" << search_wall_ms_ - index_ms_;
++        }
++        output << "}";
+     }
+ 
+     void enter() {
+@@ -44,6 +51,13 @@
+         if (!enabled_) return;
+         std::lock_guard<std::mutex> lock(mutex_);
+         if (--active_ == 0) sketch_elapsed_ += clock::now() - started_;
++    }
++
++    void add_index(double milliseconds) {
++        if (enabled_) index_ms_ += milliseconds;
++    }
++    void add_search(double resident_ms, double wall_ms) {
++        if (enabled_) { search_ms_ += resident_ms; search_wall_ms_ += wall_ms; }
+     }
+ 
+     void add_compare(double milliseconds) {
+@@ -68,6 +82,11 @@
+ 
+ namespace dashing2 {
+ 
++void cuddl_resident_index_add(double milliseconds) { timings.add_index(milliseconds); }
++void cuddl_resident_search_add(double resident_ms, double wall_ms) {
++    timings.add_search(resident_ms, wall_ms);
++}
++
+ void cuddl_resident_compare_add(double milliseconds) {
+     timings.add_compare(milliseconds);
+ }
+--- a/src/index_build.cpp
++++ b/src/index_build.cpp
+@@ -1,3 +1,4 @@
++#include "resident.h"
+ #include "cmp_main.h"
+ #include "minispan.h"
+ #include <vector>
+@@ -98,6 +99,7 @@
+         }
+     }
+     auto idxstop = std::chrono::high_resolution_clock::now();
++    cuddl_resident_index_add(std::chrono::duration<double, std::milli>(idxstop - idxstart).count());
+     if(verbosity >= DEBUG) {
+         std::fprintf(stderr, "Indexed in: %gms\n", std::chrono::duration<double, std::milli>(idxstop - idxstart).count());
+     }
+--- a/src/cmp_core.cpp
++++ b/src/cmp_core.cpp
+@@ -1,3 +1,4 @@
++#include "resident.h"
+ #include "cmp_main.h"
+ #include "sketch/count_eq.h"
+ #include "sketch/hash.h"
+@@ -778,6 +779,7 @@
+         if(verbosity >= DEBUG) {
+             std::fprintf(stderr, "Building knn graph\n");
+         }
++        auto search_started = std::chrono::steady_clock::now();
+         std::vector<pqueue> neighbor_lists = exact_knn ? build_exact_graph(idx, opts, result): build_index(idx, opts, result);
+         if(verbosity >= DEBUG) {
+             std::fprintf(stderr, "Built knn graph\n");
+@@ -796,7 +798,11 @@
+             std::fprintf(stderr, "Emitting neighbors\n");
+         }
+ 
++        auto search_finished = std::chrono::steady_clock::now();
+         emit_neighbors(neighbor_lists, opts, result);
++        cuddl_resident_search_add(
++            std::chrono::duration<double, std::milli>(search_finished - search_started).count(),
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - search_started).count());
+     } else if(opts.output_kind_ == DEDUP) {
+         // The ID corresponds to the representative of a cluster;
+         // Constituents is a vector of IDs per cluster;

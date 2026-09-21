@@ -23,6 +23,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -103,10 +104,12 @@ json measure(
         if (finish) finish();
     };
     nvbench::benchmark<decltype(run)> benchmark(run);
+    // Corpus-sized samples must finish by count, not NVBench's default wall timeout.
     benchmark.set_name(name)
         .set_stopping_criterion("sample-count")
         .set_min_samples(opts.samples)
         .set_criterion_param_int64("target-samples", opts.samples)
+        .set_timeout(std::numeric_limits<double>::max())
         .set_cold_warmup_runs(opts.warmups)
         .set_skip_batched(true);
     if (host) {
@@ -120,10 +123,14 @@ json measure(
         throw std::runtime_error(state.get_skip_reason());
     }
     std::string const base = host ? "nv/cpu_only" : "nv/cold";
+    auto const measured_samples = state.get_summary(base + "/sample_size").get_int64("value");
+    if (measured_samples != opts.samples) {
+        throw std::runtime_error(name + ": did not collect the requested timing samples");
+    }
     auto summarize = [&](bool cpu) {
         auto const prefix = base + (cpu ? "/time/cpu" : "/time/gpu");
         auto result = json{
-            {"samples", state.get_summary(base + "/sample_size").get_int64("value")},
+            {"samples", measured_samples},
             {"median_ms", state.get_summary(prefix + "/median").get_float64("value") * 1000},
             {"min_ms", state.get_summary(prefix + "/min").get_float64("value") * 1000},
             {"max_ms", state.get_summary(prefix + "/max").get_float64("value") * 1000},

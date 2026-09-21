@@ -23,7 +23,8 @@ With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
 per-genome statistics and per-pair JSON rows are not generated.
 Resident processing timings are recorded alongside wall timings in the same run.
-They exclude parsing, transfers, and output serialization.
+They exclude parsing and transfers. RabbitSketch native indexed search retains
+its coupled text formatting, writing to /dev/null for the resident interval.
 
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
 verified bit-identical against a Python oracle) and, when --skani-truth is
@@ -1350,7 +1351,9 @@ def main(
                 d2_marks[suffix] = rep_marks
                 if suffix == d2_timed:
                     d2_sketch_bytes = sum(
-                        path.stat().st_size for path in out_dir.rglob("*") if path.is_file()
+                        path.stat().st_size
+                        for path in out_dir.rglob("*")
+                        if path.is_file()
                     )
                     if sketch_all:
                         shutil.rmtree(out_dir)
@@ -1405,7 +1408,7 @@ def main(
             payload = jsonlib2.loads(stdout[stdout.index("{") :])
             resident_timings[("cuddl", "sketch")] = payload["resident"]
             native_timings[("cuddl", "sketch")] = {"wall": payload["wall"]}
-            marks = [payload["median_seconds"] * 1000] * max(samples, 1)
+            marks = [payload["wall"]["median_ms"]]
             sketch_times["cuddl"] = marks
             sketch_bytes["cuddl"] = db_out.stat().st_size
             record_sketch(
@@ -1475,7 +1478,7 @@ def main(
             resident_timings[("rabbitsketch", "compare")] = pipe["timings"][
                 "resident_compare"
             ]
-            marks = [prepare["median_ms"]] * max(samples, 1)
+            marks = [prepare["median_ms"]]
             sketch_times["rabbitsketch"] = marks
             record_sketch("rabbitsketch", "FastKMV", marks, {})
             rabbit_report, rabbit_rows = payload, pipe
@@ -1576,6 +1579,7 @@ def main(
             evaluated: int | None = None,
         ) -> None:
             jaccard_errors, ani_errors, reported = [], [], 0
+            retained_before = len(pair_table)
             stride = (
                 (len(rows) + match_rows - 1) // match_rows
                 if match_rows and len(rows) > match_rows
@@ -1600,7 +1604,9 @@ def main(
             pairs = evaluated if evaluated is not None else len(rows)
             metrics: dict = {
                 "pairs": pairs,
-                "pair_stride": stride,
+                "native_pair_rows": len(rows),
+                "retained_pair_rows": len(pair_table) - retained_before,
+                "report_row_stride": stride,
                 "per_pair_ms": statistics.median(marks) / max(pairs, 1),
             }
             if jaccard_errors:
@@ -1618,7 +1624,7 @@ def main(
                     "case": {
                         "measurement": "micro-compare",
                         "topology": topology,
-                        "pairs": len(rows),
+                        "pairs": pairs,
                         "k": sketch_k.get(tool, 0),
                         "threads": threads,
                     },
@@ -1663,12 +1669,15 @@ def main(
             d2_compare_resident = []
             marks = wall_of([cmp_cmd], samples, warmups, resident=d2_compare_resident)
             record_native_resident("dashing2", "compare", d2_compare_resident)
-            # One sample row per `pair_stride` pairs, the same rule the other tools' rows use.
-            panel_stride = max(
-                1, (len(references) * len(panel_queries)) // max(match_rows or 1, 1)
+            panel_pairs = len(references) * len(panel_queries)
+            panel_stride = (
+                max(1, (panel_pairs + match_rows - 1) // match_rows)
+                if match_rows
+                else 1
             )
             rows, evaluated = read_dashing2_panel(panel, panel_queries, panel_stride)
             record_compare("dashing2", "SetSketch", marks, rows, evaluated=evaluated)
+            measurements[-1]["metrics"]["native_pair_row_stride"] = panel_stride
 
         if "hypergen" in selected:
             dist_out = work / "hg.ani"
@@ -1937,17 +1946,19 @@ def main(
         k = min(recall_k, n_cand)
 
         def exact_jaccard(query: str, ref: str) -> float:
-            row = oracle.get((query, ref), oracle.get((ref, query)))
-            return row["jaccard"] if row is not None else 0.0
+            key = (query, ref) if (query, ref) in oracle else (ref, query)
+            return oracle[key]["jaccard"]
 
         exact_rank: dict[str, list[str]] = {}
         for query, refs in candidates.items():
-            ranked = sorted(refs, key=lambda r: (-exact_jaccard(query, r), r))
+            known = [r for r in refs if (query, r) in oracle or (r, query) in oracle]
+            ranked = sorted(known, key=lambda r: (-exact_jaccard(query, r), r))
             exact_rank[query] = ranked
         search_index_ms: dict[str, list[float]] = {}
         search_query_ms: dict[str, list[float]] = {}
         search_phases: dict[str, dict[str, float]] = {}
         search_scores: dict[tuple[str, str, str], float] = {}
+        search_cases: dict[str, dict] = {}
 
         if "cuddl" in selected:
             pipeline_bin = build / "benchmarks/cuddl-pipeline-benchmark"
@@ -2082,11 +2093,113 @@ def main(
                     except ValueError:
                         continue
 
-        # Exhaustive-rank tools reuse their COMPARE rows; sketches are the index.
+        if "dashing2" in selected:
+            records = []
+            if topology == "all-to-all":
+                neighbors = work / "d2-neighbors.tsv"
+                command = [
+                    str(dashing2),
+                    "cmp",
+                    "-k25",
+                    "-S4096",
+                    f"-p{threads}",
+                    "--cache",
+                    "--outprefix",
+                    str(d2_dir),
+                    "-F",
+                    str(reference_list),
+                    "--topk",
+                    str(k),
+                    "--cmpout",
+                    str(neighbors),
+                ]
+                wall_of(command, samples, warmups, resident=records)
+                if any(record.get("index_build_ms", 0) <= 0 for record in records):
+                    raise ValueError("Dashing2 did not execute its native LSH index")
+                search_index_ms["dashing2"] = [r["index_build_ms"] for r in records]
+                search_query_ms["dashing2"] = [r["query_wall_ms"] for r in records]
+                if not performance_only:
+                    with neighbors.open() as handle:
+                        for line in handle:
+                            if not line.strip() or line.startswith("#"):
+                                continue
+                            query, *hits = line.rstrip("\n").split("\t")
+                            for hit in hits:
+                                reference, _, score = hit.rpartition(":")
+                                search_scores[("dashing2", query, reference)] = float(
+                                    score
+                                )
+                search_cases["dashing2"] = {
+                    "index": "native-lsh",
+                    "index_supported": True,
+                }
+            else:
+                search_query_ms["dashing2"] = wall_of(
+                    cmp_cmd, samples, warmups, resident=records
+                )
+                search_index_ms["dashing2"] = sketch_times["dashing2"]
+                search_cases["dashing2"] = {
+                    "index": "none",
+                    "index_supported": False,
+                    "index_unavailable_reason": "native CLI LSH traversal is all-to-all only",
+                    "index_build_includes_sketching": True,
+                }
+                native_timings[("dashing2", "search")] = (
+                    {"index_build": native_timings[("dashing2", "sketch")]["wall"]}
+                    if ("dashing2", "sketch") in native_timings
+                    else {}
+                )
+                for row in pair_table:
+                    if row["tool"] == "dashing2" and row.get("jaccard") is not None:
+                        search_scores[("dashing2", row["query"], row["reference"])] = (
+                            row["jaccard"]
+                        )
+            record_native_resident("dashing2", "search", records)
+
+        if "rabbitsketch" in selected:
+            timings = rabbit_rows["timings"]
+            index = rabbit_rows["case"]["search_index"]
+            index_timing = (
+                timings["search_index_build"]
+                if index != "none"
+                else timings["prepare_wall"]
+            )
+            query_timing = timings["search_query_wall"]
+            search_index_ms["rabbitsketch"] = [index_timing["median_ms"]]
+            search_query_ms["rabbitsketch"] = [query_timing["median_ms"]]
+            native_timings[("rabbitsketch", "search")] = {
+                "index_build": index_timing,
+                "query": query_timing,
+            }
+            resident_timings[("rabbitsketch", "search")] = timings["resident_search"]
+            search_cases["rabbitsketch"] = {
+                "index": index,
+                "index_supported": index != "none",
+                "resident_output": rabbit_rows["case"]["search_resident_output"],
+                "index_build_includes_sketching": index == "none",
+            }
+            if index == "none":
+                search_cases["rabbitsketch"]["index_unavailable_reason"] = (
+                    "native CSR traversal is all-to-all only"
+                )
+                for row in pair_table:
+                    if row["tool"] == "rabbitsketch" and row.get("jaccard") is not None:
+                        search_scores[
+                            ("rabbitsketch", row["query"], row["reference"])
+                        ] = row["jaccard"]
+            else:
+                for row in rabbit_report["measurements"]:
+                    if row["case"]["measurement"] != "search-match":
+                        continue
+                    query = str(references[row["case"]["query_id"]])
+                    reference = str(references[row["case"]["reference_id"]])
+                    score = row["metrics"]["jaccard"]
+                    search_scores[("rabbitsketch", query, reference)] = score
+                    search_scores[("rabbitsketch", reference, query)] = score
+
+        # These lanes expose exhaustive comparison only.
         for tool, score_key in (
             ("hypergen", "ani"),
-            ("dashing2", "jaccard"),
-            ("rabbitsketch", "jaccard"),
             ("cub-exact", "jaccard"),
         ):
             if tool in selected:
@@ -2101,11 +2214,7 @@ def main(
             if "hypergen" in selected
             else []
         )
-        for tool, score_key in (
-            ("dashing2", "jaccard"),
-            ("rabbitsketch", "jaccard"),
-            ("cub-exact", "jaccard"),
-        ):
+        for tool, score_key in (("cub-exact", "jaccard"),):
             if tool in selected:
                 search_query_ms[tool] = [
                     m["timings"]["wall"]["median_ms"]
@@ -2119,7 +2228,7 @@ def main(
                     search_scores[("hypergen", row["query"], row["reference"])] = row[
                         "ani"
                     ]
-        for tool in ("dashing2", "rabbitsketch", "cub-exact"):
+        for tool in ("cub-exact",):
             if tool in selected:
                 for row in pair_table:
                     if row["tool"] == tool and row.get("jaccard") is not None:
@@ -2132,21 +2241,19 @@ def main(
         ) -> None:
             recalls, top1 = [], 0
             counted = 0
-            for query, refs in candidates.items():
+            for query in candidates:
+                exact = exact_rank[query]
                 scored = [
                     (search_scores[(tool, query, ref)], ref)
-                    for ref in refs
+                    for ref in exact
                     if (tool, query, ref) in search_scores
                 ]
-                if not scored:
-                    continue
                 ranked = [ref for _, ref in sorted(scored, key=lambda t: (-t[0], t[1]))]
-                exact = [r for r in exact_rank[query] if r in {x for _, x in scored}]
                 kk = min(k, len(exact))
                 if kk < 1:
                     continue
                 recalls.append(len(set(ranked[:kk]) & set(exact[:kk])) / kk)
-                top1 += ranked[0] == exact[0]
+                top1 += bool(ranked) and ranked[0] == exact[0]
                 counted += 1
             measurements.append(
                 {
@@ -2157,6 +2264,7 @@ def main(
                         "queries": len(query_set),
                         "k": k,
                         "threads": threads,
+                        **search_cases.get(tool, {}),
                     },
                     "timings": {
                         "index_build": summarize(search_index_ms[tool]),
@@ -2170,13 +2278,14 @@ def main(
                                 else 0.0,
                                 "top1_rate": top1 / counted if counted else 0.0,
                                 "queries_scored": counted,
+                                "accuracy_scope": "oracle_known_pairs",
                             }
-                            if not performance_only
+                            if not performance_only and oracle
                             else {}
                         ),
                         "per_query_ms": (
                             statistics.median(search_query_ms[tool])
-                            / max(len(query_set) if performance_only else counted, 1)
+                            / max(len(query_set), 1)
                         ),
                         **(extra or {}),
                     },
@@ -2194,7 +2303,7 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {"hypergen", "dashing2", "rabbitsketch", "cub-exact"}:
+                if tool in {"hypergen", "cub-exact"}:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]
@@ -2223,7 +2332,11 @@ def main(
             else "sorted_kmer_sets"
             if tool == "cub-exact"
             else "indexed_sketches"
-            if operation == "search" and tool in {"cuddl", "skani"}
+            if operation == "search"
+            and (
+                tool in {"cuddl", "skani"}
+                or measurement["case"].get("index", "none") != "none"
+            )
             else "sketches"
         )
         measurement["case"].update(resident_metadata.get((tool, operation), {}))

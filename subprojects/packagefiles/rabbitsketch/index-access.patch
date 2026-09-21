@@ -1,0 +1,23 @@
+--- a/src/api/SketchBuilder.h
++++ b/src/api/SketchBuilder.h
+@@ -40,6 +40,7 @@
+     Algorithm algorithm() const noexcept;
+     const Rank::RankMetadata& metadata() const noexcept;
+     Query::SketchDescriptor descriptor() const;
++    const FastKMV& fastKMV() const;
+     Query::Result query(
+         const BuiltSketch& other,
+         const Query::Request& request = Query::Request()) const;
+--- a/src/api/SketchBuilder.cpp
++++ b/src/api/SketchBuilder.cpp
+@@ -117,6 +117,10 @@
+     return result;
+ }
+ 
++const FastKMV& BuiltSketch::fastKMV() const {
++    return *std::get<std::shared_ptr<FastKMV>>(impl_->state);
++}
++
+ Query::Result BuiltSketch::query(
+     const BuiltSketch& other, const Query::Request& request) const {
+     const auto rejected = [&]() {

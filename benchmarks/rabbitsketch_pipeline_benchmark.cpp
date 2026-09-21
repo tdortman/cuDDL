@@ -2,6 +2,7 @@
 #include <api/SketchBuilder.h>
 #include <api/Version.h>
 #include <fastkmv.h>
+#include <InvertedIndex.h>
 #include <omp.h>
 #include <rank/CanonicalKmer.h>
 #include <rank/RankStream.h>
@@ -14,12 +15,12 @@
 #include <utility>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <limits>
-#include <mutex>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <vector>
 
@@ -112,13 +113,18 @@ json measure(
         .set_stopping_criterion("sample-count")
         .set_min_samples(opts.samples)
         .set_criterion_param_int64("target-samples", opts.samples)
+        .set_timeout(std::numeric_limits<double>::max())
         .set_skip_batched(true);
     benchmark.run();
     auto const& state = benchmark.get_states().front();
     if (state.is_skipped()) throw std::runtime_error(state.get_skip_reason());
+    auto const measured_samples = state.get_summary("nv/cpu_only/sample_size").get_int64("value");
+    if (measured_samples != opts.samples) {
+        throw std::runtime_error("RabbitSketch did not collect the requested timing samples");
+    }
     std::string const prefix = "nv/cpu_only/time/cpu";
     json result = {
-        {"samples", state.get_summary("nv/cpu_only/sample_size").get_int64("value")},
+        {"samples", measured_samples},
         {"median_ms", state.get_summary(prefix + "/median").get_float64("value") * 1000},
         {"min_ms", state.get_summary(prefix + "/min").get_float64("value") * 1000},
         {"max_ms", state.get_summary(prefix + "/max").get_float64("value") * 1000},
@@ -165,44 +171,13 @@ collection construct(records const& files, api::SketchConfig const& cfg) {
     });
 }
 
-// The union of worker compute intervals is wall time, not summed thread-seconds.
-struct resident_compute_clock {
-    using clock = std::chrono::steady_clock;
-    std::mutex mutex;
-    size_t active = 0;
-    clock::time_point started;
-    clock::duration elapsed{};
-
-    struct interval {
-        resident_compute_clock& owner;
-        explicit interval(resident_compute_clock& value) : owner(value) {
-            std::scoped_lock lock{owner.mutex};
-            if (owner.active++ == 0) owner.started = clock::now();
-        }
-        ~interval() {
-            std::scoped_lock lock{owner.mutex};
-            if (--owner.active == 0) owner.elapsed += clock::now() - owner.started;
-        }
-    };
-};
-
-collection build_files(
-    std::vector<std::string> const& paths,
-    api::SketchConfig const& cfg,
-    double& resident_ms
-) {
-    resident_compute_clock compute;
-    auto result = build_parallel(paths.size(), [&](size_t i) {
-        std::optional<api::MultiSketchBuilder> builder;
-        {
-            resident_compute_clock::interval interval{compute};
-            builder.emplace(std::vector<api::SketchConfig>{cfg});
-        }
+collection build_files(std::vector<std::string> const& paths, api::SketchConfig const& cfg) {
+    return build_parallel(paths.size(), [&](size_t i) {
+        api::MultiSketchBuilder builder({cfg});
         Sketch::IO::FastxReader reader(paths[i]);
         Sketch::IO::FastxRecord record;
         while (reader.next(record)) {
-            resident_compute_clock::interval interval{compute};
-            builder->update(record);
+            builder.update(record);
         }
         auto label = paths[i].substr(paths[i].find_last_of("/\\") + 1);
         std::replace_if(
@@ -211,12 +186,9 @@ collection build_files(
             [](char c) { return c == '\t' || c == '\r' || c == '\n' || c == '\0'; },
             '_'
         );
-        resident_compute_clock::interval interval{compute};
-        auto built = builder->finish(label, paths[i], std::string{});
+        auto built = builder.finish(label, paths[i], std::string{});
         return std::move(built.at(0));
     });
-    resident_ms += std::chrono::duration<double, std::milli>(compute.elapsed).count();
-    return result;
 }
 
 struct match {
@@ -700,6 +672,7 @@ sequence_timings sequence_resident_timings(
     // reuses its retained staging; multi-batch corpora restage outside the timers per replay
     // so staging stays bounded by the cap. Downstream stages stay whole-corpus singles.
     std::vector<double> reset_ms, construct_ms, finalize_ms, cardinality_ms, search_ms, total_ms;
+    std::vector<double> sketch_ms;
     for (int replay = -opts.warmups; replay < opts.samples; ++replay) {
         double const reset_time = measure_single_ms(opts, reset);
         double construct_time = 0;
@@ -736,6 +709,7 @@ sequence_timings sequence_resident_timings(
             reset_ms.push_back(reset_time);
             construct_ms.push_back(construct_time);
             finalize_ms.push_back(finalize_time);
+            sketch_ms.push_back(reset_time + construct_time + finalize_time);
             cardinality_ms.push_back(cardinality_time);
             search_ms.push_back(search_time);
             total_ms.push_back(
@@ -755,6 +729,7 @@ sequence_timings sequence_resident_timings(
         }
     }
     json timings;
+    timings["resident_sketch"] = summarize_replays(std::move(sketch_ms));
     timings["resident_total_wall"] = summarize_replays(total_ms);
     timings["resident_reset_wall"] = summarize_replays(reset_ms);
     timings["resident_construct_wall"] = summarize_replays(construct_ms);
@@ -895,9 +870,8 @@ json run(options const& opts) {
         reference_count > 1 ? uint64_t{reference_count} * (reference_count - 1) / 2 : 0;
 
     // The untimed build warms input caches and provides sketches for standalone compare timings.
-    double setup_resident_ms = 0;
-    auto refs = build_files(opts.references, cfg, setup_resident_ms);
-    auto queries = build_files(opts.queries, cfg, setup_resident_ms);
+    auto refs = build_files(opts.references, cfg);
+    auto queries = build_files(opts.queries, cfg);
     search_result searched;
     if (opts.performance_only) {
         searched.pairs = all ? all_to_all_pairs : uint64_t{refs.size()} * queries.size();
@@ -931,13 +905,9 @@ json run(options const& opts) {
         }
     }
 
-    std::vector<double> resident_sketch_ms;
-    resident_sketch_ms.reserve(opts.samples);
-    int prepare_sample = -opts.warmups;
     json timings = measure_pipeline(opts.samples, opts.warmups, [&](auto mark) {
-        double resident_ms = 0;
-        auto r = build_files(opts.references, cfg, resident_ms);
-        auto q = build_files(opts.queries, cfg, resident_ms);
+        auto r = build_files(opts.references, cfg);
+        auto q = build_files(opts.queries, cfg);
         mark();
         auto hits = search(r, q, all, opts.match_rows);
         if (opts.performance_only) {
@@ -947,10 +917,7 @@ json run(options const& opts) {
             consumed_size = output.size();
         }
         mark();
-        if (prepare_sample++ >= 0) resident_sketch_ms.push_back(resident_ms);
     });
-    timings["resident_sketch"] = summarize_replays(std::move(resident_sketch_ms));
-    timings["resident_sketch"]["source"] = "steady_clock_cpu_wall";
     // The record and packed-input stages materialize the whole corpus, so a streamed run skips
     // them. RabbitSketch's own file ingest is the bounded path.
     if (!streamed) {
@@ -963,6 +930,7 @@ json run(options const& opts) {
             auto q = construct(query_records, cfg);
             consumed_size = r.size() + q.size();
         });
+        timings["resident_sketch"] = timings["construct_resident"];
     }
     timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"] = measure(opts, [&] {
         auto hits = search(refs, queries, all, opts.match_rows);
@@ -970,6 +938,87 @@ json run(options const& opts) {
     });
     timings["resident_compare"] =
         timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"];
+    if (all) {
+        if (refs.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("native RabbitSketch index requires at most INT_MAX genomes");
+        }
+        std::vector<std::vector<uint64_t>> keys(refs.size());
+        std::vector<int> sizes(refs.size());
+        std::vector<std::string> labels(refs.size());
+        parallel_for(refs.size(), [&](size_t i) {
+            auto const& sketch = refs[i].sketch.fastKMV();
+            keys[i].assign(sketch.getRegisters(), sketch.getRegisters() + sketch.size());
+            sizes[i] = static_cast<int>(sketch.size());
+            labels[i] = std::to_string(i);
+        });
+        std::optional<Sketch::InvertedIndex<uint64_t>> index;
+        timings["search_index_build"] = measure(
+            opts,
+            [&] {
+                std::vector<phmap::flat_hash_map<uint64_t, std::vector<uint32_t>>> parts(
+                    opts.threads
+                );
+                parallel_for(refs.size(), [&](size_t i) {
+                    auto& part = parts[omp_get_thread_num()];
+                    for (auto key : keys[i]) {
+                        part[key].push_back(static_cast<uint32_t>(i));
+                    }
+                });
+                index = Sketch::buildCSRIndex<uint64_t>(parts, opts.threads);
+            },
+            [&] { index.reset(); }
+        );
+        auto indexed_search = [&](std::string const& destination) {
+            Sketch::computeDistances<uint64_t>(
+                *index,
+                keys,
+                sizes,
+                labels,
+                static_cast<int>(refs.size()),
+                0,
+                1.0,
+                [&](int common, int left, int right) {
+                    auto const denominator = std::min(left + right - common, opts.sketch_size);
+                    return denominator > 0 ? double(common) / denominator : 0.0;
+                },
+                [](int) { return 1; },
+                destination,
+                opts.threads
+            );
+        };
+        timings["resident_search"] = measure(opts, [&] { indexed_search("/dev/null"); });
+        auto close_output = [](FILE* file) {
+            std::fclose(file);
+        };
+        std::unique_ptr<FILE, decltype(close_output)> output(std::tmpfile(), close_output);
+        if (!output) throw std::runtime_error("cannot create native search output file");
+        auto const path = "/proc/self/fd/" + std::to_string(fileno(output.get()));
+        timings["search_query_wall"] = measure(opts, [&] { indexed_search(path); });
+        if (!opts.performance_only) {
+            std::ifstream input(path);
+            size_t query, reference;
+            double distance;
+            while (input >> query >> reference >> distance) {
+                rows.push_back(
+                    {{"implementation", {{"name", "rabbitsketch"}}},
+                     {"case",
+                      {{"measurement", "search-match"},
+                       {"query_id", query},
+                       {"reference_id", reference}}},
+                     {"metrics", {{"jaccard", 1.0 - distance}}}}
+                );
+            }
+            if (!input.eof()) throw std::runtime_error("invalid native search output");
+        }
+    } else {
+        // The native inverted-index traversal only supports all-to-all search.
+        timings["search_query_wall"] = measure(opts, [&] {
+            auto hits = search(refs, queries, false, opts.match_rows);
+            consumed_size = hits.matches.size();
+        });
+        // CPU query inputs and outputs are resident, so both scopes cover this invocation.
+        timings["resident_search"] = timings["search_query_wall"];
+    }
     if (!opts.performance_only) {
         timings["metrics_and_serialize"] = measure(opts, [&] {
             auto output = measurements(refs, queries, searched.matches).dump();
@@ -1001,6 +1050,9 @@ json run(options const& opts) {
               {"ambiguous_policy", "SkipKmer"},
               {"aggregation", "OneSketchPerFile"},
               {"index", "none"},
+              {"search_index", all ? "native-csr" : "none"},
+              {"search_index_supported", all},
+              {"search_resident_output", all ? "native_distance_text_to_dev_null" : "host_pairs"},
               {"topology", opts.topology},
               {"references", refs.size()},
               {"queries", queries.size()},
