@@ -11,8 +11,9 @@ Jaccard MAE vs exact, ANI MAE vs skani, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
 for a panel are absent from it, which is itself information. Exact-zero
 errors plot at the floor with an "exact" tag.
-Resident-only bars show measured CPU, GPU, or hybrid processing with min/max
-error bars. Missing resident measurements are omitted, never inferred from wall time.
+Timing bars use log axes and label median milliseconds above min/max error bars.
+Resident-only bars show measured CPU, GPU, or hybrid processing.
+Missing resident measurements are omitted, never inferred from wall time.
 """
 
 from pathlib import Path
@@ -112,14 +113,22 @@ def main(
             raise ValueError("need both micro-sketch and micro-compare rows")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        def save_both(fig: plt.Figure, stem: str) -> None:
+        def save_both(fig: plt.Figure, stem: str, runtime_labels=()) -> None:
             fig.tight_layout()
+            if runtime_labels:
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+                for bar, text in runtime_labels:
+                    width = bar.get_window_extent(renderer).width * 0.95
+                    while text.get_window_extent(renderer).width > width:
+                        text.set_fontsize(text.get_fontsize() * 0.9)
             fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
             pu.save_figure(fig, output_dir / f"{stem}.pdf")
 
         def time_panel(
             subset: list[dict], title: str, stem: str, *, resident: bool = False
         ) -> None:
+            runtime_labels = []
             fig, ax = plt.subplots(
                 figsize=(max(5.5, len(subset) * 1.15) if resident else 5.5, 4)
             )
@@ -143,16 +152,20 @@ def main(
                 medians = [r["wall_ms"] for r in subset]
                 lower = [max(0.0, r["wall_ms"] - r["lo_ms"]) for r in subset]
                 upper = [max(0.0, r["hi_ms"] - r["wall_ms"]) for r in subset]
-                ax.bar(names, medians, yerr=[lower, upper], capsize=3)
+                bars = ax.bar(names, medians, yerr=[lower, upper], capsize=3)
+                texts = ax.bar_label(
+                    bars, fmt="%.3g", padding=3, fontsize=pu.BAR_FONT_SIZE
+                )
+                runtime_labels = list(zip(bars, texts))
+                ax.set_yscale("log")
+                ax.margins(y=0.15)
                 if resident:
-                    ax.set_ylim(bottom=0)
-                    ax.set_ylabel("Median processing time (ms)")
+                    ax.set_ylabel("Median processing time (ms), log scale")
                 else:
-                    ax.set_yscale("log")
                     ax.set_ylabel("Median ms, log scale")
                 ax.set_title(title)
                 ax.tick_params(axis="x", labelrotation=20)
-            save_both(fig, stem)
+            save_both(fig, stem, runtime_labels)
 
         time_panel(sketch, "SKETCH wall total", "micro_time_sketch")
         time_panel(compare, "COMPARE wall total", "micro_time_compare")
