@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     std::string database_path, index_path, format = "dense";
     std::vector<std::filesystem::path> queries;
     uint32_t minimum_matches = 1;
-    unsigned workers = cuddl::default_parser_workers;
+    unsigned workers = cuddl::default_parser_workers();
     auto* build = app.add_subcommand(
         "build", "Create a dense or sparse index file from a reference database"
     );

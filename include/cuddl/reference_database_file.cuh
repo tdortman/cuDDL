@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -150,14 +151,19 @@ using sequence_record = detail::sequence_record;
 using sequence_genome = detail::sequence_genome;
 
 /// @brief Loaders a path build runs unless the caller asks for another count.
-inline constexpr unsigned default_parser_workers = 8;
+///
+/// Machine thread count, falling back to 8 when the count is unavailable.
+[[nodiscard]] inline unsigned default_parser_workers() {
+    auto const hardware = std::thread::hardware_concurrency();
+    return hardware == 0U ? 8U : hardware;
+}
 
 /// @brief Knobs for a build the caller feeds with FASTA/FASTQ paths.
 struct path_build_options {
     reference_build_statistics* statistics = nullptr;
     /// Loaders to run. The build runs at most one per input, at most the hardware, and never
     /// none, so a larger count is only a ceiling. One loader loads one genome at a time.
-    unsigned parser_workers = default_parser_workers;
+    unsigned parser_workers = default_parser_workers();
     /// Arena bytes. Unset sizes the arena from free device memory and what the inputs can fill,
     /// which is the only case a build cannot know in advance.
     std::optional<size_t> staging_bytes{};

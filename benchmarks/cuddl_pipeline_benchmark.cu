@@ -48,7 +48,7 @@ struct options {
     std::string rows = "compact", index = "dense", topology = "batch";
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
-    unsigned workers = cuddl::default_parser_workers;
+    unsigned workers = cuddl::default_parser_workers();
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
     bool resident_plan = false;
     bool performance_only = false;
@@ -2117,7 +2117,9 @@ int main(int argc, char** argv) try {
     )
         ->check(CLI::IsMember({"packed", "sequence"}));
     app.add_option(
-           "--workers", opts.workers, "File loading workers for --ingest sequence (default: 8)"
+           "--workers",
+           opts.workers,
+           "File loading workers for --ingest sequence (defaults to machine threads)"
     )
         ->check(CLI::PositiveNumber);
     app.add_option(

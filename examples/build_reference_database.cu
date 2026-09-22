@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     std::string output = "references.cuddl";
     uint32_t k{};
     uint32_t buckets{};
-    unsigned workers = cuddl::default_parser_workers;
+    unsigned workers = cuddl::default_parser_workers();
     CLI::App app{
         "Build one reference sketch per FASTA/FASTQ file in a folder, recursing into "
         "subdirectories. "
@@ -75,7 +75,11 @@ int main(int argc, char** argv) {
         ->check(CLI::IsMember({2048, 4096, 8192, 16384, 32768, 65536, 131072}));
     app.add_option("-o,--output", output, "Binary database destination (replaces existing file)")
         ->default_val(output);
-    app.add_option("--workers", workers, "Concurrent genome loaders (default: 8); 1 minimizes RAM");
+    app.add_option(
+        "--workers",
+        workers,
+        "Concurrent genome loaders (defaults to machine threads); 1 minimizes RAM"
+    );
     CLI11_PARSE(app, argc, argv);
 
     try {
