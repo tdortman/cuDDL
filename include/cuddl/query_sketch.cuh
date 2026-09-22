@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <cuddl/detail/database_staging.cuh>
@@ -20,10 +21,10 @@ namespace cuddl {
 /**
  * @brief Query sketches held on the device, in the shape a search consumes them.
  *
- * A query is the winner count of every register, one `uint16_t` row per query genome, which is
+ * A query is the winner score of every register, one `uint16_t` row per query genome, which is
  * what `reference_database::search_async` and `search_batch_async` take. Sketching queries
- * through @ref reference_database_file would build a reference-shaped object: host rows, labels,
- * and an index that queries never use. This keeps the sketches on the device in the shape a
+ * through @ref reference_database_file would retain packed host rows and labels that queries
+ * do not need. This keeps the sketches on the device in the shape a
  * search wants, and nothing else.
  *
  * The batch is move-only and owns its device allocation. Query IDs follow the order of the paths,
@@ -37,8 +38,23 @@ class query_sketch_batch {
 
     query_sketch_batch(query_sketch_batch const&) = delete;
     query_sketch_batch& operator=(query_sketch_batch const&) = delete;
-    query_sketch_batch(query_sketch_batch&&) noexcept = default;
-    query_sketch_batch& operator=(query_sketch_batch&&) noexcept = default;
+
+    // Explicit host bodies prevent NVCC from inferring device-side buffer operations.
+    __host__ ~query_sketch_batch() {} // NOLINT(modernize-use-equals-default)
+
+    query_sketch_batch(query_sketch_batch&& other) noexcept
+        : scores_(std::move(other.scores_)),
+          saturation_(std::move(other.saturation_)),
+          query_count_(std::exchange(other.query_count_, 0U)) {}
+
+    query_sketch_batch& operator=(query_sketch_batch&& other) noexcept {
+        if (this != &other) {
+            scores_ = std::move(other.scores_);
+            saturation_ = std::move(other.saturation_);
+            query_count_ = std::exchange(other.query_count_, 0U);
+        }
+        return *this;
+    }
 
     /**
      * @brief Sketches one query per plain or gzip/BGZF FASTA/FASTQ file on the GPU.

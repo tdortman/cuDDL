@@ -5,13 +5,16 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
 // Inputs, allocation, index construction, and validation are outside the timed region.
-void search_overhead(nvbench::state& state) {
+template <bool exhaustive>
+void run_search_overhead(nvbench::state& state) {
     constexpr size_t buckets = 2048U;
     using database_type = cuddl::reference_database<25U, buckets>;
+    using index_type = cuddl::reference_index<25U, buckets>;
     auto const stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const references = static_cast<uint32_t>(state.get_int64("References"));
     auto const queries = static_cast<uint32_t>(state.get_int64("Queries"));
@@ -19,7 +22,6 @@ void search_overhead(nvbench::state& state) {
     auto const index = state.get_string("Index");
     auto const storage =
         index == "sparse" ? cuddl::index_storage::sparse : cuddl::index_storage::dense;
-    bool const exhaustive = mode == "exhaustive";
     std::vector<uint16_t> rows(size_t{references} * buckets);
     std::vector<uint16_t> query_rows(size_t{queries} * buckets);
     for (uint32_t r = 0; r < references; ++r) {
@@ -37,13 +39,13 @@ void search_overhead(nvbench::state& state) {
     auto input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
     auto query_input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
     auto const compatibility = cuddl::score_compatibility::current<25U, buckets>();
-    auto database = CUDDL_UNWRAP(
-        exhaustive ? database_type::build_async(input, compatibility, stream)
-                   : database_type::build_indexed_async(input, compatibility, stream, storage)
-    );
+    auto database = CUDDL_UNWRAP(database_type::build_async(input, compatibility, stream));
+    std::optional<index_type> acceleration;
+    if constexpr (!exhaustive) {
+        acceleration.emplace(CUDDL_UNWRAP(index_type::build_async(database, stream, storage)));
+    }
     auto requirements = CUDDL_UNWRAP(
-        exhaustive ? database.batch_search_requirements(queries, stream)
-                   : database.indexed_batch_search_requirements(queries, stream)
+        database.batch_search_requirements(queries, stream, acceleration ? &*acceleration : nullptr)
     );
     uint32_t const capacity = mode == "bounded-fit"        ? expected
                               : mode == "bounded-overflow" ? expected - 1U
@@ -60,7 +62,7 @@ void search_overhead(nvbench::state& state) {
         stream, stream.device(), capacity, uint32_t{0xffffffffU}
     );
     auto search = [&](cuda::stream_ref execution_stream) {
-        if (exhaustive) {
+        if constexpr (exhaustive) {
             CUDDL_UNWRAP(database.search_batch_async(
                 query_input,
                 compatibility,
@@ -73,7 +75,7 @@ void search_overhead(nvbench::state& state) {
                 execution_stream
             ));
         } else {
-            CUDDL_UNWRAP(database.search_batch_indexed_async(
+            CUDDL_UNWRAP(database.search_batch_async(
                 query_input,
                 compatibility,
                 0U,
@@ -83,7 +85,8 @@ void search_overhead(nvbench::state& state) {
                 [](uint32_t) {},
                 matches,
                 {.minimum_matches = 5U},
-                execution_stream
+                execution_stream,
+                &*acceleration
             ));
         }
     };
@@ -124,6 +127,14 @@ void search_overhead(nvbench::state& state) {
     }
     state.add_element_count(size_t{references} * queries, "Pairs");
     state.exec([&](nvbench::launch& launch) { search(cuda::stream_ref{launch.get_stream()}); });
+}
+
+void search_overhead(nvbench::state& state) {
+    if (state.get_string("Mode") == "exhaustive") {
+        run_search_overhead<true>(state);
+    } else {
+        run_search_overhead<false>(state);
+    }
 }
 
 NVBENCH_BENCH(search_overhead)

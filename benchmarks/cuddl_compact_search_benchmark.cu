@@ -774,22 +774,28 @@ void compact_indexed_build(nvbench::state& state) {
 
     size_t resident_bytes = 0;
     {
-        auto database = CUDDL_UNWRAP(
-            (cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-                device_rows, compatibility, setup_stream, storage
-            ))
-        );
+        auto database =
+            CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
+                device_rows, compatibility, setup_stream
+            )));
+        auto acceleration =
+            CUDDL_UNWRAP((cuddl::reference_index<k_kmer_length, k_bucket_count>::build_async(
+                database, setup_stream, storage
+            )));
         setup_stream.sync();
-        resident_bytes = database.persistent_row_bytes() + database.persistent_index_bytes();
+        resident_bytes = database.persistent_row_bytes() + acceleration.persistent_index_bytes();
     }
 
     state.add_element_count(fixture.rows.size(), "Scores Indexed");
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        auto database = CUDDL_UNWRAP(
-            (cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-                device_rows, compatibility, cuda::stream_ref{launch.get_stream()}, storage
-            ))
-        );
+        auto database =
+            CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
+                device_rows, compatibility, cuda::stream_ref{launch.get_stream()}
+            )));
+        auto acceleration =
+            CUDDL_UNWRAP((cuddl::reference_index<k_kmer_length, k_bucket_count>::build_async(
+                database, cuda::stream_ref{launch.get_stream()}, storage
+            )));
         do_not_optimise(database);
     });
 
@@ -817,24 +823,29 @@ void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches
         cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1, cuda::no_init);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
-        CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_indexed_async(
-            device_rows, compatibility, setup_stream, storage
+        CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
+            device_rows, compatibility, setup_stream
+        )));
+    auto acceleration =
+        CUDDL_UNWRAP((cuddl::reference_index<k_kmer_length, k_bucket_count>::build_async(
+            database, setup_stream, storage
         )));
     auto const workspace_bytes =
-        CUDDL_UNWRAP(database.indexed_single_query_workspace_bytes(setup_stream));
+        CUDDL_UNWRAP(database.search_workspace_bytes(setup_stream, &acceleration));
     auto workspace = cuda::make_device_buffer<uint8_t>(
         setup_stream, setup_stream.device(), workspace_bytes, cuda::no_init
     );
     setup_stream.sync();
 
-    CUDDL_UNWRAP(database.search_indexed_async(
+    CUDDL_UNWRAP(database.search_async(
         device_query,
         compatibility,
         workspace,
         results,
         result_count,
         {.minimum_matches = minimum_matches},
-        setup_stream
+        setup_stream,
+        &acceleration
     ));
     setup_stream.sync();
     uint32_t observed_count = 0;
@@ -881,14 +892,15 @@ void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches
 
     state.add_element_count(reference_count, "References Searched");
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        CUDDL_UNWRAP(database.search_indexed_async(
+        CUDDL_UNWRAP(database.search_async(
             device_query,
             compatibility,
             workspace,
             results,
             result_count,
             {.minimum_matches = minimum_matches},
-            cuda::stream_ref{launch.get_stream()}
+            cuda::stream_ref{launch.get_stream()},
+            &acceleration
         ));
     });
 
@@ -909,7 +921,7 @@ void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches
     add_value(
         state,
         "Resident Bytes",
-        static_cast<double>(database.persistent_row_bytes() + database.persistent_index_bytes())
+        static_cast<double>(database.persistent_row_bytes() + acceleration.persistent_index_bytes())
     );
 }
 
@@ -925,6 +937,7 @@ void compact_indexed_zero_threshold_search(nvbench::state& state) {
 // Smaller databases repeat sampled rows; no upload/allocation is timed.
 void compact_indexed_batch_search(nvbench::state& state) {
     using database_type = cuddl::reference_database<k_kmer_length, k_bucket_count>;
+    using index_type = cuddl::reference_index<k_kmer_length, k_bucket_count>;
     auto const stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const references = static_cast<uint32_t>(state.get_int64("References"));
     auto const queries = static_cast<uint32_t>(state.get_int64("Queries"));
@@ -950,10 +963,10 @@ void compact_indexed_batch_search(nvbench::state& state) {
     auto input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), fixture.rows);
     auto query_input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
-    auto database =
-        CUDDL_UNWRAP(database_type::build_indexed_async(input, compatibility, stream, storage));
+    auto database = CUDDL_UNWRAP(database_type::build_async(input, compatibility, stream));
+    auto acceleration = CUDDL_UNWRAP((index_type::build_async(database, stream, storage)));
     auto const requirements =
-        CUDDL_UNWRAP(database.indexed_batch_search_requirements(queries, stream));
+        CUDDL_UNWRAP(database.batch_search_requirements(queries, stream, &acceleration));
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
     );
@@ -979,7 +992,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
     uint64_t candidate_count = 0U;
     std::vector<uint32_t> observed_first, observed_last;
     std::vector<bool> self_seen(queries, false);
-    CUDDL_UNWRAP(database.search_batch_indexed_async(
+    CUDDL_UNWRAP(database.search_batch_async(
         query_input,
         compatibility,
         0U,
@@ -1029,7 +1042,8 @@ void compact_indexed_batch_search(nvbench::state& state) {
         },
         {},
         {.minimum_matches = 5U},
-        stream
+        stream,
+        &acceleration
     ));
     if (observed_first != expected_first || observed_last != expected_last ||
         next_query != queries ||
@@ -1038,7 +1052,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
     }
     state.add_element_count(queries, "Queries Searched");
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        CUDDL_UNWRAP(database.search_batch_indexed_async(
+        CUDDL_UNWRAP(database.search_batch_async(
             query_input,
             compatibility,
             0U,
@@ -1048,7 +1062,8 @@ void compact_indexed_batch_search(nvbench::state& state) {
             [](uint32_t) {},
             {},
             {.minimum_matches = 5U},
-            cuda::stream_ref{launch.get_stream()}
+            cuda::stream_ref{launch.get_stream()},
+            &acceleration
         ));
     });
     add_value(
@@ -1058,7 +1073,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
     add_value(
         state,
         "Resident Bytes",
-        static_cast<double>(database.persistent_row_bytes() + database.persistent_index_bytes())
+        static_cast<double>(database.persistent_row_bytes() + acceleration.persistent_index_bytes())
     );
 }
 

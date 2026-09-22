@@ -1212,7 +1212,7 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
 }
 
 /// @brief Advances a tiled result offset after the preceding refinement completes.
-__global__ void advance_indexed_result_count_kernel(
+static __global__ void advance_indexed_result_count_kernel(
     uint32_t const* tile_count,
     uint32_t* result_offset,
     uint32_t const* required_count,

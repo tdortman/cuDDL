@@ -40,6 +40,7 @@ constexpr uint32_t k = 25;
 constexpr size_t buckets = 4096;
 using sketch = cuddl::sketch<k, buckets>;
 using database = cuddl::reference_database<k, buckets>;
+using reference_index_type = cuddl::reference_index<k, buckets>;
 
 struct options {
     std::vector<std::string> references, queries;
@@ -420,20 +421,20 @@ cuddl::score_compatibility compatibility(options const& opts) {
 database build(collection const& refs, options const& opts, cuda::stream_ref stream, bool indexed) {
     auto const compat =
         indexed ? compatibility(opts) : cuddl::score_compatibility::current<k, buckets>();
-    auto const storage =
-        opts.index == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse;
     if (opts.rows == "packed") {
-        if (indexed) {
-            return CUDDL_UNWRAP(
-                database::build_indexed_async(refs.packed, refs.saturated, compat, stream, storage)
-            );
-        }
         return CUDDL_UNWRAP(database::build_async(refs.packed, refs.saturated, compat, stream));
     }
-    if (indexed) {
-        return CUDDL_UNWRAP(database::build_indexed_async(refs.scores, compat, stream, storage));
-    }
     return CUDDL_UNWRAP(database::build_async(refs.scores, compat, stream));
+}
+
+reference_index_type build_index(database const& db, options const& opts, cuda::stream_ref stream) {
+    return CUDDL_UNWRAP(
+        reference_index_type::build_async(
+            db,
+            stream,
+            opts.index == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
+        )
+    );
 }
 
 struct search_buffers {
@@ -446,7 +447,7 @@ struct search_buffers {
         uint32_t queries,
         cuda::stream_ref stream,
         std::string const& topology = "both",
-        bool indexed = true
+        reference_index_type const* acceleration = nullptr
     )
         : workspace(stream, cuda::device_default_memory_pool(stream.device())),
           results(stream, cuda::device_default_memory_pool(stream.device())),
@@ -459,16 +460,10 @@ struct search_buffers {
             size = std::max(size, requirement.maximum_pair_count);
         };
         if (topology != "all-to-all") {
-            if (indexed) {
-                include(CUDDL_UNWRAP(db.indexed_batch_search_requirements(queries, stream)));
-            }
-            include(CUDDL_UNWRAP(db.batch_search_requirements(queries, stream)));
+            include(CUDDL_UNWRAP(db.batch_search_requirements(queries, stream, acceleration)));
         }
         if (topology != "batch") {
-            if (indexed) {
-                include(CUDDL_UNWRAP(db.indexed_all_to_all_search_requirements(stream)));
-            }
-            include(CUDDL_UNWRAP(db.all_to_all_search_requirements(stream)));
+            include(CUDDL_UNWRAP(db.all_to_all_search_requirements(stream, acceleration)));
         }
         workspace = cuda::make_device_buffer<uint8_t>(
             stream, stream.device(), workspace_bytes, cuda::no_init
@@ -489,6 +484,7 @@ struct host_results {
 
 void search(
     database const& db,
+    reference_index_type const* acceleration,
     collection const& queries,
     search_buffers& buffers,
     options const& opts,
@@ -535,17 +531,18 @@ void search(
         );
         stream.sync();  // Tile storage is reused by the next callback.
     };
-    auto const config = cuddl::indexed_search_options{.minimum_matches = opts.minimum_matches};
+    auto const config = cuddl::search_options{.minimum_matches = opts.minimum_matches};
     if (all) {
         if (indexed) {
-            CUDDL_UNWRAP(db.search_all_to_all_indexed_async(
+            CUDDL_UNWRAP(db.search_all_to_all_async(
                 buffers.workspace,
                 buffers.results,
                 buffers.count,
                 consume,
                 buffers.matches,
                 config,
-                stream
+                stream,
+                acceleration
             ));
         } else {
             CUDDL_UNWRAP(db.search_all_to_all_async(
@@ -554,7 +551,7 @@ void search(
         }
     } else {
         if (indexed) {
-            CUDDL_UNWRAP(db.search_batch_indexed_async(
+            CUDDL_UNWRAP(db.search_batch_async(
                 queries.scores,
                 compatibility(opts),
                 0,
@@ -564,7 +561,8 @@ void search(
                 consume,
                 buffers.matches,
                 config,
-                stream
+                stream,
+                acceleration
             ));
         } else {
             CUDDL_UNWRAP(db.search_batch_async(
@@ -977,7 +975,10 @@ json resident_timings(
     refs.extract(setup);
     queries.extract(setup);
     std::optional<database> db{build(refs, opts, setup, true)};
-    search_buffers buffers(*db, static_cast<uint32_t>(queries.rows()), setup, opts.topology);
+    std::optional<reference_index_type> acceleration{build_index(*db, opts, setup)};
+    search_buffers buffers(
+        *db, static_cast<uint32_t>(queries.rows()), setup, opts.topology, &*acceleration
+    );
     auto const n = refs.rows();
     auto const q = all ? n : queries.rows();
     if (n && q > std::numeric_limits<size_t>::max() / n) {
@@ -1016,6 +1017,7 @@ json resident_timings(
     };
     auto index = [&](cuda::stream_ref s) {
         db.emplace(build(refs, opts, s, true));
+        acceleration.emplace(build_index(*db, opts, s));
     };
     auto query = [&](cuda::stream_ref s) {
         auto consume = [&](uint32_t capacity) {
@@ -1041,7 +1043,18 @@ json resident_timings(
                 }
             );
         };
-        search(*db, queries, buffers, opts, s, true, all, nullptr, consume);
+        search(
+            *db,
+            acceleration ? &*acceleration : nullptr,
+            queries,
+            buffers,
+            opts,
+            s,
+            true,
+            all,
+            nullptr,
+            consume
+        );
     };
     if (sequence) {
         auto single = opts;
@@ -1271,8 +1284,12 @@ json resident_timings(
     gpu("resident_construct", construct, reset);
     gpu("resident_statistics", statistics);
     gpu("resident_rows", rows);
-    gpu("resident_index", index, [&](cuda::stream_ref) { db.reset(); });
+    gpu("resident_index", index, [&](cuda::stream_ref) {
+        acceleration.reset();
+        db.reset();
+    });
     db.emplace(build(refs, opts, setup, true));
+    acceleration.emplace(build_index(*db, opts, setup));
     setup.sync();
     gpu("resident_search", query);
     return timings;
@@ -1330,14 +1347,28 @@ void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     refs.extract(stream);
     queries.extract(stream);
     auto db = build(refs, opts, stream, !opts.exhaustive);
+    std::optional<reference_index_type> acceleration;
+    if (!opts.exhaustive) acceleration.emplace(build_index(db, opts, stream));
     search_buffers buffers(
-        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology, !opts.exhaustive
+        db,
+        static_cast<uint32_t>(queries.sketches.size()),
+        stream,
+        opts.topology,
+        acceleration ? &*acceleration : nullptr
     );
     host_results output;
     stream.sync();
     mark();
     search(
-        db, queries, buffers, opts, stream, !opts.exhaustive, opts.topology == "all-to-all", &output
+        db,
+        acceleration ? &*acceleration : nullptr,
+        queries,
+        buffers,
+        opts,
+        stream,
+        !opts.exhaustive,
+        opts.topology == "all-to-all",
+        &output
     );
     application_output(opts, refs, queries, output, stream);
     mark();
@@ -1355,14 +1386,28 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     refs.extract(stream);
     queries.extract(stream);
     auto db = build(refs, opts, stream, !opts.exhaustive);
+    std::optional<reference_index_type> acceleration;
+    if (!opts.exhaustive) acceleration.emplace(build_index(db, opts, stream));
     search_buffers buffers(
-        db, static_cast<uint32_t>(queries.sketches.size()), stream, opts.topology, !opts.exhaustive
+        db,
+        static_cast<uint32_t>(queries.sketches.size()),
+        stream,
+        opts.topology,
+        acceleration ? &*acceleration : nullptr
     );
     host_results output;
     stream.sync();
     mark();
     search(
-        db, queries, buffers, opts, stream, !opts.exhaustive, opts.topology == "all-to-all", &output
+        db,
+        acceleration ? &*acceleration : nullptr,
+        queries,
+        buffers,
+        opts,
+        stream,
+        !opts.exhaustive,
+        opts.topology == "all-to-all",
+        &output
     );
     application_output(opts, refs, queries, output, stream);
     mark();
@@ -1428,12 +1473,14 @@ json run(options const& opts) {
     stream.sync();
     if (opts.performance_only) {
         auto db = build(refs, opts, stream, !opts.exhaustive);
+        std::optional<reference_index_type> acceleration;
+        if (!opts.exhaustive) acceleration.emplace(build_index(db, opts, stream));
         search_buffers buffers(
             db,
             static_cast<uint32_t>(queries.sketches.size()),
             stream,
             opts.topology,
-            !opts.exhaustive
+            acceleration ? &*acceleration : nullptr
         );
         stream.sync();
         bool const all = opts.topology == "all-to-all";
@@ -1445,7 +1492,16 @@ json run(options const& opts) {
             phase,
             false,
             [&](cuda::stream_ref s) {
-                search(db, queries, buffers, opts, s, !opts.exhaustive, all);
+                search(
+                    db,
+                    acceleration ? &*acceleration : nullptr,
+                    queries,
+                    buffers,
+                    opts,
+                    s,
+                    !opts.exhaustive,
+                    all
+                );
             },
             {},
             &wall
@@ -1456,7 +1512,17 @@ json run(options const& opts) {
         timings["search_and_download"] =
             measure(opts, "search_and_download", true, [&](cuda::stream_ref) {
                 host_results output;
-                search(db, queries, buffers, opts, stream, !opts.exhaustive, all, &output);
+                search(
+                    db,
+                    acceleration ? &*acceleration : nullptr,
+                    queries,
+                    buffers,
+                    opts,
+                    stream,
+                    !opts.exhaustive,
+                    all,
+                    &output
+                );
                 downloaded = output.total_rows;
                 tiles = output.tiles;
                 host_bytes = output.rows.capacity() * sizeof(cuddl::batch_search_result) +
@@ -1494,7 +1560,7 @@ json run(options const& opts) {
             {"timings", timings},
             {"memory_bytes",
              {{"persistent_rows", db.persistent_row_bytes()},
-              {"persistent_index", db.persistent_index_bytes()},
+              {"persistent_index", acceleration ? acceleration->persistent_index_bytes() : 0U},
               {"search_workspace", buffers.workspace.size()},
               {"search_result_capacity",
                buffers.results.size() * sizeof(cuddl::batch_search_result)},
@@ -1541,7 +1607,10 @@ json run(options const& opts) {
     }
 
     auto db = build(refs, opts, stream, true);
-    search_buffers buffers(db, static_cast<uint32_t>(queries.sketches.size()), stream);
+    std::optional<reference_index_type> acceleration{build_index(db, opts, stream)};
+    search_buffers buffers(
+        db, static_cast<uint32_t>(queries.sketches.size()), stream, "both", &*acceleration
+    );
     stream.sync();
     json measurements = json::array();
     auto gpu = [&](std::string const& name,
@@ -1724,7 +1793,8 @@ json run(options const& opts) {
     });
     gpu("database_and_index_build", [&](cuda::stream_ref s) {
         auto value = build(refs, opts, s, true);
-        do_not_optimise(value);
+        auto acceleration = build_index(value, opts, s);
+        do_not_optimise(acceleration);
     });
 
     auto single_results = cuda::make_device_buffer<cuddl::reference_search_result>(
@@ -1733,20 +1803,21 @@ json run(options const& opts) {
     auto single_workspace = cuda::make_device_buffer<uint8_t>(
         stream,
         stream.device(),
-        CUDDL_UNWRAP(db.indexed_single_query_workspace_bytes(stream)),
+        CUDDL_UNWRAP(db.search_workspace_bytes(stream, &*acceleration)),
         cuda::no_init
     );
     auto single = [&](cuda::stream_ref s, bool indexed) {
         cuddl::device_span<uint16_t const> query{queries.scores.data(), buckets};
         if (indexed) {
-            CUDDL_UNWRAP(db.search_indexed_async(
+            CUDDL_UNWRAP(db.search_async(
                 query,
                 compatibility(opts),
                 single_workspace,
                 single_results,
                 buffers.count,
                 {.minimum_matches = opts.minimum_matches},
-                s
+                s,
+                &*acceleration
             ));
         } else {
             CUDDL_UNWRAP(db.search_async(query, compatibility(opts), {}, single_results, s));
@@ -1800,14 +1871,33 @@ json run(options const& opts) {
         }
         for (bool indexed : {false, true}) {
             host_results output;
-            search(db, queries, buffers, opts, stream, indexed, all, &output);
+            search(
+                db,
+                acceleration ? &*acceleration : nullptr,
+                queries,
+                buffers,
+                opts,
+                stream,
+                indexed,
+                all,
+                &output
+            );
             auto const observed =
                 validate(output, ref_scores, query_scores, opts, indexed, all, opts.oracle_pairs);
             auto name = std::string(all ? "search_all_to_all_" : "search_batch_") +
                         (indexed ? "indexed" : "exhaustive");
             if (!all || refs.sketches.size() > 1) {
                 gpu(name, [&](cuda::stream_ref s) {
-                    search(db, queries, buffers, opts, s, indexed, all);
+                    search(
+                        db,
+                        acceleration ? &*acceleration : nullptr,
+                        queries,
+                        buffers,
+                        opts,
+                        s,
+                        indexed,
+                        all
+                    );
                 });
             }
             // Retain the selected application results, independently checked before timing.
@@ -1839,7 +1929,17 @@ json run(options const& opts) {
                 auto zero = opts;
                 zero.minimum_matches = 0;
                 host_results exhaustive_indexed;
-                search(db, queries, buffers, zero, stream, true, all, &exhaustive_indexed);
+                search(
+                    db,
+                    acceleration ? &*acceleration : nullptr,
+                    queries,
+                    buffers,
+                    zero,
+                    stream,
+                    true,
+                    all,
+                    &exhaustive_indexed
+                );
                 validate(
                     exhaustive_indexed, ref_scores, query_scores, zero, true, all, zero.oracle_pairs
                 );
@@ -1850,6 +1950,7 @@ json run(options const& opts) {
         host_results output;
         search(
             db,
+            acceleration ? &*acceleration : nullptr,
             queries,
             buffers,
             opts,
@@ -1957,7 +2058,7 @@ json run(options const& opts) {
              {{"input_kmers", input_bytes},
               {"input_files", input_files},
               {"persistent_rows", db.persistent_row_bytes()},
-              {"persistent_index", db.persistent_index_bytes()},
+              {"persistent_index", acceleration ? acceleration->persistent_index_bytes() : 0U},
               {"search_workspace", buffers.workspace.size()},
               {"search_result_capacity",
                buffers.results.size() * sizeof(cuddl::batch_search_result)},

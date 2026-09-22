@@ -181,7 +181,7 @@ struct sequence_build_options {
  *
  * One input file is one genome, including all of its FASTA/FASTQ records. Input order defines
  * stable reference IDs; labels preserve the supplied paths. Files store packed winner/count
- * rows, saturation flags and compatibility metadata. GPU indexes are rebuilt on upload.
+ * rows, saturation flags and compatibility metadata. Upload creates row storage, not an index.
  * Build and upload are synchronous. The supplied stream must outlive the uploaded database.
  */
 class reference_database_file {
@@ -220,10 +220,10 @@ class reference_database_file {
         // expressions in a separate lambda scope, outside the exception-catching function.
         return [&]() -> Result<reference_database_file> {
             using database_type = reference_database<K, BucketCount, Layout>;
-            if (paths.size() > std::numeric_limits<uint32_t>::max() / BucketCount ||
+            if (paths.size() > std::numeric_limits<uint32_t>::max() ||
                 paths.size() >
                     std::numeric_limits<size_t>::max() / (BucketCount * sizeof(uint32_t))) {
-                return Err(Error::resource("reference collection exceeds database index capacity"));
+                return Err(Error::resource("reference collection exceeds database capacity"));
             }
             reference_database_file result;
             result.metadata_ = {
@@ -273,10 +273,10 @@ class reference_database_file {
     ) try {
         return [&]() -> Result<reference_database_file> {
             using database_type = reference_database<K, BucketCount, Layout>;
-            if (genomes.size() > std::numeric_limits<uint32_t>::max() / BucketCount ||
+            if (genomes.size() > std::numeric_limits<uint32_t>::max() ||
                 genomes.size() >
                     std::numeric_limits<size_t>::max() / (BucketCount * sizeof(uint32_t))) {
-                return Err(Error::resource("reference collection exceeds database index capacity"));
+                return Err(Error::resource("reference collection exceeds database capacity"));
             }
             reference_database_file result;
             result.metadata_ = {
@@ -365,10 +365,11 @@ class reference_database_file {
         return Err(Error::resource(error.what()));
     }
 
-    /// @brief Uploads packed rows and builds a sparse index by default; waits for completion.
+    /// @brief Uploads packed reference rows and labels without constructing an index.
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
-    [[nodiscard]] Result<reference_database<K, BucketCount, Layout>>
-    upload(cuda::stream_ref stream, index_storage storage = index_storage::sparse) const {
+    [[nodiscard]] Result<reference_database<K, BucketCount, Layout>> upload(
+        cuda::stream_ref stream
+    ) const {
         CUDDL_TRY((detail::validate_indexed_score_compatibility<K, BucketCount, Layout>(
             metadata_.compatibility
         )));
@@ -377,13 +378,13 @@ class reference_database_file {
         auto saturation = CUDDL_CUDA_TRY(
             cuda::make_device_buffer<uint32_t>(stream, stream.device(), saturation_)
         );
-        auto database = CUDDL_TRY((reference_database<K, BucketCount, Layout>::build_indexed_async(
+        auto database = CUDDL_TRY((reference_database<K, BucketCount, Layout>::build_async(
             {rows.data(), rows.size()},
             {saturation.data(), saturation.size()},
             metadata_.compatibility,
-            stream,
-            storage
+            stream
         )));
+        database.names_ = names_;
         CUDDL_CUDA_TRY(stream.sync());
         return std::move(database);
     }
@@ -475,8 +476,7 @@ class reference_database_file {
             uint64_t const count = result.metadata_.reference_count;
             uint64_t const words = count * c.bucket_count;
             uint64_t const payload_bytes = (words + count) * sizeof(uint32_t);
-            if (words > std::numeric_limits<uint32_t>::max() ||
-                words > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
+            if (words > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
                 payload_bytes + count * sizeof(uint32_t) + sizeof(uint32_t) > reader.remaining) {
                 return Err(Error::invalid_argument("invalid reference database extents"));
             }
@@ -523,6 +523,7 @@ class reference_database_file {
     }
 
    private:
+    friend class reference_index_file;
     reference_database_file() = default;
     reference_database_metadata metadata_{};
     std::vector<std::string> names_;

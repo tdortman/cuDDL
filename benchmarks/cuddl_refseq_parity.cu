@@ -34,6 +34,7 @@ namespace {
 using namespace std::chrono;
 using refseq_register_layout = cuddl::register_layout<5, 11>;
 using ddl_t = cuddl::reference_database<25, 4096, refseq_register_layout>;
+using index_t = cuddl::reference_index<25, 4096, refseq_register_layout>;
 
 /// @brief The official BBTools RefSeq DDL sketch asset pinned for parity validation.
 ///
@@ -763,11 +764,12 @@ int main(int argc, char** argv) {
                     });
                 }
                 auto const t_index_start = now_ms();
-                auto built = ddl_t::build_indexed_async(device_scores, compatibility, stream);
+                auto built = ddl_t::build_async(device_scores, compatibility, stream);
                 if (!built) {
                     throw std::runtime_error("index build failed: " + built.error().message());
                 }
                 auto database = std::move(*built);
+                auto acceleration = CUDDL_UNWRAP(index_t::build_async(database, stream));
                 cuda::stream_ref{stream.get()}.sync();
                 auto const t_index_end = now_ms();
                 if (measured) {
@@ -782,13 +784,13 @@ int main(int argc, char** argv) {
 
                 if (iteration == 0U) {
                     device_rows_bytes = database.persistent_row_bytes();
-                    device_index_bytes = database.persistent_index_bytes();
+                    device_index_bytes = acceleration.persistent_index_bytes();
 
-                    auto const batch_requirements = database.indexed_batch_search_requirements(
-                        static_cast<uint32_t>(reports.size()), stream
+                    auto const batch_requirements = database.batch_search_requirements(
+                        static_cast<uint32_t>(reports.size()), stream, &acceleration
                     );
-                    auto const exhaustive_requirements = database.indexed_batch_search_requirements(
-                        static_cast<uint32_t>(reports.size()), stream
+                    auto const exhaustive_requirements = database.batch_search_requirements(
+                        static_cast<uint32_t>(reports.size()), stream, &acceleration
                     );
                     if (!batch_requirements || !exhaustive_requirements) {
                         throw std::runtime_error("batch workspace sizing failed");
@@ -857,7 +859,7 @@ int main(int argc, char** argv) {
                 auto batch_match_counts =
                     cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
                 auto const t_batch_start = now_ms();
-                auto const batch_res = database.search_batch_indexed_async(
+                auto const batch_res = database.search_batch_async(
                     device_queries,
                     compatibility,
                     0U,
@@ -867,7 +869,8 @@ int main(int argc, char** argv) {
                     [](uint32_t) {},
                     batch_match_counts,
                     {.minimum_matches = min_hits},
-                    stream
+                    stream,
+                    &acceleration
                 );
                 cuda::stream_ref{stream.get()}.sync();
                 auto const t_batch_end = now_ms();

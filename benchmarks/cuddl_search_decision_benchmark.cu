@@ -42,8 +42,10 @@ namespace {
 
 using clock_type = std::chrono::steady_clock;
 using database_type = cuddl::reference_database<25, 2048>;
+using index_type = cuddl::reference_index<25, 2048>;
 using refseq_register_layout = cuddl::register_layout<5, 11>;
 using refseq_database_type = cuddl::reference_database<25, 4096, refseq_register_layout>;
+using refseq_index_type = cuddl::reference_index<25, 4096, refseq_register_layout>;
 
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
@@ -659,10 +661,13 @@ struct indexed_search_buffers {
     cuda::device_buffer<uint32_t> result_count;
 };
 
-[[nodiscard]] indexed_search_buffers
-make_indexed_search_buffers(database_type const& database, cuda::stream_ref setup_stream) {
+[[nodiscard]] indexed_search_buffers make_indexed_search_buffers(
+    database_type const& database,
+    index_type const& acceleration,
+    cuda::stream_ref setup_stream
+) {
     auto const requirements =
-        CUDDL_UNWRAP(database.indexed_all_to_all_search_requirements(setup_stream));
+        CUDDL_UNWRAP(database.all_to_all_search_requirements(setup_stream, &acceleration));
     return {
         .workspace = cuda::make_device_buffer<uint8_t>(
             setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
@@ -679,20 +684,22 @@ make_indexed_search_buffers(database_type const& database, cuda::stream_ref setu
 template <typename Execute>
 [[nodiscard]] search_output execute_indexed_search(
     database_type const& database,
+    index_type const& acceleration,
     uint32_t minimum_matches,
     Execute&& execute,
     cuda::stream_ref setup_stream
 ) {
-    auto buffers = make_indexed_search_buffers(database, setup_stream);
+    auto buffers = make_indexed_search_buffers(database, acceleration, setup_stream);
     execute([&](cudaStream_t stream) {
-        CUDDL_UNWRAP(database.search_all_to_all_indexed_async(
+        CUDDL_UNWRAP(database.search_all_to_all_async(
             buffers.workspace,
             buffers.results,
             buffers.result_count,
             [](uint32_t) {},
             {},
             {.minimum_matches = minimum_matches},
-            cuda::stream_ref{stream}
+            cuda::stream_ref{stream},
+            &acceleration
         ));
     });
     return {.results = {}, .workspace_bytes = buffers.workspace.size()};
@@ -700,12 +707,13 @@ template <typename Execute>
 
 [[nodiscard]] search_output collect_indexed_results(
     database_type const& database,
+    index_type const& acceleration,
     uint32_t minimum_matches,
     cuda::stream_ref setup_stream
 ) {
-    auto buffers = make_indexed_search_buffers(database, setup_stream);
+    auto buffers = make_indexed_search_buffers(database, acceleration, setup_stream);
     search_output output{.results = {}, .workspace_bytes = buffers.workspace.size()};
-    CUDDL_UNWRAP(database.search_all_to_all_indexed_async(
+    CUDDL_UNWRAP(database.search_all_to_all_async(
         buffers.workspace,
         buffers.results,
         buffers.result_count,
@@ -726,7 +734,8 @@ template <typename Execute>
         },
         {},
         {.minimum_matches = minimum_matches},
-        setup_stream
+        setup_stream,
+        &acceleration
     ));
     return output;
 }
@@ -946,10 +955,12 @@ void indexed_build(nvbench::state& state) {
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
         auto database = CUDDL_UNWRAP(
-            database_type::build_indexed_async(
+            database_type::build_async(
                 device_rows, compatibility, cuda::stream_ref{launch.get_stream()}
             )
         );
+        auto acceleration =
+            CUDDL_UNWRAP(index_type::build_async(database, cuda::stream_ref{launch.get_stream()}));
         do_not_optimise(database);
     });
     stash_state("indexed_build", axes_key(settings, &mode), state);
@@ -1063,12 +1074,13 @@ void indexed_search(nvbench::state& state) {
         oracle = collect_exhaustive_results(database, k_minimum_matches, setup_stream);
     }
 
-    auto database = CUDDL_UNWRAP(
-        database_type::build_indexed_async(device_rows, indexed_metadata, setup_stream)
-    );
+    auto database =
+        CUDDL_UNWRAP(database_type::build_async(device_rows, indexed_metadata, setup_stream));
+    auto acceleration = CUDDL_UNWRAP(index_type::build_async(database, setup_stream));
     setup_stream.sync();
     auto indexed = execute_indexed_search(
         database,
+        acceleration,
         k_minimum_matches,
         [&](auto&& launch) {
             state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& nvbench_launch) {
@@ -1078,7 +1090,7 @@ void indexed_search(nvbench::state& state) {
         setup_stream
     );
     auto const indexed_validation =
-        collect_indexed_results(database, k_minimum_matches, setup_stream);
+        collect_indexed_results(database, acceleration, k_minimum_matches, setup_stream);
 
     started = clock_type::now();
     validate_exhaustive_results(oracle.results, settings, k_minimum_matches);
@@ -1091,7 +1103,7 @@ void indexed_search(nvbench::state& state) {
     add_value(
         state,
         "resident_bytes",
-        static_cast<double>(database.persistent_row_bytes() + database.persistent_index_bytes())
+        static_cast<double>(database.persistent_row_bytes() + acceleration.persistent_index_bytes())
     );
     add_value(state, "search_workspace_bytes", static_cast<double>(indexed.workspace_bytes));
     add_value(state, "atomic_updates", static_cast<double>(indexed_metrics.posting_visits));
@@ -1164,6 +1176,7 @@ struct refseq_context {
     cuda::device_buffer<uint16_t> rows;
     std::optional<refseq_database_type> exhaustive_database;
     std::optional<refseq_database_type> indexed_database;
+    std::optional<refseq_index_type> acceleration;
     uint32_t exhaustive_reference_count{};
     uint32_t indexed_reference_count{};
     uint32_t indexed_key_bits{};
@@ -1325,20 +1338,24 @@ void refseq_indexed_search(nvbench::state& state) {
     auto& context = get_refseq_context();
     if (!context.indexed_database || context.indexed_reference_count != reference_count ||
         context.indexed_key_bits != mode.key_bits) {
+        context.acceleration.reset();
         context.indexed_database.reset();
         auto database = CUDDL_UNWRAP(
-            refseq_database_type::build_indexed_async(
+            refseq_database_type::build_async(
                 refseq_reference_rows(context, reference_count), compatibility, setup_stream
             )
         );
+        auto acceleration = CUDDL_UNWRAP(refseq_index_type::build_async(database, setup_stream));
         context.indexed_database.emplace(std::move(database));
+        context.acceleration.emplace(std::move(acceleration));
         context.indexed_reference_count = reference_count;
         context.indexed_key_bits = mode.key_bits;
         setup_stream.sync();
     }
     auto const& database = *context.indexed_database;
+    auto const& acceleration = *context.acceleration;
     auto const requirements = CUDDL_UNWRAP(
-        database.indexed_batch_search_requirements(k_refseq_query_count, setup_stream)
+        database.batch_search_requirements(k_refseq_query_count, setup_stream, &acceleration)
     );
     auto workspace = cuda::make_device_buffer<uint8_t>(
         setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
@@ -1352,10 +1369,10 @@ void refseq_indexed_search(nvbench::state& state) {
         state,
         reference_count,
         compatibility,
-        database.persistent_row_bytes() + database.persistent_index_bytes()
+        database.persistent_row_bytes() + acceleration.persistent_index_bytes()
     );
     uint64_t selected_candidates = 0U;
-    CUDDL_UNWRAP(database.search_batch_indexed_async(
+    CUDDL_UNWRAP(database.search_batch_async(
         refseq_queries(context),
         compatibility,
         0U,
@@ -1377,7 +1394,8 @@ void refseq_indexed_search(nvbench::state& state) {
         },
         {},
         {.minimum_matches = k_minimum_matches},
-        setup_stream
+        setup_stream,
+        &acceleration
     ));
     add_value(state, "selected_candidates", static_cast<double>(selected_candidates));
     add_value(
@@ -1391,7 +1409,7 @@ void refseq_indexed_search(nvbench::state& state) {
     );
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        CUDDL_UNWRAP(database.search_batch_indexed_async(
+        CUDDL_UNWRAP(database.search_batch_async(
             refseq_queries(context),
             compatibility,
             0U,
@@ -1401,7 +1419,8 @@ void refseq_indexed_search(nvbench::state& state) {
             [](uint32_t) {},
             {},
             {.minimum_matches = k_minimum_matches},
-            cuda::stream_ref{launch.get_stream()}
+            cuda::stream_ref{launch.get_stream()},
+            &acceleration
         ));
     });
     stash_state("refseq_indexed_search", refseq_axes_key(reference_count, &mode), state);

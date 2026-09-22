@@ -12,6 +12,15 @@ test_exe = executable(
 
 test('cuddl-tests', test_exe)
 
+index_file_test_exe = executable(
+    'test-reference-index-file',
+    files('reference_index_file_test.cu'),
+    dependencies: [cuddl_dep, gtest_dep, gtest_main_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
+test('reference-index-file-tests', index_file_test_exe)
+
 result_json_test_exe = executable(
     'test-result-json',
     files('result_json_test.cu'),

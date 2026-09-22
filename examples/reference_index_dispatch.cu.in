@@ -1,0 +1,111 @@
+#include "reference_index_command.hpp"
+#include <cuddl/query_sketch.cuh>
+#include <cuddl/reference_index_file.cuh>
+#include <algorithm>
+#include <iomanip>
+#include <iostream>
+#include <optional>
+
+namespace {
+
+
+template <uint32_t K, size_t Buckets>
+void search(
+    cuddl::reference_database<K, Buckets> const& database,
+    cuddl::reference_index<K, Buckets> const* index,
+    std::vector<std::filesystem::path> const& paths,
+    uint32_t minimum_matches,
+    unsigned workers,
+    cuda::stream_ref stream
+) {
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream,
+        stream.device(),
+        CUDDL_UNWRAP(database.search_workspace_bytes(stream, index)),
+        cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
+        stream, stream.device(), database.single_query_result_count(), cuda::no_init
+    );
+    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
+    std::vector<cuddl::reference_search_result> host;
+    std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\tcardinality\n"
+              << std::setprecision(17);
+    using query_type = cuddl::query_sketch_batch<K, Buckets>;
+    for (size_t first = 0; first < paths.size(); first += 32) {
+        auto batch_size = std::min(size_t{32}, paths.size() - first);
+        auto queries = CUDDL_UNWRAP(
+            query_type::sketch(
+                std::span{paths.data() + first, batch_size}, stream, {.parser_workers = workers}
+            )
+        );
+        for (size_t i = 0; i < batch_size; ++i) {
+            CUDDL_UNWRAP(database.search_async(
+                {queries.scores().data() + i * Buckets, Buckets},
+                query_type::compatibility(),
+                {workspace.data(), workspace.size()},
+                {results.data(), results.size()},
+                {count.data(), count.size()},
+                {.minimum_matches = minimum_matches},
+                stream,
+                index
+            ));
+            uint32_t found{};
+            cuda::copy_bytes(stream, count, cuda::std::span{&found, size_t{1}});
+            stream.sync();
+            host.resize(found);
+            if (found != 0) {
+                cuda::copy_bytes(
+                    stream,
+                    cuda::std::span{results.data(), static_cast<size_t>(found)},
+                    cuda::std::span{host.data(), host.size()}
+                );
+                stream.sync();
+            }
+            for (auto const& result : host) {
+                auto const& counts = result.summary.counts;
+                std::cout << first + i << '\t' << result.reference_id << '\t' << counts.lower
+                          << '\t' << counts.equal << '\t' << counts.higher << '\t'
+                          << counts.both_empty << '\t' << result.summary.cardinality << '\n';
+            }
+        }
+    }
+    if (!std::cout) throw std::runtime_error("cannot write search results");
+}
+
+template <size_t Buckets, uint32_t K = 1>
+void dispatch_reference_index(reference_index_command const& command) {
+    if (command.database.metadata().compatibility.kmer_length != K) {
+        if constexpr (K < 31) return dispatch_reference_index<Buckets, K + 1>(command);
+        throw std::invalid_argument("unsupported k-mer length");
+    }
+    cuda::stream stream{cuda::devices[0]};
+    auto database = CUDDL_UNWRAP((command.database.upload<K, Buckets>(stream)));
+    using index_type = cuddl::reference_index<K, Buckets>;
+    if (command.build) {
+        auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, command.storage));
+        CUDDL_UNWRAP(
+            cuddl::reference_index_file::save(index, database, command.index_path, stream)
+        );
+    } else {
+        std::optional<index_type> index;
+        if (!command.index_path.empty()) {
+            index.emplace(CUDDL_UNWRAP(
+                cuddl::reference_index_file::load(command.index_path, database, stream)
+            ));
+        }
+        search(
+            database,
+            index ? &*index : nullptr,
+            command.queries,
+            command.minimum_matches,
+            command.workers,
+            stream
+        );
+    }
+}
+}  // namespace
+
+void dispatch_reference_index_@BUCKETS@(reference_index_command const& command) {
+    dispatch_reference_index<@BUCKETS@>(command);
+}
