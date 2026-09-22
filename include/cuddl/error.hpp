@@ -36,16 +36,19 @@ struct SourceLocation {
     }
 };
 
+/// @brief CUDA failure payload: status code, call site, and formatted message.
 struct CudaError {
     cudaError_t code{};
     SourceLocation location;
     std::string message;
 };
 
+/// @brief Invalid-argument failure payload.
 struct InvalidArgumentError {
     std::string message;
 };
 
+/// @brief Resource failure payload: allocation, I/O, or capacity errors.
 struct ResourceError {
     std::string message;
 };

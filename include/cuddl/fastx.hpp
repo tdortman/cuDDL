@@ -25,9 +25,10 @@ using fasta_parse_result = detail::fasta_parse_result;
  * breaks the rolling window, and no k-mer spanning it is emitted. Record boundaries also reset
  * the window, without contributing to `invalid_windows`. See @ref detail::parse_fasta.
  *
+ * @param path FASTA/FASTQ file to parse.
+ * @param k K-mer length.
  * @param threads Worker count for parallel files, defaulting to
  *        `std::thread::hardware_concurrency()`; files at or below 1 MiB parse serially.
- *
  * @return Parsed k-mers and counts, or an error if the file cannot be opened.
  */
 inline Result<fasta_parse_result> parse_fasta_file(

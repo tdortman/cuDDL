@@ -83,6 +83,7 @@ class sketch {
     sketch(sketch const&) = delete;
     sketch& operator=(sketch const&) = delete;
     sketch(sketch&&) noexcept = default;
+    /// @brief Move-assigns the sketch, leaving the source empty.
     sketch& operator=(sketch&&) noexcept = default;
 
     /// @brief Packed device registers.
@@ -120,6 +121,10 @@ class sketch {
         return added_;
     }
 
+    /// @brief Resets every register and the saturation flag to zero without synchronising.
+    ///
+    /// Resets the offered k-mer count, so the next estimate is capped at what the sketch is
+    /// given after this call. The caller must keep the sketch alive until @p stream completes.
     [[nodiscard]] Result<void> clear_async(cuda::stream_ref stream) const noexcept {
         if (auto const result = view().clear_async(stream); !result) {
             return result;
@@ -128,6 +133,7 @@ class sketch {
         return {};
     }
 
+    /// @brief Resets every register and the saturation flag to zero, then synchronises.
     [[nodiscard]] Result<void> clear(cuda::stream_ref stream) const noexcept {
         if (auto const result = clear_async(stream); !result) {
             return result;

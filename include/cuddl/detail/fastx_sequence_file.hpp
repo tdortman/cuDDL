@@ -106,6 +106,7 @@ fastx_line_end_avx2(std::string_view data, size_t position) {
 #endif
 
 #if defined(__ARM_FEATURE_SVE)
+/// @brief SVE line-end scan; falls back to the scalar loop where SVE is unavailable.
 [[nodiscard]] inline size_t fastx_line_end_sve(std::string_view data, size_t position) {
     while (position < data.size()) {
         const svbool_t active = svwhilelt_b8(position, data.size());
@@ -123,6 +124,7 @@ fastx_line_end_avx2(std::string_view data, size_t position) {
 #endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
+/// @brief NEON line-end scan over 16-byte blocks.
 [[nodiscard]] inline size_t fastx_line_end_neon(std::string_view data, size_t position) {
     const uint8x16_t newline = vdupq_n_u8('\n');
     const uint8x16_t carriage_return = vdupq_n_u8('\r');
@@ -147,6 +149,7 @@ fastx_line_end_avx2(std::string_view data, size_t position) {
 
 using fastx_line_end_fn = decltype(&fastx_line_end_scalar);
 
+/// @brief Selects the fastest line-end scanner the host supports.
 [[nodiscard]] inline fastx_line_end_fn resolve_fastx_line_end() {
 #if defined(__ARM_FEATURE_SVE)
     return fastx_line_end_sve;
@@ -161,6 +164,7 @@ using fastx_line_end_fn = decltype(&fastx_line_end_scalar);
 
 static const fastx_line_end_fn line_end = resolve_fastx_line_end();
 
+/// @brief First line-end position at or after @p position using the resolved scanner.
 [[nodiscard]] inline size_t fastx_line_end(std::string_view data, size_t position) {
     return line_end(data, position);
 }
@@ -195,8 +199,7 @@ static const fastx_line_end_fn line_end = resolve_fastx_line_end();
     return extents;
 }
 
-// Collects every '>' offset in data[begin, end). Phase one of the parallel FASTA scan:
-// pure search, no header interpretation.
+/// @brief Collects every '>' offset in data[begin, end): phase one of the parallel FASTA scan.
 inline void gather_header_candidates(
     std::string_view data,
     size_t begin,
@@ -213,9 +216,7 @@ inline void gather_header_candidates(
     }
 }
 
-// Serial header walk over ascending '>' candidates. Produces exactly
-// fastx_fasta_extents(data): candidates before the cursor are bytes a
-// serial search jumps over with its line-end skip, and the predecessor rule is local.
+/// @brief Serial header walk over ascending '>' candidates, matching fastx_fasta_extents.
 inline std::vector<fastx_sequence_extent>
 walk_header_candidates(std::string_view data, std::vector<size_t> const& candidates) {
     std::vector<fastx_sequence_extent> extents;
@@ -240,9 +241,7 @@ walk_header_candidates(std::string_view data, std::vector<size_t> const& candida
     return extents;
 }
 
-// Parallel equivalent of fastx_fasta_extents for large inputs. Shards the
-// '>' search (the full-buffer memchr pass) across threads, then walks the ordered
-// candidates once. Small inputs use the serial scan directly.
+/// @brief Parallel fastx_fasta_extents for large inputs; serial scan for small ones.
 inline std::vector<fastx_sequence_extent> parallel_fastx_fasta_extents(std::string_view data) {
     auto const hardware = std::max(1U, std::thread::hardware_concurrency());
     auto const shards =
@@ -1030,7 +1029,9 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
 // rethrown by take, matching std::async propagation into the build error handlers.
 class fastx_load_pool {
    public:
+    /// @param paths Files the pool loads in order.
     /// @param workers Loader threads.
+    /// @param source Decompression buffer source; the default detects gzip by magic bytes.
     /// @param window  Files the loaders may hold ahead of the consumer, at least one per worker.
     ///                Results are taken in order, so the window is what hides a slow file: with a
     ///                window of one worker-worth there is no slack, and the consumer waits on the

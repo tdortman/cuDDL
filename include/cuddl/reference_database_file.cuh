@@ -192,9 +192,11 @@ struct sequence_build_options {
  */
 class reference_database_file {
    public:
+    /// @brief Compatibility metadata and reference count.
     [[nodiscard]] reference_database_metadata metadata() const noexcept {
         return metadata_;
     }
+    /// @brief Reference labels in reference-ID order.
     [[nodiscard]] std::span<std::string const> names() const noexcept {
         return names_;
     }

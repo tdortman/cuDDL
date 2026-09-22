@@ -276,6 +276,8 @@ inline void consume_byte(
  * window prefix and then consumes its segments, and the per-span results concatenate to the
  * byte-identical single-threaded output.
  *
+ * @param path FASTA/FASTQ file to parse.
+ * @param k K-mer length.
  * @param threads Worker count for parallel files, defaulting to
  *        `std::thread::hardware_concurrency()`; files at or below 1 MiB parse serially
  *        regardless.

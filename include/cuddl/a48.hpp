@@ -436,6 +436,7 @@ decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t e
     std::string_view input,
     unsigned requested_threads = std::thread::hardware_concurrency()
 ) {
+    /// @brief One undecoded record: its header block, data row, and file ordinal.
     struct record_job {
         std::string header;
         std::string_view data;
@@ -675,6 +676,7 @@ struct oracle_result {
     std::vector<row_summary> summaries;
 };
 
+/// @brief Exact match counts and pair summaries for one flat query row.
 [[nodiscard]] inline oracle_result exhaustive_oracle(
     std::vector<uint16_t> const& rows,
     std::vector<uint16_t> const& query,

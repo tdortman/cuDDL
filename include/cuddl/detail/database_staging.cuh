@@ -203,6 +203,10 @@ class database_stager {
     }
 
     /// @throws cuda::cuda_error or std::bad_alloc when the device buffers cannot be allocated.
+    /// @param stream Stream owning the arena, descriptors, and row store.
+    /// @param references Genome count sizing the host row store.
+    /// @param bounds Arena sizing the device row store, arena, and descriptors.
+    /// @param statistics Optional build statistics sink, null to skip.
     /// @param direct stages the caller's bytes in place, for a device that reads pageable host
     /// memory: no copy, and the arena stays unused.
     database_stager(
@@ -715,6 +719,9 @@ class pinned_sequence_pool {
 /// worker-worth leaves the consumer waiting on a straggler while every other loader sits idle.
 class path_loaders {
    public:
+    /// @param stream Stream owning the loader buffers.
+    /// @param paths Genome files in reference-ID order.
+    /// @param parser_workers Loader ceiling; the build clamps it to inputs and hardware.
     /// @param page_locked gives the loaders page-locked buffers to decompress into.
     path_loaders(
         cuda::stream_ref stream,

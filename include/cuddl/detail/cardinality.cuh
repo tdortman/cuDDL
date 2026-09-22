@@ -77,6 +77,7 @@ minimum_mle_f32(float bucket_count, float empty_count, float sum_restored) noexc
            (empty_count + sum_restored / static_cast<float>(hash_range));
 }
 
+/// @brief Single-precision @ref mean_m for the throughput-bound cardinality reduction.
 __host__ __device__ inline float
 mean_m_f32(float bucket_count, float filled, float sum_restored) noexcept {
     if (filled <= 0.0f || sum_restored <= 0.0f) {
@@ -85,6 +86,7 @@ mean_m_f32(float bucket_count, float filled, float sum_restored) noexcept {
     return bucket_count * filled * static_cast<float>(hash_range) / sum_restored;
 }
 
+/// @brief Single-precision @ref cardinality for the throughput-bound cardinality reduction.
 __host__ __device__ inline float
 cardinality_f32(float bucket_count, float empty_count, float sum_restored) noexcept {
     return minimum_mle_f32(bucket_count, empty_count, sum_restored);

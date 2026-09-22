@@ -24,6 +24,7 @@ struct pairwise_counts {
         return *this;
     }
 
+    /// @brief Sums two count sets for device reductions.
     friend __host__ __device__ pairwise_counts
     operator+(pairwise_counts left, pairwise_counts const right) noexcept {
         return left += right;

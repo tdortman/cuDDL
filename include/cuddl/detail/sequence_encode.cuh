@@ -18,8 +18,10 @@
 
 namespace cuddl::detail {
 
-// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads
-// reuse neighboring words to construct eight overlapping windows on both strands.
+/// @brief Encodes raw ASCII windows into registers using shared overlapping tiles.
+///
+/// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads reuse
+/// neighboring words to construct eight overlapping windows on both strands.
 template <size_t BucketCount, typename Layout>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
@@ -163,6 +165,7 @@ __device__ __forceinline__ void add_sequence_windows(
     }
 }
 
+/// @brief Tile kernel for one staged file-builder chunk, carrying K-1 bases across tiles.
 template <size_t BucketCount, typename Layout>
 __global__ void add_sequence_tile_kernel(
     char const* sequence,
@@ -198,7 +201,7 @@ struct sequence_batch_chunk {
     uint32_t windows;
 };
 
-// Logical blocks cover every chunk in one launch, including independent short records.
+/// @brief Batch kernel covering every staged chunk in one launch, including short records.
 template <size_t BucketCount, typename Layout>
 __global__ void add_sequence_batch_kernel(
     sequence_batch_chunk const* chunks,
@@ -238,8 +241,10 @@ __global__ void add_sequence_batch_kernel(
     }
 }
 
-// Single-sequence launch for the public raw-ASCII API. Unlike the file-builder tile path,
-// there is no cross-chunk carry: the caller supplies any K-1 overlap explicitly.
+/// @brief Single-sequence kernel for the public raw-ASCII API.
+///
+/// Unlike the file-builder tile path, there is no cross-chunk carry: the caller supplies any
+/// K-1 overlap explicitly.
 template <size_t BucketCount, typename Layout>
 __global__ void add_sequence_single_kernel(
     char const* sequence,
@@ -259,11 +264,11 @@ __global__ void add_sequence_single_kernel(
     );
 }
 
-// Shared launch for one device-resident ASCII chunk. Windows derive as
-// size >= k ? size - k + 1 : 0; short input is a no-op. Window counts above
-// UINT32_MAX are rejected instead of narrowing, so size must not exceed
-// UINT32_MAX + k - 1. No hidden carry: the caller supplies any K-1 overlap
-// explicitly.
+/// @brief Shared launch for one device-resident ASCII chunk.
+///
+/// Windows derive as size >= k ? size - k + 1 : 0; short input is a no-op. Window counts above
+/// UINT32_MAX are rejected instead of narrowing, so size must not exceed UINT32_MAX + k - 1.
+/// No hidden carry: the caller supplies any K-1 overlap explicitly.
 template <size_t BucketCount, typename Layout = default_register_layout>
 __host__ inline Result<void> launch_sequence_add(
     device_span<char const> sequence,

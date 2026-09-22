@@ -29,6 +29,7 @@ __host__ __device__ constexpr size_t bucket_of(uint64_t hash) noexcept {
     return hash & (BucketCount - 1);
 }
 
+/// @brief xxHash-64 round primes.
 constexpr uint64_t PRIME64_1 = 11400714785074694791ULL;
 constexpr uint64_t PRIME64_2 = 14029467366897019727ULL;
 constexpr uint64_t PRIME64_3 = 1609587929392839161ULL;

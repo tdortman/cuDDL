@@ -31,6 +31,7 @@ class reference_index {
           index_posting_capacity_(std::exchange(other.index_posting_capacity_, 0)),
           indexed_(std::exchange(other.indexed_, false)) {}
 
+    /// @brief Move-assigns the index, leaving the source empty.
     reference_index& operator=(reference_index&& other) noexcept {
         if (this != &other) {
             identity_ = std::move(other.identity_);
@@ -43,6 +44,7 @@ class reference_index {
         return *this;
     }
 
+    /// @brief Dense index when offsets cover every cell, sparse when only keys are stored.
     [[nodiscard]] index_storage storage() const noexcept {
         return index_offsets_.empty() ? index_storage::sparse : index_storage::dense;
     }
@@ -59,6 +61,7 @@ class reference_index {
         return build_index<score_type>(database, stream, storage);
     }
 
+    /// @brief Bytes the saved index file needs for offsets, postings, and keys.
     [[nodiscard]] size_t persistent_index_bytes() const noexcept {
         return index_offsets_.size() * sizeof(uint32_t) +
                index_postings_.size() * sizeof(uint32_t) + index_keys_.size() * sizeof(uint16_t);

@@ -341,18 +341,22 @@ class reference_database_view {
         return packed_;
     }
 
+    /// @brief Compatibility metadata and reference count.
     [[nodiscard]] constexpr reference_database_metadata metadata() const noexcept {
         return metadata_;
     }
 
+    /// @brief Reference count.
     [[nodiscard]] constexpr uint32_t reference_count() const noexcept {
         return metadata_.reference_count;
     }
 
+    /// @brief True when an index backs this view.
     [[nodiscard]] constexpr bool has_index() const noexcept {
         return indexed_;
     }
 
+    /// @brief Bytes one compact row store needs for @p reference_count references.
     [[nodiscard]] static constexpr size_t persistent_row_bytes(uint32_t reference_count) noexcept {
         return static_cast<size_t>(reference_count) * BucketCount * sizeof(score_type);
     }
@@ -364,20 +368,24 @@ class reference_database_view {
                (BucketCount * sizeof(register_type) + sizeof(uint32_t));
     }
 
+    /// @brief Bytes this view's own row store needs.
     [[nodiscard]] constexpr size_t persistent_row_bytes() const noexcept {
         return packed_ ? packed_rows_.size_bytes() + saturation_states_.size_bytes()
                        : rows_.size_bytes();
     }
 
+    /// @brief Bytes this view's index needs for offsets, postings, and keys.
     [[nodiscard]] constexpr size_t persistent_index_bytes() const noexcept {
         return index_offsets_.size_bytes() + index_postings_.size_bytes() +
                index_keys_.size_bytes();
     }
 
+    /// @brief Caller-owned bytes for one exhaustive query; always zero.
     [[nodiscard]] static constexpr size_t single_query_workspace_bytes(uint32_t) noexcept {
         return 0;
     }
 
+    /// @brief Caller-owned bytes for one exhaustive query on this view; always zero.
     [[nodiscard]] constexpr size_t single_query_workspace_bytes() const noexcept {
         return 0;
     }
@@ -388,6 +396,7 @@ class reference_database_view {
         return reference_count;
     }
 
+    /// @brief Results one exhaustive query writes: one per reference.
     [[nodiscard]] constexpr uint32_t single_query_result_count() const noexcept {
         return metadata_.reference_count;
     }
@@ -1691,6 +1700,7 @@ class reference_database {
         return build_rows_async(rows, saturation_states, compatibility, stream);
     }
 
+    /// @brief Compact winner-score rows in reference-ID order.
     [[nodiscard]] device_span<score_type const> data() const noexcept {
         return view().data();
     }
@@ -1705,22 +1715,27 @@ class reference_database {
         return view().saturation_states();
     }
 
+    /// @brief Reference labels in reference-ID order.
     [[nodiscard]] std::span<std::string const> names() const noexcept {
         return names_;
     }
 
+    /// @brief Compatibility metadata and reference count.
     [[nodiscard]] reference_database_metadata metadata() const noexcept {
         return metadata_;
     }
 
+    /// @brief Reference count.
     [[nodiscard]] uint32_t reference_count() const noexcept {
         return metadata_.reference_count;
     }
 
+    /// @brief True when packed winner/count rows (not compact scores) back this database.
     [[nodiscard]] bool preserves_multiplicity() const noexcept {
         return packed_;
     }
 
+    /// @brief Bytes one compact row store needs for @p reference_count references.
     [[nodiscard]] static constexpr size_t persistent_row_bytes(uint32_t reference_count) noexcept {
         return view_type::persistent_row_bytes(reference_count);
     }
@@ -1731,6 +1746,7 @@ class reference_database {
         return view_type::persistent_packed_row_bytes(reference_count);
     }
 
+    /// @brief Bytes this database's own row store needs.
     [[nodiscard]] size_t persistent_row_bytes() const noexcept {
         return view().persistent_row_bytes();
     }
@@ -1741,6 +1757,7 @@ class reference_database {
         return view_type::single_query_workspace_bytes(reference_count);
     }
 
+    /// @brief Caller-owned bytes for one exhaustive query on this database; always zero.
     [[nodiscard]] size_t single_query_workspace_bytes() const noexcept {
         return view().single_query_workspace_bytes();
     }
@@ -1757,6 +1774,7 @@ class reference_database {
         return view_type::single_query_result_count(reference_count);
     }
 
+    /// @brief Results one exhaustive query writes: one per reference.
     [[nodiscard]] uint32_t single_query_result_count() const noexcept {
         return view().single_query_result_count();
     }

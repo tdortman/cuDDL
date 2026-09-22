@@ -33,6 +33,7 @@ struct summary_payload {
     uint64_t empty{};
     double restored_sum{};
 
+    /// @brief Accumulates @p other into this instance for block reductions.
     __device__ summary_payload& operator+=(summary_payload const& other) noexcept {
         counts += other.counts;
         empty += other.empty;
@@ -40,6 +41,7 @@ struct summary_payload {
         return *this;
     }
 
+    /// @brief Sums two accumulators for CUB block reductions.
     friend __device__ summary_payload
     operator+(summary_payload left, summary_payload const& right) noexcept {
         return left += right;
@@ -351,6 +353,7 @@ __host__ __device__ constexpr uint16_t reference_score(uint16_t score) noexcept 
     return score;
 }
 
+/// @brief Winning score of a packed register; the uint16_t overload passes scores through.
 __host__ __device__ constexpr uint16_t reference_score(uint32_t packed_register) noexcept {
     return winner(packed_register);
 }
@@ -915,8 +918,8 @@ constexpr uint32_t index_match_cells_per_warp = 8U;
 
 /// @brief Counts dense index matches for every query/reference pair in one tile.
 ///
-/// One warp owns @ref index_match_cells_per_warp (query, bucket) cells per iteration. Each
-/// cell's posting list is walked with a lane stride, so hot keys with long lists (the dominant
+/// One warp owns cuddl::detail::index_match_cells_per_warp (query, bucket) cells per iteration.
+/// Each cell's posting list is walked with a lane stride, so hot keys with long lists (the dominant
 /// cost on skewed rows) are consumed 32 postings at a time instead of serially by a single
 /// thread, and the two per-cell offset loads collapse into warp-uniform broadcasts.
 template <size_t BucketCount, typename QueryRow>
@@ -1024,8 +1027,8 @@ struct batch_minimum_match_predicate {
 /// @brief Classifies one contiguous per-lane chunk of both rows.
 ///
 /// With @p Use256 the chunk covers 16 buckets for 16-bit scores and 8 buckets for packed
-/// 32-bit registers, through @ref load_256_global_nc: one 256-bit load per row on sm_100+ and
-/// two 128-bit loads below, so it needs rows aligned to @ref load_256_alignment. Without it the
+/// 32-bit registers, through cuddl::detail::load_256_global_nc: one 256-bit load per row on sm_100+
+/// and two 128-bit loads below, so it needs rows aligned to @ref load_256_alignment. Without it the
 /// chunk covers 8 or 4 buckets with per-element scalar loads, which are safe for rows aligned
 /// only to their score type (2 or 4 bytes).
 template <bool Use256, typename QueryScore, typename ReferenceScore>
@@ -1223,10 +1226,12 @@ static __global__ void advance_indexed_result_count_kernel(
     }
 }
 
+/// @brief Per-thread accumulator feeding the CUB block reduction for cardinality.
 struct cardinality_payload {
     uint32_t empty{};
     float restored{};
 
+    /// @brief Sums two accumulators for the block reduction.
     friend __device__ cardinality_payload
     operator+(cardinality_payload left, cardinality_payload right) noexcept {
         return {left.empty + right.empty, left.restored + right.restored};
@@ -1262,6 +1267,7 @@ cardinality_kernel(uint32_t const* registers, uint64_t* empty_out, double* estim
     }
 }
 
+/// @brief Computes BBTools and paper-style HybridDDL estimates in one register scan.
 template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ void hybrid_cardinality_kernel(
     uint32_t const* const registers,
@@ -1295,6 +1301,7 @@ __global__ void hybrid_cardinality_kernel(
     }
 }
 
+/// @brief Computes one HybridDDL variant estimate for estimator comparisons.
 template <size_t BucketCount, hybrid_variant Variant, typename Layout = default_register_layout>
 __global__ void
 hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const estimate) {

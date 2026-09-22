@@ -47,6 +47,7 @@ class query_sketch_batch {
           saturation_(std::move(other.saturation_)),
           query_count_(std::exchange(other.query_count_, 0U)) {}
 
+    /// @brief Move-assigns the batch, leaving the source empty.
     query_sketch_batch& operator=(query_sketch_batch&& other) noexcept {
         if (this != &other) {
             scores_ = std::move(other.scores_);
@@ -124,6 +125,7 @@ class query_sketch_batch {
         return saturation_;
     }
 
+    /// @brief Query count, in the order the paths or genomes were supplied.
     [[nodiscard]] uint32_t query_count() const noexcept {
         return query_count_;
     }

@@ -8,6 +8,7 @@
 
 namespace cuddl::detail {
 
+/// @brief NLZ histogram bins for the hybrid estimator, including the empty tier.
 constexpr int32_t nlz_bins = 66;
 constexpr double dlc_blend_low = 0.088;
 constexpr double dlc_blend_high = 0.952;
@@ -16,6 +17,7 @@ constexpr double dlc_info_power = 4.5;
 constexpr double hybrid_low = 0.2;
 constexpr double hybrid_high = 5.0;
 
+/// @brief Which HybridDDL blend the variant kernel computes.
 enum class hybrid_variant : uint8_t {
     bbtools,
     paper,
@@ -53,6 +55,7 @@ static __device__ constexpr float ddl_mean_m_cf[] = {
     1.00041684f,
 };
 
+/// @brief Interpolates the MeanM correction factor for @p estimate from the calibration table.
 __device__ inline double interpolate_mean_m_cf(double estimate) noexcept {
     if (estimate <= ddl_cf_keys[0]) {
         return ddl_mean_m_cf[0];
@@ -74,6 +77,7 @@ __device__ inline double interpolate_mean_m_cf(double estimate) noexcept {
     return ddl_mean_m_cf[low] + fraction * (ddl_mean_m_cf[high] - ddl_mean_m_cf[low]);
 }
 
+/// @brief Linear-counting estimate from the first occupied NLZ tier.
 __device__ inline double lc_min(uint32_t const* bins, double bucket_count) noexcept {
     auto cumulative = bins[0];
     if (cumulative > 0U) {
@@ -90,6 +94,7 @@ __device__ inline double lc_min(uint32_t const* bins, double bucket_count) noexc
     return 0.0;
 }
 
+/// @brief Distributed linear-counting estimate, blended from per-tier estimates by precision.
 __device__ inline double dlc(uint32_t const* bins, double bucket_count, double lc) noexcept {
     auto const empty = bins[0];
     auto const minimum = max(1.0, bucket_count * dlc_min_fraction);
@@ -134,6 +139,7 @@ __device__ inline double dlc(uint32_t const* bins, double bucket_count, double l
     return pure;
 }
 
+/// @brief Log-blended low and corrected estimates across the hybrid transition zone.
 __device__ inline double hybrid(
     double low_estimate,
     double zone_estimate,
@@ -152,6 +158,7 @@ __device__ inline double hybrid(
     return (1.0 - t) * low_estimate + t * corrected_mean;
 }
 
+/// @brief BBTools occupancy-corrected MeanM estimate from restored magnitudes.
 __device__ inline double
 bbtools_mean_m(double bucket_count, double filled, double restored_sum) noexcept {
     if (filled <= 0.0 || restored_sum <= 0.0) {
@@ -162,6 +169,7 @@ bbtools_mean_m(double bucket_count, double filled, double restored_sum) noexcept
     return hash_range / mean * filled * occupancy_correction;
 }
 
+/// @brief Fused BBTools, paper, linear-counting, DLC, and raw MeanM estimates.
 __device__ inline hybrid_cardinality_estimates
 hybrid_estimates(uint32_t const* bins, double bucket_count, double restored_sum) noexcept {
     auto const empty = static_cast<double>(bins[0]);
@@ -210,6 +218,7 @@ __device__ inline float interpolate_mean_m_cf_f32(float estimate) noexcept {
     return ddl_mean_m_cf[low] + fraction * (ddl_mean_m_cf[high] - ddl_mean_m_cf[low]);
 }
 
+/// @brief Single-precision @ref lc_min for the latency-bound hybrid scan.
 __device__ inline float lc_min_f32(uint32_t const* bins, float bucket_count) noexcept {
     auto cumulative = bins[0];
     if (cumulative > 0U) {
@@ -226,6 +235,7 @@ __device__ inline float lc_min_f32(uint32_t const* bins, float bucket_count) noe
     return 0.0f;
 }
 
+/// @brief Single-precision @ref dlc for the latency-bound hybrid scan.
 __device__ inline float dlc_f32(uint32_t const* bins, float bucket_count, float lc) noexcept {
     auto const empty = static_cast<float>(bins[0]);
     auto const minimum = max(1.0f, bucket_count * static_cast<float>(dlc_min_fraction));
@@ -271,6 +281,7 @@ __device__ inline float dlc_f32(uint32_t const* bins, float bucket_count, float 
     return pure;
 }
 
+/// @brief Single-precision @ref hybrid for the latency-bound hybrid scan.
 __device__ inline float hybrid_f32(
     float low_estimate,
     float zone_estimate,
@@ -289,6 +300,7 @@ __device__ inline float hybrid_f32(
     return (1.0f - t) * low_estimate + t * corrected_mean;
 }
 
+/// @brief Single-precision @ref bbtools_mean_m for the latency-bound hybrid scan.
 __device__ inline float
 bbtools_mean_m_f32(float bucket_count, float filled, float restored_sum) noexcept {
     if (filled <= 0.0f || restored_sum <= 0.0f) {
@@ -299,6 +311,7 @@ bbtools_mean_m_f32(float bucket_count, float filled, float restored_sum) noexcep
     return static_cast<float>(hash_range) / mean * filled * occupancy_correction;
 }
 
+/// @brief Single-precision @ref hybrid_estimates for the latency-bound hybrid scan.
 __device__ inline hybrid_cardinality_estimates
 hybrid_estimates_f32(uint32_t const* bins, float bucket_count, float restored_sum) noexcept {
     auto const empty = static_cast<float>(bins[0]);
