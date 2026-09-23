@@ -2,6 +2,8 @@
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
 
+#include <libdeflate.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -278,12 +280,12 @@ TEST(ReferenceIndexFileTest, EmptyIndexesRoundTripAndMalformedFilesFailAtLoad) {
             auto data_bytes = std::filesystem::file_size(path) - sizeof(uint32_t);
             auto remaining = data_bytes;
             std::array<char, 65536> buffer{};
-            auto checksum = crc32(0, nullptr, 0);
+            uint32_t checksum = 0;
             while (remaining != 0) {
                 auto chunk = std::min<uint64_t>(remaining, buffer.size());
                 corrupt.read(buffer.data(), static_cast<std::streamsize>(chunk));
                 ASSERT_TRUE(corrupt);
-                checksum = crc32_z(checksum, reinterpret_cast<Bytef const*>(buffer.data()), chunk);
+                checksum = libdeflate_crc32(checksum, buffer.data(), chunk);
                 remaining -= chunk;
             }
             corrupt.seekp(static_cast<std::streamoff>(data_bytes));
@@ -333,10 +335,7 @@ TEST(ReferenceIndexFileTest, ValidChecksumDoesNotPermitMalformedSparsePostings) 
             }
         };
         put(offset, value);
-        put(bytes.size() - 4,
-            static_cast<uint32_t>(
-                crc32_z(0, reinterpret_cast<Bytef const*>(bytes.data()), bytes.size() - 4)
-            ));
+        put(bytes.size() - 4, libdeflate_crc32(0, bytes.data(), bytes.size() - 4));
         {
             std::ofstream output(path, std::ios::binary | std::ios::trunc);
             output.write(bytes.data(), bytes.size());
@@ -351,6 +350,57 @@ TEST(ReferenceIndexFileTest, ValidChecksumDoesNotPermitMalformedSparsePostings) 
     uint32_t first_id = static_cast<unsigned char>(original[32]);
     reject(36, first_id);                      // Duplicate valid ID, with matching zero keys.
     reject(original.size() - 8, 0x00010000U);  // Sorted nonzero key for an empty reference.
+}
+
+TEST(ReferenceIndexFileTest, PostingsAscendByReferenceWithinEveryKey) {
+    temporary_directory temporary;
+    cuda::stream stream{cuda::devices[0]};
+    // Identical genomes share every key, so each posting list spans many warps of the build.
+    std::array<cuddl::sequence_record, 1> bases{
+        {{"ACGTTGCACTGATCGAGGCTAACGTTGCACTGATCGAGGCTAACGT"}}
+    };
+    std::vector<cuddl::sequence_genome> genomes;
+    std::vector<std::string> names;
+    for (size_t i = 0; i < 4096; ++i) names.push_back(std::to_string(i));
+    for (auto const& name : names) genomes.push_back({bases, name});
+    auto archive = CUDDL_UNWRAP((database_file::build_from_sequences<25, 2048>(genomes, stream)));
+    auto database = CUDDL_UNWRAP((archive.upload<25, 2048>(stream)));
+    for (auto storage : {cuddl::index_storage::dense, cuddl::index_storage::sparse}) {
+        auto path = temporary.path / "shared.index";
+        ASSERT_TRUE((write_index<25, 2048>(archive, path, stream, storage)));
+        auto loaded = index_file::load<25, 2048>(path, database, stream);
+        ASSERT_TRUE(loaded) << loaded.error().message();
+
+        // The same postings out of order must not load.
+        std::ifstream input(path, std::ios::binary);
+        std::string bytes{std::istreambuf_iterator<char>{input}, {}};
+        input.close();
+        uint64_t count = 0;
+        std::memcpy(&count, bytes.data() + 24, sizeof(count));
+        auto key_bytes = storage == cuddl::index_storage::sparse ? count * sizeof(uint16_t) : 0;
+        auto postings = bytes.size() - 4 - key_bytes - count * 4;
+        if (storage == cuddl::index_storage::sparse) {
+            // Skip the leading empty-key run so the swap lands inside one nonzero key.
+            auto const* keys = bytes.data() + bytes.size() - 4 - key_bytes;
+            size_t first = 0;
+            while (keys[2 * first] == 0 && keys[2 * first + 1] == 0) ++first;
+            postings += first * 4;
+        }
+        std::swap_ranges(
+            bytes.begin() + static_cast<std::ptrdiff_t>(postings),
+            bytes.begin() + static_cast<std::ptrdiff_t>(postings + 4),
+            bytes.begin() + static_cast<std::ptrdiff_t>(postings + 4)
+        );
+        auto checksum = libdeflate_crc32(0, bytes.data(), bytes.size() - 4);
+        for (size_t i = 0; i < 4; ++i) {
+            bytes[bytes.size() - 4 + i] = static_cast<char>(checksum >> (8 * i));
+        }
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        EXPECT_FALSE((index_file::load<25, 2048>(path, database, stream)));
+    }
 }
 
 }  // namespace

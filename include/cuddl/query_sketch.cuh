@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuddl/batch.cuh>
 #include <cuddl/detail/database_staging.cuh>
 #include <cuddl/detail/register.cuh>
 #include <cuddl/device_span.cuh>
@@ -40,7 +41,7 @@ class query_sketch_batch {
     query_sketch_batch& operator=(query_sketch_batch const&) = delete;
 
     // Explicit host bodies prevent NVCC from inferring device-side buffer operations.
-    __host__ ~query_sketch_batch() {} // NOLINT(modernize-use-equals-default)
+    __host__ ~query_sketch_batch() {}  // NOLINT(modernize-use-equals-default)
 
     query_sketch_batch(query_sketch_batch&& other) noexcept
         : scores_(std::move(other.scores_)),
@@ -70,15 +71,17 @@ class query_sketch_batch {
         path_build_options options = {}
     ) try {
         return [&]() -> Result<query_sketch_batch> {
-            auto store = CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
+            query_sketch_batch batch(stream, static_cast<uint32_t>(paths.size()));
+            CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
                 paths,
                 stream,
                 options.staging_bytes,
                 options.parser_workers,
                 options.transfer,
-                options.statistics
+                options.statistics,
+                batch.reduce_rows(stream)
             )));
-            return compact(store, paths.size(), stream);
+            return batch;
         }();
     } catch (cuda::cuda_error const& error) {
         return Err(Error::cuda(static_cast<cudaError_t>(error.status())));
@@ -99,10 +102,15 @@ class query_sketch_batch {
         sequence_build_options options = {}
     ) try {
         return [&]() -> Result<query_sketch_batch> {
-            auto store = CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
-                genomes, stream, options.staging_bytes, options.statistics
+            query_sketch_batch batch(stream, static_cast<uint32_t>(genomes.size()));
+            CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
+                genomes,
+                stream,
+                options.staging_bytes,
+                options.statistics,
+                batch.reduce_rows(stream)
             )));
-            return compact(store, genomes.size(), stream);
+            return batch;
         }();
     } catch (cuda::cuda_error const& error) {
         return Err(Error::cuda(static_cast<cudaError_t>(error.status())));
@@ -148,33 +156,33 @@ class query_sketch_batch {
           saturation_(queries),
           query_count_(queries) {}
 
-    /// @brief Reduces a store's registers to query scores, and keeps its flags beside them.
-    ///
-    /// The store is host-side already, so the reduction runs where its words are: the same
-    /// winning score every compact row holds, read from `BucketCount` registers per query. Only
-    /// the scores cross to the device, in one copy.
-    [[nodiscard]] static Result<query_sketch_batch>
-    compact(std::span<uint32_t const> store, size_t queries, cuda::stream_ref stream) {
-        query_sketch_batch batch(stream, static_cast<uint32_t>(queries));
-        std::vector<score_type> scores(queries * BucketCount);
-        for (size_t query = 0; query < queries; ++query) {
-            auto const* const row = store.data() + query * (BucketCount + 1);
-            for (size_t bucket = 0; bucket < BucketCount; ++bucket) {
-                scores[query * BucketCount + bucket] = detail::winner(row[bucket]);
-            }
-            batch.saturation_[query] = row[BucketCount];
-        }
-        if (queries != 0) {
-            CUDDL_CUDA_TRY(
-                cuda::copy_bytes(
-                    stream,
-                    cuda::std::span{scores.data(), scores.size()},
-                    device_span<score_type>{batch.scores_.data(), scores.size()}
-                )
-            );
-        }
-        CUDDL_CUDA_TRY(stream.sync());
-        return batch;
+    /// @brief Staging sink that reduces each group's registers to query scores on the device
+    /// and copies only the saturation words back. The staging's final sync covers both.
+    [[nodiscard]] auto reduce_rows(cuda::stream_ref stream) {
+        return
+            [this,
+             stream](device_span<uint32_t const> group, size_t base, size_t count) -> Result<void> {
+                CUDDL_TRY(
+                    extract_scores_batch_async<BucketCount>(
+                        group,
+                        device_span<score_type>{
+                            scores_.data() + base * BucketCount, count * BucketCount
+                        },
+                        stream
+                    )
+                );
+                CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
+                    saturation_.data() + base,
+                    sizeof(uint32_t),
+                    group.data() + BucketCount,
+                    (BucketCount + 1) * sizeof(uint32_t),
+                    sizeof(uint32_t),
+                    count,
+                    cudaMemcpyDeviceToHost,
+                    stream.get()
+                ));
+                return Ok();
+            };
     }
 
     cuda::device_buffer<score_type> scores_;

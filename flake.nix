@@ -175,7 +175,7 @@
                   - -I$(pwd)/include
                   - -I$(pwd)/subprojects/nvbench
                   - -I$(pwd)/subprojects/cuco/include
-                  - -I$(pwd)/subprojects/zlib-1.3.2
+                  - -I$(pwd)/subprojects/libdeflate
                   - -I$(pwd)/subprojects/googletest-1.17.0/googletest/include
 
                 Remove:

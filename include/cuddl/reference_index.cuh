@@ -213,6 +213,25 @@ class reference_index {
             index.index_postings_.data()
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
+        // Postings ascend by reference ID within each cell, so a search can restrict a cell to a
+        // reference range with a binary search.
+        auto sorted = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), static_cast<size_t>(posting_capacity), cuda::no_init
+            )
+        );
+        CUDDL_CUDA_TRY(
+            cub::DeviceSegmentedSort::SortKeys(
+                index.index_postings_.data(),
+                sorted.data(),
+                static_cast<int64_t>(posting_capacity),
+                static_cast<int64_t>(cell_count),
+                index.index_offsets_.data(),
+                index.index_offsets_.data() + 1,
+                stream
+            )
+        );
+        index.index_postings_ = std::move(sorted);
         index.indexed_ = true;
         return Result<reference_index>::ok(std::move(index));
     }
@@ -274,8 +293,9 @@ class reference_index {
             cuda::make_counting_iterator(uint32_t{0}),
             detail::sparse_segment_offset{reference_count}
         );
+        // Stable, so reference IDs, which arrive ascending per bucket, stay ascending per key.
         CUDDL_CUDA_TRY(
-            cub::DeviceSegmentedSort::SortPairs(
+            cub::DeviceSegmentedSort::StableSortPairs(
                 keys.data(),
                 index_keys_.data(),
                 ids.data(),

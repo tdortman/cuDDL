@@ -4,6 +4,11 @@
 #include <cuddl/reference_database_file.cuh>
 #include <cuddl/reference_index.cuh>
 
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+
 namespace cuddl::detail {
 
 struct reference_index_digest {
@@ -286,73 +291,94 @@ class reference_index_file {
         return host;
     }
 
+    /// @brief Checks every bucket's postings; buckets are independent, so they are checked in
+    /// parallel, which keeps loading an index over hundreds of thousands of references fast.
     static Result<void> validate_payload(decoded_index const& index) {
-        auto const& database_ = index.database_;
         auto const& offsets_ = index.offsets_;
         auto const& postings_ = index.postings_;
         auto const& keys_ = index.keys_;
-        auto storage_ = index.storage_;
         auto const m = index.database_.metadata();
         auto const& c = m.compatibility;
-        std::vector<uint32_t> seen(m.reference_count, std::numeric_limits<uint32_t>::max());
-        auto rows = database_.rows();
-        if (storage_ == index_storage::sparse) {
-            for (uint32_t bucket = 0; bucket < c.indexed_bucket_count; ++bucket) {
+        auto const rows = index.database_.rows();
+        auto const sparse = index.storage_ == index_storage::sparse;
+        auto const key_count = static_cast<size_t>(c.key_mask) + 1;
+        if (!sparse) {
+            if (offsets_.front() != 0 || offsets_.back() != postings_.size()) {
+                return Err(Error::invalid_argument("invalid dense index endpoints"));
+            }
+        }
+        // Each bucket either passes or names why it fails; seen[id] == bucket marks an ID
+        // already listed in that bucket.
+        auto const check_bucket =
+            [&](uint32_t bucket, std::vector<uint32_t>& seen, size_t& indexed) -> char const* {
+            auto const score_of = [&](uint32_t id) {
+                return detail::winner(rows[static_cast<size_t>(id) * c.bucket_count + bucket]);
+            };
+            if (sparse) {
                 auto start = static_cast<size_t>(bucket) * m.reference_count;
                 for (uint32_t i = 0; i < m.reference_count; ++i) {
                     auto pos = start + i;
                     auto id = postings_[pos];
                     if (id >= m.reference_count || seen[id] == bucket ||
-                        (i != 0 && keys_[pos] < keys_[pos - 1])) {
-                        return Err(Error::invalid_argument("invalid sparse index postings"));
+                        (i != 0 && keys_[pos] < keys_[pos - 1]) ||
+                        (i != 0 && keys_[pos] == keys_[pos - 1] && id <= postings_[pos - 1])) {
+                        return "invalid sparse index postings";
                     }
                     seen[id] = bucket;
-                    auto score =
-                        detail::winner(rows[static_cast<size_t>(id) * c.bucket_count + bucket]);
+                    auto score = score_of(id);
                     auto key =
                         score == 0 || c.key_mask == 0xffffU ? score : (score & c.key_mask) + 1U;
-                    if (keys_[pos] != key) {
-                        return Err(
-                            Error::invalid_argument("sparse index key does not match reference")
-                        );
+                    if (keys_[pos] != key) return "sparse index key does not match reference";
+                }
+                return nullptr;
+            }
+            for (uint32_t id = 0; id < m.reference_count; ++id) indexed += score_of(id) != 0;
+            for (size_t key = 0; key < key_count; ++key) {
+                auto cell = static_cast<size_t>(bucket) * key_count + key;
+                auto begin = offsets_[cell], end = offsets_[cell + 1];
+                if (begin > end || end > postings_.size()) return "invalid dense index offsets";
+                for (auto pos = begin; pos < end; ++pos) {
+                    auto id = postings_[pos];
+                    if (id >= m.reference_count || seen[id] == bucket ||
+                        (pos != begin && id <= postings_[pos - 1])) {
+                        return "invalid dense index postings";
+                    }
+                    seen[id] = bucket;
+                    auto score = score_of(id);
+                    if (score == 0 || (score & c.key_mask) != key) {
+                        return "dense index key does not match reference";
                     }
                 }
             }
-        } else {
-            if (offsets_.front() != 0 || offsets_.back() != postings_.size()) {
-                return Err(Error::invalid_argument("invalid dense index endpoints"));
-            }
-            size_t expected = 0;
-            for (auto row : rows) {
-                expected += detail::winner(row) != 0;
-            }
-            if (expected != postings_.size()) {
-                return Err(Error::invalid_argument("dense index omits reference scores"));
-            }
-            auto key_count = static_cast<size_t>(c.key_mask) + 1;
-            for (uint32_t bucket = 0; bucket < c.indexed_bucket_count; ++bucket) {
-                for (size_t key = 0; key < key_count; ++key) {
-                    auto cell = static_cast<size_t>(bucket) * key_count + key;
-                    auto begin = offsets_[cell], end = offsets_[cell + 1];
-                    if (begin > end || end > postings_.size()) {
-                        return Err(Error::invalid_argument("invalid dense index offsets"));
-                    }
-                    for (auto pos = begin; pos < end; ++pos) {
-                        auto id = postings_[pos];
-                        if (id >= m.reference_count || seen[id] == bucket) {
-                            return Err(Error::invalid_argument("invalid dense index postings"));
-                        }
-                        seen[id] = bucket;
-                        auto score =
-                            detail::winner(rows[static_cast<size_t>(id) * c.bucket_count + bucket]);
-                        if (score == 0 || (score & c.key_mask) != key) {
-                            return Err(
-                                Error::invalid_argument("dense index key does not match reference")
-                            );
+            return nullptr;
+        };
+        auto const workers =
+            std::max(1U, std::min(std::thread::hardware_concurrency(), c.indexed_bucket_count));
+        std::atomic<uint32_t> next{0};
+        std::atomic<size_t> indexed{0};
+        std::atomic<char const*> failure{nullptr};
+        {
+            std::vector<std::jthread> pool;
+            for (unsigned worker = 0; worker < workers; ++worker) {
+                pool.emplace_back([&] {
+                    std::vector<uint32_t> seen(
+                        m.reference_count, std::numeric_limits<uint32_t>::max()
+                    );
+                    size_t local = 0;
+                    for (uint32_t bucket; failure.load(std::memory_order_relaxed) == nullptr &&
+                                          (bucket = next++) < c.indexed_bucket_count;) {
+                        if (auto const error = check_bucket(bucket, seen, local)) {
+                            char const* none = nullptr;
+                            failure.compare_exchange_strong(none, error);
                         }
                     }
-                }
+                    indexed += local;
+                });
             }
+        }
+        if (auto const error = failure.load()) return Err(Error::invalid_argument(error));
+        if (!sparse && indexed != postings_.size()) {
+            return Err(Error::invalid_argument("dense index omits reference scores"));
         }
         return Ok();
     }

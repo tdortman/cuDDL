@@ -1,6 +1,6 @@
 #pragma once
 
-#include <zlib.h>
+#include <libdeflate.h>
 
 #include <algorithm>
 #include <array>
@@ -8,8 +8,11 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -82,6 +85,41 @@ find_bgzf_blocks(std::string const& path, uint64_t file_size) {
     return offset == file_size ? blocks : std::vector<bgzf_block>{};
 }
 
+/// @brief Decompresses every gzip member of @p compressed, growing the output as needed.
+[[nodiscard]] inline std::string gunzip(std::string_view compressed, std::string const& origin) {
+    std::unique_ptr<libdeflate_decompressor, decltype(&libdeflate_free_decompressor)> decoder{
+        libdeflate_alloc_decompressor(), &libdeflate_free_decompressor
+    };
+    if (!decoder) throw std::runtime_error("cannot allocate gzip decompressor");
+    std::string output(std::max<size_t>(compressed.size() * 4U, size_t{1} << 16U), '\0');
+    size_t consumed = 0;
+    size_t produced = 0;
+    while (consumed < compressed.size()) {
+        size_t member_in = 0;
+        size_t member_out = 0;
+        auto const status = libdeflate_gzip_decompress_ex(
+            decoder.get(),
+            compressed.data() + consumed,
+            compressed.size() - consumed,
+            output.data() + produced,
+            output.size() - produced,
+            &member_in,
+            &member_out
+        );
+        if (status == LIBDEFLATE_INSUFFICIENT_SPACE) {
+            output.resize(output.size() * 2U);
+            continue;
+        }
+        if (status != LIBDEFLATE_SUCCESS) {
+            throw std::runtime_error("invalid gzip data: " + origin);
+        }
+        consumed += member_in;
+        produced += member_out;
+    }
+    output.resize(produced);
+    return output;
+}
+
 [[nodiscard]] inline std::string inflate_bgzf_block(std::ifstream& file, bgzf_block const& block) {
     std::string compressed(block.size, '\0');
     file.seekg(static_cast<std::streamoff>(block.offset));
@@ -89,34 +127,7 @@ find_bgzf_blocks(std::string const& path, uint64_t file_size) {
     if (!file) {
         throw std::runtime_error("cannot read compressed BGZF block");
     }
-
-    z_stream stream{};
-    if (inflateInit2(&stream, 15 + 16) != Z_OK) {
-        throw std::runtime_error("cannot initialise gzip inflater");
-    }
-    stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
-    stream.avail_in = compressed.size();
-
-    std::string output;
-    std::vector<char> buffer(1U << 20);
-    while (true) {
-        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
-        stream.avail_out = buffer.size();
-        auto const status = inflate(&stream, Z_NO_FLUSH);
-        auto const produced = buffer.size() - stream.avail_out;
-        if (produced != 0U) {
-            output.append(buffer.data(), produced);
-        }
-        if (status == Z_STREAM_END) {
-            break;
-        }
-        if (status != Z_OK || (stream.avail_in == 0U && produced == 0U)) {
-            inflateEnd(&stream);
-            throw std::runtime_error("BGZF block inflate failed");
-        }
-    }
-    inflateEnd(&stream);
-    return output;
+    return gunzip(compressed, "BGZF block");
 }
 
 /// Reads an entire plain, gzip, or BGZF file. BGZF members are inflated in parallel.
@@ -168,25 +179,14 @@ find_bgzf_blocks(std::string const& path, uint64_t file_size) {
         return contents;
     }
 
-    gzFile handle = gzopen(path.c_str(), "rb");
-    if (handle == nullptr) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
         throw std::runtime_error("cannot open asset (plain or .gz expected): " + path);
     }
-    gzbuffer(handle, 1U << 20);
-    std::string contents;
-    contents.reserve(static_cast<size_t>(compressed_size) * 2U + (1U << 20));
-    std::vector<char> buffer(1U << 20);
-    while (true) {
-        auto const count = gzread(handle, buffer.data(), static_cast<unsigned>(buffer.size()));
-        if (count <= 0) {
-            break;
-        }
-        contents.append(buffer.data(), static_cast<size_t>(count));
-    }
-    if (gzclose(handle) != Z_OK) {
-        throw std::runtime_error("cannot finish reading compressed asset: " + path);
-    }
-    return contents;
+    std::string contents{std::istreambuf_iterator<char>{file}, {}};
+    auto const gzip = contents.size() >= 2U && static_cast<uint8_t>(contents[0]) == 0x1fU &&
+                      static_cast<uint8_t>(contents[1]) == 0x8bU;
+    return gzip ? gunzip(contents, path) : contents;
 }
 
 }  // namespace cuddl_bench

@@ -87,6 +87,12 @@ struct staging_plan {
     size_t max_pieces = 0;  // descriptors one batch may hold
 };
 
+/// Default arena ceiling. A batch is sketched only once its arena fills, so an arena that holds
+/// the whole corpus leaves the device idle until the last genome loads. Bounding it lets each
+/// batch's kernel overlap the loading of the next: on a GH200 building 2048 genomes this cut the
+/// build from 239 to 194 ms, and it cost nothing on a 24-thread RTX 5070 Ti host.
+inline constexpr size_t default_arena_ceiling = size_t{128} << 20;
+
 /// @brief Sizes the arena and the row store from free device memory and the corpus.
 ///
 /// @p staged_ceiling bounds the bytes the corpus can stage, which keeps a small collection from
@@ -125,7 +131,8 @@ template <uint32_t K, size_t BucketCount>
     size_t const arena_ceiling = static_cast<size_t>(std::min(
         {staged_ceiling,
          static_cast<uint64_t>(usable - usable / 5),
-         static_cast<uint64_t>(host_share)}
+         static_cast<uint64_t>(host_share),
+         static_cast<uint64_t>(default_arena_ceiling)}
     ));
     size_t const row_store_bytes = group * row_bytes;
     size_t const after_rows = usable > row_store_bytes ? usable - row_store_bytes : 0;
@@ -155,6 +162,12 @@ template <uint32_t K, size_t BucketCount>
     return staging_plan{group, staging, max_piece, max_pieces};
 }
 
+/// Host memory the device still has to read must stay alive: the transfer engine's read of a
+/// pageable buffer is not ordered with the host writes that follow it. Sixteen slots take the
+/// tail off that wait; at four the tail reached hundreds of milliseconds while dozens of
+/// loaders fed one consumer.
+inline constexpr size_t stager_hold_slots = 16;
+
 /// @brief Encodes genome records into register rows through a device arena.
 ///
 /// One copy of the staging machinery, fed by every entry point that builds a reference database
@@ -162,9 +175,10 @@ template <uint32_t K, size_t BucketCount>
 /// bases only, no line breaks, and no k-mer crossing two spans.
 ///
 /// The arena, its descriptors, the record runs, the `k - 1` overlap a record too large for the
-/// arena needs, the batch launches and the row readback all live here. A producer keeps only
-/// what is its own: where the bytes come from, and which of them must outlive the copies the
-/// device makes from them.
+/// arena needs and the batch launches all live here. Rows stay on the device: each group's rows
+/// go to the caller's sink, which copies them wherever the build wants them. A producer keeps
+/// only what is its own: where the bytes come from, and which of them must outlive the copies
+/// the device makes from them.
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class database_stager {
     struct resident_event_span {
@@ -192,11 +206,7 @@ class database_stager {
     };
 
    public:
-    /// Host memory the device still has to read must stay alive: the transfer engine's read of a
-    /// pageable buffer is not ordered with the host writes that follow it. Sixteen slots take the
-    /// tail off that wait; at four the tail reached hundreds of milliseconds while dozens of
-    /// loaders fed one consumer.
-    static constexpr size_t hold_slots = 16;
+    static constexpr size_t hold_slots = stager_hold_slots;
 
     static constexpr size_t row_words() noexcept {
         return BucketCount + 1;
@@ -204,14 +214,12 @@ class database_stager {
 
     /// @throws cuda::cuda_error or std::bad_alloc when the device buffers cannot be allocated.
     /// @param stream Stream owning the arena, descriptors, and row store.
-    /// @param references Genome count sizing the host row store.
     /// @param bounds Arena sizing the device row store, arena, and descriptors.
     /// @param statistics Optional build statistics sink, null to skip.
     /// @param direct stages the caller's bytes in place, for a device that reads pageable host
     /// memory: no copy, and the arena stays unused.
     database_stager(
         cuda::stream_ref stream,
-        size_t references,
         staging_plan bounds,
         reference_build_statistics* statistics = nullptr,
         bool direct = false
@@ -239,7 +247,6 @@ class database_stager {
                   cuda::no_init
               )
           ),
-          host_rows_(references * row_words()),
           held_(hold_slots),
           sm_(static_cast<size_t>(
               stream.device().attribute(cuda::device_attributes::multiprocessor_count)
@@ -372,24 +379,19 @@ class database_stager {
         return Ok();
     }
 
-    /// @brief Launches everything staged, then copies the group's rows towards the host.
-    [[nodiscard]] Result<void> end_group(size_t base, size_t genomes) {
+    /// @brief Launches everything staged and returns the group's rows on the device.
+    ///
+    /// Each genome's row holds `row_words()` words: `BucketCount` packed registers followed by
+    /// its saturation word, the layout a single sketch allocation has. The rows are complete once
+    /// the stream reaches this point, and the next @ref begin_group reuses them, so a consumer
+    /// enqueues its reads on the stager's stream before then.
+    [[nodiscard]] Result<device_span<uint32_t const>> end_group(size_t genomes) {
         CUDDL_TRY(flush());
-        CUDDL_CUDA_TRY(
-            cuda::copy_bytes(
-                stream_,
-                device_span<uint32_t const>{rows_.data(), genomes * row_words()},
-                cuda::std::span{host_rows_.data() + base * row_words(), genomes * row_words()}
-            )
-        );
-        return Ok();
+        return device_span<uint32_t const>{rows_.data(), genomes * row_words()};
     }
 
-    /// @brief Waits for the device, then hands over the store it filled.
-    ///
-    /// The store holds `row_words()` words per genome: `BucketCount` packed registers followed by
-    /// that genome's saturation word, the layout a single sketch allocation has.
-    [[nodiscard]] Result<std::vector<uint32_t>> release_store() {
+    /// @brief Waits for the device and publishes the statistics.
+    [[nodiscard]] Result<void> finish() {
         CUDDL_CUDA_TRY(stream_.sync());
         if (statistics_ != nullptr) {
             statistics_->staging_bytes = bounds_.staging;
@@ -401,7 +403,7 @@ class database_stager {
                 statistics_->resident_compute_ms += elapsed_ms;
             }
         }
-        return std::move(host_rows_);
+        return Ok();
     }
 
    private:
@@ -553,7 +555,6 @@ class database_stager {
     cuda::device_buffer<uint32_t> rows_;
     cuda::device_buffer<char> arena_;
     cuda::device_buffer<sequence_batch_chunk> descriptors_;
-    std::vector<uint32_t> host_rows_;
     /// Batches whose kernels may still be reading a held buffer.
     static constexpr size_t held_batches = 1;
     std::deque<std::pair<cuda::event, std::vector<std::unique_ptr<fastx_sequence_file>>>> released_;
@@ -582,24 +583,42 @@ struct sequence_genome {
     std::string_view name;  // copied into the labels; may be empty
 };
 
-/// @brief Unpacks a store into packed rows and one saturation word per genome.
+/// @brief Copies device store rows into separate packed rows and saturation words.
 ///
-/// The store pads each genome with its saturation word, so a build unpacked as it read the store
-/// would copy once per genome; this reads the padding it already holds.
+/// The store pads each genome with its saturation word; two strided copies split that layout
+/// on the way out, so the host never rereads the rows to unpack them. @p rows and
+/// @p saturation must stay alive until @p stream reaches this point.
 template <size_t BucketCount>
-void unpack_store(
-    std::span<uint32_t const> store,
+[[nodiscard]] Result<void> download_store(
+    device_span<uint32_t const> store,
     std::span<uint32_t> rows,
-    std::span<uint32_t> saturation
-) noexcept {
-    for (size_t genome = 0; genome < saturation.size(); ++genome) {
-        std::memcpy(
-            rows.data() + genome * BucketCount,
-            store.data() + genome * (BucketCount + 1),
-            BucketCount * sizeof(uint32_t)
-        );
-        saturation[genome] = store[genome * (BucketCount + 1) + BucketCount];
-    }
+    std::span<uint32_t> saturation,
+    cuda::stream_ref stream
+) {
+    auto const genomes = saturation.size();
+    if (genomes == 0) return Ok();
+    constexpr auto pitch = (BucketCount + 1) * sizeof(uint32_t);
+    CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
+        rows.data(),
+        BucketCount * sizeof(uint32_t),
+        store.data(),
+        pitch,
+        BucketCount * sizeof(uint32_t),
+        genomes,
+        cudaMemcpyDeviceToHost,
+        stream.get()
+    ));
+    CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
+        saturation.data(),
+        sizeof(uint32_t),
+        store.data() + BucketCount,
+        pitch,
+        sizeof(uint32_t),
+        genomes,
+        cudaMemcpyDeviceToHost,
+        stream.get()
+    ));
+    return Ok();
 }
 
 // Page-locked sequence storage handed to loader threads. A lease returns to the pool when the
@@ -732,11 +751,14 @@ class path_loaders {
         : workers_(worker_count(paths.size(), parser_workers)),
           buffers_(stream, workers_, size_t{32} << 20),
           page_locked_(page_locked) {
-        // One buffer per in-flight file, plus headroom: a worker asks for its next file while
-        // every loaded file still holds a lease, so an exact match would refuse.
-        buffers_.set_capacity(workers_ + 2);
+        // One buffer per in-flight file plus the stager's hold ring, plus headroom: a worker
+        // asks for its next file while every loaded file still holds a lease. A pool smaller
+        // than the window sends the rest through pageable heap buffers at a fraction of the
+        // pinned copy rate.
+        auto const window = workers_ * 4;
+        buffers_.set_capacity(window + stager_hold_slots + 2);
         if (page_locked_) source_ = {acquire_pinned_target, &buffers_};
-        if (workers_ > 1) pool_.emplace(paths, workers_, source_, workers_ * 4);
+        if (workers_ > 1) pool_.emplace(paths, workers_, source_, window);
     }
 
     /// @brief Loaders this build runs.
@@ -784,31 +806,40 @@ class path_loaders {
 ///
 /// @p fill receives the stager, a group's first genome and its size, and stages that whole group.
 /// Genomes are numbered within their group, so a fill stages genome @c genome - @c base.
-template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout, typename Fill>
-[[nodiscard]] Result<std::vector<uint32_t>> stage_groups(
+/// @p sink receives each finished group's device rows with its first genome and size, and must
+/// enqueue every read of them on @p stream: the next group reuses the rows.
+template <
+    uint32_t K,
+    size_t BucketCount,
+    typename Layout = default_register_layout,
+    typename Fill,
+    typename Sink>
+[[nodiscard]] Result<void> stage_groups(
     size_t genomes,
     uint64_t staged_ceiling,
     std::optional<size_t> staging_bytes,
     cuda::stream_ref stream,
     reference_build_statistics* statistics,
     Fill&& fill,
+    Sink&& sink,
     bool in_place = false
 ) {
     auto const plan =
         CUDDL_TRY((plan_staging<K, BucketCount>(genomes, staged_ceiling, staging_bytes, stream)));
-    database_stager<K, BucketCount, Layout> stager(stream, genomes, plan, statistics, in_place);
+    database_stager<K, BucketCount, Layout> stager(stream, plan, statistics, in_place);
     size_t base = 0;
     while (base < genomes) {
         auto const count = std::min(plan.group, genomes - base);
         CUDDL_TRY(stager.begin_group(count));
         CUDDL_TRY(fill(stager, base, count));
-        CUDDL_TRY(stager.end_group(base, count));
+        auto const rows = CUDDL_TRY(stager.end_group(count));
+        CUDDL_TRY(sink(rows, base, count));
         base += count;
     }
-    return stager.release_store();
+    return stager.finish();
 }
 
-/// @brief Stages a path collection and returns the store.
+/// @brief Stages a path collection, handing each group's device rows to @p sink.
 ///
 /// @p parser_workers is a value, not a sentinel: the build clamps it to what the inputs and the
 /// hardware allow, so asking for the default is asking for the default.
@@ -816,14 +847,15 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 /// The arena ceiling is the decompressed size of every input: a bound from compressed sizes alone
 /// overestimates a corpus several times over, and an arena past what the corpus can hold is
 /// memory the device never needs.
-template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
-[[nodiscard]] Result<std::vector<uint32_t>> stage_paths(
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout, typename Sink>
+[[nodiscard]] Result<void> stage_paths(
     std::span<std::filesystem::path const> paths,
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
     transfer_mode transfer,
-    reference_build_statistics* statistics
+    reference_build_statistics* statistics,
+    Sink&& sink
 ) {
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
@@ -835,12 +867,15 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             )
         );
     }
-    if (paths.empty()) return std::vector<uint32_t>{};
+    if (paths.empty()) return Ok();
     auto const in_place = stages_in_place(transfer, stream.device());
     auto const page_locked = pages_locked(transfer, stream.device());
     path_loaders loaders(stream, paths, parser_workers, page_locked);
+    // The corpus size only bounds a default arena, and only below its ceiling, so probing stops
+    // there: a corpus of any size then costs at most a few dozen file opens here.
     uint64_t staged_ceiling = 0;
     for (auto const& path : paths) {
+        if (staging_bytes.has_value() || staged_ceiling >= default_arena_ceiling) break;
         auto const decompressed = gzip_decompressed_size(path.string());
         if (decompressed != 0) {
             staged_ceiling += decompressed;
@@ -850,7 +885,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         auto const size = std::filesystem::file_size(path, error);
         if (!error) staged_ceiling += size;
     }
-    auto store = CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
+    CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
         paths.size(),
         staged_ceiling,
         staging_bytes,
@@ -871,6 +906,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             }
             return Ok();
         },
+        sink,
         in_place
     )));
     if (statistics != nullptr) {
@@ -879,18 +915,19 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         statistics->in_place = in_place;
     }
     loaders.reset();
-    return store;
+    return Ok();
 }
 
-/// @brief Stages bases the caller already holds and returns the store.
-template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
-[[nodiscard]] Result<std::vector<uint32_t>> stage_sequences(
+/// @brief Stages bases the caller already holds, handing each group's device rows to @p sink.
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout, typename Sink>
+[[nodiscard]] Result<void> stage_sequences(
     std::span<sequence_genome const> genomes,
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
-    reference_build_statistics* statistics
+    reference_build_statistics* statistics,
+    Sink&& sink
 ) {
-    if (genomes.empty()) return std::vector<uint32_t>{};
+    if (genomes.empty()) return Ok();
     // The caller knows exactly what the corpus holds, so the ceiling is the sum of its bases
     // rather than an estimate read out of file headers.
     uint64_t staged_ceiling = 0;
@@ -920,7 +957,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                 CUDDL_TRY(stager.add_genome(id - base, records));
             }
             return Ok();
-        }
+        },
+        sink
     );
 }
 

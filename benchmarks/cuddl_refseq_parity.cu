@@ -1,4 +1,3 @@
-#include <zlib.h>
 #include <CLI/CLI.hpp>
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>

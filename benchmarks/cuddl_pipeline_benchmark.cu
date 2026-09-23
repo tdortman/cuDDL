@@ -162,9 +162,9 @@ parsed_files parse(std::vector<std::string> const& paths) {
 // on the GPU, so neither a host nor a device k-mer array is materialized. Footprint is rows
 // (genomes * buckets) instead of bases, which is what makes a full RefSeq collection fit.
 struct genome_rows {
-    // One contiguous run per genome: buckets registers followed by the saturation word.
-    std::vector<uint32_t> registers;
-    std::vector<uint32_t> saturation;
+    // One contiguous run per genome on the device: buckets registers, then the saturation word.
+    std::optional<cuda::device_buffer<uint32_t>> store;
+    size_t genomes = 0;
     uint64_t input_bytes = 0;
     unsigned parser_workers = 0;  // loaders the ingest ran, after the build's defaulting
 };
@@ -176,20 +176,12 @@ genome_rows stream_genomes(
 ) {
     std::vector<std::filesystem::path> files{paths.begin(), paths.end()};
     cuddl::reference_build_statistics statistics;
-    auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<k, buckets>(
+    genome_rows result;
+    result.store = CUDDL_UNWRAP((cuddl::build_sketch_store<k, buckets>(
         files, stream, {.statistics = &statistics, .parser_workers = opts.workers}
     )));
-    genome_rows result;
+    result.genomes = paths.size();
     result.parser_workers = statistics.workers;
-    auto const count = file.saturation().size();
-    result.saturation.assign(file.saturation().begin(), file.saturation().end());
-    result.registers.resize(count * (buckets + 1));
-    for (size_t i = 0; i < count; ++i) {
-        std::copy_n(
-            file.rows().data() + i * buckets, buckets, result.registers.data() + i * (buckets + 1)
-        );
-        result.registers[i * (buckets + 1) + buckets] = file.saturation()[i];
-    }
     for (auto const& path : paths) {
         std::error_code error;
         auto const size = std::filesystem::file_size(path, error);
@@ -208,8 +200,6 @@ cuddl::device_span<uint32_t const> stored_rows(cuddl::device_span<uint32_t> rows
 // Each input file is a genome. Records within a file retain parser boundary semantics.
 struct collection {
     std::vector<cuda::device_buffer<uint64_t>> inputs;
-    // Streamed register source: (buckets + 1) words per genome, kept alive for the copies.
-    cuda::device_buffer<uint32_t> registers;
     // Rows this collection owns inside a shared streamed store; empty for per-file sketches.
     cuddl::device_span<uint32_t> store;
     std::vector<sketch> sketches;
@@ -251,9 +241,7 @@ struct collection {
           ),
           cardinalities(
               cuda::make_device_buffer<double>(stream, stream.device(), genomes, cuda::no_init)
-          ),
-          registers(cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init)) {
-    }
+          ) {}
 
     collection(
         parsed_files const& files,
@@ -270,24 +258,27 @@ struct collection {
         }
     }
 
-    // Rows are copied into sketches; the caller keeps @p rows alive until the stream completes.
+    // Binds the streamed device store; @p rows must outlive the collection. Per-genome sketches
+    // are only made when @p with_sketches asks for them, for suites that compare single sketches.
     collection(
-        genome_rows const& rows,
+        genome_rows& rows,
         cuda::stream_ref stream,
         bool compact_rows = true,
-        bool packed_rows = true
+        bool packed_rows = true,
+        bool with_sketches = true
     )
-        : collection(rows.saturation.size(), stream, compact_rows, packed_rows) {
-        if (saturated.size()) {
-            cuda::copy_bytes(stream, rows.saturation, saturated);
+        : collection(rows.genomes, stream, compact_rows, packed_rows) {
+        if (!rows.store || rows.genomes == 0) {
+            return;
         }
-        registers = cuda::make_device_buffer<uint32_t>(stream, stream.device(), rows.registers);
-        for (size_t i = 0; i < rows.saturation.size(); ++i) {
+        bind_store({rows.store->data(), rows.store->size()});
+        if (!with_sketches) {
+            return;
+        }
+        for (size_t i = 0; i < rows.genomes; ++i) {
             sketches.emplace_back(stream);
             CUDDL_UNWRAP(
-                sketches[i].assign_async(
-                    {registers.data() + i * (buckets + 1), buckets + 1}, stream
-                )
+                sketches[i].assign_async({store.data() + i * (buckets + 1), buckets + 1}, stream)
             );
         }
     }
@@ -437,10 +428,18 @@ reference_index_type build_index(database const& db, options const& opts, cuda::
     );
 }
 
+using pinned_results = cuda::
+    buffer<cuddl::batch_search_result, cuda::mr::host_accessible, cuda::mr::device_accessible>;
+using pinned_words = cuda::buffer<uint32_t, cuda::mr::host_accessible, cuda::mr::device_accessible>;
+
 struct search_buffers {
     cuda::device_buffer<uint8_t> workspace;
     cuda::device_buffer<cuddl::batch_search_result> results;
     cuda::device_buffer<uint32_t> count, matches;
+    // Page-locked download targets: a tile copies at the link rate, with no pageable bounce and
+    // no host vector to zero-fill per tile.
+    pinned_results host_results;
+    pinned_words host_count, host_matches;
 
     search_buffers(
         database const& db,
@@ -452,7 +451,10 @@ struct search_buffers {
         : workspace(stream, cuda::device_default_memory_pool(stream.device())),
           results(stream, cuda::device_default_memory_pool(stream.device())),
           count(cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init)),
-          matches(stream, cuda::device_default_memory_pool(stream.device())) {
+          matches(stream, cuda::device_default_memory_pool(stream.device())),
+          host_results(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init),
+          host_count(stream, cuda::pinned_default_memory_pool(), 1, cuda::no_init),
+          host_matches(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init) {
         size_t workspace_bytes = 0;
         uint32_t size = 1;
         auto include = [&](cuddl::batch_search_requirements const& requirement) {
@@ -472,6 +474,10 @@ struct search_buffers {
             stream, stream.device(), size, cuda::no_init
         );
         matches = cuda::make_device_buffer<uint32_t>(stream, stream.device(), size, cuda::no_init);
+        host_results =
+            pinned_results(stream, cuda::pinned_default_memory_pool(), size, cuda::no_init);
+        host_matches =
+            pinned_words(stream, cuda::pinned_default_memory_pool(), size, cuda::no_init);
     }
 };
 
@@ -494,16 +500,14 @@ void search(
     host_results* output = nullptr,
     std::function<void(uint32_t)> device_consume = {}
 ) {
-    if (output && opts.performance_only) {
-        output->rows.reserve(buffers.results.size());
-        output->matches.reserve(buffers.matches.size());
-    }
     auto consume = [&](uint32_t capacity) {
         if (device_consume) device_consume(capacity);
         if (!output) {
             return;  // A device consumer can retain results without host downloads.
         }
-        auto count = download(buffers.count, stream).front();
+        cuda::copy_bytes(stream, buffers.count, buffers.host_count);
+        stream.sync();
+        auto const count = buffers.host_count.data()[0];
         if (!(count <= buffers.results.size())) {
             throw std::runtime_error("invalid search result count");
         }
@@ -512,22 +516,26 @@ void search(
         }
         output->total_rows += count;
         ++output->tiles;
-        if (opts.performance_only) {
-            output->rows.clear();
-            output->matches.clear();
+        // Performance runs keep only the latest tile, in the pinned staging; full runs retain
+        // every row for the output phase.
+        auto* rows = buffers.host_results.data();
+        auto* matches = buffers.host_matches.data();
+        if (!opts.performance_only) {
+            auto const offset = output->rows.size();
+            output->rows.resize(offset + count);
+            output->matches.resize(offset + count);
+            rows = output->rows.data() + offset;
+            matches = output->matches.data() + offset;
         }
-        auto const offset = output->rows.size();
-        output->rows.resize(offset + count);
-        output->matches.resize(offset + count);
         cuda::copy_bytes(
             stream,
             cuda::std::span{buffers.results.data(), size_t{count}},
-            cuda::std::span{output->rows.data() + offset, size_t{count}}
+            cuda::std::span{rows, size_t{count}}
         );
         cuda::copy_bytes(
             stream,
             cuda::std::span{buffers.matches.data(), size_t{count}},
-            cuda::std::span{output->matches.data() + offset, size_t{count}}
+            cuda::std::span{matches, size_t{count}}
         );
         stream.sync();  // Tile storage is reused by the next callback.
     };
@@ -1207,11 +1215,18 @@ json resident_timings(
             segment("resident_search", query);
             // Validate the timed resident construction, including multiplicities and saturation.
             auto const observed_registers = download(store, setup);
+            auto expected_registers = download(*expected_references->store, setup);
+            if (expected_queries->store) {
+                auto const queries_expected = download(*expected_queries->store, setup);
+                expected_registers.insert(
+                    expected_registers.end(), queries_expected.begin(), queries_expected.end()
+                );
+            }
+            if (observed_registers.size() != expected_registers.size()) {
+                throw std::runtime_error("resident sequence store size differs");
+            }
             for (size_t i = 0; i < observed_registers.size(); ++i) {
-                auto const expected =
-                    i < expected_references->registers.size()
-                        ? expected_references->registers[i]
-                        : expected_queries->registers[i - expected_references->registers.size()];
+                auto const expected = expected_registers[i];
                 if (observed_registers[i] != expected) {
                     throw std::runtime_error(
                         "resident sequence register " + std::to_string(i) + " expected " +
@@ -1381,8 +1396,8 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     auto reference_rows = stream_genomes(opts.references, opts, stream);
     auto query_rows =
         opts.topology == "batch" ? stream_genomes(opts.queries, opts, stream) : genome_rows{};
-    collection refs(reference_rows, stream, opts.rows == "compact", opts.rows == "packed");
-    collection queries(query_rows, stream, true, false);
+    collection refs(reference_rows, stream, opts.rows == "compact", opts.rows == "packed", false);
+    collection queries(query_rows, stream, true, false, false);
     refs.extract(stream);
     queries.extract(stream);
     auto db = build(refs, opts, stream, !opts.exhaustive);
@@ -1390,7 +1405,7 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     if (!opts.exhaustive) acceleration.emplace(build_index(db, opts, stream));
     search_buffers buffers(
         db,
-        static_cast<uint32_t>(queries.sketches.size()),
+        static_cast<uint32_t>(queries.rows()),
         stream,
         opts.topology,
         acceleration ? &*acceleration : nullptr
@@ -1456,8 +1471,8 @@ json run(options const& opts) {
         reference_rows = stream_genomes(opts.references, opts, stream);
         query_rows = stream_genomes(opts.queries, opts, stream);
         // Both row formats are allocated so the stage suite matches the packed-input path.
-        refs_holder.emplace(reference_rows, stream);
-        queries_holder.emplace(query_rows, stream);
+        refs_holder.emplace(reference_rows, stream, true, true, !opts.performance_only);
+        queries_holder.emplace(query_rows, stream, true, true, !opts.performance_only);
     } else {
         reference_files = parse(opts.references);
         query_files = parse(opts.queries);
@@ -1477,7 +1492,7 @@ json run(options const& opts) {
         if (!opts.exhaustive) acceleration.emplace(build_index(db, opts, stream));
         search_buffers buffers(
             db,
-            static_cast<uint32_t>(queries.sketches.size()),
+            static_cast<uint32_t>(queries.rows()),
             stream,
             opts.topology,
             acceleration ? &*acceleration : nullptr
@@ -1525,8 +1540,8 @@ json run(options const& opts) {
                 );
                 downloaded = output.total_rows;
                 tiles = output.tiles;
-                host_bytes = output.rows.capacity() * sizeof(cuddl::batch_search_result) +
-                             output.matches.capacity() * sizeof(uint32_t);
+                host_bytes = buffers.host_results.size() * sizeof(cuddl::batch_search_result) +
+                             buffers.host_matches.size() * sizeof(uint32_t);
                 do_not_optimise(output);
             });
         json measurements = json::array({{
@@ -1545,8 +1560,8 @@ json run(options const& opts) {
               {"ingest", opts.ingest},
               {"minimum_matches", opts.minimum_matches},
               {"parser_threads", streamed ? reference_rows.parser_workers : 0},
-              {"references", refs.sketches.size()},
-              {"queries", all ? refs.sketches.size() : queries.sketches.size()},
+              {"references", refs.rows()},
+              {"queries", all ? refs.rows() : queries.rows()},
               {"samples", opts.samples},
               {"warmups", opts.warmups},
               {"input_cache", "warm_os_cache"},

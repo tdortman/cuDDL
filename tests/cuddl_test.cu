@@ -9,7 +9,7 @@
 #include <cuda/buffer>
 #include <cuda/stream>
 
-#include <zlib.h>
+#include <libdeflate.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -18,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1587,6 +1588,89 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
     EXPECT_EQ(packed_indexed_host[0], compact_indexed_host[0]);
 }
 
+// Batches large enough for the tiled shared-counter kernel: many reference tiles with a ragged
+// last tile, and one tile covering every reference. Indexed results must equal the exhaustive
+// search filtered by the same threshold, for dense and sparse indexes.
+TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    constexpr uint32_t minimum_matches = 390U;
+    for (auto [reference_count, query_count] : {std::pair{20000U, 7U}, std::pair{300U, 600U}}) {
+        SCOPED_TRACE(reference_count);
+        // Few distinct scores per bucket, so keys are shared by many references and the
+        // match counts straddle the threshold.
+        std::mt19937 random(reference_count);
+        std::vector<uint16_t> scores(static_cast<size_t>(reference_count) * b_default);
+        for (auto& score : scores) score = static_cast<uint16_t>(random() % 4U);
+        std::vector<uint16_t> queries(static_cast<size_t>(query_count) * b_default);
+        for (uint32_t query = 0; query < query_count; ++query) {
+            auto const source = (query * 7919U) % reference_count;
+            std::copy_n(
+                scores.begin() + static_cast<std::ptrdiff_t>(source) * b_default,
+                b_default,
+                queries.begin() + static_cast<std::ptrdiff_t>(query) * b_default
+            );
+        }
+        auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), queries);
+        auto device_scores = cuda::make_device_buffer<uint16_t>(stream, stream.device(), scores);
+        auto database =
+            CUDDL_UNWRAP(database_type::build_async(device_scores, compatibility, stream));
+        auto const pairs = static_cast<size_t>(query_count) * reference_count;
+        auto run = [&](index_type const* index) {
+            auto requirements =
+                CUDDL_UNWRAP(database.batch_search_requirements(query_count, stream, index));
+            auto workspace = cuda::make_device_buffer<uint8_t>(
+                stream, stream.device(), requirements.workspace_bytes, uint8_t{}
+            );
+            auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+                stream, stream.device(), pairs, cuddl::batch_search_result{}
+            );
+            auto matches = cuda::make_device_buffer<uint32_t>(stream, stream.device(), pairs, 0U);
+            auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 0U);
+            CUDDL_UNWRAP(database.search_batch_async(
+                device_queries,
+                compatibility,
+                0U,
+                workspace,
+                results,
+                count,
+                [](uint32_t) {},
+                matches,
+                {.minimum_matches = minimum_matches},
+                stream,
+                index
+            ));
+            std::vector<cuddl::batch_search_result> host_results;
+            std::vector<uint32_t> host_matches, host_count;
+            EXPECT_TRUE(copy_device_buffer(results, host_results));
+            EXPECT_TRUE(copy_device_buffer(matches, host_matches));
+            EXPECT_TRUE(copy_device_buffer(count, host_count));
+            host_results.resize(host_count.front());
+            host_matches.resize(host_count.front());
+            return std::pair{host_results, host_matches};
+        };
+        auto [exhaustive, exhaustive_matches] = run(nullptr);
+        std::vector<cuddl::batch_search_result> expected;
+        std::vector<uint32_t> expected_matches;
+        for (size_t i = 0; i < exhaustive.size(); ++i) {
+            if (exhaustive_matches[i] >= minimum_matches) {
+                expected.push_back(exhaustive[i]);
+                expected_matches.push_back(exhaustive_matches[i]);
+            }
+        }
+        ASSERT_FALSE(expected.empty());
+        ASSERT_LT(expected.size(), pairs);
+        for (auto storage : {cuddl::index_storage::dense, cuddl::index_storage::sparse}) {
+            auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, storage));
+            auto [indexed, indexed_matches] = run(&index);
+            EXPECT_EQ(indexed, expected);
+            EXPECT_EQ(indexed_matches, expected_matches);
+        }
+    }
+}
+
 TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactAndPacked) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
@@ -2139,8 +2223,16 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
     auto const exhaustive_requirements = *database.batch_search_requirements(query_count, stream);
     auto const indexed_requirements =
         *database.batch_search_requirements(query_count, stream, &database_index);
-    EXPECT_EQ(exhaustive_requirements.maximum_pair_count, 128U * reference_count);
-    EXPECT_EQ(indexed_requirements.maximum_pair_count, 128U * reference_count);
+    // Tiles hold whole queries, and both paths bound them identically.
+    EXPECT_EQ(exhaustive_requirements.maximum_pair_count % reference_count, 0U);
+    EXPECT_EQ(indexed_requirements.maximum_pair_count, exhaustive_requirements.maximum_pair_count);
+    auto const tile_queries = exhaustive_requirements.maximum_pair_count / reference_count;
+    std::vector<uint32_t> expected_capacities;
+    for (uint32_t first = 0U; first < query_count; first += tile_queries) {
+        expected_capacities.push_back(
+            std::min(tile_queries, query_count - first) * reference_count
+        );
+    }
 
     auto collect = [&](bool indexed) {
         auto const& requirements = indexed ? indexed_requirements : exhaustive_requirements;
@@ -2205,7 +2297,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
                                           cuda::stream_ref{stream_}
                                       );
         EXPECT_TRUE(search.has_value()) << search.error().message();
-        EXPECT_EQ(tile_capacities, (std::vector<uint32_t>{256U, 4U}));
+        EXPECT_EQ(tile_capacities, expected_capacities);
         EXPECT_EQ(collected.size(), static_cast<size_t>(query_count) * reference_count);
         std::sort(collected.begin(), collected.end(), [](auto const& left, auto const& right) {
             return std::tie(left.query_id, left.reference_id) <
@@ -3058,14 +3150,14 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchModesMatchExhaustiveAcrossThresholds)
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
     constexpr size_t reference_count = 7U;
-    auto const full = cuddl::score_compatibility::current<k_default, b_default>();
-    EXPECT_EQ(full.indexed_bucket_count, b_default);
-    EXPECT_EQ(full.key_mask, std::numeric_limits<uint16_t>::max());
+    auto const masked = cuddl::score_compatibility::current<k_default, b_default>();
+    EXPECT_EQ(masked.indexed_bucket_count, b_default);
+    EXPECT_EQ(masked.key_mask, 0x7fffU);
+    auto full = masked;
+    full.key_mask = std::numeric_limits<uint16_t>::max();
 
     auto partial = full;
     partial.indexed_bucket_count = b_default / 2U;
-    auto masked = full;
-    masked.key_mask = 0x7fffU;
     auto combined = partial;
     combined.key_mask = masked.key_mask;
     std::array modes{full, partial, masked, combined};
@@ -3252,9 +3344,9 @@ TEST_F(ReferenceDatabaseTest, MaskedKeysPreserveZeroAndExactCollisionSemantics) 
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
     constexpr size_t reference_count = 4U;
-    auto const full = cuddl::score_compatibility::current<k_default, b_default>();
-    auto masked = full;
-    masked.key_mask = 0x7fffU;
+    auto const masked = cuddl::score_compatibility::current<k_default, b_default>();
+    auto full = masked;
+    full.key_mask = std::numeric_limits<uint16_t>::max();
 
     std::vector<uint16_t> rows(reference_count * b_default, 0U);
     rows[0] = 0x8000U;
@@ -3928,11 +4020,7 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     // Check structural validation independently of CRC failure.
     auto invalid_flag = bytes;
     invalid_flag[invalid_flag.size() - 8] = 2;
-    auto checksum = static_cast<uint32_t>(crc32_z(
-        crc32(0, nullptr, 0),
-        reinterpret_cast<Bytef const*>(invalid_flag.data()),
-        invalid_flag.size() - 4
-    ));
+    auto checksum = libdeflate_crc32(0, invalid_flag.data(), invalid_flag.size() - 4);
     for (size_t i = 0; i < 4; ++i) {
         invalid_flag[invalid_flag.size() - 4 + i] = static_cast<char>(checksum >> (8 * i));
     }
@@ -4223,6 +4311,22 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
         std::span<std::string const>{labels}.first(1),
         stream
     )));
+    // Words the file form would reject are refused wherever they sit in the store.
+    auto const rejects = [&](size_t index, uint32_t word) {
+        auto corrupted = store;
+        corrupted[index] = word;
+        auto device = cuda::make_device_buffer<uint32_t>(stream, stream.device(), corrupted);
+        auto const result = cuddl::reference_database_file::from_store<25, buckets>(
+            {device.data(), device.size()}, labels, stream
+        );
+        return !result;
+    };
+    // Second genome's saturation word.
+    EXPECT_TRUE(rejects(2 * (buckets + 1) - 1, 2U));
+    // A winner without a count, and a count without a winner, in the last register.
+    EXPECT_TRUE(rejects(2 * (buckets + 1) - 2, cuddl::detail::pack(7, 0)));
+    EXPECT_TRUE(rejects(buckets + 1, cuddl::detail::pack(0, 3)));
+    EXPECT_FALSE(rejects(0, cuddl::detail::pack(7, 3)));
     std::filesystem::remove(file);
     for (auto const& path : paths) std::filesystem::remove(path);
 }
@@ -4398,13 +4502,31 @@ TEST(FastaTest, RecordBoundariesResetSerialAndParallelWindows) {
     }
 }
 
+/// Writes @p content as one gzip member of stored (uncompressed) DEFLATE blocks.
 std::string write_tmp_gzip(std::string const& content) {
     static int counter = 0;
     auto const path = std::string("/tmp/cuddl_gzip_test_") + std::to_string(++counter) + ".fa.gz";
-    std::unique_ptr<gzFile_s, decltype(&gzclose)> out{gzopen(path.c_str(), "wb"), &gzclose};
-    if (out && !content.empty()) {
-        (void)gzwrite(out.get(), content.data(), static_cast<unsigned>(content.size()));
+    std::string bytes{"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff", 10};
+    auto const put16 = [&](uint32_t value) {
+        bytes.push_back(static_cast<char>(value & 0xffU));
+        bytes.push_back(static_cast<char>(value >> 8U));
+    };
+    size_t offset = 0;
+    do {
+        auto const size = std::min<size_t>(content.size() - offset, 0xffffU);
+        bytes.push_back(offset + size == content.size() ? '\x01' : '\x00');
+        put16(static_cast<uint32_t>(size));
+        put16(static_cast<uint32_t>(~size & 0xffffU));
+        bytes.append(content, offset, size);
+        offset += size;
+    } while (offset < content.size());
+    auto const crc = libdeflate_crc32(0, content.data(), content.size());
+    auto const length = static_cast<uint32_t>(content.size());
+    for (auto value : {crc, length}) {
+        put16(value & 0xffffU);
+        put16(value >> 16U);
     }
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
     return path;
 }
 
@@ -4464,6 +4586,50 @@ TEST(FastaTest, GzipMatchesPlainAndRejectsTruncated) {
     std::filesystem::resize_file(truncated, full_size - 10);
     EXPECT_FALSE(cuddl::parse_fasta_file(truncated, 3).has_value());
     std::remove(truncated.c_str());
+}
+
+TEST(FastaTest, GzipMembersValidateStructureAndLengthWithoutPayloadCrc) {
+    std::string const content = ">a\nACGTNACGT\n>b\nTTGGCCAA\n";
+    auto const zipped = write_tmp_gzip(content);
+    std::ifstream input(zipped, std::ios::binary);
+    std::string member{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    input.close();
+    std::filesystem::remove(zipped);
+    ASSERT_GE(member.size(), 18U);
+    auto parse = [&](std::string const& bytes) {
+        auto const path = write_tmp_fasta(bytes);
+        auto result = cuddl::parse_fasta_file(path, 3);
+        std::filesystem::remove(path);
+        return result;
+    };
+    auto const expected = parse(content + content);
+    ASSERT_TRUE(expected.has_value());
+    member[member.size() - 8] ^= 1;
+    // Extra data, filename, comment and header CRC must not displace the member trailer.
+    auto decorated = member;
+    decorated[3] = 4 | 8 | 16 | 2;
+    decorated.insert(10, std::string{"\x03\x00xyzname\0comment\0\0\0", 20});
+    auto const actual = parse(decorated + member);
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->kmers, expected->kmers);
+    EXPECT_EQ(actual->bases, expected->bases);
+    EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+    auto wrong_size = member;
+    wrong_size.back() ^= 1;
+    EXPECT_FALSE(parse(wrong_size).has_value());
+    auto reserved_flag = member;
+    reserved_flag[3] |= 0x20;
+    EXPECT_FALSE(parse(reserved_flag).has_value());
+    auto bad_deflate = member;
+    bad_deflate[10] = 7;  // Reserved DEFLATE block type.
+    EXPECT_FALSE(parse(bad_deflate).has_value());
+    auto missing_name = member.substr(0, 10) + std::string(8, 'x');
+    missing_name[3] = 8;
+    EXPECT_FALSE(parse(missing_name).has_value());
+    auto oversized_extra = member;
+    oversized_extra[3] = 4;
+    oversized_extra.insert(10, std::string(2, '\xff'));
+    EXPECT_FALSE(parse(oversized_extra).has_value());
 }
 
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {

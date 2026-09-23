@@ -68,7 +68,9 @@ struct score_compatibility {
             .canonicalisation_policy = 1U,
             .blacklist_identity = 0U,
             .blacklist_version = 0U,
-            .key_mask = std::numeric_limits<uint16_t>::max(),
+            // Genomic winner scores virtually never set the top bit, so folding it halves the
+            // dense index at no practical cost in selectivity.
+            .key_mask = 0x7fffU,
         };
     }
 
@@ -200,8 +202,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     if (compatibility.indexed_bucket_count != BucketCount) {
         return Err(Error::invalid_argument("non-indexed builds require every bucket"));
     }
-    if (compatibility.key_mask != std::numeric_limits<uint16_t>::max()) {
-        return Err(Error::invalid_argument("non-indexed builds require an unmasked key"));
+    if (compatibility.key_mask != 0xffffU && compatibility.key_mask != 0x7fffU) {
+        return Err(Error::invalid_argument("non-indexed builds require a 16-bit or 15-bit key"));
     }
     return Ok();
 }
@@ -219,8 +221,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         compatibility.indexed_bucket_count != full_bucket_count / 2U) {
         return Err(Error::invalid_argument("indexed builds require a full or half bucket count"));
     }
-    if (compatibility.key_mask != std::numeric_limits<uint16_t>::max() &&
-        compatibility.key_mask != 0x7fffU) {
+    if (compatibility.key_mask != 0xffffU && compatibility.key_mask != 0x7fffU) {
         return Err(Error::invalid_argument("indexed builds require a 16-bit or 15-bit key mask"));
     }
     return Ok();
@@ -241,26 +242,35 @@ indexed_posting_count(uint32_t reference_count, score_compatibility const& compa
     return (address + alignment - 1U) & ~(static_cast<uintptr_t>(alignment) - 1U);
 }
 
-constexpr size_t indexed_batch_pair_storage_bytes = 200U * 1024U * 1024U;
+/// @brief Query rows one all-to-all tile compares against the database.
 constexpr uint32_t batch_query_tile_count = 128U;
 
-[[nodiscard]] constexpr uint32_t
-batch_query_tile_size(uint32_t reference_count, uint32_t query_count) noexcept {
+[[nodiscard]] constexpr uint32_t batch_query_tile_size(
+    uint32_t reference_count,
+    uint32_t query_count,
+    uint32_t tile_limit = batch_query_tile_count
+) noexcept {
     if (reference_count == 0U || query_count == 0U) {
         return 0U;
     }
     auto const count_capacity = std::numeric_limits<uint32_t>::max() / reference_count;
-    return std::min(query_count, std::min(batch_query_tile_count, std::max(1U, count_capacity)));
+    return std::min(query_count, std::min(tile_limit, std::max(1U, count_capacity)));
 }
 
-[[nodiscard]] constexpr uint32_t
-indexed_batch_query_tile_size(uint32_t reference_count, uint32_t query_count) noexcept {
-    constexpr size_t bytes_per_pair = 2U * sizeof(uint32_t);
-    auto const pair_capacity = indexed_batch_pair_storage_bytes / bytes_per_pair;
-    auto const query_capacity = pair_capacity / reference_count;
-    auto const bounded_capacity = query_capacity == 0U ? size_t{1} : query_capacity;
+/// @brief Query rows one external batch tile may hold on @p device.
+///
+/// A tile's results, match counts, counters and candidates cost about 44 bytes per pair, and a
+/// quarter of the device's memory goes to them, so a 16 GB device holds about 90 million pairs
+/// per tile. Larger tiles give the counting kernels more queries to overlap. The limit depends
+/// only on the device, so storage sized from the requirements always matches the search.
+[[nodiscard]] inline uint32_t
+external_batch_query_limit(uint32_t reference_count, cuda::device_ref device) {
+    constexpr size_t bytes_per_pair = sizeof(batch_search_result) + 3U * sizeof(uint32_t);
+    auto const budget = device.attribute(cuda::device_attributes::total_global_memory) / 4U;
+    auto const pairs = budget / bytes_per_pair;
+    auto const queries = reference_count == 0U ? pairs : pairs / reference_count;
     return static_cast<uint32_t>(
-        static_cast<size_t>(query_count) < bounded_capacity ? query_count : bounded_capacity
+        std::clamp<size_t>(queries, batch_query_tile_count, std::numeric_limits<uint32_t>::max())
     );
 }
 
@@ -440,9 +450,8 @@ class reference_database_view {
     /// @brief Storage reused while exhaustively searching @p query_count compact rows.
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
-        auto const pair_count = CUDDL_TRY(dense_batch_pair_count(
-            detail::batch_query_tile_size(metadata_.reference_count, query_count)
-        ));
+        auto const pair_count =
+            CUDDL_TRY(dense_batch_pair_count(external_batch_tile(query_count, stream)));
         return make_batch_requirements(pair_count, pair_count, false, stream);
     }
 
@@ -450,9 +459,8 @@ class reference_database_view {
     [[nodiscard]] Result<cuddl::batch_search_requirements>
     indexed_batch_search_requirements(uint32_t query_count, cuda::stream_ref stream) const {
         CUDDL_TRY(validate_index_storage());
-        auto const pair_count = CUDDL_TRY(dense_batch_pair_count(
-            detail::batch_query_tile_size(metadata_.reference_count, query_count)
-        ));
+        auto const pair_count =
+            CUDDL_TRY(dense_batch_pair_count(external_batch_tile(query_count, stream)));
         return make_batch_requirements(pair_count, pair_count, true, stream);
     }
 
@@ -800,8 +808,7 @@ class reference_database_view {
         CUDDL_TRY(
             validate_batch_outputs(requirements, results, result_count, result_match_counts, true)
         );
-        auto const tile_size =
-            detail::batch_query_tile_size(metadata_.reference_count, query_count);
+        auto const tile_size = external_batch_tile(query_count, stream);
         if (tile_size == 0U) {
             return write_batch_result_count(0U, result_count, stream);
         }
@@ -876,8 +883,7 @@ class reference_database_view {
         CUDDL_TRY(validate_indexed_batch_inputs(
             requirements, workspace, results, result_count, result_match_counts, options
         ));
-        auto const tile_size =
-            detail::batch_query_tile_size(metadata_.reference_count, query_count);
+        auto const tile_size = external_batch_tile(query_count, stream);
         if (tile_size == 0U) {
             return write_batch_result_count(0U, result_count, stream);
         }
@@ -1169,6 +1175,15 @@ class reference_database_view {
         return Ok();
     }
 
+    [[nodiscard]] uint32_t
+    external_batch_tile(uint32_t query_count, cuda::stream_ref stream) const {
+        return detail::batch_query_tile_size(
+            metadata_.reference_count,
+            query_count,
+            detail::external_batch_query_limit(metadata_.reference_count, stream.device())
+        );
+    }
+
     [[nodiscard]] Result<uint32_t> dense_batch_pair_count(uint32_t query_count) const {
         auto const pair_count = static_cast<uint64_t>(query_count) * metadata_.reference_count;
         if (pair_count > std::numeric_limits<uint32_t>::max()) {
@@ -1217,10 +1232,7 @@ class reference_database_view {
             return requirements;
         }
 
-        auto const query_count = dense_pair_count / metadata_.reference_count;
-        auto const tile_query_count =
-            detail::indexed_batch_query_tile_size(metadata_.reference_count, query_count);
-        auto const tile_pair_count = tile_query_count * metadata_.reference_count;
+        auto const tile_pair_count = dense_pair_count;
         size_t selection_bytes = 0;
         auto const ids = cuda::make_counting_iterator(uint32_t{0});
         auto const selection = cuda_try(
@@ -1473,116 +1485,112 @@ class reference_database_view {
                                           : requirements.maximum_pair_count;
         auto const capacity = static_cast<uint32_t>(written_capacity);
         auto const ids = cuda::make_counting_iterator(uint32_t{0});
-        auto const launch_tiles = [&](bool refine,
-                                      uint32_t* result_offset,
-                                      uint32_t const* required_count) -> Result<void> {
-            auto const query_tile_size =
-                detail::indexed_batch_query_tile_size(metadata_.reference_count, query_count);
-            for (uint32_t first_query = 0U; first_query < query_count;
-                 first_query += query_tile_size) {
-                auto const remaining = query_count - first_query;
-                auto const tile_query_count =
-                    remaining < query_tile_size ? remaining : query_tile_size;
-                auto const tile_pair_count = tile_query_count * metadata_.reference_count;
-                if (!indexed_) {
-                    CUDDL_TRY(count_exhaustive_matches(
-                        queries,
+        auto const multiprocessors = static_cast<uint32_t>(
+            stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+        );
+
+        // Refinement is memory bound; one resident wave of full blocks hides its latency.
+        auto const refinement_blocks =
+            multiprocessors *
+            static_cast<uint32_t>(
+                stream.device().attribute(cuda::device_attributes::max_threads_per_multiprocessor)
+            ) /
+            detail::block_size;
+
+        auto const tile_pair_count = query_count * metadata_.reference_count;
+        auto const count_and_select = [&]() -> Result<void> {
+            constexpr uint32_t first_query = 0U;
+            auto const tile_query_count = query_count;
+            if (!indexed_) {
+                CUDDL_TRY(count_exhaustive_matches(
+                    queries,
+                    query_row_offset + first_query,
+                    tile_query_count,
+                    rows,
+                    match_counts,
+                    stream
+                ));
+            } else if (
+                detail::uses_tiled_index_counts(
+                    metadata_.reference_count,
+                    tile_query_count,
+                    metadata_.compatibility.indexed_bucket_count
+                )
+            ) {
+                auto const tile = detail::index_tile_references(
+                    metadata_.reference_count, tile_query_count, multiprocessors
+                );
+                dim3 const grid(tile_query_count, (metadata_.reference_count + tile - 1U) / tile);
+                detail::count_batch_index_tile_kernel<BucketCount>
+                    <<<grid, detail::block_size, tile / 2U * sizeof(uint32_t), stream.get()>>>(
+                        queries.data(),
                         query_row_offset + first_query,
-                        tile_query_count,
-                        rows,
+                        index_offsets_.data(),
+                        index_postings_.data(),
+                        metadata_.reference_count,
+                        metadata_.compatibility.indexed_bucket_count,
+                        metadata_.compatibility.key_mask,
+                        tile,
                         match_counts,
-                        stream
-                    ));
-                } else {
-                    CUDDL_CUDA_TRY(
-                        cuda::fill_bytes(
-                            stream,
-                            cuda::std::span{match_counts, static_cast<size_t>(tile_pair_count)},
-                            0
-                        )
+                        index_keys_.empty() ? nullptr : index_keys_.data()
                     );
-                    auto const query_buckets = static_cast<size_t>(tile_query_count) *
-                                               metadata_.compatibility.indexed_bucket_count;
-                    constexpr auto cells_per_warp = detail::index_match_cells_per_warp;
-                    auto const cells_per_block = warps_per_block * cells_per_warp;
-                    auto const required_bucket_blocks =
-                        (query_buckets + cells_per_block - 1U) / cells_per_block;
-                    auto const bucket_blocks = static_cast<uint32_t>(
-                        required_bucket_blocks < 65535U ? required_bucket_blocks : 65535U
-                    );
-                    detail::count_batch_index_matches_kernel<BucketCount>
-                        <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
-                            queries.data(),
-                            query_row_offset + first_query,
-                            tile_query_count,
-                            index_offsets_.data(),
-                            index_postings_.data(),
-                            metadata_.reference_count,
-                            metadata_.compatibility.indexed_bucket_count,
-                            metadata_.compatibility.key_mask,
-                            match_counts,
-                            index_keys_.data()
-                        );
-                    CUDDL_CUDA_TRY(cudaGetLastError());
-                }
+                CUDDL_CUDA_TRY(cudaGetLastError());
+            } else {
                 CUDDL_CUDA_TRY(
-                    cub::DeviceSelect::If(
-                        temporary_workspace,
-                        temporary_bytes,
-                        ids,
-                        candidate_ids,
-                        tile_candidate_count,
-                        static_cast<int64_t>(tile_pair_count),
-                        detail::batch_minimum_match_predicate{
-                            match_counts,
-                            options.minimum_matches,
-                            metadata_.reference_count,
-                            query_id_offset + first_query,
-                            AllToAll
-                        },
-                        stream.get()
+                    cuda::fill_bytes(
+                        stream,
+                        cuda::std::span{match_counts, static_cast<size_t>(tile_pair_count)},
+                        0
                     )
                 );
-                if (refine) {
-                    constexpr uint32_t refinement_blocks = 128U;
-                    detail::refine_batch_index_candidates_kernel<BucketCount>
-                        <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
-                            queries.data(),
-                            query_row_offset + first_query,
-                            query_id_offset + first_query,
-                            rows.data(),
-                            metadata_.reference_count,
-                            match_counts,
-                            candidate_ids,
-                            tile_candidate_count,
-                            result_offset,
-                            required_count,
-                            capacity,
-                            results.data(),
-                            result_match_counts.empty() ? nullptr : result_match_counts.data()
-                        );
-                    CUDDL_CUDA_TRY(cudaGetLastError());
-                }
-                detail::advance_indexed_result_count_kernel<<<1, 1, 0, stream.get()>>>(
-                    tile_candidate_count, result_offset, required_count, capacity
+                auto const query_buckets = static_cast<size_t>(tile_query_count) *
+                                           metadata_.compatibility.indexed_bucket_count;
+                constexpr auto cells_per_warp = detail::index_match_cells_per_warp;
+                auto const cells_per_block = warps_per_block * cells_per_warp;
+                auto const required_bucket_blocks =
+                    (query_buckets + cells_per_block - 1U) / cells_per_block;
+                auto const bucket_blocks = static_cast<uint32_t>(
+                    required_bucket_blocks < 65535U ? required_bucket_blocks : 65535U
                 );
+                detail::count_batch_index_matches_kernel<BucketCount>
+                    <<<bucket_blocks, detail::block_size, 0, stream.get()>>>(
+                        queries.data(),
+                        query_row_offset + first_query,
+                        tile_query_count,
+                        index_offsets_.data(),
+                        index_postings_.data(),
+                        metadata_.reference_count,
+                        metadata_.compatibility.indexed_bucket_count,
+                        metadata_.compatibility.key_mask,
+                        match_counts,
+                        index_keys_.data()
+                    );
                 CUDDL_CUDA_TRY(cudaGetLastError());
             }
+            CUDDL_CUDA_TRY(
+                cub::DeviceSelect::If(
+                    temporary_workspace,
+                    temporary_bytes,
+                    ids,
+                    candidate_ids,
+                    tile_candidate_count,
+                    static_cast<int64_t>(tile_pair_count),
+                    detail::batch_minimum_match_predicate{
+                        match_counts,
+                        options.minimum_matches,
+                        metadata_.reference_count,
+                        query_id_offset + first_query,
+                        AllToAll
+                    },
+                    stream.get()
+                )
+            );
             return Ok();
         };
-
-        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, result_count.first(1), 0));
-        if (written_capacity == requirements.maximum_pair_count) {
-            return launch_tiles(true, result_count.data(), nullptr);
-        }
-        CUDDL_TRY(launch_tiles(false, result_count.data(), nullptr));
-        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, cuda::std::span{write_offset, size_t{1}}, 0));
-        if (query_count ==
-            detail::indexed_batch_query_tile_size(metadata_.reference_count, query_count)) {
-            // The first pass retained all candidates and match counts. The device-side
-            // capacity guard preserves the no-partial-output contract on overflow.
+        auto const refine = [&](uint32_t* result_offset,
+                                uint32_t const* required_count) -> Result<void> {
             detail::refine_batch_index_candidates_kernel<BucketCount>
-                <<<128U, detail::block_size, 0, stream.get()>>>(
+                <<<refinement_blocks, detail::block_size, 0, stream.get()>>>(
                     queries.data(),
                     query_row_offset,
                     query_id_offset,
@@ -1591,17 +1599,32 @@ class reference_database_view {
                     match_counts,
                     candidate_ids,
                     tile_candidate_count,
-                    write_offset,
-                    result_count.data(),
+                    result_offset,
+                    required_count,
                     capacity,
                     results.data(),
                     result_match_counts.empty() ? nullptr : result_match_counts.data()
                 );
             return cuda_try(cudaGetLastError());
+        };
+
+        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, result_count.first(1), 0));
+        CUDDL_TRY(count_and_select());
+        if (written_capacity == requirements.maximum_pair_count) {
+            CUDDL_TRY(refine(result_count.data(), nullptr));
+            detail::advance_indexed_result_count_kernel<<<1, 1, 0, stream.get()>>>(
+                tile_candidate_count, result_count.data(), nullptr, capacity
+            );
+            return cuda_try(cudaGetLastError());
         }
-        // ponytail: batches exceeding the 200 MiB workspace replay selection; retaining
-        // every tile would require additional caller-owned storage.
-        return launch_tiles(true, write_offset, result_count.data());
+        // Storage smaller than the worst case: publish the required count first, and let the
+        // device-side capacity guard preserve the no-partial-output contract on overflow.
+        detail::advance_indexed_result_count_kernel<<<1, 1, 0, stream.get()>>>(
+            tile_candidate_count, result_count.data(), nullptr, capacity
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, cuda::std::span{write_offset, size_t{1}}, 0));
+        return refine(write_offset, result_count.data());
     }
 
    private:

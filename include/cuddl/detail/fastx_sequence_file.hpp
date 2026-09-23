@@ -583,12 +583,64 @@ struct shared_gzip_decompressor {
     }
 };
 
+/// @brief Decodes one gzip member, checking structure and ISIZE but not checksums.
+/// Skipping the payload CRC avoids a second pass over every decompressed byte.
+[[nodiscard]] inline libdeflate_result decompress_gzip_member(
+    libdeflate_decompressor* decoder,
+    std::string_view input,
+    char* output,
+    size_t capacity,
+    size_t& consumed,
+    size_t& produced
+) {
+    auto const byte = [&](size_t i) {
+        return static_cast<uint32_t>(static_cast<unsigned char>(input[i]));
+    };
+    if (input.size() < 18 || byte(0) != 0x1f || byte(1) != 0x8b || byte(2) != 8 ||
+        (byte(3) & 0xe0) != 0) {
+        return LIBDEFLATE_BAD_DATA;
+    }
+    auto const flags = byte(3);
+    auto const end = input.size() - 8;
+    size_t at = 10;
+    if ((flags & 4) != 0) {
+        if (end - at < 2) return LIBDEFLATE_BAD_DATA;
+        auto const length = byte(at) | (byte(at + 1) << 8);
+        at += 2;
+        if (length > end - at) return LIBDEFLATE_BAD_DATA;
+        at += length;
+    }
+    for (auto const flag : {8U, 16U}) {
+        if ((flags & flag) != 0) {
+            auto const terminator = input.find('\0', at);
+            if (terminator == std::string_view::npos || terminator >= end) {
+                return LIBDEFLATE_BAD_DATA;
+            }
+            at = terminator + 1;
+        }
+    }
+    if ((flags & 2) != 0) {
+        if (end - at < 2) return LIBDEFLATE_BAD_DATA;
+        at += 2;
+    }
+    size_t deflate_bytes = 0;
+    auto const status = libdeflate_deflate_decompress_ex(
+        decoder, input.data() + at, end - at, output, capacity, &deflate_bytes, &produced
+    );
+    if (status != LIBDEFLATE_SUCCESS) return status;
+    auto const trailer = at + deflate_bytes;
+    auto const size = byte(trailer + 4) | (byte(trailer + 5) << 8) | (byte(trailer + 6) << 16) |
+                      (byte(trailer + 7) << 24);
+    if (static_cast<uint32_t>(produced) != size) return LIBDEFLATE_BAD_DATA;
+    consumed = trailer + 8;
+    return LIBDEFLATE_SUCCESS;
+}
+
 /// @brief Decompresses gzip members from a mapped buffer into @p output, appending.
 ///
 /// Members are decompressed one at a time so concatenated streams (BGZF among them) work.
-/// libdeflate verifies each member's CRC32 and length trailer, so corrupt and truncated
-/// input both fail here instead of yielding partial sequence. `output` grows as needed, so a
-/// caller that pre-sized storage can only ever save reallocations, never lose data.
+/// Each member's structure, DEFLATE data and length trailer are checked, but CRC32 is not.
+/// `output` grows as needed, so pre-sizing storage saves reallocations without truncating data.
 [[nodiscard]] inline Result<void>
 gunzip_members_into(std::string_view input, std::string& output, std::string const& path) {
     static thread_local shared_gzip_decompressor shared;
@@ -602,14 +654,13 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
     while (consumed < input.size()) {
         size_t member_in = 0;
         size_t member_out = 0;
-        auto const status = libdeflate_gzip_decompress_ex(
+        auto const status = decompress_gzip_member(
             shared.handle,
-            input.data() + consumed,
-            input.size() - consumed,
+            input.substr(consumed),
             output.data() + produced,
             output.size() - produced,
-            &member_in,
-            &member_out
+            member_in,
+            member_out
         );
         if (status == LIBDEFLATE_INSUFFICIENT_SPACE) {
             output.resize(output.size() * 2 + 1);
@@ -645,14 +696,13 @@ gunzip_members_into(std::string_view input, std::string& output, std::string con
     while (consumed < input.size()) {
         size_t member_in = 0;
         size_t member_out = 0;
-        auto const status = libdeflate_gzip_decompress_ex(
+        auto const status = decompress_gzip_member(
             shared.handle,
-            input.data() + consumed,
-            input.size() - consumed,
+            input.substr(consumed),
             target.data + produced,
             target.capacity - produced,
-            &member_in,
-            &member_out
+            member_in,
+            member_out
         );
         if (status == LIBDEFLATE_INSUFFICIENT_SPACE) {
             // A caller-supplied buffer cannot grow, so the loader falls back instead.
@@ -739,7 +789,7 @@ struct compact_shuffle_table {
 /// @brief One bit per byte of @p flags, which holds a lane of 0x00 or 0xff per comparison.
 [[nodiscard]] inline unsigned compact_mask(uint8x16_t flags) noexcept {
     constexpr std::uint8_t weights[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
-    auto const weighted = vandq_u8(vshrq_n_u8(flags, 7), vld1q_u8(weights));
+    auto const weighted = vandq_u8(flags, vld1q_u8(weights));
     return static_cast<unsigned>(vaddv_u8(vget_low_u8(weighted))) |
            (static_cast<unsigned>(vaddv_u8(vget_high_u8(weighted))) << 8U);
 }
@@ -767,9 +817,11 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
         auto const packed_low = vqtbl1q_u8(block, vld1q_u8(table.control[low]));
         auto const packed_high =
             vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
-        vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_low);
+        // Eight bytes per half, like the x86 path: a wider store would write past the block
+        // being read, over the next block when compacting in place.
+        vst1_u8(reinterpret_cast<std::uint8_t*>(out), vget_low_u8(packed_low));
         out += table.kept[low];
-        vst1q_u8(reinterpret_cast<std::uint8_t*>(out), packed_high);
+        vst1_u8(reinterpret_cast<std::uint8_t*>(out), vget_low_u8(packed_high));
         out += table.kept[high];
         at += 16;
     }

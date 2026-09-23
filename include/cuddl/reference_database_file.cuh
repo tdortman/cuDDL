@@ -15,8 +15,12 @@
 #include <thread>
 #include <vector>
 
+#include <libdeflate.h>
 #include <unistd.h>
-#include <zlib.h>
+
+#include <cub/device/device_reduce.cuh>
+#include <cuda/iterator>
+#include <cuda/std/functional>
 
 #include <cuddl/detail/database_staging.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
@@ -44,7 +48,8 @@ inline T database_file_little_endian(T value) {
 struct database_file_reader {
     std::ifstream input;
     uint64_t remaining{};
-    uLong checksum = crc32(0, nullptr, 0);
+    // libdeflate's CRC-32 equals zlib's and uses carry-less multiplication where available.
+    uint32_t checksum = 0;
 
     Result<void> bytes(void* destination, size_t size) {
         if (size > remaining ||
@@ -54,7 +59,7 @@ struct database_file_reader {
         if (size != 0) {
             input.read(static_cast<char*>(destination), static_cast<std::streamsize>(size));
             if (!input) return Err(Error::resource("cannot read reference database file"));
-            checksum = crc32_z(checksum, static_cast<Bytef const*>(destination), size);
+            checksum = libdeflate_crc32(checksum, destination, size);
         }
         remaining -= size;
         return Ok();
@@ -81,7 +86,7 @@ struct database_file_reader {
 struct database_file_writer {
     std::string temporary;
     FILE* output{};
-    uLong checksum = crc32(0, nullptr, 0);
+    uint32_t checksum = 0;
 
     ~database_file_writer() {
         if (output) std::fclose(output);
@@ -95,7 +100,7 @@ struct database_file_writer {
             if (std::fwrite(source, 1, size, output) != size) {
                 return Err(Error::resource("cannot write reference database file"));
             }
-            checksum = crc32_z(checksum, static_cast<Bytef const*>(source), size);
+            checksum = libdeflate_crc32(checksum, source, size);
         }
         return Ok();
     }
@@ -137,6 +142,74 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
     return Ok();
 }
 
+/// Invalid-word flags one stored sketch word contributes to a store validation.
+inline constexpr uint32_t invalid_saturation_flag = 1U;
+inline constexpr uint32_t invalid_register_flag = 2U;
+
+/// @brief Flags a store word the file form would reject: a saturation word other than 0 or 1,
+/// or a register whose winner and count disagree about being empty.
+template <size_t BucketCount>
+struct invalid_store_word {
+    uint32_t const* store;
+
+    [[nodiscard]] __device__ uint32_t operator()(uint64_t index) const noexcept {
+        auto const word = store[index];
+        if (index % (BucketCount + 1) == BucketCount) {
+            return word > 1U ? invalid_saturation_flag : 0U;
+        }
+        return (winner(word) == 0U) != (count(word) == 0U) ? invalid_register_flag : 0U;
+    }
+};
+
+/// @brief Validates every word of a device store in one reduction.
+template <size_t BucketCount>
+[[nodiscard]] Result<void>
+validate_store(device_span<uint32_t const> store, cuda::stream_ref stream) {
+    if (store.empty()) return Ok();
+    auto flags = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
+    auto const words = cuda::counting_iterator<uint64_t>{0};
+    auto const transform = invalid_store_word<BucketCount>{store.data()};
+    size_t temporary_bytes = 0;
+    CUDDL_CUDA_TRY(
+        cub::DeviceReduce::TransformReduce(
+            nullptr,
+            temporary_bytes,
+            words,
+            flags.data(),
+            store.size(),
+            cuda::std::bit_or<uint32_t>{},
+            transform,
+            uint32_t{0},
+            stream.get()
+        )
+    );
+    auto temporary =
+        cuda::make_device_buffer<uint8_t>(stream, stream.device(), temporary_bytes, cuda::no_init);
+    CUDDL_CUDA_TRY(
+        cub::DeviceReduce::TransformReduce(
+            temporary.data(),
+            temporary_bytes,
+            words,
+            flags.data(),
+            store.size(),
+            cuda::std::bit_or<uint32_t>{},
+            transform,
+            uint32_t{0},
+            stream.get()
+        )
+    );
+    uint32_t result = 0;
+    CUDDL_CUDA_TRY(cuda::copy_bytes(stream, flags, cuda::std::span{&result, 1}));
+    CUDDL_CUDA_TRY(stream.sync());
+    if (result & invalid_saturation_flag) {
+        return Err(Error::invalid_argument("invalid database saturation flag"));
+    }
+    if (result & invalid_register_flag) {
+        return Err(Error::invalid_argument("invalid packed database register"));
+    }
+    return Ok();
+}
+
 }  // namespace cuddl::detail
 
 namespace cuddl {
@@ -165,7 +238,7 @@ struct path_build_options {
     /// none, so a larger count is only a ceiling. One loader loads one genome at a time.
     unsigned parser_workers = default_parser_workers();
     /// Arena bytes. Unset sizes the arena from free device memory and what the inputs can fill,
-    /// which is the only case a build cannot know in advance.
+    /// capped at 128 MiB so sketching overlaps loading.
     std::optional<size_t> staging_bytes{};
     /// How the build moves bytes. `automatic` asks the device: a device that reads pageable host
     /// memory, which is what makes Grace Hopper and Grace Blackwell coherent, stages the loader's
@@ -178,7 +251,8 @@ struct path_build_options {
 /// @brief Knobs for a build the caller feeds with bases it already holds.
 struct sequence_build_options {
     reference_build_statistics* statistics = nullptr;
-    /// Arena bytes. Unset sizes the arena from free device memory and what the bases can fill.
+    /// Arena bytes. Unset sizes the arena from free device memory and what the bases can fill,
+    /// capped at 128 MiB so sketching overlaps staging.
     std::optional<size_t> staging_bytes{};
 };
 
@@ -243,15 +317,15 @@ class reference_database_file {
             result.names_.reserve(paths.size());
             // No inputs means no staging budget to resolve and nothing to encode.
             if (paths.empty()) return result;
-            auto store = CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
+            CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
                 paths,
                 stream,
                 options.staging_bytes,
                 options.parser_workers,
                 options.transfer,
-                options.statistics
+                options.statistics,
+                result.download_rows<BucketCount>(stream)
             )));
-            detail::unpack_store<BucketCount>(store, result.rows_, result.saturation_);
             for (auto const& path : paths) result.names_.push_back(path.string());
             // Instantiate the same constraints as the destination GPU database.
             static_assert(sizeof(database_type) > 0);
@@ -295,11 +369,14 @@ class reference_database_file {
             result.saturation_.resize(genomes.size());
             result.names_.reserve(genomes.size());
             if (genomes.empty()) return result;
-            auto store = CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
-                genomes, stream, options.staging_bytes, options.statistics
+            CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
+                genomes,
+                stream,
+                options.staging_bytes,
+                options.statistics,
+                result.download_rows<BucketCount>(stream)
             )));
-            detail::unpack_store<BucketCount>(store, result.rows_, result.saturation_);
-            for (auto const& genome : genomes) result.names_.push_back(std::string(genome.name));
+            for (auto const& genome : genomes) result.names_.emplace_back(genome.name);
             static_assert(sizeof(database_type) > 0);
             return result;
         }();
@@ -346,24 +423,11 @@ class reference_database_file {
             result.rows_.resize(count * BucketCount);
             result.saturation_.resize(count);
             if (count == 0) return result;
-            std::vector<uint32_t> host_store(store.size());
-            CUDDL_CUDA_TRY(
-                cuda::copy_bytes(
-                    stream, store, cuda::std::span{host_store.data(), host_store.size()}
-                )
+            CUDDL_TRY(detail::validate_store<BucketCount>(store, stream));
+            CUDDL_TRY(
+                detail::download_store<BucketCount>(store, result.rows_, result.saturation_, stream)
             );
             CUDDL_CUDA_TRY(stream.sync());
-            detail::unpack_store<BucketCount>(host_store, result.rows_, result.saturation_);
-            for (auto state : result.saturation_) {
-                if (state > 1) {
-                    return Err(Error::invalid_argument("invalid database saturation flag"));
-                }
-            }
-            for (auto row : result.rows_) {
-                if ((detail::winner(row) == 0) != (detail::count(row) == 0)) {
-                    return Err(Error::invalid_argument("invalid packed database register"));
-                }
-            }
             result.names_.assign(names.begin(), names.end());
             return result;
         }();
@@ -473,12 +537,12 @@ class reference_database_file {
             auto const& c = result.metadata_.compatibility;
             if (c.kmer_length < 1 || c.kmer_length > 31 || c.bucket_count < 2048 ||
                 c.bucket_count > 131072 || !std::has_single_bit(c.bucket_count) ||
-                c.indexed_bucket_count != c.bucket_count || c.key_mask != 0xffffU ||
-                c.exponent_bits == 0 || c.mantissa_bits == 0 ||
-                c.exponent_bits + c.mantissa_bits != 16 || c.score_encoder_identity != 1 ||
-                c.hash_identity != 1 || c.hash_seed != detail::seed ||
-                c.canonicalisation_policy != 1 || c.blacklist_identity != 0 ||
-                c.blacklist_version != 0) {
+                c.indexed_bucket_count != c.bucket_count ||
+                (c.key_mask != 0xffffU && c.key_mask != 0x7fffU) || c.exponent_bits == 0 ||
+                c.mantissa_bits == 0 || c.exponent_bits + c.mantissa_bits != 16 ||
+                c.score_encoder_identity != 1 || c.hash_identity != 1 ||
+                c.hash_seed != detail::seed || c.canonicalisation_policy != 1 ||
+                c.blacklist_identity != 0 || c.blacklist_version != 0) {
                 return Err(Error::invalid_argument("unsupported database construction metadata"));
             }
             uint64_t const count = result.metadata_.reference_count;
@@ -533,10 +597,70 @@ class reference_database_file {
    private:
     friend class reference_index_file;
     reference_database_file() = default;
+
+    /// @brief Staging sink that splits each group's device rows into this file's host rows and
+    /// saturation words. The build's final sync covers the copies.
+    template <size_t BucketCount>
+    [[nodiscard]] auto download_rows(cuda::stream_ref stream) {
+        return [this, stream](device_span<uint32_t const> group, size_t base, size_t count) {
+            return detail::download_store<BucketCount>(
+                group,
+                std::span{rows_}.subspan(base * BucketCount, count * BucketCount),
+                std::span{saturation_}.subspan(base, count),
+                stream
+            );
+        };
+    }
     reference_database_metadata metadata_{};
     std::vector<std::string> names_;
     std::vector<uint32_t> rows_;
     std::vector<uint32_t> saturation_;
 };
+
+/**
+ * @brief Sketches one genome per plain or gzip/BGZF FASTA/FASTQ file into a device store.
+ *
+ * Each genome gets `BucketCount` packed registers followed by its saturation word, the stored
+ * sketch layout the batch operations in batch.cuh consume, in the order of @p paths. The rows
+ * never leave the device. The build is synchronous.
+ */
+template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
+[[nodiscard]] Result<cuda::device_buffer<uint32_t>> build_sketch_store(
+    std::span<std::filesystem::path const> paths,
+    cuda::stream_ref stream,
+    path_build_options options = {}
+) try {
+    return [&]() -> Result<cuda::device_buffer<uint32_t>> {
+        constexpr size_t row_words = BucketCount + 1;
+        auto store = cuda::make_device_buffer<uint32_t>(
+            stream, stream.device(), paths.size() * row_words, cuda::no_init
+        );
+        CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
+            paths,
+            stream,
+            options.staging_bytes,
+            options.parser_workers,
+            options.transfer,
+            options.statistics,
+            [&](device_span<uint32_t const> group, size_t base, size_t count) -> Result<void> {
+                CUDDL_CUDA_TRY(
+                    cuda::copy_bytes(
+                        stream,
+                        group,
+                        device_span<uint32_t>{store.data() + base * row_words, count * row_words}
+                    )
+                );
+                return Ok();
+            }
+        )));
+        return store;
+    }();
+} catch (cuda::cuda_error const& error) {
+    return Err(Error::cuda(static_cast<cudaError_t>(error.status())));
+} catch (std::system_error const& error) {
+    return Err(Error::resource(error.what()));
+} catch (std::bad_alloc const& error) {
+    return Err(Error::resource(error.what()));
+}
 
 }  // namespace cuddl

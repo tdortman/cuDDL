@@ -33,7 +33,7 @@ Each input file represents one genome, including all of its sequence records. Re
 
 The default build targets `sm_80`, `sm_90`, and `sm_120`. Your toolkit must recognize all three targets. For a different GPU target, adjust `cuda_arch_args` in [meson.build](meson.build) before configuring.
 
-Meson fetches the pinned dependencies, including CCCL, zlib, libdeflate, and CLI11. Use the supplied CCCL revision: cuDDL requires its CUB 3.6.0 headers rather than an arbitrary toolkit-bundled version. The initial setup needs network access.
+Meson fetches the pinned dependencies, including CCCL, libdeflate, and CLI11. Use the supplied CCCL revision: cuDDL requires its CUB 3.6.0 headers rather than an arbitrary toolkit-bundled version. The initial setup needs network access.
 
 ### Build
 
@@ -78,6 +78,7 @@ The following commands assume reference genomes are under `genomes/references/` 
 The builder searches the folder recursively and sorts file paths to assign reference IDs. Keep that ordered input list if you need to map result IDs back to filenames.
 
 Supported input extensions are `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, case-insensitively. Gzip and BGZF files may add `.gz`, `.bgz`, or `.bgzf`.
+Gzip loading checks member structure, DEFLATE decoding, and uncompressed lengths, but skips CRC32 verification to avoid another pass over decompressed data. Check input integrity separately when needed; checksum validation for saved databases and indexes is unchanged.
 
 | Option      | Accepted values                                                                                     |
 | ----------- | --------------------------------------------------------------------------------------------------- |
@@ -137,6 +138,8 @@ Include `<cuddl/cuddl.cuh>` for the main API. File-based reference database I/O 
 | `cuddl::reference_database_file` / `cuddl::reference_index_file` | Save and load databases and indexes.                                           |
 
 Start with the runnable [sketch example](examples/main.cu), [database builder](examples/build_reference_database.cu), or [search implementation](examples/reference_index_dispatch.cu.in).
+
+For GPU-only pipelines, `cuddl::build_sketch_store<K, BucketCount>` loads genome files into a device-resident store without downloading the registers. Each row contains `BucketCount` packed registers followed by a saturation word. The batch operations in `<cuddl/batch.cuh>` consume this layout directly. Use `query_sketch_batch` when you only need query scores.
 
 The API uses CUDA streams. Keep the allocation stream alive longer than its sketches and keep asynchronous inputs alive and unchanged until the stream completes. `add_sequence_async` expects contiguous device-resident ASCII bases, not a FASTA file; use the file-loading APIs for FASTA and FASTQ input. Operations returning `cuddl::Result` require error handling; the examples use `CUDDL_UNWRAP`.
 

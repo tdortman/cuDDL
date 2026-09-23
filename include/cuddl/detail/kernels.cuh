@@ -568,7 +568,7 @@ __global__ void count_index_cells_bucket_kernel(
 /// opt-in shared-memory cap). The posting position is computed directly as `offsets[cell] +
 /// local_rank`: the block's shared-memory rank is the only per-cell cursor state, so no global
 /// cursor atomics and no per-cell cursor scratch are needed. Posting order within a cell is
-/// unspecified (the interface never depended on it).
+/// arbitrary here; the index build sorts each cell afterwards.
 template <typename Row>
 __global__ void scatter_index_postings_bucket_kernel(
     Row const* transposed,
@@ -911,17 +911,40 @@ __global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
     }
 }
 
-/// @brief Cells one warp owns per iteration of @ref count_batch_index_matches_kernel.
+/// @brief Cells one warp owns per iteration of @ref count_batch_index_matches_kernel: one per
+/// lane.
 ///
 /// The host divides the grid by this so every launched warp stays busy.
-constexpr uint32_t index_match_cells_per_warp = 8U;
+constexpr uint32_t index_match_cells_per_warp = 32U;
 
-/// @brief Counts dense index matches for every query/reference pair in one tile.
+/// @brief One thread's posting range for a bucket/key cell of a dense or sparse index.
+__device__ inline uint2 lane_posting_range(
+    uint32_t const* offsets,
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    uint32_t bucket,
+    uint32_t key,
+    uint32_t key_count
+) {
+    if (sorted_keys == nullptr) {
+        auto const cell = static_cast<size_t>(bucket) * key_count + key;
+        return {offsets[cell], offsets[cell + 1U]};
+    }
+    auto const* first = sorted_keys + static_cast<size_t>(bucket) * reference_count;
+    auto const sparse_key = static_cast<uint16_t>(key + (key_count == 32768U));
+    auto const range = cuda::std::equal_range(first, first + reference_count, sparse_key);
+    return {
+        static_cast<uint32_t>(range.first - sorted_keys),
+        static_cast<uint32_t>(range.second - sorted_keys)
+    };
+}
+
+/// @brief Counts index matches for every query/reference pair in one tile.
 ///
-/// One warp owns cuddl::detail::index_match_cells_per_warp (query, bucket) cells per iteration.
-/// Each cell's posting list is walked with a lane stride, so hot keys with long lists (the dominant
-/// cost on skewed rows) are consumed 32 postings at a time instead of serially by a single
-/// thread, and the two per-cell offset loads collapse into warp-uniform broadcasts.
+/// Each lane of a warp resolves the posting range of its own (query, bucket) cell, so a warp
+/// keeps 32 independent range lookups in flight. The warp then walks every non-empty range with
+/// a lane stride, so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
+/// postings at a time.
 template <size_t BucketCount, typename QueryRow>
 __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     QueryRow const* queries,
@@ -942,52 +965,41 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     auto const total_cells = static_cast<uint64_t>(query_count) * indexed_bucket_count;
     auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
     // The indexed bucket count is always a power of two (BucketCount or BucketCount / 2), so
-    // splitting the linear cell id costs a shift and a mask instead of a 64-bit division on
-    // every cell; the division dominated the mostly-empty-cell path.
+    // splitting the linear cell id costs a shift and a mask instead of a 64-bit division.
     auto const bucket_shift = static_cast<uint32_t>(cuda::std::countr_zero(indexed_bucket_count));
     auto const bucket_mask = indexed_bucket_count - 1U;
-    // A few cells per warp: one cell's work is a short chain of dependent loads (score, then
-    // the posting range, then the postings), so issuing every cell's score load before consuming
-    // any of them multiplies the outstanding requests per warp instead of serializing on one
-    // cell. The host shrinks the grid by the same factor.
-    constexpr uint32_t cells_per_warp = index_match_cells_per_warp;
     auto const first_cell =
-        (static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp) * cells_per_warp;
+        (static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp) * index_match_cells_per_warp;
     auto const warp_cell_stride =
-        static_cast<uint64_t>(gridDim.x) * warps_per_block * cells_per_warp;
+        static_cast<uint64_t>(gridDim.x) * warps_per_block * index_match_cells_per_warp;
     for (auto cell_base = first_cell; cell_base < total_cells; cell_base += warp_cell_stride) {
-        uint32_t scores[cells_per_warp];
-        uint32_t query_indexes[cells_per_warp];
-        uint32_t buckets[cells_per_warp];
-        _Pragma("unroll")
-        for (uint32_t i = 0U; i < cells_per_warp; ++i) {
-            auto const cell = cell_base + static_cast<uint64_t>(i);
-            auto const in_range = cell < total_cells;
-            auto const bounded = in_range ? cell : uint64_t{0};
-            auto const query_index = static_cast<uint32_t>(bounded >> bucket_shift);
-            query_indexes[i] = query_index;
-            buckets[i] = static_cast<uint32_t>(bounded) & bucket_mask;
-            scores[i] =
-                in_range ? reference_score(
-                               queries[(query_row_offset + query_index) * BucketCount + buckets[i]]
-                           )
-                         : 0U;
-        }
-        _Pragma("unroll")
-        for (uint32_t i = 0U; i < cells_per_warp; ++i) {
-            auto const score = scores[i];
-            if (score == 0U) {
-                continue;
-            }
-            auto const key = static_cast<uint32_t>(score & key_mask);
-            auto const range = index_posting_range(
-                offsets, sorted_keys, reference_count, buckets[i], key, key_count
+        auto const cell = cell_base + lane;
+        auto const query_index = static_cast<uint32_t>(cell >> bucket_shift);
+        auto const bucket = static_cast<uint32_t>(cell) & bucket_mask;
+        auto const score =
+            cell < total_cells
+                ? reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket])
+                : 0U;
+        uint2 range{0U, 0U};
+        if (score != 0U) {
+            range = lane_posting_range(
+                offsets,
+                sorted_keys,
+                reference_count,
+                bucket,
+                static_cast<uint32_t>(score & key_mask),
+                key_count
             );
-            auto const begin = range.x;
-            auto const end = range.y;
+        }
+        auto pending = __ballot_sync(0xffffffffU, range.x < range.y);
+        while (pending != 0U) {
+            auto const source = static_cast<uint32_t>(__ffs(pending) - 1);
+            pending &= pending - 1U;
+            auto const end = __shfl_sync(0xffffffffU, range.y, source);
+            auto posting = __shfl_sync(0xffffffffU, range.x, source) + lane;
             auto* const counts =
-                match_counts + static_cast<size_t>(query_indexes[i]) * reference_count;
-            auto posting = begin + lane;
+                match_counts + static_cast<size_t>(__shfl_sync(0xffffffffU, query_index, source)) *
+                                   reference_count;
             // Four independent posting loads in flight per lane keep the atomic stream fed
             // while the following loads are still outstanding.
             for (; posting + 3U * warp_width < end; posting += 4U * warp_width) {
@@ -1005,6 +1017,131 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
                 atomicAdd(&counts[postings[posting]], 1U);
             }
         }
+    }
+}
+
+/// @brief References one @ref count_batch_index_tile_kernel block may count, two per word.
+constexpr uint32_t index_tile_max_references = 16384U;
+
+/// @brief Whether a batch counts through @ref count_batch_index_tile_kernel.
+///
+/// Its 16-bit counters hold at most 65535 matches. Tiny batches finish sooner on the global
+/// kernel, which needs no per-block counter initialization or flush.
+[[nodiscard]] inline bool uses_tiled_index_counts(
+    uint32_t reference_count,
+    uint32_t query_count,
+    uint32_t indexed_bucket_count
+) noexcept {
+    return reference_count != 0U && indexed_bucket_count <= 0xffffU &&
+           (reference_count >= 8192U || query_count >= 512U);
+}
+
+/// @brief References per tile: at most @ref index_tile_max_references, and small enough that
+/// the batch launches about four blocks per SM.
+[[nodiscard]] inline uint32_t index_tile_references(
+    uint32_t reference_count,
+    uint32_t query_count,
+    uint32_t multiprocessors
+) noexcept {
+    auto const needed =
+        (reference_count + index_tile_max_references - 1U) / index_tile_max_references;
+    auto const filling = (4U * multiprocessors + query_count - 1U) / query_count;
+    auto const tiles = needed > filling ? needed : filling;
+    return ((reference_count + tiles - 1U) / tiles + 63U) / 64U * 64U;
+}
+
+/// @brief Counts index matches for one query against one reference tile in shared memory.
+///
+/// Block (x, y) owns query x and references [y * tile, (y + 1) * tile), with two 16-bit
+/// counters per shared word. Postings ascend by reference within each key, so each posting list
+/// is narrowed to the tile with two binary searches. The flush writes every pair of the tile,
+/// so @p match_counts needs no zeroing.
+template <size_t BucketCount, typename QueryRow>
+__global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
+    QueryRow const* queries,
+    size_t query_row_offset,
+    uint32_t const* offsets,
+    uint32_t const* postings,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t tile,
+    uint32_t* match_counts,
+    uint16_t const* sorted_keys
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t warps_per_block = block_size / warp_width;
+    extern __shared__ uint32_t packed_counts[];
+    auto const query_index = static_cast<uint32_t>(blockIdx.x);
+    auto const low = static_cast<uint32_t>(blockIdx.y) * tile;
+    auto const high = min(low + tile, reference_count);
+    auto const width = high - low;
+    for (auto i = threadIdx.x; i < (width + 1U) / 2U; i += blockDim.x) {
+        packed_counts[i] = 0U;
+    }
+    __syncthreads();
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    auto const* query = queries + (query_row_offset + query_index) * BucketCount;
+    auto const count = [&](uint32_t reference) {
+        auto const slot = reference - low;
+        atomicAdd(&packed_counts[slot / 2U], 1U << ((slot % 2U) * 16U));
+    };
+    // Each lane resolves one bucket's posting range, so a warp keeps 32 independent offset
+    // loads and binary searches in flight; the warp then walks the ranges together.
+    for (auto base = warp * warp_width; base < indexed_bucket_count;
+         base += warps_per_block * warp_width) {
+        auto const bucket = base + lane;
+        auto const score = bucket < indexed_bucket_count ? reference_score(query[bucket]) : 0U;
+        uint32_t begin = 0U;
+        uint32_t end = 0U;
+        if (score != 0U) {
+            auto const range = lane_posting_range(
+                offsets,
+                sorted_keys,
+                reference_count,
+                bucket,
+                static_cast<uint32_t>(score & key_mask),
+                key_count
+            );
+            begin = range.x;
+            end = range.y;
+            if (gridDim.y > 1U) {
+                begin = static_cast<uint32_t>(
+                    cuda::std::lower_bound(postings + begin, postings + end, low) - postings
+                );
+                end = static_cast<uint32_t>(
+                    cuda::std::lower_bound(postings + begin, postings + end, high) - postings
+                );
+            }
+        }
+        auto pending = __ballot_sync(0xffffffffU, begin < end);
+        while (pending != 0U) {
+            auto const source = static_cast<uint32_t>(__ffs(pending) - 1);
+            pending &= pending - 1U;
+            auto const range_end = __shfl_sync(0xffffffffU, end, source);
+            auto posting = __shfl_sync(0xffffffffU, begin, source) + lane;
+            for (; posting + 3U * warp_width < range_end; posting += 4U * warp_width) {
+                uint32_t ids[4];
+                _Pragma("unroll")
+                for (uint32_t j = 0U; j < 4U; ++j) {
+                    ids[j] = postings[posting + j * warp_width];
+                }
+                _Pragma("unroll")
+                for (uint32_t j = 0U; j < 4U; ++j) {
+                    count(ids[j]);
+                }
+            }
+            for (; posting < range_end; posting += warp_width) {
+                count(postings[posting]);
+            }
+        }
+    }
+    __syncthreads();
+    auto* const counts = match_counts + static_cast<size_t>(query_index) * reference_count + low;
+    for (auto i = threadIdx.x; i < width; i += blockDim.x) {
+        counts[i] = (packed_counts[i / 2U] >> ((i % 2U) * 16U)) & 0xffffU;
     }
 }
 
@@ -1157,13 +1294,14 @@ __global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kern
     }
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
     auto const candidate_stride = static_cast<uint32_t>(gridDim.x) * warps_per_block;
 
     // The wide load path needs rows aligned to @ref load_256_alignment; callers may hand over
     // spans whose base breaks that, in which case the same chunking falls back to scalar loads.
     auto const wide256 = wide_rows_aligned(queries, rows);
-    for (; candidate_index < *candidate_count; candidate_index += candidate_stride) {
+    for (auto candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
+         candidate_index < *candidate_count;
+         candidate_index += candidate_stride) {
         auto const pair_id = candidate_ids[candidate_index];
         auto const query_index = pair_id / reference_count;
         auto const reference_id = pair_id % reference_count;
