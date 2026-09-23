@@ -1216,7 +1216,8 @@ json resident_timings(
             // Validate the timed resident construction, including multiplicities and saturation.
             auto const observed_registers = download(store, setup);
             auto expected_registers = download(*expected_references->store, setup);
-            if (expected_queries->store) {
+            // All-to-all stages only the references, matching paths above.
+            if (!all && expected_queries->store) {
                 auto const queries_expected = download(*expected_queries->store, setup);
                 expected_registers.insert(
                     expected_registers.end(), queries_expected.begin(), queries_expected.end()
