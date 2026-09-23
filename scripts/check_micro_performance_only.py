@@ -8,6 +8,7 @@
 import json
 import random
 import subprocess
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -49,6 +50,7 @@ def main() -> None:
             ("dashing2", False, "all-to-all"),
             ("dashing2", True, "batch"),
             ("hypergen", True, "all-to-all"),
+            ("hypergen", True, "batch"),
             ("cuddl", True, "all-to-all"),
             ("cuddl", True, "batch"),
             ("rabbitsketch", True, "all-to-all"),
@@ -137,10 +139,11 @@ def main() -> None:
                         if tool == "rabbitsketch"
                         else measurement["metrics"]
                     )
+                    # Wall adds process start, loading, and FASTX query sketching.
                     assert (
                         measurement["timings"][timing]["median_ms"]
-                        == metrics["retrieval_ms"]
-                    )
+                        > measurement["timings"]["resident"]["median_ms"]
+                    ), measurement
                     assert "excluded_output_ms" in metrics
                     if tool == "cuddl":
                         assert metrics["excluded_output_ms"] == 0
@@ -186,6 +189,61 @@ def main() -> None:
             print(
                 f"{tool} {topology}: {'performance-only' if performance_only else 'accuracy'} passed"
             )
+
+        examples = runner.parent.parent / "build/examples"
+        database = work / "cli.cuddl"
+        index = work / "cli.index"
+        subprocess.run(
+            [
+                str(examples / "cuddl-build-reference-db"),
+                str(genomes),
+                "--k",
+                "25",
+                "--buckets",
+                "4096",
+                "--output",
+                str(database),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                str(examples / "cuddl-reference-index"),
+                "build",
+                str(database),
+                "--output",
+                str(index),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        for extra in ([], ["--index", str(index)]):
+            command = [
+                str(examples / "cuddl-reference-index"),
+                "search",
+                str(database),
+                "--all-to-all",
+                "--minimum-matches",
+                "1" if extra else "0",
+                *extra,
+            ]
+            listing = subprocess.run(
+                command, check=True, capture_output=True, text=True
+            ).stdout.splitlines()[1:]
+            tsv = sorted(
+                (*map(int, row.split("\t")[:6]), float(row.split("\t")[6]))
+                for row in listing
+            )
+            assert [row[:2] for row in tsv] == [(0, 1), (0, 2), (1, 2)], tsv
+            binary = work / "cli-results.bin"
+            subprocess.run(
+                [*command, "--output", str(binary)], check=True, capture_output=True
+            )
+            assert sorted(struct.iter_unpack("<6Id", binary.read_bytes())) == tsv
+        print(
+            "cuddl CLI: all-to-all searches each unordered pair once, TSV and binary agree"
+        )
 
         rabbit = (
             runner.parent.parent / "build/benchmarks/rabbitsketch-pipeline-benchmark"

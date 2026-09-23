@@ -12,12 +12,22 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
   sketch command; cuDDL times reference-database build; RabbitSketch
   times pipeline prepare; cub-exact times its device sketch phase.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
-  cuDDL runs exhaustive comparison without an index,
-  RabbitSketch its pipeline query, cub-exact its device phase, and the CLI
-  tools their native compare commands. Each lane's times cover producing the
-  pairwise results; the pipeline benchmarks' own output phases (per-genome
-  metrics and a JSON sample of match rows) are recorded beside them, never
-  counted as comparison.
+  cuDDL's wall is its search CLI without an index (load the reference database,
+  sketch FASTX queries, compare, write binary results); RabbitSketch's wall sketches FASTX
+  queries against resident references; cub-exact times its device phase, and the
+  CLI tools their native compare commands. Batch queries are sketched from FASTX
+  inside the wall: skani dist sketches both sides itself; Dashing2 loads cached
+  reference sketches and evicts query cache entries before each rep; hypergen runs
+  `sketch` on the queries before `dist` on the saved reference sketch. All-to-all
+  compares each unordered reference pair once: cuDDL reuses
+  its database rows, RabbitSketch re-sketches the reference files. Resident times
+  cover the comparison alone; the pipeline benchmarks' own output phases
+  (per-genome metrics and a JSON sample of match rows) are recorded beside them,
+  never counted as comparison. cuDDL's pipeline runs use the database file's row
+  layout, index geometry, and search calls, so resident and wall time the same work.
+- SEARCH: the query wall includes FASTX query sketching and getting the index
+  ready: cuDDL loads a saved index file; tools without an index file format
+  (RabbitSketch, Dashing2) construct it inside the timed interval.
 
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
@@ -51,6 +61,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
@@ -209,6 +220,77 @@ def cub_inputs(
     return ["--config", str(config)]
 
 
+def cuddl_database(
+    builder: Path, work: Path, name: str, references: list[Path], workers: int
+) -> Path:
+    """Builds a cuDDL reference database whose IDs follow the order of @p references.
+
+    The builder takes a folder and sorts its paths, so zero-padded symlinks pin the order.
+    """
+    farm = work / f"{name}-refs"
+    farm.mkdir()
+    width = len(str(len(references)))
+    for i, path in enumerate(references):
+        (farm / f"{i:0{width}d}-{path.name}").symlink_to(path.resolve())
+    database = work / f"{name}.cuddl"
+    run_timed(
+        f"cuddl database: {len(references)} references",
+        [
+            str(builder),
+            str(farm),
+            "--k",
+            "25",
+            "--buckets",
+            "4096",
+            "--output",
+            str(database),
+            "--workers",
+            str(workers),
+        ],
+    )
+    return database
+
+
+def cuddl_search_command(
+    cli: Path,
+    work: Path,
+    name: str,
+    database: Path,
+    queries: list[Path] | None,
+    minimum_matches: int,
+    workers: int,
+    index: Path | None = None,
+) -> list[str]:
+    """Returns a CLI search that loads @p database (and @p index).
+
+    FASTX @p queries are sketched and searched against every reference; None searches the
+    database rows against each other, each unordered pair once. Results go to a binary file in
+    @p work, as other lanes write theirs to disk.
+    """
+    # --config belongs to the top-level app, --all-to-all to the search subcommand.
+    before, after = [], ["--all-to-all"]
+    if queries is not None:
+        config = work / f"{name}-cli.toml"
+        config.write_text(
+            "[search]\nquery = " + json.dumps([str(q) for q in queries]) + "\n"
+        )
+        before, after = ["--config", str(config)], []
+    return [
+        str(cli),
+        *before,
+        "search",
+        str(database),
+        *after,
+        *(["--index", str(index)] if index else []),
+        "--output",
+        str(work / f"{name}-results.bin"),
+        "--minimum-matches",
+        str(minimum_matches),
+        "--workers",
+        str(workers),
+    ]
+
+
 def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
     """Runs one benchmark invocation, reporting what started and how long it took.
 
@@ -227,14 +309,27 @@ def wall_of(
     samples: int,
     warmups: int,
     resident: list[dict] | None = None,
+    prepare: Callable[[], None] | None = None,
+    resident_skip: int = 0,
 ) -> list[float]:
+    """Times @p command, a command or a group run back to back, per rep.
+
+    @p prepare runs untimed before each rep. Resident timings sum over the group, except its
+    first @p resident_skip commands, which count toward wall time only.
+    """
     groups = command if command and isinstance(command[0], list) else [command]
     marks: list[float] = []
     for rep in range(warmups + samples):
+        if prepare is not None:
+            prepare()
         resident_parts = [] if resident is not None else None
         tick = time.perf_counter()
-        for item in groups:
-            run(item, quiet=True, resident=resident_parts)
+        for index, item in enumerate(groups):
+            run(
+                item,
+                quiet=True,
+                resident=resident_parts if index >= resident_skip else None,
+            )
         done = time.perf_counter()
         if rep >= warmups:
             marks.append((done - tick) * 1000)
@@ -330,6 +425,18 @@ def retrieval_phases(
     if device_phase is not None:
         phases["device_search_ms"] = timings[device_phase]["median_ms"]
     return phases
+
+
+# Database files store packed rows and index every bucket with 15-bit keys, so the pipeline runs
+# that supply resident timings and accuracy use the same geometry as the timed CLI.
+_CUDDL_FILE_CONFIGURATION = [
+    "--rows",
+    "packed",
+    "--indexed-buckets",
+    "4096",
+    "--key-bits",
+    "15",
+]
 
 
 # The phase that produces the pairwise results, per tool and topology. RabbitSketch's search is
@@ -685,6 +792,8 @@ def main(
     dashing2 = build / "subprojects/dashing2/dashing2"
     cub = build / "benchmarks/cub-exact-pairwise"
     refbuild = build / "benchmarks/cuddl-reference-build-benchmark"
+    cuddl_cli = build / "examples/cuddl-reference-index"
+    cuddl_dbbuild = build / "examples/cuddl-build-reference-db"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
     # Forwarded to every cub lane that evaluates pairs, so a large corpus can be told to keep
     # less resident than the default share of host memory.
@@ -700,12 +809,14 @@ def main(
     if "cub-exact" in selected:
         required.append(cub)
     if "cuddl" in selected:
-        required.append(refbuild)
+        required += [refbuild, cuddl_cli, cuddl_dbbuild]
     if "rabbitsketch" in selected:
         required.append(rabbit)
     for binary in required:
         if not binary.exists():
-            raise typer.BadParameter(f"missing binary, build first: {binary}")
+            raise typer.BadParameter(
+                f"missing binary, build first (cuDDL CLIs need -Dexamples=enabled): {binary}"
+            )
 
     measurements: list[dict] = []
     resident_timings: dict[tuple[str, str], dict] = {}
@@ -1642,15 +1753,32 @@ def main(
             # `cmp` writes a value per pair. A square matrix over a full corpus is about ten
             # billion numbers, which no host can hold, so the queries go in by file: the
             # rectangular panel holds one row per reference and one column per query, which is
-            # the same asymmetric comparison bounded by the query count. It reuses the sketch
-            # cache the sketch lane filled, so the timed passes compare only.
+            # the same asymmetric comparison bounded by the query count. References load from
+            # the sketch cache the sketch lane filled. Batch queries enter under their own
+            # names, and their cache entries are removed before every rep, so each timed pass
+            # sketches them from FASTX; all-to-all queries are the cached references.
             d2_dir = work / "d2"
             d2_dir.mkdir(exist_ok=True)
             panel_queries = query_list or references
+            d2_query_inputs = list(panel_queries)
+            d2_prepare = None
+            if topology == "batch":
+                d2_query_dir = work / "d2-fastx-queries"
+                d2_query_dir.mkdir(exist_ok=True)
+                d2_query_inputs = []
+                for n, path in enumerate(panel_queries):
+                    link = d2_query_dir / f"fastx-query-{n}-{path.name}"
+                    link.symlink_to(path.resolve())
+                    d2_query_inputs.append(link)
+
+                def d2_prepare() -> None:
+                    for cached in d2_dir.glob("fastx-query-*"):
+                        cached.unlink()
+
             reference_list = work / "d2refs.txt"
             query_listing = work / "d2queries.txt"
             reference_list.write_text("".join(f"{p}\n" for p in references))
-            query_listing.write_text("".join(f"{p}\n" for p in panel_queries))
+            query_listing.write_text("".join(f"{p}\n" for p in d2_query_inputs))
             panel = work / "d2panel.txt"
             cmp_cmd = [
                 str(dashing2),
@@ -1669,7 +1797,13 @@ def main(
                 str(panel),
             ]
             d2_compare_resident = []
-            marks = wall_of([cmp_cmd], samples, warmups, resident=d2_compare_resident)
+            marks = wall_of(
+                [cmp_cmd],
+                samples,
+                warmups,
+                resident=d2_compare_resident,
+                prepare=d2_prepare,
+            )
             record_native_resident("dashing2", "compare", d2_compare_resident)
             panel_pairs = len(references) * len(panel_queries)
             panel_stride = (
@@ -1686,25 +1820,44 @@ def main(
             query_sketch = (
                 str(work / "hgq.sk") if topology == "batch" else str(work / "hgr.sk")
             )
+            hg_dist = [
+                str(hypergen),
+                "dist",
+                "-r",
+                str(work / "hgr.sk"),
+                "-q",
+                query_sketch,
+                "-o",
+                str(dist_out),
+                "-a",
+                "0",
+                "-t",
+                str(threads),
+            ]
+            # dist only reads sketch files, so batch walls sketch the FASTX queries first;
+            # resident time stays the comparison alone. All-to-all queries are the reference
+            # sketch file.
+            hg_query_sketch = [
+                str(hypergen),
+                "sketch",
+                "-p",
+                str(work / "hgqueries"),
+                "-o",
+                query_sketch,
+                "-t",
+                str(threads),
+                "-k",
+                "25",
+                "-D",
+                hypergen_device,
+            ]
             hg_compare_resident = []
             marks = wall_of(
-                [
-                    str(hypergen),
-                    "dist",
-                    "-r",
-                    str(work / "hgr.sk"),
-                    "-q",
-                    query_sketch,
-                    "-o",
-                    str(dist_out),
-                    "-a",
-                    "0",
-                    "-t",
-                    str(threads),
-                ],
+                [hg_query_sketch, hg_dist] if topology == "batch" else [hg_dist],
                 samples,
                 warmups,
                 resident=hg_compare_resident,
+                resident_skip=1 if topology == "batch" else 0,
             )
             record_native_resident("hypergen", "compare", hg_compare_resident)
             rows = []
@@ -1819,8 +1972,8 @@ def main(
                     cuddl_ingest,
                     "--resident-bytes",
                     "0",
-                    "--rows",
-                    "compact",
+                    # Same layout and index geometry as the CLI's database file.
+                    *_CUDDL_FILE_CONFIGURATION,
                     "--exhaustive",
                     "--minimum-matches",
                     "0",
@@ -1861,16 +2014,32 @@ def main(
             resident_timings[("cuddl", "compare")] = pipe["timings"][
                 f"{_CUDDL_DEVICE_PHASES[topology]}_exhaustive"
             ]
-            native_timings[("cuddl", "compare")] = {
-                "wall": pipe["timings"]["search_and_download"]
-            }
-            evaluated = pipe["metrics"].get("match_rows_total")
+            # Wall is the CLI: load the database, sketch FASTX queries (batch) or reuse its
+            # rows (all-to-all, unique pairs only), compare, write binary results.
+            cuddl_db = cuddl_database(
+                cuddl_dbbuild, work, "cuddl-compare", references, cuddl_workers
+            )
+            typer.echo(f"  cuddl compare: CLI wall ({topology})")
+            marks = wall_of(
+                cuddl_search_command(
+                    cuddl_cli,
+                    work,
+                    "cuddl-compare",
+                    cuddl_db,
+                    query_list if topology == "batch" else None,
+                    0,
+                    cuddl_workers,
+                ),
+                samples,
+                warmups,
+            )
+            native_timings[("cuddl", "compare")] = {"wall": summarize(marks)}
             record_compare(
                 "cuddl",
                 "gpu",
-                [phases["retrieval_ms"]] * max(samples, 1),
+                marks,
                 rows,
-                evaluated=evaluated,
+                evaluated=count_pairs(references, query_list, topology),
             )
             measurements[-1]["metrics"].update(phases)
 
@@ -1889,14 +2058,14 @@ def main(
                         }
                     )
             phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
-            native_timings[("rabbitsketch", "compare")] = {
-                "wall": rabbit_rows["timings"][_RABBITS_RESULT_PHASES[topology]]
-            }
+            # Wall sketches the query side from FASTX against resident reference sketches.
+            fastx_compare = rabbit_rows["timings"]["query_fastx_compare"]
+            native_timings[("rabbitsketch", "compare")] = {"wall": fastx_compare}
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
             record_compare(
                 "rabbitsketch",
                 "FastKMV",
-                [phases["retrieval_ms"]] * max(samples, 1),
+                [fastx_compare["median_ms"]] * max(samples, 1),
                 rows,
                 evaluated=evaluated,
             )
@@ -2003,8 +2172,7 @@ def main(
                     cuddl_ingest,
                     "--resident-bytes",
                     "0",
-                    "--rows",
-                    "compact",
+                    *_CUDDL_FILE_CONFIGURATION,
                     "--index",
                     cuddl_index,
                     "--minimum-matches",
@@ -2034,12 +2202,55 @@ def main(
             resident_timings[("cuddl", "search")] = pipe["timings"][
                 f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed"
             ]
+            # Wall is the CLI: load the database and the saved index, sketch FASTX queries
+            # (batch) or reuse its rows (all-to-all, unique pairs only), search, write binary
+            # results.
+            # Index construction is timed separately as index_build.
+            search_db = (
+                cuddl_db
+                if search_references is references
+                else cuddl_database(
+                    cuddl_dbbuild,
+                    work,
+                    "cuddl-search",
+                    search_references,
+                    cuddl_workers,
+                )
+            )
+            search_index_file = search_db.with_suffix(f".{cuddl_index}.index")
+            run_timed(
+                f"cuddl search: save {cuddl_index} index",
+                [
+                    str(cuddl_cli),
+                    "build",
+                    str(search_db),
+                    "--format",
+                    str(cuddl_index),
+                    "--output",
+                    str(search_index_file),
+                ],
+            )
+            typer.echo(f"  cuddl search: CLI wall ({search_topology})")
+            marks = wall_of(
+                cuddl_search_command(
+                    cuddl_cli,
+                    work,
+                    "cuddl-search",
+                    search_db,
+                    query_set if search_topology == "batch" else None,
+                    min_matches,
+                    cuddl_workers,
+                    search_index_file,
+                ),
+                samples,
+                warmups,
+            )
             native_timings[("cuddl", "search")] = {
-                "query": pipe["timings"]["search_and_download"],
+                "query": summarize(marks),
                 "index_build": pipe["timings"]["prepare_wall"],
             }
             search_index_ms["cuddl"] = [pipe["timings"]["prepare_wall"]["median_ms"]]
-            search_query_ms["cuddl"] = [phases["retrieval_ms"]]
+            search_query_ms["cuddl"] = marks
             for m in payload["measurements"]:
                 if m["case"].get("measurement") == "match":
                     metrics = m.get("metrics", {})
@@ -2115,11 +2326,13 @@ def main(
                     "--cmpout",
                     str(neighbors),
                 ]
-                wall_of(command, samples, warmups, resident=records)
+                # No index file format: the process wall loads cached sketches, builds the
+                # LSH index, and queries it.
+                marks = wall_of(command, samples, warmups, resident=records)
                 if any(record.get("index_build_ms", 0) <= 0 for record in records):
                     raise ValueError("Dashing2 did not execute its native LSH index")
                 search_index_ms["dashing2"] = [r["index_build_ms"] for r in records]
-                search_query_ms["dashing2"] = [r["query_wall_ms"] for r in records]
+                search_query_ms["dashing2"] = marks
                 if not performance_only:
                     with neighbors.open() as handle:
                         for line in handle:
@@ -2137,7 +2350,7 @@ def main(
                 }
             else:
                 search_query_ms["dashing2"] = wall_of(
-                    cmp_cmd, samples, warmups, resident=records
+                    cmp_cmd, samples, warmups, resident=records, prepare=d2_prepare
                 )
                 search_index_ms["dashing2"] = sketch_times["dashing2"]
                 search_cases["dashing2"] = {
@@ -2166,7 +2379,8 @@ def main(
                 if index != "none"
                 else timings["prepare_wall"]
             )
-            query_timing = timings["search_query_wall"]
+            # No index file format: the FASTX query wall also constructs the index.
+            query_timing = timings["query_fastx_search"]
             search_index_ms["rabbitsketch"] = [index_timing["median_ms"]]
             search_query_ms["rabbitsketch"] = [query_timing["median_ms"]]
             native_timings[("rabbitsketch", "search")] = {
