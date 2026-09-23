@@ -1529,6 +1529,19 @@ def main(
             record_sketch(
                 "cuddl", "reference-db", marks, {"sketch_bytes": sketch_bytes["cuddl"]}
             )
+            # The SKETCH database has the same configuration as the CLI's, so COMPARE and
+            # SEARCH reuse it whenever it holds exactly their references, in order.
+            cuddl_databases = {
+                tuple(sketch_file_args if sketch_all else file_args): db_out
+            }
+
+            def cuddl_reference_database(refs: list[Path], name: str) -> Path:
+                key = tuple(str(p) for p in refs)
+                if key not in cuddl_databases:
+                    cuddl_databases[key] = cuddl_database(
+                        cuddl_dbbuild, work, name, refs, cuddl_workers
+                    )
+                return cuddl_databases[key]
 
         if "rabbitsketch" in selected:
             import json as jsonlib3
@@ -2018,9 +2031,7 @@ def main(
             ]
             # Wall is the CLI: load the database, sketch FASTX queries (batch) or reuse its
             # rows (all-to-all, unique pairs only), compare, and discard the binary results.
-            cuddl_db = cuddl_database(
-                cuddl_dbbuild, work, "cuddl-compare", references, cuddl_workers
-            )
+            cuddl_db = cuddl_reference_database(references, "cuddl-compare")
             typer.echo(f"  cuddl compare: CLI wall ({topology})")
             marks = wall_of(
                 cuddl_search_command(
@@ -2208,17 +2219,7 @@ def main(
             # (batch) or reuse its rows (all-to-all, unique pairs only), search, and discard
             # the binary results.
             # Index construction is timed separately as index_build.
-            search_db = (
-                cuddl_db
-                if search_references == references
-                else cuddl_database(
-                    cuddl_dbbuild,
-                    work,
-                    "cuddl-search",
-                    search_references,
-                    cuddl_workers,
-                )
-            )
+            search_db = cuddl_reference_database(search_references, "cuddl-search")
             search_index_file = search_db.with_suffix(f".{cuddl_index}.index")
             run_timed(
                 f"cuddl search: save {cuddl_index} index",
