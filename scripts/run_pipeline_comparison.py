@@ -362,7 +362,7 @@ def main(
                         "--resident-bytes",
                         str(effective_resident_bytes),
                         "--sketch-size",
-                        "4096",
+                        "2048",
                         *(["--threads", str(threads)] if threads is not None else []),
                     ],
                 )
@@ -387,7 +387,7 @@ def main(
                         "--k",
                         "25",
                         "--hv-dim",
-                        "4096",
+                        "2048",
                         "--device",
                         hypergen_device,
                         *(["--threads", str(threads)] if threads is not None else []),

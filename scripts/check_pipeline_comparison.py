@@ -90,8 +90,8 @@ def _reports(
         "resident_minimum_matches": 0,
         "rows": "packed",
         "index": "sparse",
-        "buckets": 4096,
-        "indexed_buckets": 2048,
+        "buckets": 2048,
+        "indexed_buckets": 1024,
         "key_bits": 15,
         "hash_seed": 42,
     }
@@ -116,7 +116,7 @@ def _reports(
         if rabbit_ingest == "sequence"
         else "packed_u64_actg_max",
         "resident_minimum_matches": 0,
-        "sketch_size": 4096,
+        "sketch_size": 2048,
         "orchestration_threads": 7,
     }
     if seq_resident and rabbit_ingest == "sequence":

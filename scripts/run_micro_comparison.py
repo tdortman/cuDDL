@@ -41,8 +41,10 @@ Truth comes from cub-exact-pairwise (exact Jaccard and containment,
 verified bit-identical against a Python oracle) and, when --skani-truth is
 passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
 work and the slowest lane on a full corpus: it can run on a host that is not
-measuring a GPU. k and sketch sizes stay native per tool and are recorded;
-tools are compared in error-versus-time space, never by equalizing inputs.
+measuring a GPU. Fixed-size sketches use 2048 entries (cuDDL buckets with DDL's
+5-bit exponent and 11-bit mantissa, Dashing2 registers, RabbitSketch slots,
+hypergen dimensions); skani keeps its own sampling and k. Entries differ in width
+and information per tool, so tools are compared in error-versus-time space.
 
 Caps are automatic unless passed explicitly: threads default to the CPU
 count, max-kmers derives from free VRAM, the evaluated pair set derives
@@ -242,7 +244,9 @@ def cuddl_database(
             "--k",
             "25",
             "--buckets",
-            "4096",
+            "2048",
+            "--exponent-bits",
+            "5",
             "--output",
             str(database),
             "--workers",
@@ -435,7 +439,7 @@ _CUDDL_FILE_CONFIGURATION = [
     "--rows",
     "packed",
     "--indexed-buckets",
-    "4096",
+    "2048",
     "--key-bits",
     "15",
 ]
@@ -1342,6 +1346,8 @@ def main(
                         "25",
                         "-D",
                         hypergen_device,
+                        "-d",
+                        "2048",
                     ]
                 ]
                 if topology == "batch":
@@ -1359,6 +1365,8 @@ def main(
                             "25",
                             "-D",
                             hypergen_device,
+                            "-d",
+                            "2048",
                         ]
                     )
                 # The subset sketch only feeds dist; its timing is the full run's. One pass is
@@ -1446,7 +1454,7 @@ def main(
                             str(dashing2),
                             "sketch",
                             "-k25",
-                            "-S4096",
+                            "-S2048",
                             f"-p{threads}",
                             "--cache",
                             "--outprefix",
@@ -1584,7 +1592,7 @@ def main(
                     "--resident-bytes",
                     str(resident_cap),
                     "--sketch-size",
-                    "4096",
+                    "2048",
                     "--config",
                     str(cfg),
                     "--output",
@@ -1799,7 +1807,7 @@ def main(
                 str(dashing2),
                 "cmp",
                 "-k25",
-                "-S4096",
+                "-S2048",
                 f"-p{threads}",
                 "--cache",
                 "--outprefix",
@@ -1865,6 +1873,8 @@ def main(
                 "25",
                 "-D",
                 hypergen_device,
+                "-d",
+                "2048",
             ]
             hg_compare_resident = []
             marks = wall_of(
@@ -2317,7 +2327,7 @@ def main(
                     str(dashing2),
                     "cmp",
                     "-k25",
-                    "-S4096",
+                    "-S2048",
                     f"-p{threads}",
                     "--cache",
                     "--outprefix",

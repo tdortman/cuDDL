@@ -37,10 +37,12 @@
 
 namespace {
 constexpr uint32_t k = 25;
-constexpr size_t buckets = 4096;
-using sketch = cuddl::sketch<k, buckets>;
-using database = cuddl::reference_database<k, buckets>;
-using reference_index_type = cuddl::reference_index<k, buckets>;
+constexpr size_t buckets = 2048;
+// DDL's recommended genome-to-genome configuration: 5-bit exponent, 11-bit mantissa.
+using layout = cuddl::register_layout<5, 11>;
+using sketch = cuddl::sketch<k, buckets, layout>;
+using database = cuddl::reference_database<k, buckets, layout>;
+using reference_index_type = cuddl::reference_index<k, buckets, layout>;
 
 struct options {
     std::vector<std::string> references, queries;
@@ -177,7 +179,7 @@ genome_rows stream_genomes(
     std::vector<std::filesystem::path> files{paths.begin(), paths.end()};
     cuddl::reference_build_statistics statistics;
     genome_rows result;
-    result.store = CUDDL_UNWRAP((cuddl::build_sketch_store<k, buckets>(
+    result.store = CUDDL_UNWRAP((cuddl::build_sketch_store<k, buckets, layout>(
         files, stream, {.statistics = &statistics, .parser_workers = opts.workers}
     )));
     result.genomes = paths.size();
@@ -380,11 +382,9 @@ struct collection {
     }
     void cardinality(cuda::stream_ref stream) {
         if (store.size()) {
-            CUDDL_UNWRAP(
-                cuddl::cardinality_batch_async<buckets>(
-                    stored_rows(store), empty, cardinalities, stream
-                )
-            );
+            CUDDL_UNWRAP((cuddl::cardinality_batch_async<buckets, layout>(
+                stored_rows(store), empty, cardinalities, stream
+            )));
             return;
         }
         for (size_t i = 0; i < sketches.size(); ++i) {
@@ -404,14 +404,14 @@ std::vector<T> download(cuda::device_buffer<T> const& data, cuda::stream_ref str
 }
 
 cuddl::score_compatibility compatibility(options const& opts) {
-    auto result = cuddl::score_compatibility::current<k, buckets>();
+    auto result = cuddl::score_compatibility::current<k, buckets, layout>();
     result.indexed_bucket_count = opts.indexed_buckets;
     result.key_mask = static_cast<uint16_t>((uint32_t{1} << opts.key_bits) - 1);
     return result;
 }
 database build(collection const& refs, options const& opts, cuda::stream_ref stream, bool indexed) {
     auto const compat =
-        indexed ? compatibility(opts) : cuddl::score_compatibility::current<k, buckets>();
+        indexed ? compatibility(opts) : cuddl::score_compatibility::current<k, buckets, layout>();
     if (opts.rows == "packed") {
         return CUDDL_UNWRAP(database::build_async(refs.packed, refs.saturated, compat, stream));
     }
@@ -1113,10 +1113,9 @@ json resident_timings(
         size_t block_end = 0;
         auto construct_sequence = [&](cuda::stream_ref s) {
             auto const grid = static_cast<uint32_t>(std::min(block_end, max_grid));
-            cuddl::detail::add_sequence_batch_kernel<buckets, cuddl::default_register_layout>
-                <<<grid, 256, 0, s.get()>>>(
-                    staged->data(), host.size(), block_end, k, store.data()
-                );
+            cuddl::detail::add_sequence_batch_kernel<buckets, layout><<<grid, 256, 0, s.get()>>>(
+                staged->data(), host.size(), block_end, k, store.data()
+            );
             CUDDL_CUDA_CALL(cudaGetLastError());
         };
         std::map<std::string, std::vector<double>> samples;
@@ -1641,9 +1640,9 @@ json run(options const& opts) {
     };
     // Packed-input stages need a materialized k-mer stream; a streamed corpus skips them.
     if (!streamed) {
-        std::string a48_text = "#k\t25\n#exponent\t6\n";
+        std::string a48_text = "#k\t25\n#exponent\t" + std::to_string(layout::exponent_bits) + "\n";
         for (size_t r = 0; r < refs.sketches.size(); ++r) {
-            a48_text += "#id\t" + std::to_string(r) + "\n#len\t4096\n";
+            a48_text += "#id\t" + std::to_string(r) + "\n#len\t" + std::to_string(buckets) + "\n";
             for (size_t b = 0; b < buckets; ++b) {
                 if (b != 0) {
                     a48_text += '\t';

@@ -92,7 +92,7 @@ def main(
                     "--topology",
                     topology,
                     "--indexed-buckets",
-                    "4096" if topology == "all-to-all" else "2048",
+                    "2048" if topology == "all-to-all" else "1024",
                     "--key-bits",
                     "16" if rows == "packed" else "15",
                     "--minimum-matches",
@@ -141,12 +141,12 @@ def main(
                             for key, value in values.items()
                             if key.startswith("q_")
                         )
-                        == 4096
+                        == 2048
                     )
                     if case["genome_id"] == 2:
                         assert values["saturated"] and values["q_65535"] > 0
                     if case["role"] == "query" and case["genome_id"] == 1:
-                        assert values["cardinality"] == 0 and values["q_0"] == 4096
+                        assert values["cardinality"] == 0 and values["q_0"] == 2048
                 elif case["measurement"] == "match" and topology == "batch":
                     assert case["query_id"] != 1, (
                         "empty query passed the positive retrieval threshold"

@@ -21,7 +21,8 @@ int main(int argc, char** argv) try {
     bool parse_only = false;
     std::string transfer = "automatic";
     CLI::App app{
-        "NVBench wall timing of FASTX -> reference sketches -> binary file (k=25, buckets=4096)"
+        "NVBench wall timing of FASTX -> reference sketches -> binary file "
+        "(k=25, buckets=2048, 5-bit exponent + 11-bit mantissa)"
     };
     app.add_option("--reference", references)->required()->check(CLI::ExistingFile);
     app.add_option("--database", output, "Temporary benchmark database destination")->required();
@@ -82,14 +83,16 @@ int main(int argc, char** argv) try {
             } else {
                 statistics = {};
                 statistics.measure_resident = true;
-                auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 4096>(
-                    paths,
-                    stream,
-                    {.statistics = &statistics,
-                     .parser_workers = workers,
-                     .staging_bytes = staging_bytes,
-                     .transfer = requested_transfer}
-                )));
+                auto file = CUDDL_UNWRAP(
+                    (cuddl::reference_database_file::build<25, 2048, cuddl::register_layout<5, 11>>(
+                        paths,
+                        stream,
+                        {.statistics = &statistics,
+                         .parser_workers = workers,
+                         .staging_bytes = staging_bytes,
+                         .transfer = requested_transfer}
+                    ))
+                );
                 CUDDL_UNWRAP(file.save(output));
             }
             timer.stop();
