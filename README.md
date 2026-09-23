@@ -44,7 +44,7 @@ cd cuDDL
 # Optional: enter the supplied development environment.
 nix develop
 
-# Build the command-line examples without the benchmark toolchain.
+# The command-line examples are off by default, enable them explicitly.
 meson setup build -Dexamples=enabled -Dtests=disabled -Dbenchmarks=disabled
 meson compile -C build
 ```

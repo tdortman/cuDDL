@@ -15,6 +15,6 @@ option(
 option(
     'examples',
     type: 'feature',
-    value: 'auto',
+    value: 'disabled',
     description: 'Build examples for the library',
 )
