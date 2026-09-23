@@ -115,6 +115,8 @@ Both `dense` and `sparse` index formats are supported; `dense` is the CLI defaul
 
 `--minimum-matches` counts matching indexed buckets, not matching k-mers or a percentage identity. A positive threshold filters candidates and is not an exhaustive comparison. Omit `--index` to search directly against the database.
 
+To compare the references with each other instead of with separate queries, replace `--query` with `--all-to-all`. Each unordered pair is searched once and reported with `query_id < reference_id`; both IDs are reference IDs. Long query lists can go in a TOML file passed as `--config options.toml` before `search`, with `query = [...]` under a `[search]` section.
+
 ### Reading the output
 
 Search writes a tab-separated table to standard output:
@@ -124,6 +126,8 @@ query_id    reference_id    lower    equal    higher    both_empty    cardinalit
 ```
 
 The actual delimiter is a tab. Query IDs are zero-based in the order supplied to `--query`; reference IDs are zero-based in the builder's sorted file order. The remaining columns contain raw sketch comparison counts and a cardinality estimate. This CLI does not output ranked hits or ANI scores. Use the C++ metric helpers when you need derived metrics.
+
+For large result sets, pass `--output results.bin` to skip text formatting. The file holds headerless 32-byte little-endian records with the same fields in the same order: six `uint32` values followed by a `float64` cardinality. Python reads it with `struct.iter_unpack("<6Id", data)`; NumPy reads it with a structured dtype of six `<u4` fields and one `<f8` field.
 
 ## C++ API
 

@@ -1,13 +1,20 @@
 #include "reference_index_command.hpp"
+
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
+
 #include <algorithm>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <type_traits>
 
 namespace {
 
+// Binary output rows are raw little-endian batch_search_result records, documented in README.md.
+static_assert(sizeof(cuddl::batch_search_result) == 32);
+static_assert(std::is_trivially_copyable_v<cuddl::batch_search_result>);
 
 /// Query genomes sketched per batch; each batch then runs as one batched search.
 constexpr size_t query_batch_size = 4096;
@@ -17,6 +24,8 @@ void search(
     cuddl::reference_database<K, Buckets> const& database,
     cuddl::reference_index<K, Buckets> const* index,
     std::vector<std::filesystem::path> const& paths,
+    std::filesystem::path const& output,
+    bool all_to_all,
     uint32_t minimum_matches,
     unsigned workers,
     cuda::stream_ref stream
@@ -24,7 +33,10 @@ void search(
     using query_type = cuddl::query_sketch_batch<K, Buckets>;
     auto const batch_capacity = std::min(query_batch_size, paths.size());
     auto const requirements = CUDDL_UNWRAP(
-        database.batch_search_requirements(static_cast<uint32_t>(batch_capacity), stream, index)
+        all_to_all ? database.all_to_all_search_requirements(stream, index)
+                   : database.batch_search_requirements(
+                         static_cast<uint32_t>(batch_capacity), stream, index
+                     )
     );
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
@@ -34,60 +46,114 @@ void search(
     );
     auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
     std::vector<cuddl::batch_search_result> host;
-    std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\tcardinality\n"
-              << std::setprecision(17);
-    for (size_t first = 0; first < paths.size(); first += query_batch_size) {
-        auto batch_size = std::min(query_batch_size, paths.size() - first);
-        auto queries = CUDDL_UNWRAP(
-            query_type::sketch(
-                std::span{paths.data() + first, batch_size}, stream, {.parser_workers = workers}
-            )
-        );
-        // Each tile's results are printed before the next tile reuses the storage.
-        auto print_tile = [&](uint32_t) {
-            uint32_t found{};
-            cuda::copy_bytes(stream, count, cuda::std::span{&found, size_t{1}});
-            stream.sync();
-            host.resize(found);
-            if (found != 0) {
-                cuda::copy_bytes(
-                    stream,
-                    cuda::std::span{results.data(), static_cast<size_t>(found)},
-                    cuda::std::span{host.data(), host.size()}
-                );
-                stream.sync();
-            }
-            for (auto const& result : host) {
-                auto const& counts = result.summary.counts;
-                std::cout << result.query_id << '\t' << result.reference_id << '\t'
-                          << counts.lower << '\t' << counts.equal << '\t' << counts.higher
-                          << '\t' << counts.both_empty << '\t' << result.summary.cardinality
-                          << '\n';
-            }
-        };
-        CUDDL_UNWRAP(database.search_batch_async(
-            queries.scores(),
-            query_type::compatibility(),
-            static_cast<uint32_t>(first),
-            {workspace.data(), workspace.size()},
-            {results.data(), results.size()},
-            {count.data(), count.size()},
-            print_tile,
-            {},
-            {.minimum_matches = minimum_matches},
-            stream,
-            index
-        ));
+    std::ofstream binary;
+    if (output.empty()) {
+        std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\tcardinality\n"
+                  << std::setprecision(17);
+    } else {
+        binary.open(output, std::ios::binary | std::ios::trunc);
+        if (!binary) throw std::runtime_error("cannot open " + output.string());
     }
-    if (!std::cout) throw std::runtime_error("cannot write search results");
+    // Each tile's results are written before the next tile reuses the storage.
+    auto write_tile = [&](uint32_t) {
+        uint32_t found{};
+        cuda::copy_bytes(stream, count, cuda::std::span{&found, size_t{1}});
+        stream.sync();
+        host.resize(found);
+        if (found != 0) {
+            cuda::copy_bytes(
+                stream,
+                cuda::std::span{results.data(), static_cast<size_t>(found)},
+                cuda::std::span{host.data(), host.size()}
+            );
+            stream.sync();
+        }
+        if (binary.is_open()) {
+            binary.write(
+                reinterpret_cast<char const*>(host.data()),
+                static_cast<std::streamsize>(host.size() * sizeof(cuddl::batch_search_result))
+            );
+            return;
+        }
+        for (auto const& result : host) {
+            auto const& counts = result.summary.counts;
+            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
+                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
+                      << '\t' << result.summary.cardinality << '\n';
+        }
+    };
+    // Without an index or a threshold every pair is reported, so the dedicated exhaustive
+    // kernels run instead of counting matches only to discard nothing.
+    bool const exhaustive = index == nullptr && minimum_matches == 0;
+    if (all_to_all) {
+        // Database rows are the queries; only pairs with query_id < reference_id are searched.
+        if (exhaustive) {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                {workspace.data(), workspace.size()},
+                {results.data(), results.size()},
+                {count.data(), count.size()},
+                write_tile,
+                {},
+                stream
+            ));
+        } else {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                {workspace.data(), workspace.size()},
+                {results.data(), results.size()},
+                {count.data(), count.size()},
+                write_tile,
+                {},
+                {.minimum_matches = minimum_matches},
+                stream,
+                index
+            ));
+        }
+    } else {
+        for (size_t first = 0; first < paths.size(); first += query_batch_size) {
+            auto batch_size = std::min(query_batch_size, paths.size() - first);
+            auto queries = CUDDL_UNWRAP(
+                query_type::sketch(
+                    std::span{paths.data() + first, batch_size}, stream, {.parser_workers = workers}
+                )
+            );
+            if (exhaustive) {
+                CUDDL_UNWRAP(database.search_batch_async(
+                    queries.scores(),
+                    query_type::compatibility(),
+                    static_cast<uint32_t>(first),
+                    {workspace.data(), workspace.size()},
+                    {results.data(), results.size()},
+                    {count.data(), count.size()},
+                    write_tile,
+                    {},
+                    stream
+                ));
+            } else {
+                CUDDL_UNWRAP(database.search_batch_async(
+                    queries.scores(),
+                    query_type::compatibility(),
+                    static_cast<uint32_t>(first),
+                    {workspace.data(), workspace.size()},
+                    {results.data(), results.size()},
+                    {count.data(), count.size()},
+                    write_tile,
+                    {},
+                    {.minimum_matches = minimum_matches},
+                    stream,
+                    index
+                ));
+            }
+        }
+    }
+    if (binary.is_open() ? !binary.flush() : !std::cout) {
+        throw std::runtime_error("cannot write search results");
+    }
 }
 
-template <size_t Buckets, uint32_t K = 1>
+}  // namespace
+
+template <size_t Buckets, uint32_t K>
 void dispatch_reference_index(reference_index_command const& command) {
-    if (command.database.metadata().compatibility.kmer_length != K) {
-        if constexpr (K < 31) return dispatch_reference_index<Buckets, K + 1>(command);
-        throw std::invalid_argument("unsupported k-mer length");
-    }
     cuda::stream stream{cuda::devices[0]};
     auto database = CUDDL_UNWRAP((command.database.upload<K, Buckets>(stream)));
     using index_type = cuddl::reference_index<K, Buckets>;
@@ -107,14 +173,14 @@ void dispatch_reference_index(reference_index_command const& command) {
             database,
             index ? &*index : nullptr,
             command.queries,
+            command.output,
+            command.all_to_all,
             command.minimum_matches,
             command.workers,
             stream
         );
     }
 }
-}  // namespace
 
-void dispatch_reference_index_@BUCKETS@(reference_index_command const& command) {
-    dispatch_reference_index<@BUCKETS@>(command);
-}
+// Meson substitutes one explicit instantiation per k-mer length assigned to this unit.
+@INSTANTIATIONS@

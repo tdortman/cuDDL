@@ -1,14 +1,40 @@
 #include <CLI/CLI.hpp>
+
 #include <iostream>
 #include <string>
 
 #include "reference_index_command.hpp"
+
+namespace {
+
+template <size_t Buckets, uint32_t K = 1>
+void dispatch_kmers(reference_index_command const& command, uint32_t kmer_length) {
+    if (kmer_length == K) return dispatch_reference_index<Buckets, K>(command);
+    if constexpr (K < 31) return dispatch_kmers<Buckets, K + 1>(command, kmer_length);
+    throw std::invalid_argument("unsupported k-mer length");
+}
+
+/// Bucket counts are the powers of two from 2048 through 131072.
+template <size_t Buckets = 2048>
+void dispatch_buckets(
+    reference_index_command const& command,
+    cuddl::score_compatibility const& compatibility
+) {
+    if (compatibility.bucket_count == Buckets) {
+        return dispatch_kmers<Buckets>(command, compatibility.kmer_length);
+    }
+    if constexpr (Buckets < 131072) return dispatch_buckets<Buckets * 2>(command, compatibility);
+    throw std::invalid_argument("unsupported sketch bucket count");
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     CLI::App app{"Build persistent retrieval indexes or search a validated index file"};
     app.require_subcommand(1);
     std::string database_path, index_path, format = "dense";
     std::vector<std::filesystem::path> queries;
+    std::filesystem::path output;
     uint32_t minimum_matches = 1;
     unsigned workers = cuddl::default_parser_workers();
     auto* build = app.add_subcommand(
@@ -26,10 +52,20 @@ int main(int argc, char** argv) {
     query->add_option("database", database_path)->required()->check(CLI::ExistingFile);
     query->add_option("--index", index_path, "Optional acceleration index file")
         ->check(CLI::ExistingFile);
+    auto* query_option =
+        query
+            ->add_option(
+                "--query", queries, "One query genome per FASTA/FASTQ file, in supplied order"
+            )
+            ->check(CLI::ExistingFile);
+    bool all_to_all = false;
     query
-        ->add_option("--query", queries, "One query genome per FASTA/FASTQ file, in supplied order")
-        ->required()
-        ->check(CLI::ExistingFile);
+        ->add_flag(
+            "--all-to-all",
+            all_to_all,
+            "Search database rows against each other, each unordered pair once, instead of --query"
+        )
+        ->excludes(query_option);
     query
         ->add_option(
             "--minimum-matches",
@@ -37,10 +73,21 @@ int main(int argc, char** argv) {
             "Required matching indexed buckets; zero searches all references"
         )
         ->default_val(minimum_matches);
+    query->add_option(
+        "-o,--output",
+        output,
+        "Write binary result records here instead of TSV on standard output (replaces file)"
+    );
     query->add_option("--workers", workers, "Concurrent query genome loaders")
         ->check(CLI::PositiveNumber);
+    app.set_config(
+        "--config", "", "TOML options file; long query lists go under [search] as query = [...]"
+    );
     CLI11_PARSE(app, argc, argv);
     try {
+        if (*query && !all_to_all && queries.empty()) {
+            throw std::invalid_argument("search needs --query or --all-to-all");
+        }
         if (*build && std::filesystem::exists(index_path) &&
             std::filesystem::equivalent(database_path, index_path)) {
             throw std::invalid_argument("index output must not overwrite the reference database");
@@ -54,36 +101,14 @@ int main(int argc, char** argv) {
             database,
             index_path,
             queries,
+            output,
+            all_to_all,
             minimum_matches,
             workers,
             bool(*build),
             format == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
         };
-        switch (compatibility.bucket_count) {
-            case 2048:
-                dispatch_reference_index_2048(command);
-                break;
-            case 4096:
-                dispatch_reference_index_4096(command);
-                break;
-            case 8192:
-                dispatch_reference_index_8192(command);
-                break;
-            case 16384:
-                dispatch_reference_index_16384(command);
-                break;
-            case 32768:
-                dispatch_reference_index_32768(command);
-                break;
-            case 65536:
-                dispatch_reference_index_65536(command);
-                break;
-            case 131072:
-                dispatch_reference_index_131072(command);
-                break;
-            default:
-                throw std::invalid_argument("unsupported sketch bucket count");
-        }
+        dispatch_buckets(command, compatibility);
         if (*build) std::cout << "Saved " << format << " index to " << index_path << '\n';
 
     } catch (std::exception const& error) {
