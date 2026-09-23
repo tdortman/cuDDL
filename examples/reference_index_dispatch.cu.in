@@ -19,10 +19,10 @@ static_assert(std::is_trivially_copyable_v<cuddl::batch_search_result>);
 /// Query genomes sketched per batch; each batch then runs as one batched search.
 constexpr size_t query_batch_size = 4096;
 
-template <uint32_t K, size_t Buckets>
+template <uint32_t K, size_t Buckets, typename Layout>
 void search(
-    cuddl::reference_database<K, Buckets> const& database,
-    cuddl::reference_index<K, Buckets> const* index,
+    cuddl::reference_database<K, Buckets, Layout> const& database,
+    cuddl::reference_index<K, Buckets, Layout> const* index,
     std::vector<std::filesystem::path> const& paths,
     std::filesystem::path const& output,
     bool all_to_all,
@@ -30,7 +30,7 @@ void search(
     unsigned workers,
     cuda::stream_ref stream
 ) {
-    using query_type = cuddl::query_sketch_batch<K, Buckets>;
+    using query_type = cuddl::query_sketch_batch<K, Buckets, Layout>;
     auto const batch_capacity = std::min(query_batch_size, paths.size());
     auto const requirements = CUDDL_UNWRAP(
         all_to_all ? database.all_to_all_search_requirements(stream, index)
@@ -152,11 +152,12 @@ void search(
 
 }  // namespace
 
-template <size_t Buckets, uint32_t K>
+template <size_t Buckets, uint32_t K, uint32_t ExponentBits>
 void dispatch_reference_index(reference_index_command const& command) {
+    using layout = cuddl::register_layout<ExponentBits, 16U - ExponentBits>;
     cuda::stream stream{cuda::devices[0]};
-    auto database = CUDDL_UNWRAP((command.database.upload<K, Buckets>(stream)));
-    using index_type = cuddl::reference_index<K, Buckets>;
+    auto database = CUDDL_UNWRAP((command.database.upload<K, Buckets, layout>(stream)));
+    using index_type = cuddl::reference_index<K, Buckets, layout>;
     if (command.build) {
         auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, command.storage));
         CUDDL_UNWRAP(
@@ -182,5 +183,6 @@ void dispatch_reference_index(reference_index_command const& command) {
     }
 }
 
-// Meson substitutes one explicit instantiation per k-mer length assigned to this unit.
+// Meson substitutes one explicit instantiation per k-mer length and exponent width assigned to
+// this unit.
 @INSTANTIATIONS@

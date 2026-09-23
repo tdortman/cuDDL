@@ -80,11 +80,12 @@ The builder searches the folder recursively and sorts file paths to assign refer
 Supported input extensions are `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, case-insensitively. Gzip and BGZF files may add `.gz`, `.bgz`, or `.bgzf`.
 Gzip loading checks member structure, DEFLATE decoding, and uncompressed lengths, but skips CRC32 verification to avoid another pass over decompressed data. Check input integrity separately when needed; checksum validation for saved databases and indexes is unchanged.
 
-| Option      | Accepted values                                                                                     |
-| ----------- | --------------------------------------------------------------------------------------------------- |
-| `--k`       | 1 through 31                                                                                        |
-| `--buckets` | 2048, 4096, 8192, 16384, 32768, 65536, 131072                                                       |
-| `--workers` | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage. |
+| Option            | Accepted values                                                                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--k`             | 1 through 31                                                                                                                                                  |
+| `--buckets`       | 2048, 4096, 8192, 16384, 32768, 65536, 131072                                                                                                                 |
+| `--exponent-bits` | 6 (default, 10-bit mantissa) for unbounded cardinality such as metagenomes; 5 (11-bit mantissa) halves false register matches for genome-to-genome comparison |
+| `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
 
 ### 2. Search without an index
 

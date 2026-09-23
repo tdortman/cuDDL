@@ -7,10 +7,22 @@
 
 namespace {
 
+template <size_t Buckets, uint32_t K>
+void dispatch_layout(reference_index_command const& command, uint32_t exponent_bits) {
+    if (exponent_bits == 5) return dispatch_reference_index<Buckets, K, 5>(command);
+    if (exponent_bits == 6) return dispatch_reference_index<Buckets, K, 6>(command);
+    throw std::invalid_argument("unsupported register exponent width");
+}
+
 template <size_t Buckets, uint32_t K = 1>
-void dispatch_kmers(reference_index_command const& command, uint32_t kmer_length) {
-    if (kmer_length == K) return dispatch_reference_index<Buckets, K>(command);
-    if constexpr (K < 31) return dispatch_kmers<Buckets, K + 1>(command, kmer_length);
+void dispatch_kmers(
+    reference_index_command const& command,
+    cuddl::score_compatibility const& compatibility
+) {
+    if (compatibility.kmer_length == K) {
+        return dispatch_layout<Buckets, K>(command, compatibility.exponent_bits);
+    }
+    if constexpr (K < 31) return dispatch_kmers<Buckets, K + 1>(command, compatibility);
     throw std::invalid_argument("unsupported k-mer length");
 }
 
@@ -21,7 +33,7 @@ void dispatch_buckets(
     cuddl::score_compatibility const& compatibility
 ) {
     if (compatibility.bucket_count == Buckets) {
-        return dispatch_kmers<Buckets>(command, compatibility.kmer_length);
+        return dispatch_kmers<Buckets>(command, compatibility);
     }
     if constexpr (Buckets < 131072) return dispatch_buckets<Buckets * 2>(command, compatibility);
     throw std::invalid_argument("unsupported sketch bucket count");

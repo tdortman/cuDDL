@@ -18,7 +18,7 @@ struct reference_index_command {
 };
 
 /// @brief Runs @p command for one sketch configuration. Meson generates the instantiations from
-/// reference_index_dispatch.cu.in, one unit per bucket count and k-mer range, to bound compiler
-/// memory.
-template <size_t Buckets, uint32_t K>
+/// reference_index_dispatch.cu.in, one unit per bucket count, k-mer range, and exponent width
+/// (5 or 6 bits), to bound compiler memory.
+template <size_t Buckets, uint32_t K, uint32_t ExponentBits>
 void dispatch_reference_index(reference_index_command const& command);
