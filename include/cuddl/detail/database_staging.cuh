@@ -621,18 +621,17 @@ template <size_t BucketCount>
     return Ok();
 }
 
-// Page-locked sequence storage handed to loader threads. A lease returns to the pool when the
+// Reusable sequence storage handed to loader threads. A lease returns to the pool when the
 // parsed file holding it dies, which is after the caller enqueued every copy that reads it.
 // Releasing records that point on the stream; the next loader to take the slot waits for it
 // there, so a buffer is never rewritten under a DMA and the build never has to drain.
-class pinned_sequence_pool {
+class sequence_buffer_pool {
    public:
     /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
-    pinned_sequence_pool(cuda::stream_ref stream, size_t buffers, size_t limit)
-        : stream_(stream), limit_(limit) {
+    sequence_buffer_pool(cuda::stream_ref stream, size_t buffers, size_t limit, bool page_locked)
+        : stream_(stream), limit_(limit), page_locked_(page_locked) {
         slots_.reserve(buffers);
         in_use_.reserve(buffers);
-        consumed_.reserve(buffers);
     }
 
     /// @brief Number of buffers the pool may grow to.
@@ -645,72 +644,79 @@ class pinned_sequence_pool {
         return slots_.size();
     }
 
-    /// @brief Returns page-locked bytes, or a null target when the pool cannot serve.
+    /// @brief Returns reusable bytes, or a null target when the pool cannot serve.
     [[nodiscard]] decompression_target acquire(size_t bytes) {
         if (bytes == 0 || bytes > limit_) return {};
         size_t index = 0;
+        slot* owner = nullptr;
         {
             std::lock_guard lock(mutex_);
             index = claim(bytes);
             if (index == slots_.size()) return {};
+            owner = slots_[index].get();
         }
         // Wait on the loader thread rather than the build loop: the slot is already reserved,
         // so this blocks only the genome that needs it. A failing wait throws out of the loader,
         // which reports it through the pool's error slot like any other load failure.
-        consumed_[index].sync();
-        return lease(index);
+        owner->consumed.sync();
+        if (owner->size < bytes) {
+            auto grown = size_t{1} << 16;
+            while (grown < bytes) {
+                grown *= 2;
+            }
+            owner->resize(stream_, grown, page_locked_);
+        }
+        return lease(index, owner);
     }
 
    private:
-    /// @brief Reserves a free slot holding at least @p bytes, or returns slots_.size().
+    /// @brief Reserves a free slot, or returns slots_.size() when the pool is full.
     [[nodiscard]] size_t claim(size_t bytes) {
         for (size_t i = 0; i < slots_.size(); ++i) {
             if (in_use_[i]) continue;
-            if (slots_[i]->buffer.size() < bytes) {
-                // Grow a free buffer instead of falling back. Genome sizes vary within a
-                // corpus, and a buffer sized for the first small genome would otherwise
-                // never serve the larger ones. Rounding up to a power of two bounds how many
-                // times any buffer is reallocated, and page-locked allocation is not cheap.
-                auto grown = size_t{1} << 16;
-                while (grown < bytes) grown *= 2;
-                slots_[i] = std::make_unique<slot>(
-                    cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
-                        stream_, cuda::pinned_default_memory_pool(), grown, cuda::no_init
-                    )
-                );
-            }
             in_use_[i] = true;
             return i;
         }
         if (slots_.size() >= capacity_) return slots_.size();
-        slots_.push_back(
-            std::make_unique<slot>(
-                cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>(
-                    stream_, cuda::pinned_default_memory_pool(), bytes, cuda::no_init
-                )
-            )
-        );
+        slots_.push_back(std::make_unique<slot>(stream_, bytes, page_locked_));
         in_use_.push_back(true);
-        consumed_.emplace_back(stream_);
         return slots_.size() - 1;
     }
 
    private:
     struct slot {
-        cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible> buffer;
+        std::optional<cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>>
+            pinned;
+        std::unique_ptr<char[]> heap;
+        size_t size = 0;
+        cuda::event consumed;
+
+        slot(cuda::stream_ref stream, size_t bytes, bool page_locked) : consumed(stream) {
+            resize(stream, bytes, page_locked);
+        }
+
+        void resize(cuda::stream_ref stream, size_t bytes, bool page_locked) {
+            if (page_locked) {
+                pinned.emplace(stream, cuda::pinned_default_memory_pool(), bytes, cuda::no_init);
+            } else {
+                heap = std::make_unique_for_overwrite<char[]>(bytes);
+            }
+            size = bytes;
+        }
+
+        char* data() {
+            return heap ? heap.get() : pinned->data();
+        }
     };
 
-    [[nodiscard]] decompression_target lease(size_t index) {
+    [[nodiscard]] decompression_target lease(size_t index, slot* owner) {
         auto* pool = this;
-        auto* owner = slots_[index].get();
         return {
-            owner->buffer.data(),
-            owner->buffer.size(),
-            std::shared_ptr<void>(owner, [pool, index](void*) {
+            owner->data(), owner->size, std::shared_ptr<void>(owner, [pool, index, owner](void*) {
                 std::lock_guard lock(pool->mutex_);
                 // Record before publishing the slot: a loader that takes it must see the
                 // event of every copy the previous lease fed.
-                pool->consumed_[index].record(pool->stream_);
+                owner->consumed.record(pool->stream_);
                 pool->in_use_[index] = false;
             })
         };
@@ -718,24 +724,24 @@ class pinned_sequence_pool {
 
     cuda::stream_ref stream_;
     size_t limit_;
+    bool page_locked_;
     size_t capacity_{1};
     std::vector<std::unique_ptr<slot>> slots_;
     std::vector<bool> in_use_;
-    std::vector<cuda::event> consumed_;
     std::mutex mutex_;
 };
 
-/// @brief `decompression_source` trampoline for `pinned_sequence_pool`.
-[[nodiscard]] inline decompression_target acquire_pinned_target(void* context, size_t bytes) {
-    return static_cast<pinned_sequence_pool*>(context)->acquire(bytes);
+/// @brief `decompression_source` trampoline for `sequence_buffer_pool`.
+[[nodiscard]] inline decompression_target acquire_sequence_target(void* context, size_t bytes) {
+    return static_cast<sequence_buffer_pool*>(context)->acquire(bytes);
 }
 
 /// @brief Loader state a build fed by paths keeps for its whole run.
 ///
-/// One page-locked sequence buffer per loader lets the transfer engine read the decompressed
-/// genome in place instead of restaging it on the consumer thread. The pool hands out load
-/// results a few files ahead of the consumer, which takes them in order: a window of one
-/// worker-worth leaves the consumer waiting on a straggler while every other loader sits idle.
+/// Reused decompression buffers avoid repeated allocations, and can be page-locked for DMA.
+/// The pool hands out load results a few files ahead of the consumer, which takes them in order.
+/// A window of one worker-worth leaves the consumer waiting on a straggler while every other
+/// loader sits idle.
 class path_loaders {
    public:
     /// @param stream Stream owning the loader buffers.
@@ -749,29 +755,27 @@ class path_loaders {
         bool page_locked
     )
         : workers_(worker_count(paths.size(), parser_workers)),
-          buffers_(stream, workers_, size_t{32} << 20),
+          buffers_(stream, workers_, size_t{32} << 20, page_locked),
           page_locked_(page_locked) {
         // One buffer per in-flight file plus the stager's hold ring, plus headroom: a worker
         // asks for its next file while every loaded file still holds a lease. A pool smaller
-        // than the window sends the rest through pageable heap buffers at a fraction of the
-        // pinned copy rate.
+        // than the window makes the remaining files allocate their own buffers.
         auto const window = workers_ * 4;
         buffers_.set_capacity(window + stager_hold_slots + 2);
-        if (page_locked_) source_ = {acquire_pinned_target, &buffers_};
+        source_ = {acquire_sequence_target, &buffers_};
         if (workers_ > 1) pool_.emplace(paths, workers_, source_, window);
     }
 
     /// @brief Loaders this build runs.
     ///
-    /// The pinned pool allocates its buffers lazily, so its own count says nothing about how many
-    /// loaders there are: reading it here once left every build on the calling thread.
+    /// The pool allocates buffers lazily, independently of the number of loader threads.
     [[nodiscard]] size_t workers() const noexcept {
         return workers_;
     }
 
     /// @brief Page-locked buffers the loaders held, for the statistics.
     [[nodiscard]] size_t page_locked_buffers() const noexcept {
-        return buffers_.buffers();
+        return page_locked_ ? buffers_.buffers() : 0;
     }
 
     /// @brief Loads genome @p id, through the pool when the build runs more than one loader.
@@ -796,7 +800,7 @@ class path_loaders {
     }
 
     size_t workers_ = 1;
-    pinned_sequence_pool buffers_;
+    sequence_buffer_pool buffers_;
     bool page_locked_ = false;
     decompression_source source_{};
     std::optional<fastx_load_pool> pool_;
@@ -897,8 +901,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                 auto sequence = CUDDL_TRY(loaders.take(paths, id));
                 // Read the loaded file's parts before the move below: argument order is
                 // unspecified, so a moved-from Result must not be dereferenced.
-                auto const* const pinned_base = sequence->decompressed_target;
-                auto const pinned_size = sequence->decompressed_size;
+                auto const* const pinned_base =
+                    page_locked ? sequence->decompressed_target : nullptr;
+                auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
                 auto const& extents = sequence->extents;
                 CUDDL_TRY(stager.add_genome(
                     id - base, extents, pinned_base, pinned_size, std::move(sequence)

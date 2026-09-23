@@ -550,18 +550,17 @@ struct fastx_sequence_file {
 
 /// @brief Host-visible buffer a caller offers for decompressed bytes.
 ///
-/// GPU callers supply page-locked memory so the transfer engine can read the sequence
-/// in place, which removes the staging copy that a heap buffer would need. `owner` keeps the
-/// storage alive for as long as the parsed file holds it.
+/// Callers can reuse pageable or page-locked memory. `owner` keeps the storage alive for as
+/// long as the parsed file holds it.
 struct decompression_target {
     char* data = nullptr;
     size_t capacity = 0;
     std::shared_ptr<void> owner;
 };
 
-/// @brief Supplies page-locked storage for one file, or a null target when none is available.
+/// @brief Supplies storage for one file, or a null target when none is available.
 ///
-/// Reusing buffers is the caller's problem, so it decides how much page-locked memory to
+/// Reusing buffers is the caller's problem, so it decides how much memory to
 /// commit. A null target simply leaves the loader on its own growing buffer.
 struct decompression_source {
     decompression_target (*acquire)(void* context, size_t bytes) = nullptr;
