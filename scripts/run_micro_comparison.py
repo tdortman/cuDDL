@@ -1008,14 +1008,16 @@ def main(
             target = max(_CHUNK_BUDGET_BYTES, _CHUNK_MIN_ROWS * _CHUNK_ROW_BYTES)
             by_output = max(1, target // (max(1, skani_refs) * _CHUNK_ROW_BYTES))
             skani_chunk = min(_CHUNK_MAX_QUERIES, by_output)
+        reference_paths = set(references)
         file_args = [str(p) for p in references] + [
-            str(p) for p in query_list if p not in references
+            str(p) for p in query_list if p not in reference_paths
         ]
         if not sketch_all:
             sketch_references = references
             sketch_queries = query_list
+        sketch_reference_paths = set(sketch_references)
         sketch_file_args = [str(p) for p in sketch_references] + [
-            str(p) for p in sketch_queries if p not in sketch_references
+            str(p) for p in sketch_queries if p not in sketch_reference_paths
         ]
 
         if need_cub and not performance_only:
