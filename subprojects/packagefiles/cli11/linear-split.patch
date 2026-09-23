@@ -1,0 +1,63 @@
+--- a/include/CLI/impl/StringTools_inl.hpp
++++ b/include/CLI/impl/StringTools_inl.hpp
+@@ -421,15 +421,16 @@
+     trim(str);
+ 
+     std::vector<std::string> output;
+-    while(!str.empty()) {
+-        if(bracketChars().find_first_of(str[0]) != std::string::npos) {
+-            auto bracketLoc = bracketChars().find_first_of(str[0]);
+-            auto end = close_sequence(str, 0, matchBracketChars()[bracketLoc]);
++    std::size_t start = 0;
++    while(start < str.size()) {
++        if(bracketChars().find_first_of(str[start]) != std::string::npos) {
++            auto bracketLoc = bracketChars().find_first_of(str[start]);
++            auto end = close_sequence(str, start, matchBracketChars()[bracketLoc]);
+             if(end >= str.size()) {
+-                output.push_back(std::move(str));
+-                str.clear();
++                output.push_back(str.substr(start));
++                break;
+             } else {
+-                output.push_back(str.substr(0, end + 1));
++                output.push_back(str.substr(start, end - start + 1));
+                 // The character following a closing quote/bracket is normally a delimiter and is
+                 // consumed.  If it is an ordinary character it must be retained (resume from it) so
+                 // no characters are silently lost (e.g. `"abc"def` -> {"abc", "def"}).  However if it
+@@ -438,26 +439,23 @@
+                 // it is skipped like the original delimiter case to keep splitting well behaved.
+                 char follow = str[end + 1];
+                 bool skip_follow = find_ws(follow) || (bracketChars().find_first_of(follow) != std::string::npos);
+-                auto next = skip_follow ? end + 2 : end + 1;
+-                if(next < str.size()) {
+-                    str = str.substr(next);
+-                } else {
+-                    str.clear();
+-                }
++                start = skip_follow ? end + 2 : end + 1;
+             }
+ 
+         } else {
+-            auto it = std::find_if(std::begin(str), std::end(str), find_ws);
++            auto it = std::find_if(std::begin(str) + static_cast<std::ptrdiff_t>(start), std::end(str), find_ws);
+             if(it != std::end(str)) {
+-                std::string value = std::string(str.begin(), it);
+-                output.push_back(value);
+-                str = std::string(it + 1, str.end());
++                auto end = static_cast<std::size_t>(it - str.begin());
++                output.push_back(str.substr(start, end - start));
++                start = end + 1;
+             } else {
+-                output.push_back(str);
+-                str.clear();
++                output.push_back(str.substr(start));
++                break;
+             }
+         }
+-        trim(str);
++        while(start < str.size() && std::isspace(str[start], std::locale())) {
++            ++start;
++        }
+     }
+     return output;
+ }
