@@ -938,43 +938,56 @@ json run(options const& opts) {
     });
     timings["resident_compare"] =
         timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"];
+    // Wall scopes sketch the query side from FASTX; all-to-all queries are the reference files.
+    auto const& query_paths = all ? opts.references : opts.queries;
+    timings["query_fastx_compare"] = measure(opts, [&] {
+        auto q = build_files(query_paths, cfg);
+        auto hits =
+            all ? search(q, q, true, opts.match_rows) : search(refs, q, false, opts.match_rows);
+        consumed_size = hits.matches.size();
+    });
     if (all) {
         if (refs.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
             throw std::runtime_error("native RabbitSketch index requires at most INT_MAX genomes");
         }
-        std::vector<std::vector<uint64_t>> keys(refs.size());
-        std::vector<int> sizes(refs.size());
-        std::vector<std::string> labels(refs.size());
-        parallel_for(refs.size(), [&](size_t i) {
-            auto const& sketch = refs[i].sketch.fastKMV();
-            keys[i].assign(sketch.getRegisters(), sketch.getRegisters() + sketch.size());
-            sizes[i] = static_cast<int>(sketch.size());
-            labels[i] = std::to_string(i);
-        });
-        std::optional<Sketch::InvertedIndex<uint64_t>> index;
-        timings["search_index_build"] = measure(
-            opts,
-            [&] {
-                std::vector<phmap::flat_hash_map<uint64_t, std::vector<uint32_t>>> parts(
-                    opts.threads
-                );
-                parallel_for(refs.size(), [&](size_t i) {
-                    auto& part = parts[omp_get_thread_num()];
-                    for (auto key : keys[i]) {
-                        part[key].push_back(static_cast<uint32_t>(i));
-                    }
-                });
-                index = Sketch::buildCSRIndex<uint64_t>(parts, opts.threads);
-            },
-            [&] { index.reset(); }
-        );
-        auto indexed_search = [&](std::string const& destination) {
+        struct native_index {
+            std::vector<std::vector<uint64_t>> keys;
+            std::vector<int> sizes;
+            std::vector<std::string> labels;
+            std::optional<Sketch::InvertedIndex<uint64_t>> index;
+        };
+        auto index_keys = [&](collection const& sketches) {
+            native_index n{
+                std::vector<std::vector<uint64_t>>(sketches.size()),
+                std::vector<int>(sketches.size()),
+                std::vector<std::string>(sketches.size()),
+                std::nullopt
+            };
+            parallel_for(sketches.size(), [&](size_t i) {
+                auto const& sketch = sketches[i].sketch.fastKMV();
+                n.keys[i].assign(sketch.getRegisters(), sketch.getRegisters() + sketch.size());
+                n.sizes[i] = static_cast<int>(sketch.size());
+                n.labels[i] = std::to_string(i);
+            });
+            return n;
+        };
+        auto build_index = [&](native_index& n) {
+            std::vector<phmap::flat_hash_map<uint64_t, std::vector<uint32_t>>> parts(opts.threads);
+            parallel_for(n.keys.size(), [&](size_t i) {
+                auto& part = parts[omp_get_thread_num()];
+                for (auto key : n.keys[i]) {
+                    part[key].push_back(static_cast<uint32_t>(i));
+                }
+            });
+            n.index = Sketch::buildCSRIndex<uint64_t>(parts, opts.threads);
+        };
+        auto indexed_search = [&](native_index const& n, std::string const& destination) {
             Sketch::computeDistances<uint64_t>(
-                *index,
-                keys,
-                sizes,
-                labels,
-                static_cast<int>(refs.size()),
+                *n.index,
+                n.keys,
+                n.sizes,
+                n.labels,
+                static_cast<int>(n.keys.size()),
                 0,
                 1.0,
                 [&](int common, int left, int right) {
@@ -986,14 +999,23 @@ json run(options const& opts) {
                 opts.threads
             );
         };
-        timings["resident_search"] = measure(opts, [&] { indexed_search("/dev/null"); });
+        auto resident = index_keys(refs);
+        timings["search_index_build"] =
+            measure(opts, [&] { build_index(resident); }, [&] { resident.index.reset(); });
+        timings["resident_search"] = measure(opts, [&] { indexed_search(resident, "/dev/null"); });
         auto close_output = [](FILE* file) {
             std::fclose(file);
         };
         std::unique_ptr<FILE, decltype(close_output)> output(std::tmpfile(), close_output);
         if (!output) throw std::runtime_error("cannot create native search output file");
         auto const path = "/proc/self/fd/" + std::to_string(fileno(output.get()));
-        timings["search_query_wall"] = measure(opts, [&] { indexed_search(path); });
+        timings["search_query_wall"] = measure(opts, [&] { indexed_search(resident, path); });
+        // No index file format exists, so the FASTX search wall also constructs the index.
+        timings["query_fastx_search"] = measure(opts, [&] {
+            auto fresh = index_keys(build_files(query_paths, cfg));
+            build_index(fresh);
+            indexed_search(fresh, path);
+        });
         if (!opts.performance_only) {
             std::ifstream input(path);
             size_t query, reference;
@@ -1018,6 +1040,7 @@ json run(options const& opts) {
         });
         // CPU query inputs and outputs are resident, so both scopes cover this invocation.
         timings["resident_search"] = timings["search_query_wall"];
+        timings["query_fastx_search"] = timings["query_fastx_compare"];
     }
     if (!opts.performance_only) {
         timings["metrics_and_serialize"] = measure(opts, [&] {
