@@ -99,6 +99,13 @@ def main() -> None:
             }
             for measurement in measurements:
                 operation = measurement["case"]["measurement"]
+                if tool == "dashing2" and operation == "micro-sketch":
+                    assert "resident" not in measurement["timings"]
+                    assert "resident_input" not in measurement["case"]
+                    assert "resident_device" not in measurement["case"]
+                    assert measurement["timings"]["wall"]["median_ms"] > 0
+                    assert measurement["timings"]["wall"]["samples"] == samples
+                    continue
                 resident = measurement["timings"]["resident"]
                 assert resident["median_ms"] > 0, measurement
                 assert resident["min_ms"] <= resident["median_ms"] <= resident["max_ms"]

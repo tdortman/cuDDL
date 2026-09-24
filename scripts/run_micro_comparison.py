@@ -1437,7 +1437,6 @@ def main(
             if sketch_all:
                 d2_runs.insert(0, ("-full", sketch_file_args))
             d2_marks = {}
-            d2_resident = []
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
@@ -1464,9 +1463,6 @@ def main(
                         ],
                         quiet=True,
                         log_tail=True,
-                        resident=d2_resident
-                        if suffix == d2_timed and rep >= warmups
-                        else [],
                     )
                     done = time.perf_counter()
                     if rep >= warmups:
@@ -1481,7 +1477,6 @@ def main(
                     if sketch_all:
                         shutil.rmtree(out_dir)
             marks = d2_marks[d2_timed]
-            record_native_resident("dashing2", "sketch", d2_resident)
             sketch_times["dashing2"] = marks
             sketch_bytes["dashing2"] = d2_sketch_bytes
             record_sketch(
@@ -2551,24 +2546,25 @@ def main(
         tool = measurement["implementation"]["name"]
         operation = measurement["case"]["measurement"].removeprefix("micro-")
         measurement["timings"].update(native_timings.get((tool, operation), {}))
-        measurement["timings"]["resident"] = resident_timings[(tool, operation)]
-        measurement["case"]["resident_device"] = (
-            "cuda" if tool in {"cuddl", "cub-exact"} else "cpu"
-        )
-        measurement["case"]["resident_input"] = (
-            "sequence_ascii"
-            if operation == "sketch"
-            else "sorted_kmer_sets"
-            if tool == "cub-exact"
-            else "indexed_sketches"
-            if operation == "search"
-            and (
-                tool in {"cuddl", "skani"}
-                or measurement["case"].get("index", "none") != "none"
+        if (tool, operation) in resident_timings:
+            measurement["timings"]["resident"] = resident_timings[(tool, operation)]
+            measurement["case"]["resident_device"] = (
+                "cuda" if tool in {"cuddl", "cub-exact"} else "cpu"
             )
-            else "sketches"
-        )
-        measurement["case"].update(resident_metadata.get((tool, operation), {}))
+            measurement["case"]["resident_input"] = (
+                "sequence_ascii"
+                if operation == "sketch"
+                else "sorted_kmer_sets"
+                if tool == "cub-exact"
+                else "indexed_sketches"
+                if operation == "search"
+                and (
+                    tool in {"cuddl", "skani"}
+                    or measurement["case"].get("index", "none") != "none"
+                )
+                else "sketches"
+            )
+            measurement["case"].update(resident_metadata.get((tool, operation), {}))
         if measurement["implementation"]["name"] == "cuddl" and measurement["case"][
             "measurement"
         ] in {"micro-compare", "micro-search"}:

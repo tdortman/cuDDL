@@ -19,20 +19,24 @@
      bool enabled_ = false;
      const char* path_ = nullptr;
  
-@@ -26,12 +27,18 @@
+@@ -26,14 +27,20 @@
      ~resident_timings() {
          if (!enabled_) return;
          std::ofstream output(path_, std::ios::trunc);
 +        bool const searching = search_wall_ms_ > 0;
          bool const compare = compare_ms_ > 0;
-         output << "{\"resident_ms\":"
+-        output << (compare ? "{\"resident_ms\":" : "{\"active_sketch_ms\":")
++        output << (searching || compare ? "{\"resident_ms\":" : "{\"active_sketch_ms\":")
 -               << (compare ? compare_ms_
 -                           : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
 +               << (searching ? search_ms_ - index_ms_ : compare ? compare_ms_
 +                   : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
-                << ",\"source\":\"steady_clock_cpu_wall\",\"device\":\"cpu\",\"input\":\""
--               << (compare ? "sketches" : "sequence_ascii") << "\"}";
-+               << (searching ? "indexed_sketches" : compare ? "sketches" : "sequence_ascii") << "\"";
+                << ",\"source\":\""
+-               << (compare ? "steady_clock_cpu_wall" : "steady_clock_overlapped_fastx_wall")
++               << (searching || compare ? "steady_clock_cpu_wall" : "steady_clock_overlapped_fastx_wall")
+                << "\",\"device\":\"cpu\",\"input\":\""
+-               << (compare ? "sketches" : "streamed_fastx") << "\"}";
++               << (searching ? "indexed_sketches" : compare ? "sketches" : "streamed_fastx") << "\"";
 +        if (searching) {
 +            output << ",\"index_build_ms\":" << index_ms_
 +                   << ",\"query_wall_ms\":" << search_wall_ms_ - index_ms_;
