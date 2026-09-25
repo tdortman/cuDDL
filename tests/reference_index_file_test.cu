@@ -123,35 +123,24 @@ std::vector<cuddl::batch_search_result> search_batch(
     bool all_to_all
 ) {
     auto requirements = CUDDL_UNWRAP(
-        all_to_all ? db.all_to_all_search_requirements(stream, index)
+        all_to_all ? db.all_to_all_search_requirements(index)
                    : db.batch_search_requirements(1U, stream, index)
     );
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
     std::vector<cuddl::batch_search_result> output;
-    auto consume = [&](uint32_t) {
-        uint32_t found = 0;
-        cuda::copy_bytes(stream, count, cuda::std::span{&found, size_t{1}});
-        stream.sync();
-        auto offset = output.size();
-        output.resize(offset + found);
-        if (found != 0) {
-            cuda::copy_bytes(
-                stream,
-                cuda::std::span{results.data(), size_t{found}},
-                cuda::std::span{output.data() + offset, size_t{found}}
-            );
-            stream.sync();
-        }
+    auto consume = [&](cuddl::batch_result_tile const& tile) {
+        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const passing = tile_copy.passing();
+        output.insert(output.end(), passing.begin(), passing.end());
     };
     if (all_to_all) {
         CUDDL_UNWRAP(db.search_all_to_all_async(
-            workspace, results, count, consume, {}, {.minimum_matches = 1U}, stream, index
+            workspace, results, consume, {}, {.minimum_matches = 1U}, stream, index
         ));
     } else {
         CUDDL_UNWRAP(db.search_batch_async(
@@ -160,7 +149,6 @@ std::vector<cuddl::batch_search_result> search_batch(
             0U,
             workspace,
             results,
-            count,
             consume,
             {},
             {.minimum_matches = 1U},

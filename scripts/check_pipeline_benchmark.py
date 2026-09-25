@@ -72,12 +72,12 @@ def main(
             "search_all_to_all_exhaustive",
             "search_and_download",
         }
-        for rows, index, topology in itertools.product(
-            ("compact", "packed"),
+        for key_bits, index, topology in itertools.product(
+            ("15", "16"),
             ("dense", "sparse"),
             ("batch", "all-to-all"),
         ):
-            report = root / f"{rows}-{index}-{topology}.json"
+            report = root / f"k{key_bits}-{index}-{topology}.json"
             command = [str(binary.resolve())]
             for name in ("genome", "partial", "saturated"):
                 command.extend(("--reference", str(paths[name])))
@@ -85,8 +85,6 @@ def main(
                 command.extend(("--query", str(paths[name])))
             command.extend(
                 (
-                    "--rows",
-                    rows,
                     "--index",
                     index,
                     "--topology",
@@ -94,7 +92,7 @@ def main(
                     "--indexed-buckets",
                     "2048" if topology == "all-to-all" else "1024",
                     "--key-bits",
-                    "16" if rows == "packed" else "15",
+                    key_bits,
                     "--minimum-matches",
                     "0" if topology == "all-to-all" else "5",
                     "--samples",
@@ -153,7 +151,7 @@ def main(
                     )
                     if case["query_id"] == 0 and case["reference_id"] == 0:
                         assert values["wkid"] == 1 and values["ani"] == 1
-            typer.echo(f"PASS {rows} / {index} / {topology}")
+            typer.echo(f"PASS k{key_bits} / {index} / {topology}")
         # Streamed ingestion replaces the host k-mer arrays with bounded per-genome GPU tiles.
         streamed = root / "streamed.json"
         command = [str(binary.resolve())]
@@ -167,8 +165,6 @@ def main(
                 "sequence",
                 "--resident-bytes",
                 "4096",
-                "--rows",
-                "compact",
                 "--index",
                 "sparse",
                 "--topology",
@@ -225,7 +221,7 @@ def main(
                 assert value["samples"] == 2
                 assert 0 <= value["min_ms"] <= value["median_ms"] <= value["max_ms"]
         # Streamed rows must reproduce the packed-input sketches, pair metrics, and match rows.
-        packed = load_result(root / "compact-sparse-batch.json", "pipeline")
+        packed = load_result(root / "k15-sparse-batch.json", "pipeline")
         assert data["measurements"][1:] == packed["measurements"][1:], (
             "streamed ingestion differs from packed-input construction"
         )
@@ -258,8 +254,6 @@ def main(
                 "sequence",
                 "--resident-bytes",
                 "1048576",
-                "--rows",
-                "compact",
                 "--index",
                 "sparse",
                 "--topology",

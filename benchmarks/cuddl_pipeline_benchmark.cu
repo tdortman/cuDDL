@@ -47,7 +47,7 @@ using reference_index_type = cuddl::reference_index<k, buckets, layout>;
 struct options {
     std::vector<std::string> references, queries;
     std::string output, name = "cuDDL pipeline";
-    std::string rows = "compact", index = "dense", topology = "batch";
+    std::string index = "dense", topology = "batch";
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
     unsigned workers = cuddl::default_parser_workers();
@@ -412,9 +412,6 @@ cuddl::score_compatibility compatibility(options const& opts) {
 database build(collection const& refs, options const& opts, cuda::stream_ref stream, bool indexed) {
     auto const compat =
         indexed ? compatibility(opts) : cuddl::score_compatibility::current<k, buckets, layout>();
-    if (opts.rows == "packed") {
-        return CUDDL_UNWRAP(database::build_async(refs.packed, refs.saturated, compat, stream));
-    }
     return CUDDL_UNWRAP(database::build_async(refs.scores, compat, stream));
 }
 
@@ -428,18 +425,10 @@ reference_index_type build_index(database const& db, options const& opts, cuda::
     );
 }
 
-using pinned_results = cuda::
-    buffer<cuddl::batch_search_result, cuda::mr::host_accessible, cuda::mr::device_accessible>;
-using pinned_words = cuda::buffer<uint32_t, cuda::mr::host_accessible, cuda::mr::device_accessible>;
-
 struct search_buffers {
     cuda::device_buffer<uint8_t> workspace;
-    cuda::device_buffer<cuddl::batch_search_result> results;
+    cuda::device_buffer<cuddl::packed_pairwise_counts> results;
     cuda::device_buffer<uint32_t> count, matches;
-    // Page-locked download targets: a tile copies at the link rate, with no pageable bounce and
-    // no host vector to zero-fill per tile.
-    pinned_results host_results;
-    pinned_words host_count, host_matches;
 
     search_buffers(
         database const& db,
@@ -451,10 +440,7 @@ struct search_buffers {
         : workspace(stream, cuda::device_default_memory_pool(stream.device())),
           results(stream, cuda::device_default_memory_pool(stream.device())),
           count(cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init)),
-          matches(stream, cuda::device_default_memory_pool(stream.device())),
-          host_results(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init),
-          host_count(stream, cuda::pinned_default_memory_pool(), 1, cuda::no_init),
-          host_matches(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init) {
+          matches(stream, cuda::device_default_memory_pool(stream.device())) {
         size_t workspace_bytes = 0;
         uint32_t size = 1;
         auto include = [&](cuddl::batch_search_requirements const& requirement) {
@@ -465,19 +451,15 @@ struct search_buffers {
             include(CUDDL_UNWRAP(db.batch_search_requirements(queries, stream, acceleration)));
         }
         if (topology != "batch") {
-            include(CUDDL_UNWRAP(db.all_to_all_search_requirements(stream, acceleration)));
+            include(CUDDL_UNWRAP(db.all_to_all_search_requirements(acceleration)));
         }
         workspace = cuda::make_device_buffer<uint8_t>(
             stream, stream.device(), workspace_bytes, cuda::no_init
         );
-        results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
             stream, stream.device(), size, cuda::no_init
         );
         matches = cuda::make_device_buffer<uint32_t>(stream, stream.device(), size, cuda::no_init);
-        host_results =
-            pinned_results(stream, cuda::pinned_default_memory_pool(), size, cuda::no_init);
-        host_matches =
-            pinned_words(stream, cuda::pinned_default_memory_pool(), size, cuda::no_init);
     }
 };
 
@@ -498,46 +480,28 @@ void search(
     bool indexed,
     bool all,
     host_results* output = nullptr,
-    std::function<void(uint32_t)> device_consume = {}
+    std::function<void(cuddl::batch_result_tile const&)> device_consume = {}
 ) {
-    auto consume = [&](uint32_t capacity) {
-        if (device_consume) device_consume(capacity);
+    auto consume = [&](cuddl::batch_result_tile const& tile) {
+        if (device_consume) device_consume(tile);
         if (!output) {
             return;  // A device consumer can retain results without host downloads.
         }
-        cuda::copy_bytes(stream, buffers.count, buffers.host_count);
-        stream.sync();
-        auto const count = buffers.host_count.data()[0];
-        if (!(count <= buffers.results.size())) {
-            throw std::runtime_error("invalid search result count");
-        }
-        if (count == 0) {
+        // Tile storage is reused by the next callback, so the host copy happens here.
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const rows = host.passing();
+        if (rows.empty()) {
             return;
         }
-        output->total_rows += count;
+        output->total_rows += rows.size();
         ++output->tiles;
-        // Performance runs keep only the latest tile, in the pinned staging; full runs retain
-        // every row for the output phase.
-        auto* rows = buffers.host_results.data();
-        auto* matches = buffers.host_matches.data();
+        // Performance runs download each tile but keep none; full runs retain every row for the
+        // output phase.
         if (!opts.performance_only) {
-            auto const offset = output->rows.size();
-            output->rows.resize(offset + count);
-            output->matches.resize(offset + count);
-            rows = output->rows.data() + offset;
-            matches = output->matches.data() + offset;
+            auto const matches = host.passing_match_counts();
+            output->rows.insert(output->rows.end(), rows.begin(), rows.end());
+            output->matches.insert(output->matches.end(), matches.begin(), matches.end());
         }
-        cuda::copy_bytes(
-            stream,
-            cuda::std::span{buffers.results.data(), size_t{count}},
-            cuda::std::span{rows, size_t{count}}
-        );
-        cuda::copy_bytes(
-            stream,
-            cuda::std::span{buffers.matches.data(), size_t{count}},
-            cuda::std::span{matches, size_t{count}}
-        );
-        stream.sync();  // Tile storage is reused by the next callback.
     };
     auto const config = cuddl::search_options{.minimum_matches = opts.minimum_matches};
     if (all) {
@@ -545,7 +509,6 @@ void search(
             CUDDL_UNWRAP(db.search_all_to_all_async(
                 buffers.workspace,
                 buffers.results,
-                buffers.count,
                 consume,
                 buffers.matches,
                 config,
@@ -554,7 +517,7 @@ void search(
             ));
         } else {
             CUDDL_UNWRAP(db.search_all_to_all_async(
-                buffers.workspace, buffers.results, buffers.count, consume, buffers.matches, stream
+                buffers.workspace, buffers.results, consume, buffers.matches, stream
             ));
         }
     } else {
@@ -565,7 +528,6 @@ void search(
                 0,
                 buffers.workspace,
                 buffers.results,
-                buffers.count,
                 consume,
                 buffers.matches,
                 config,
@@ -579,7 +541,6 @@ void search(
                 0,
                 buffers.workspace,
                 buffers.results,
-                buffers.count,
                 consume,
                 buffers.matches,
                 stream
@@ -659,11 +620,10 @@ validation validate(
                 throw std::runtime_error("search IDs/order differ from oracle");
             }
             if (sampled) {
-                if (!(row.summary.counts == oracle(a, b))) {
+                if (!(row.counts == oracle(a, b))) {
                     throw std::runtime_error("search counts differ from scalar oracle");
                 }
-                if (!(output.matches[cursor] ==
-                      (indexed ? match_count : row.summary.counts.equal))) {
+                if (!(output.matches[cursor] == (indexed ? match_count : row.counts.equal))) {
                     throw std::runtime_error("search match diagnostics differ from oracle");
                 }
                 ++result.checked;
@@ -833,9 +793,8 @@ size_t index_generation_peak(options const& opts, uint32_t references, cuda::str
     // Build arguments evaluate before optional::emplace destroys the old generation,
     // so a rebuild holds old and new rows plus the new index and temporaries.
     // Counting the full new generation is conservative but safe against pool reuse.
-    size_t const rows = (opts.rows == "packed") ? database::persistent_packed_row_bytes(references)
-                                                : database::persistent_row_bytes(references);
-    size_t const row_size = (opts.rows == "packed") ? sizeof(uint32_t) : sizeof(uint16_t);
+    size_t const rows = database::persistent_row_bytes(references);
+    size_t const row_size = sizeof(uint16_t);
     size_t index = 0;
     size_t transients = static_cast<size_t>(postings) * row_size;
     if (opts.index == "sparse") {
@@ -961,12 +920,8 @@ json resident_timings(
     auto store = cuda::make_device_buffer<uint32_t>(
         setup, setup.device(), sequence ? paths.size() * (buckets + 1) : 0, cuda::no_init
     );
-    collection refs =
-        sequence
-            ? collection(
-                  opts.references.size(), setup, opts.rows == "compact", opts.rows == "packed"
-              )
-            : collection(reference_files, setup, opts.rows == "compact", opts.rows == "packed");
+    collection refs = sequence ? collection(opts.references.size(), setup, true, false)
+                               : collection(reference_files, setup, true, false);
     collection queries = sequence
                              ? collection(all ? 0 : opts.queries.size(), setup, true, false)
                              : collection(all ? parsed_files{} : query_files, setup, true, false);
@@ -1016,11 +971,7 @@ json resident_timings(
         queries.winner_counts(s);
     };
     auto rows = [&](cuda::stream_ref s) {
-        if (opts.rows == "compact") {
-            refs.extract_scores(s);
-        } else {
-            refs.extract_packed(s);
-        }
+        refs.extract_scores(s);
         queries.extract_scores(s);
     };
     auto index = [&](cuda::stream_ref s) {
@@ -1028,25 +979,23 @@ json resident_timings(
         acceleration.emplace(build_index(*db, opts, s));
     };
     auto query = [&](cuda::stream_ref s) {
-        auto consume = [&](uint32_t capacity) {
-            auto const* source = buffers.results.data();
-            auto const* source_matches = buffers.matches.data();
-            auto const* count = buffers.count.data();
+        auto consume = [&](cuddl::batch_result_tile const& tile) {
             auto* target = retained.data();
             auto* matches = retained_matches.data();
             thrust::for_each_n(
                 thrust::cuda::par_nosync.on(s.get()),
                 thrust::counting_iterator<size_t>{0},
-                capacity,
+                static_cast<size_t>(tile.query_count) * tile.reference_count,
                 [=] __device__(size_t i) {
-                    if (i < *count) {
-                        auto const row = source[i];
-                        auto const qid = static_cast<size_t>(row.query_id);
-                        auto const rid = static_cast<size_t>(row.reference_id);
+                    auto const qid =
+                        tile.first_query_id + static_cast<uint32_t>(i / tile.reference_count);
+                    auto const rid = static_cast<uint32_t>(i % tile.reference_count);
+                    if (auto const row = tile.find(qid, rid)) {
                         auto const position =
-                            all ? qid * (2 * n - qid - 1) / 2 + rid - qid - 1 : qid * n + rid;
-                        target[position] = row;
-                        matches[position] = source_matches[i];
+                            all ? size_t{qid} * (2 * n - qid - 1) / 2 + rid - qid - 1
+                                : size_t{qid} * n + rid;
+                        target[position] = *row;
+                        matches[position] = tile.match_count(qid, rid);
                     }
                 }
             );
@@ -1272,13 +1221,15 @@ json resident_timings(
         return result;
     }
     json timings;
-    auto gpu = [&](char const* name,
-                   auto function,
-                   std::function<void(cuda::stream_ref)> prepare = {}) {
-        json wall;
-        timings[name] = measure(opts, name, false, function, prepare, &wall, [&] { db.reset(); });
-        timings[std::string(name) + "_wall"] = std::move(wall);
-    };
+    auto gpu =
+        [&](char const* name, auto function, std::function<void(cuda::stream_ref)> prepare = {}) {
+            json wall;
+            timings[name] = measure(opts, name, false, function, prepare, &wall, [&] {
+                acceleration.reset();
+                db.reset();
+            });
+            timings[std::string(name) + "_wall"] = std::move(wall);
+        };
     gpu(
         "resident_total",
         [&](cuda::stream_ref s) {
@@ -1334,7 +1285,7 @@ void application_output(
         result["matches"].push_back(
             {{"query_id", row.query_id},
              {"reference_id", row.reference_id},
-             {"metrics", metrics(row.summary)}}
+             {"metrics", metrics({.counts = row.counts})}}
         );
         ++emitted;
     };
@@ -1355,7 +1306,7 @@ template <typename Mark>
 void end_to_end(options const& opts, cuda::stream_ref stream, Mark&& mark) {
     auto reference_files = parse(opts.references);
     auto query_files = opts.topology == "batch" ? parse(opts.queries) : parsed_files{};
-    collection refs(reference_files, stream, opts.rows == "compact", opts.rows == "packed");
+    collection refs(reference_files, stream, true, false);
     collection queries(query_files, stream, true, false);
     refs.add(stream);
     queries.add(stream);
@@ -1396,7 +1347,7 @@ void end_to_end_streamed(options const& opts, cuda::stream_ref stream, Mark&& ma
     auto reference_rows = stream_genomes(opts.references, opts, stream);
     auto query_rows =
         opts.topology == "batch" ? stream_genomes(opts.queries, opts, stream) : genome_rows{};
-    collection refs(reference_rows, stream, opts.rows == "compact", opts.rows == "packed", false);
+    collection refs(reference_rows, stream, true, false, false);
     collection queries(query_rows, stream, true, false, false);
     refs.extract(stream);
     queries.extract(stream);
@@ -1540,21 +1491,20 @@ json run(options const& opts) {
                 );
                 downloaded = output.total_rows;
                 tiles = output.tiles;
-                host_bytes = buffers.host_results.size() * sizeof(cuddl::batch_search_result) +
-                             buffers.host_matches.size() * sizeof(uint32_t);
+                host_bytes = buffers.results.size() * sizeof(cuddl::packed_pairwise_counts) +
+                             buffers.matches.size() * sizeof(uint32_t);
                 do_not_optimise(output);
             });
         json measurements = json::array({{
             {"implementation",
              {{"name", "cuddl"},
               {"revision", command_output("git rev-parse HEAD")},
-              {"variant", opts.rows + "_" + (opts.exhaustive ? "exhaustive" : opts.index)}}},
+              {"variant", opts.exhaustive ? "exhaustive" : opts.index}}},
             {"case",
              {{"measurement", "pipeline"},
               {"performance_only", true},
               {"k", k},
               {"buckets", buckets},
-              {"rows", opts.rows},
               {"index", opts.exhaustive ? "none" : opts.index},
               {"topology", opts.topology},
               {"ingest", opts.ingest},
@@ -1578,7 +1528,7 @@ json run(options const& opts) {
               {"persistent_index", acceleration ? acceleration->persistent_index_bytes() : 0U},
               {"search_workspace", buffers.workspace.size()},
               {"search_result_capacity",
-               buffers.results.size() * sizeof(cuddl::batch_search_result)},
+               buffers.results.size() * sizeof(cuddl::packed_pairwise_counts)},
               {"search_match_capacity", buffers.matches.size() * sizeof(uint32_t)},
               {"host_result_capacity", host_bytes}}},
         }});
@@ -1835,7 +1785,9 @@ json run(options const& opts) {
                 &*acceleration
             ));
         } else {
-            CUDDL_UNWRAP(db.search_async(query, compatibility(opts), {}, single_results, s));
+            CUDDL_UNWRAP(
+                db.search_async(query, compatibility(opts), single_workspace, single_results, s)
+            );
         }
     };
     for (bool indexed : {false, true}) {
@@ -1850,7 +1802,7 @@ json run(options const& opts) {
                 continue;
             }
             if (!(expected < size && rows[expected].reference_id == r &&
-                  rows[expected].summary.counts ==
+                  rows[expected].counts ==
                       oracle(query_scores.data(), ref_scores.data() + r * buckets))) {
                 throw std::runtime_error("single-query search differs from oracle");
             }
@@ -1877,7 +1829,7 @@ json run(options const& opts) {
               {{"measurement", "match"},
                {"query_id", row.query_id},
                {"reference_id", row.reference_id}}},
-             {"metrics", metrics(row.summary)}}
+             {"metrics", metrics({.counts = row.counts})}}
         );
     };
     for (bool all : {false, true}) {
@@ -2021,12 +1973,11 @@ json run(options const& opts) {
             {"implementation",
              {{"name", "cuddl"},
               {"revision", command_output("git rev-parse HEAD")},
-              {"variant", opts.rows + "_" + (opts.exhaustive ? "exhaustive" : opts.index)}}},
+              {"variant", opts.exhaustive ? "exhaustive" : opts.index}}},
             {"case",
              {{"measurement", "pipeline"},
               {"k", k},
               {"buckets", buckets},
-              {"rows", opts.rows},
               {"index", opts.exhaustive ? "none" : opts.index},
               {"topology", opts.topology},
               {"ingest", opts.ingest},
@@ -2066,8 +2017,7 @@ json run(options const& opts) {
               {"match_rows_emitted", match_rows_emitted},
               {"all_to_all_suite", all_to_all_fits},
               {"all_to_all_nonempty", refs.sketches.size() > 1},
-              {"corresponding_pairs", pair_count},
-              {"preserves_multiplicity", db.preserves_multiplicity()}}},
+              {"corresponding_pairs", pair_count}}},
             {"timings", timings},
             {"memory_bytes",
              {{"input_kmers", input_bytes},
@@ -2076,7 +2026,7 @@ json run(options const& opts) {
               {"persistent_index", acceleration ? acceleration->persistent_index_bytes() : 0U},
               {"search_workspace", buffers.workspace.size()},
               {"search_result_capacity",
-               buffers.results.size() * sizeof(cuddl::batch_search_result)},
+               buffers.results.size() * sizeof(cuddl::packed_pairwise_counts)},
               {"search_match_capacity", buffers.matches.size() * sizeof(uint32_t)}}},
         }
     );
@@ -2104,7 +2054,6 @@ int main(int argc, char** argv) try {
         ->check(CLI::ExistingFile);
     app.add_option("--output", opts.output, "Shared-schema JSON output, stdout if omitted");
     app.add_option("--name", opts.name);
-    app.add_option("--rows", opts.rows)->check(CLI::IsMember({"compact", "packed"}));
     app.add_option("--index", opts.index)->check(CLI::IsMember({"dense", "sparse"}));
     app.add_flag(
         "--exhaustive",

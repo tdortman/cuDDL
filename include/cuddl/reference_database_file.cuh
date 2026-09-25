@@ -72,8 +72,9 @@ struct database_file_reader {
         return Ok();
     }
 
-    Result<void> words(std::vector<uint32_t>& items) {
-        CUDDL_TRY(bytes(items.data(), items.size() * sizeof(uint32_t)));
+    template <typename T>
+    Result<void> words(std::vector<T>& items) {
+        CUDDL_TRY(bytes(items.data(), items.size() * sizeof(T)));
         if constexpr (std::endian::native != std::endian::little) {
             for (auto& item : items) {
                 item = database_file_little_endian(item);
@@ -111,9 +112,10 @@ struct database_file_writer {
         return bytes(&item, sizeof(item));
     }
 
-    Result<void> words(std::vector<uint32_t> const& items) {
+    template <typename T>
+    Result<void> words(std::vector<T> const& items) {
         if constexpr (std::endian::native == std::endian::little) {
-            return bytes(items.data(), items.size() * sizeof(uint32_t));
+            return bytes(items.data(), items.size() * sizeof(T));
         } else {
             for (auto item : items) {
                 CUDDL_TRY(value(item));
@@ -139,74 +141,6 @@ Result<void> database_file_metadata(IO& io, reference_database_metadata& metadat
     CUDDL_TRY(io.value(c.blacklist_version));
     CUDDL_TRY(io.value(c.key_mask));
     CUDDL_TRY(io.value(metadata.reference_count));
-    return Ok();
-}
-
-/// Invalid-word flags one stored sketch word contributes to a store validation.
-inline constexpr uint32_t invalid_saturation_flag = 1U;
-inline constexpr uint32_t invalid_register_flag = 2U;
-
-/// @brief Flags a store word the file form would reject: a saturation word other than 0 or 1,
-/// or a register whose winner and count disagree about being empty.
-template <size_t BucketCount>
-struct invalid_store_word {
-    uint32_t const* store;
-
-    [[nodiscard]] __device__ uint32_t operator()(uint64_t index) const noexcept {
-        auto const word = store[index];
-        if (index % (BucketCount + 1) == BucketCount) {
-            return word > 1U ? invalid_saturation_flag : 0U;
-        }
-        return (winner(word) == 0U) != (count(word) == 0U) ? invalid_register_flag : 0U;
-    }
-};
-
-/// @brief Validates every word of a device store in one reduction.
-template <size_t BucketCount>
-[[nodiscard]] Result<void>
-validate_store(device_span<uint32_t const> store, cuda::stream_ref stream) {
-    if (store.empty()) return Ok();
-    auto flags = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
-    auto const words = cuda::counting_iterator<uint64_t>{0};
-    auto const transform = invalid_store_word<BucketCount>{store.data()};
-    size_t temporary_bytes = 0;
-    CUDDL_CUDA_TRY(
-        cub::DeviceReduce::TransformReduce(
-            nullptr,
-            temporary_bytes,
-            words,
-            flags.data(),
-            store.size(),
-            cuda::std::bit_or<uint32_t>{},
-            transform,
-            uint32_t{0},
-            stream.get()
-        )
-    );
-    auto temporary =
-        cuda::make_device_buffer<uint8_t>(stream, stream.device(), temporary_bytes, cuda::no_init);
-    CUDDL_CUDA_TRY(
-        cub::DeviceReduce::TransformReduce(
-            temporary.data(),
-            temporary_bytes,
-            words,
-            flags.data(),
-            store.size(),
-            cuda::std::bit_or<uint32_t>{},
-            transform,
-            uint32_t{0},
-            stream.get()
-        )
-    );
-    uint32_t result = 0;
-    CUDDL_CUDA_TRY(cuda::copy_bytes(stream, flags, cuda::std::span{&result, 1}));
-    CUDDL_CUDA_TRY(stream.sync());
-    if (result & invalid_saturation_flag) {
-        return Err(Error::invalid_argument("invalid database saturation flag"));
-    }
-    if (result & invalid_register_flag) {
-        return Err(Error::invalid_argument("invalid packed database register"));
-    }
     return Ok();
 }
 
@@ -260,11 +194,14 @@ struct sequence_build_options {
  * @brief Host-owned reference sketches and labels, ready for binary storage or GPU upload.
  *
  * One input file is one genome, including all of its FASTA/FASTQ records. Input order defines
- * stable reference IDs; labels preserve the supplied paths. Files store packed winner/count
- * rows, saturation flags and compatibility metadata. Upload creates row storage, not an index.
+ * stable reference IDs; labels preserve the supplied paths. Files store winner-score rows and
+ * compatibility metadata. Upload creates row storage, not an index.
  * Build and upload are synchronous. The supplied stream must outlive the uploaded database.
  */
 class reference_database_file {
+    /// @brief On-disk format revision; 2 stores winner-score rows.
+    static constexpr uint32_t database_file_version = 2U;
+
    public:
     /// @brief Compatibility metadata and reference count.
     [[nodiscard]] reference_database_metadata metadata() const noexcept {
@@ -274,13 +211,9 @@ class reference_database_file {
     [[nodiscard]] std::span<std::string const> names() const noexcept {
         return names_;
     }
-    /// @brief Packed winner/count registers in reference-ID order, one bucket row per genome.
-    [[nodiscard]] std::span<uint32_t const> rows() const noexcept {
+    /// @brief Winner scores in reference-ID order, one bucket row per genome.
+    [[nodiscard]] std::span<uint16_t const> rows() const noexcept {
         return rows_;
-    }
-    /// @brief Saturation flags in reference-ID order.
-    [[nodiscard]] std::span<uint32_t const> saturation() const noexcept {
-        return saturation_;
     }
 
     /**
@@ -313,7 +246,6 @@ class reference_database_file {
                 static_cast<uint32_t>(paths.size())
             };
             result.rows_.resize(paths.size() * BucketCount);
-            result.saturation_.resize(paths.size());
             result.names_.reserve(paths.size());
             // No inputs means no staging budget to resolve and nothing to encode.
             if (paths.empty()) return result;
@@ -366,7 +298,6 @@ class reference_database_file {
                 static_cast<uint32_t>(genomes.size())
             };
             result.rows_.resize(genomes.size() * BucketCount);
-            result.saturation_.resize(genomes.size());
             result.names_.reserve(genomes.size());
             if (genomes.empty()) return result;
             CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
@@ -421,12 +352,8 @@ class reference_database_file {
                 score_compatibility::current<K, BucketCount, Layout>(), static_cast<uint32_t>(count)
             };
             result.rows_.resize(count * BucketCount);
-            result.saturation_.resize(count);
             if (count == 0) return result;
-            CUDDL_TRY(detail::validate_store<BucketCount>(store, stream));
-            CUDDL_TRY(
-                detail::download_store<BucketCount>(store, result.rows_, result.saturation_, stream)
-            );
+            CUDDL_TRY(detail::download_store<BucketCount>(store, result.rows_, stream));
             CUDDL_CUDA_TRY(stream.sync());
             result.names_.assign(names.begin(), names.end());
             return result;
@@ -437,7 +364,7 @@ class reference_database_file {
         return Err(Error::resource(error.what()));
     }
 
-    /// @brief Uploads packed reference rows and labels without constructing an index.
+    /// @brief Uploads reference score rows and labels without constructing an index.
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     [[nodiscard]] Result<reference_database<K, BucketCount, Layout>> upload(
         cuda::stream_ref stream
@@ -446,15 +373,9 @@ class reference_database_file {
             metadata_.compatibility
         )));
         auto rows =
-            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, stream.device(), rows_));
-        auto saturation = CUDDL_CUDA_TRY(
-            cuda::make_device_buffer<uint32_t>(stream, stream.device(), saturation_)
-        );
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows_));
         auto database = CUDDL_TRY((reference_database<K, BucketCount, Layout>::build_async(
-            {rows.data(), rows.size()},
-            {saturation.data(), saturation.size()},
-            metadata_.compatibility,
-            stream
+            {rows.data(), rows.size()}, metadata_.compatibility, stream
         )));
         database.names_ = names_;
         CUDDL_CUDA_TRY(stream.sync());
@@ -483,7 +404,7 @@ class reference_database_file {
                 return Err(Error::resource("cannot open temporary database file"));
             }
             CUDDL_TRY(writer.bytes("CUDDLDB\0", 8));
-            CUDDL_TRY(writer.value(uint32_t{1}));
+            CUDDL_TRY(writer.value(database_file_version));
             auto metadata = metadata_;
             CUDDL_TRY(detail::database_file_metadata(writer, metadata));
             for (auto const& name : names_) {
@@ -494,7 +415,6 @@ class reference_database_file {
                 CUDDL_TRY(writer.bytes(name.data(), name.size()));
             }
             CUDDL_TRY(writer.words(rows_));
-            CUDDL_TRY(writer.words(saturation_));
             CUDDL_TRY(writer.value(static_cast<uint32_t>(writer.checksum)));
             auto closed = std::fclose(std::exchange(writer.output, nullptr));
             if (closed != 0) return Err(Error::resource("cannot close database file"));
@@ -529,7 +449,7 @@ class reference_database_file {
             }
             uint32_t version{};
             CUDDL_TRY(reader.value(version));
-            if (version != 1) {
+            if (version != database_file_version) {
                 return Err(Error::invalid_argument("unsupported database file version"));
             }
             reference_database_file result;
@@ -547,8 +467,8 @@ class reference_database_file {
             }
             uint64_t const count = result.metadata_.reference_count;
             uint64_t const words = count * c.bucket_count;
-            uint64_t const payload_bytes = (words + count) * sizeof(uint32_t);
-            if (words > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
+            uint64_t const payload_bytes = words * sizeof(uint16_t);
+            if (words > std::numeric_limits<size_t>::max() / sizeof(uint16_t) ||
                 payload_bytes + count * sizeof(uint32_t) + sizeof(uint32_t) > reader.remaining) {
                 return Err(Error::invalid_argument("invalid reference database extents"));
             }
@@ -569,24 +489,12 @@ class reference_database_file {
                 return Err(Error::invalid_argument("unexpected reference database payload size"));
             }
             result.rows_.resize(words);
-            result.saturation_.resize(count);
             CUDDL_TRY(reader.words(result.rows_));
-            CUDDL_TRY(reader.words(result.saturation_));
             auto const expected_checksum = static_cast<uint32_t>(reader.checksum);
             uint32_t checksum{};
             CUDDL_TRY(reader.value(checksum));
             if (checksum != expected_checksum) {
                 return Err(Error::invalid_argument("database checksum mismatch"));
-            }
-            for (auto state : result.saturation_) {
-                if (state > 1) {
-                    return Err(Error::invalid_argument("invalid database saturation flag"));
-                }
-            }
-            for (auto row : result.rows_) {
-                if ((detail::winner(row) == 0) != (detail::count(row) == 0)) {
-                    return Err(Error::invalid_argument("invalid packed database register"));
-                }
             }
             return result;
         }();
@@ -598,23 +506,19 @@ class reference_database_file {
     friend class reference_index_file;
     reference_database_file() = default;
 
-    /// @brief Staging sink that splits each group's device rows into this file's host rows and
-    /// saturation words. The build's final sync covers the copies.
+    /// @brief Staging sink that copies each group's device scores into this file's host rows.
+    /// The build's final sync covers the copies.
     template <size_t BucketCount>
     [[nodiscard]] auto download_rows(cuda::stream_ref stream) {
         return [this, stream](device_span<uint32_t const> group, size_t base, size_t count) {
             return detail::download_store<BucketCount>(
-                group,
-                std::span{rows_}.subspan(base * BucketCount, count * BucketCount),
-                std::span{saturation_}.subspan(base, count),
-                stream
+                group, std::span{rows_}.subspan(base * BucketCount, count * BucketCount), stream
             );
         };
     }
     reference_database_metadata metadata_{};
     std::vector<std::string> names_;
-    std::vector<uint32_t> rows_;
-    std::vector<uint32_t> saturation_;
+    std::vector<uint16_t> rows_;
 };
 
 /**

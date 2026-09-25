@@ -5,7 +5,9 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_histogram.cuh>
 #include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cuda/std/algorithm>
+#include <cuda/std/bit>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 
@@ -70,40 +72,6 @@ __device__ summary_payload combine_payloads(summary_payload a, summary_payload c
 template <typename QueryScore, typename ReferenceScore>
 constexpr uint32_t wide_chunk_buckets =
     (sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 16U : 8U;
-
-/// @brief Classifies one contiguous per-lane chunk of both rows (defined below).
-template <bool Use256, typename QueryScore, typename ReferenceScore>
-__device__ void classify_wide_chunk(
-    pairwise_counts& target,
-    QueryScore const* query,
-    ReferenceScore const* reference
-) noexcept;
-
-/**
- * @brief Constructs a sketch from packed k-mers using direct global packed CAS.
- *
- * @p saturation records whether any register's winner count saturated.
- */
-template <size_t BucketCount, typename Layout = default_register_layout>
-__global__ __launch_bounds__(block_size, 4) void add_kernel(
-    uint64_t const* input,
-    size_t input_size,
-    uint32_t* registers,
-    uint32_t& saturation
-) {
-    auto const index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    auto const stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (auto offset = index; offset < input_size; offset += stride * 2U) {
-        _Pragma("unroll")
-        for (uint32_t item = 0; item < 2U; ++item) {
-            auto const current = offset + stride * item;
-            if (current < input_size) {
-                auto const hash = hash_kmer(input[current]);
-                update(&registers[bucket_of<BucketCount>(hash)], score<Layout>(hash), saturation);
-            }
-        }
-    }
-}
 
 /// @brief Largest sketch (in registers) whose per-CTA staging fits in default static shared memory.
 constexpr size_t shared_construction_max_buckets = (size_t{1} << 13);
@@ -370,107 +338,6 @@ reduce_warp(cg::thread_block_tile<32> const warp, pairwise_counts counts) {
     return counts;
 }
 
-/**
- * @brief Compares one compact query row with every row in a reference database.
- *
- * Each reference owns a compile-time number of warps and writes exactly one stable-ID result.
- */
-template <
-    size_t BucketCount,
-    uint32_t BlockSize,
-    uint32_t WarpsPerReference,
-    typename ReferenceRow,
-    typename SearchResult>
-__global__ __launch_bounds__(BlockSize) void exhaustive_search_kernel(
-    ReferenceRow const* rows,
-    uint32_t reference_count,
-    uint16_t const* query,
-    SearchResult* results
-) {
-    static_assert(BlockSize % 32U == 0U);
-    static_assert(
-        WarpsPerReference == 1U || WarpsPerReference == 2U || WarpsPerReference == 4U ||
-        WarpsPerReference == 8U
-    );
-    static_assert(BlockSize >= 32U * WarpsPerReference);
-    static_assert(BlockSize % (32U * WarpsPerReference) == 0U);
-    constexpr uint32_t warp_width = 32U;
-    constexpr uint32_t warps_per_block = BlockSize / warp_width;
-    constexpr uint32_t threads_per_reference = warp_width * WarpsPerReference;
-    constexpr uint32_t references_per_block = warps_per_block / WarpsPerReference;
-
-    __shared__ pairwise_counts warp_summaries[warps_per_block];
-    auto const block = cg::this_thread_block();
-    auto const warp = cg::tiled_partition<warp_width>(block);
-    auto const reference_in_block = static_cast<uint32_t>(threadIdx.x) / threads_per_reference;
-    auto const thread_in_reference = static_cast<uint32_t>(threadIdx.x) % threads_per_reference;
-    auto const warp_in_reference = thread_in_reference / warp_width;
-    auto const reference_id =
-        static_cast<uint32_t>(blockIdx.x) * references_per_block + reference_in_block;
-    auto const valid_reference = reference_id < reference_count;
-
-    pairwise_counts local{};
-    if (valid_reference) {
-        auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
-        // Same wide chunk path as the batch kernel: every row stride is a multiple of the
-        // required alignment, so the two base pointers decide the load width.
-        auto const wide = wide_rows_aligned(query, rows);
-        if (wide) {
-            constexpr uint32_t chunk_buckets = wide_chunk_buckets<uint16_t, ReferenceRow>;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (auto chunk = thread_in_reference; chunk < chunks_per_row;
-                 chunk += threads_per_reference) {
-                classify_wide_chunk<true>(
-                    local,
-                    query + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + row_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
-        } else {
-            constexpr uint32_t chunk_buckets = wide_chunk_buckets<uint16_t, ReferenceRow> / 2U;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (auto chunk = thread_in_reference; chunk < chunks_per_row;
-                 chunk += threads_per_reference) {
-                classify_wide_chunk<false>(
-                    local,
-                    query + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + row_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
-        }
-    }
-    auto const warp_total = reduce_warp(warp, local);
-
-    if constexpr (WarpsPerReference == 1U) {
-        if (warp.thread_rank() == 0U && valid_reference) {
-            results[reference_id].reference_id = reference_id;
-            results[reference_id].summary.counts = warp_total;
-            results[reference_id].summary.cardinality = 0.0;
-        }
-        return;
-    }
-
-    if (warp.thread_rank() == 0U) {
-        warp_summaries[static_cast<uint32_t>(threadIdx.x) / warp_width] = warp_total;
-    }
-    block.sync();
-
-    if (warp_in_reference == 0U) {
-        pairwise_counts partial{};
-        if (warp.thread_rank() < WarpsPerReference) {
-            partial = warp_summaries[reference_in_block * WarpsPerReference + warp.thread_rank()];
-        }
-        auto const reference_total = reduce_warp(warp, partial);
-        if (warp.thread_rank() == 0U && valid_reference) {
-            results[reference_id].reference_id = reference_id;
-            results[reference_id].summary.counts = reference_total;
-            results[reference_id].summary.cardinality = 0.0;
-        }
-    }
-}
-
 /// @brief Transposes the indexed-bucket slice of a row-major score matrix into bucket-major
 /// order.
 ///
@@ -613,120 +480,6 @@ __global__ void scatter_index_postings_bucket_kernel(
     }
 }
 
-/// @brief Finds one bucket/key posting range, with one binary search per warp.
-__device__ inline uint2 index_posting_range(
-    uint32_t const* offsets,
-    uint16_t const* sorted_keys,
-    uint32_t reference_count,
-    uint32_t bucket,
-    uint32_t key,
-    uint32_t key_count
-) {
-    if (sorted_keys == nullptr) {
-        auto const cell = static_cast<size_t>(bucket) * key_count + key;
-        return {offsets[cell], offsets[cell + 1U]};
-    }
-    uint32_t begin = 0U;
-    uint32_t end = 0U;
-    if ((threadIdx.x & 31U) == 0U) {
-        auto const* first = sorted_keys + static_cast<size_t>(bucket) * reference_count;
-        auto const* last = first + reference_count;
-        auto const sparse_key = static_cast<uint16_t>(key + (key_count == 32768U));
-        auto const range = cuda::std::equal_range(first, last, sparse_key);
-        begin = static_cast<uint32_t>(range.first - sorted_keys);
-        end = static_cast<uint32_t>(range.second - sorted_keys);
-    }
-    return {__shfl_sync(0xffffffffU, begin, 0), __shfl_sync(0xffffffffU, end, 0)};
-}
-
-/// @brief Counts the query's non-empty posting matches for every reference.
-///
-/// One warp owns each bucket cell and walks its posting list with a lane stride,
-/// so hot keys with long lists (the dominant cost on skewed rows) are consumed 32
-/// postings at a time instead of serially by a single thread.
-///
-/// When the launch stages one shared counter per reference, postings accumulate in
-/// shared memory and flush once per block instead of contending on the global
-/// counters for every posting. Blocks whose total posting work is below one hit per
-/// reference skip the staging and keep the original global path, so cold buckets
-/// never pay the staging scan.
-template <size_t BucketCount>
-__global__ void count_index_matches_kernel(
-    uint16_t const* query,
-    uint32_t const* offsets,
-    uint32_t const* postings,
-    uint32_t indexed_bucket_count,
-    uint16_t key_mask,
-    uint32_t* match_counts,
-    uint16_t const* sorted_keys,
-    uint32_t reference_count,
-    bool use_shared_counters
-) {
-    constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
-    extern __shared__ uint32_t shared_counts[];
-    __shared__ uint32_t block_posting_total;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const bucket = static_cast<size_t>(blockIdx.x) * warps_per_block + warp;
-    // Tail warps read an empty score instead of returning, so every thread reaches
-    // the staging barriers below on the shared path.
-    auto const score = bucket < indexed_bucket_count ? query[bucket] : uint16_t{0};
-    uint32_t begin = 0U;
-    uint32_t end = 0U;
-    if (score != 0U) {
-        auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
-        auto const key = static_cast<uint32_t>(score & key_mask);
-        auto const range = index_posting_range(
-            offsets, sorted_keys, reference_count, static_cast<uint32_t>(bucket), key, key_count
-        );
-        begin = range.x;
-        end = range.y;
-    }
-    if (!use_shared_counters || reference_count == 0U) {
-        if (score == 0U) {
-            return;
-        }
-        for (auto posting = begin + lane; posting < end; posting += warp_width) {
-            atomicAdd(&match_counts[postings[posting]], 1U);
-        }
-        return;
-    }
-    if (threadIdx.x == 0U) {
-        block_posting_total = 0U;
-    }
-    __syncthreads();
-    if (lane == 0U && end != begin) {
-        atomicAdd(&block_posting_total, end - begin);
-    }
-    __syncthreads();
-    if (block_posting_total < reference_count) {
-        if (score == 0U) {
-            return;
-        }
-        for (auto posting = begin + lane; posting < end; posting += warp_width) {
-            atomicAdd(&match_counts[postings[posting]], 1U);
-        }
-        return;
-    }
-    for (auto i = threadIdx.x; i < reference_count; i += blockDim.x) {
-        shared_counts[i] = 0U;
-    }
-    __syncthreads();
-    if (score != 0U) {
-        for (auto posting = begin + lane; posting < end; posting += warp_width) {
-            atomicAdd(&shared_counts[postings[posting]], 1U);
-        }
-    }
-    __syncthreads();
-    for (auto i = threadIdx.x; i < reference_count; i += blockDim.x) {
-        auto const staged = shared_counts[i];
-        if (staged != 0U) {
-            atomicAdd(&match_counts[i], staged);
-        }
-    }
-}
-
 /// @brief Stable CUB selection predicate over per-reference match counts.
 struct minimum_match_predicate {
     uint32_t const* match_counts;
@@ -736,180 +489,6 @@ struct minimum_match_predicate {
         return match_counts[reference_id] >= minimum_matches;
     }
 };
-
-/// @brief Exactly refines every selected reference over its full winner-score row.
-template <size_t BucketCount, typename ReferenceRow, typename SearchResult>
-__global__ __launch_bounds__(block_size) void refine_index_candidates_kernel(
-    ReferenceRow const* rows,
-    uint16_t const* query,
-    uint32_t const* candidate_ids,
-    uint32_t const* candidate_count,
-    SearchResult* results
-) {
-    constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
-    using warp_reduce = cub::WarpReduce<pairwise_counts>;
-    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
-
-    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto const candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
-    if (candidate_index >= *candidate_count) {
-        return;
-    }
-
-    auto const reference_id = candidate_ids[candidate_index];
-    pairwise_counts local{};
-    auto const row_offset = static_cast<size_t>(reference_id) * BucketCount;
-    for (auto bucket = static_cast<size_t>(lane); bucket < BucketCount; bucket += warp_width) {
-        classify(local, query[bucket], reference_score(rows[row_offset + bucket]));
-    }
-    auto const total = warp_reduce(storage[warp]).Sum(local);
-    if (lane == 0U) {
-        results[candidate_index].reference_id = reference_id;
-        results[candidate_index].summary.counts = total;
-        results[candidate_index].summary.cardinality = 0.0;
-    }
-}
-
-/**
- * @brief Exactly compares a query tile with a reference database.
- *
- * In all-to-all mode the query rows come from the database backing and only pairs with
- * `query_id < reference_id` are emitted.
- */
-template <
-    size_t BucketCount,
-    bool AllToAll,
-    typename QueryRow,
-    typename ReferenceRow,
-    typename SearchResult>
-__global__ __launch_bounds__(block_size) void batch_exhaustive_search_kernel(
-    QueryRow const* queries,
-    size_t query_row_offset,
-    uint32_t query_count,
-    uint32_t query_id_offset,
-    ReferenceRow const* rows,
-    uint32_t reference_count,
-    SearchResult* results,
-    uint32_t* result_match_counts,
-    uint32_t* result_count,
-    uint32_t pair_count
-) {
-    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
-        *result_count = pair_count;
-    }
-    constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
-    using count_reduce = cub::WarpReduce<pairwise_counts>;
-    __shared__ typename count_reduce::TempStorage count_storage[warps_per_block];
-
-    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    // The wide path needs rows aligned to @ref load_256_alignment, which is 32 bytes on sm_100+
-    // and 16 bytes below. Every row stride here is a multiple of it, so checking the two base
-    // pointers covers every row the warp touches. Otherwise the chunking falls back to scalar
-    // loads.
-    auto const wide = wide_rows_aligned(queries, rows);
-    auto const classify_rows = [&](size_t query_offset, size_t reference_offset) {
-        pairwise_counts local{};
-        if (wide) {
-            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow>;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (uint32_t chunk = lane; chunk < chunks_per_row; chunk += warp_width) {
-                classify_wide_chunk<true>(
-                    local,
-                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
-        } else {
-            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow> / 2U;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (uint32_t chunk = lane; chunk < chunks_per_row; chunk += warp_width) {
-                classify_wide_chunk<false>(
-                    local,
-                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
-        }
-        return local;
-    };
-    if constexpr (!AllToAll) {
-        // Reference-major traversal: each warp owns one reference and compares it against
-        // every query in the tile, so each reference row is loaded once (and reused from L1
-        // for the remaining queries) instead of once per (query, reference) pair. The query
-        // rows themselves fit in L2 and are shared by every warp; staging them in shared
-        // memory was profiled and rejected because the larger shared footprint caps the
-        // occupancy at one block per SM. Results keep their dense query-major positions, so
-        // the output layout is unchanged.
-        auto reference = static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
-        auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
-        for (; reference < reference_count; reference += reference_stride) {
-            auto const reference_id = static_cast<uint32_t>(reference);
-            auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-            for (uint32_t query_index = 0U; query_index < query_count; ++query_index) {
-                auto const query_id = query_id_offset + query_index;
-                auto const query_offset =
-                    (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
-                auto const local = classify_rows(query_offset, reference_offset);
-                auto const total = count_reduce(count_storage[warp]).Sum(local);
-                if (lane == 0U) {
-                    auto const result_index =
-                        static_cast<size_t>(query_index) * reference_count + reference_id;
-                    results[result_index].query_id = query_id;
-                    results[result_index].reference_id = reference_id;
-                    results[result_index].summary.counts = total;
-                    results[result_index].summary.cardinality = 0.0;
-                    if (result_match_counts != nullptr) {
-                        result_match_counts[result_index] = total.equal;
-                    }
-                }
-                __syncwarp();
-            }
-        }
-    } else {
-        for (auto query = static_cast<uint64_t>(blockIdx.y); query < query_count;
-             query += static_cast<uint64_t>(gridDim.y)) {
-            auto const query_index = static_cast<uint32_t>(query);
-            auto const query_id = query_id_offset + query_index;
-            auto const first_reference =
-                AllToAll ? static_cast<uint64_t>(query_id) + 1U : uint64_t{0};
-            auto const earlier_queries = query_index == 0U ? 0U : query_index - 1U;
-            auto const preceding_pairs =
-                AllToAll
-                    ? static_cast<size_t>(query_index) * (reference_count - query_id_offset - 1U) -
-                          static_cast<size_t>(query_index) * earlier_queries / 2U
-                    : static_cast<size_t>(query_index) * reference_count;
-            auto const query_offset =
-                (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
-
-            auto reference =
-                first_reference + static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
-            auto const reference_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
-            for (; reference < reference_count; reference += reference_stride) {
-                auto const reference_id = static_cast<uint32_t>(reference);
-                auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-                auto const local = classify_rows(query_offset, reference_offset);
-                auto const total = count_reduce(count_storage[warp]).Sum(local);
-                if (lane == 0U) {
-                    auto const result_index = preceding_pairs + reference_id - first_reference;
-                    results[result_index].query_id = query_id;
-                    results[result_index].reference_id = reference_id;
-                    results[result_index].summary.counts = total;
-                    results[result_index].summary.cardinality = 0.0;
-                    if (result_match_counts != nullptr) {
-                        result_match_counts[result_index] = total.equal;
-                    }
-                }
-                __syncwarp();
-            }
-        }
-    }
-}
 
 /// @brief Cells one warp owns per iteration of @ref count_batch_index_matches_kernel: one per
 /// lane.
@@ -937,6 +516,180 @@ __device__ inline uint2 lane_posting_range(
         static_cast<uint32_t>(range.first - sorted_keys),
         static_cast<uint32_t>(range.second - sorted_keys)
     };
+}
+
+/// @brief Low key bits a sparse key directory cell spans for @p reference_count references.
+///
+/// Cells average about eight keys per bucket for uniformly spread keys, so a lookup reads the
+/// cell's two bounds and then searches within about one memory sector.
+__host__ __device__ constexpr uint32_t sparse_directory_shift(uint32_t reference_count) noexcept {
+    uint32_t cell_bits = 0U;
+    while (cell_bits < 16U && (uint64_t{1} << (cell_bits + 1U)) * 8U <= reference_count) {
+        ++cell_bits;
+    }
+    return 16U - cell_bits;
+}
+
+/// @brief Bounds per bucket in a sparse key directory.
+__host__ __device__ constexpr uint32_t sparse_directory_entries(uint32_t reference_count) noexcept {
+    return (1U << (16U - sparse_directory_shift(reference_count))) + 1U;
+}
+
+/// @brief Builds a sparse key directory: entry c of bucket b is the first position in b's
+/// sorted keys whose key is at least `c << shift`.
+__global__ __launch_bounds__(block_size) static void build_sparse_directory_kernel(
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint32_t* directory
+) {
+    auto const entries = sparse_directory_entries(reference_count);
+    auto const shift = sparse_directory_shift(reference_count);
+    auto const total = static_cast<size_t>(indexed_bucket_count) * entries;
+    for (auto i = static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x; i < total;
+         i += static_cast<size_t>(gridDim.x) * block_size) {
+        auto const bucket = i / entries;
+        auto const bound = static_cast<uint32_t>(i % entries) << shift;
+        auto const* first = sorted_keys + bucket * reference_count;
+        directory[i] = static_cast<uint32_t>(
+            cuda::std::lower_bound(
+                first,
+                first + reference_count,
+                bound,
+                [](uint16_t key, uint32_t value) { return key < value; }
+            ) -
+            first
+        );
+    }
+}
+
+/// @brief Adds the squared length of every nonzero-key posting list to @p work.
+///
+/// Dense indexes pass their cell offsets (@p key_count cells per bucket); sparse indexes pass
+/// their per-bucket sorted keys instead, whose runs are the posting lists. The sum is the
+/// number of (reference, reference, bucket) triples sharing an index key: an index walks about
+/// `work / reference_count` postings per database-like query.
+__global__ __launch_bounds__(block_size) static void index_pair_work_kernel(
+    uint32_t const* offsets,
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint32_t key_count,
+    unsigned long long* work
+) {
+    auto const total = offsets != nullptr
+                           ? static_cast<size_t>(indexed_bucket_count) * key_count
+                           : static_cast<size_t>(indexed_bucket_count) * reference_count;
+    unsigned long long local = 0U;
+    for (auto i = static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x; i < total;
+         i += static_cast<size_t>(gridDim.x) * block_size) {
+        uint64_t length = 0U;
+        if (offsets != nullptr) {
+            if (i % key_count != 0U) {
+                length = offsets[i + 1U] - offsets[i];
+            }
+        } else {
+            auto const position = static_cast<uint32_t>(i % reference_count);
+            auto const* first = sorted_keys + (i - position);
+            auto const key = first[position];
+            if (key != 0U && (position == 0U || first[position - 1U] != key)) {
+                length = static_cast<uint64_t>(
+                    cuda::std::upper_bound(first + position, first + reference_count, key) -
+                    (first + position)
+                );
+            }
+        }
+        local += length * length;
+    }
+    if (local != 0U) {
+        atomicAdd(work, local);
+    }
+}
+
+/// @brief One sparse bucket/key posting range, narrowed through the bucket's key directory.
+__device__ inline uint2 directory_posting_range(
+    uint16_t const* sorted_keys,
+    uint32_t const* directory,
+    uint32_t reference_count,
+    uint32_t bucket,
+    uint32_t sparse_key
+) {
+    auto const* first = sorted_keys + static_cast<size_t>(bucket) * reference_count;
+    auto const* cells =
+        directory + static_cast<size_t>(bucket) * sparse_directory_entries(reference_count);
+    auto const cell = sparse_key >> sparse_directory_shift(reference_count);
+    auto const* low = first + cells[cell];
+    auto const* high = first + cells[cell + 1U];
+    auto const less = [](uint16_t key, uint32_t value) {
+        return key < value;
+    };
+    auto const* begin = cuda::std::lower_bound(low, high, sparse_key, less);
+    auto const* end = cuda::std::lower_bound(begin, high, sparse_key + 1U, less);
+    return {static_cast<uint32_t>(begin - sorted_keys), static_cast<uint32_t>(end - sorted_keys)};
+}
+
+/// @brief Threads of the single @ref index_posting_ranges_kernel block.
+constexpr uint32_t posting_range_block_size = 1024U;
+
+/// @brief Resolves one query's posting range in every indexed bucket.
+///
+/// Writes each bucket's first posting and the inclusive prefix sum of the range lengths, so
+/// @ref count_balanced_index_matches_kernel can split all postings evenly across its grid
+/// however skewed the individual lists are.
+static __global__ __launch_bounds__(posting_range_block_size) void index_posting_ranges_kernel(
+    uint16_t const* query,
+    uint32_t const* offsets,
+    uint16_t const* sorted_keys,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t* range_begin,
+    uint32_t* range_end_scan
+) {
+    using block_scan = cub::BlockScan<uint32_t, posting_range_block_size>;
+    __shared__ typename block_scan::TempStorage storage;
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    uint32_t carry = 0U;
+    for (uint32_t base = 0U; base < indexed_bucket_count; base += posting_range_block_size) {
+        auto const bucket = base + static_cast<uint32_t>(threadIdx.x);
+        auto const score = bucket < indexed_bucket_count ? query[bucket] : uint16_t{0};
+        uint2 range{0U, 0U};
+        if (score != 0U) {
+            range = lane_posting_range(
+                offsets, sorted_keys, reference_count, bucket, score & key_mask, key_count
+            );
+        }
+        uint32_t end = 0U;
+        uint32_t aggregate = 0U;
+        block_scan(storage).InclusiveSum(range.y - range.x, end, aggregate);
+        if (bucket < indexed_bucket_count) {
+            range_begin[bucket] = range.x;
+            range_end_scan[bucket] = carry + end;
+        }
+        carry += aggregate;
+        __syncthreads();
+    }
+}
+
+/// @brief Counts the query's posting matches for every reference, one posting per thread.
+static __global__ __launch_bounds__(block_size) void count_balanced_index_matches_kernel(
+    uint32_t const* range_begin,
+    uint32_t const* range_end_scan,
+    uint32_t indexed_bucket_count,
+    uint32_t const* postings,
+    uint32_t* match_counts
+) {
+    auto const total = range_end_scan[indexed_bucket_count - 1U];
+    auto const stride = static_cast<uint32_t>(gridDim.x) * block_size;
+    for (auto item = static_cast<uint32_t>(blockIdx.x) * block_size + threadIdx.x; item < total;
+         item += stride) {
+        auto const bucket = static_cast<uint32_t>(
+            cuda::std::upper_bound(range_end_scan, range_end_scan + indexed_bucket_count, item) -
+            range_end_scan
+        );
+        auto const first_item = bucket == 0U ? 0U : range_end_scan[bucket - 1U];
+        atomicAdd(&match_counts[postings[range_begin[bucket] + (item - first_item)]], 1U);
+    }
 }
 
 /// @brief Counts index matches for every query/reference pair in one tile.
@@ -1020,8 +773,23 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
     }
 }
 
+/// @brief Candidate bitmap words per query row, one bit per reference.
+__host__ __device__ constexpr uint32_t candidate_bit_words(uint32_t reference_count) noexcept {
+    return (reference_count + 31U) / 32U;
+}
+
+/// @brief Threads per @ref count_batch_index_tile_kernel block.
+constexpr uint32_t index_tile_block_size = 1024U;
+
+/// @brief Longest posting range one @ref count_batch_index_tile_kernel lane walks alone.
+constexpr uint32_t index_tile_lane_postings = 16U;
+
+/// @brief Long posting ranges one @ref count_batch_index_tile_kernel block walks together;
+/// small enough to keep three blocks per SM beside the counters.
+constexpr uint32_t index_tile_long_capacity = 32U;
+
 /// @brief References one @ref count_batch_index_tile_kernel block may count, two per word.
-constexpr uint32_t index_tile_max_references = 16384U;
+constexpr uint32_t index_tile_max_references = 32768U;
 
 /// @brief Whether a batch counts through @ref count_batch_index_tile_kernel.
 ///
@@ -1052,12 +820,17 @@ constexpr uint32_t index_tile_max_references = 16384U;
 
 /// @brief Counts index matches for one query against one reference tile in shared memory.
 ///
-/// Block (x, y) owns query x and references [y * tile, (y + 1) * tile), with two 16-bit
-/// counters per shared word. Postings ascend by reference within each key, so each posting list
-/// is narrowed to the tile with two binary searches. The flush writes every pair of the tile,
-/// so @p match_counts needs no zeroing.
+/// Block b owns query b / tiles and references [t * tile, (t + 1) * tile) for t = b % tiles,
+/// with two 16-bit counters per shared word. A query's tiles run as neighbouring blocks, so they
+/// share its posting-range lookups through the caches. Postings ascend by reference within each
+/// key, so each posting list is narrowed to the tile with two binary searches. The flush writes
+/// every pair of the tile, so @p match_counts needs no zeroing.
+///
+/// Launched with @ref index_tile_block_size threads: the shared counters, not the thread count,
+/// bound how many blocks fit on an SM, so larger blocks keep more warps resident to hide the
+/// posting loads' latency.
 template <size_t BucketCount, typename QueryRow>
-__global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
+__global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_kernel(
     QueryRow const* queries,
     size_t query_row_offset,
     uint32_t const* offsets,
@@ -1067,17 +840,28 @@ __global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
     uint16_t key_mask,
     uint32_t tile,
     uint32_t* match_counts,
-    uint16_t const* sorted_keys
+    uint16_t const* sorted_keys,
+    uint2 const* ranges,
+    uint32_t minimum_matches,
+    uint32_t query_id_offset,
+    bool all_to_all,
+    uint32_t* candidate_bits
 ) {
     constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
+    constexpr uint32_t warps_per_block = index_tile_block_size / warp_width;
     extern __shared__ uint32_t packed_counts[];
-    auto const query_index = static_cast<uint32_t>(blockIdx.x);
-    auto const low = static_cast<uint32_t>(blockIdx.y) * tile;
+    auto const tiles = (reference_count + tile - 1U) / tile;
+    auto const query_index = static_cast<uint32_t>(blockIdx.x) / tiles;
+    auto const low = static_cast<uint32_t>(blockIdx.x) % tiles * tile;
     auto const high = min(low + tile, reference_count);
     auto const width = high - low;
+    __shared__ uint2 long_ranges[index_tile_long_capacity];
+    __shared__ uint32_t long_count;
     for (auto i = threadIdx.x; i < (width + 1U) / 2U; i += blockDim.x) {
         packed_counts[i] = 0U;
+    }
+    if (threadIdx.x == 0U) {
+        long_count = 0U;
     }
     __syncthreads();
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
@@ -1097,17 +881,22 @@ __global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
         uint32_t begin = 0U;
         uint32_t end = 0U;
         if (score != 0U) {
-            auto const range = lane_posting_range(
-                offsets,
-                sorted_keys,
-                reference_count,
-                bucket,
-                static_cast<uint32_t>(score & key_mask),
-                key_count
-            );
+            auto const range =
+                ranges != nullptr
+                    ? ranges[static_cast<size_t>(query_index) * indexed_bucket_count + bucket]
+                    : lane_posting_range(
+                          offsets,
+                          sorted_keys,
+                          reference_count,
+                          bucket,
+                          static_cast<uint32_t>(score & key_mask),
+                          key_count
+                      );
             begin = range.x;
             end = range.y;
-            if (gridDim.y > 1U) {
+            // Long lists are narrowed to the tile by binary search; short ones are cheaper to
+            // filter while walking them below.
+            if (tiles > 1U && end - begin > index_tile_lane_postings) {
                 begin = static_cast<uint32_t>(
                     cuda::std::lower_bound(postings + begin, postings + end, low) - postings
                 );
@@ -1116,7 +905,31 @@ __global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
                 );
             }
         }
-        auto pending = __ballot_sync(0xffffffffU, begin < end);
+        // Typical ranges hold a few postings, so each lane walks its own short range, keeping
+        // the postings inside the tile; only long ranges are walked by the whole warp, which
+        // would otherwise leave most lanes idle.
+        auto const lane_walk = end - begin <= index_tile_lane_postings;
+        if (lane_walk) {
+            for (auto posting = begin; posting < end; ++posting) {
+                auto const reference = postings[posting];
+                if (reference >= high) {
+                    break;
+                }
+                if (reference >= low) {
+                    count(reference);
+                }
+            }
+        }
+        // Long ranges are recorded for the whole block to walk after this loop; without a free
+        // slot the owning warp walks them itself.
+        uint32_t slot = index_tile_long_capacity;
+        if (!lane_walk) {
+            slot = atomicAdd(&long_count, 1U);
+            if (slot < index_tile_long_capacity) {
+                long_ranges[slot] = make_uint2(begin, end);
+            }
+        }
+        auto pending = __ballot_sync(0xffffffffU, !lane_walk && slot >= index_tile_long_capacity);
         while (pending != 0U) {
             auto const source = static_cast<uint32_t>(__ffs(pending) - 1);
             pending &= pending - 1U;
@@ -1139,108 +952,144 @@ __global__ __launch_bounds__(block_size) void count_batch_index_tile_kernel(
         }
     }
     __syncthreads();
-    auto* const counts = match_counts + static_cast<size_t>(query_index) * reference_count + low;
-    for (auto i = threadIdx.x; i < width; i += blockDim.x) {
-        counts[i] = (packed_counts[i / 2U] >> ((i % 2U) * 16U)) & 0xffffU;
+    // Every thread takes part in each long range, four loads in flight per thread.
+    auto const long_ranges_used =
+        long_count < index_tile_long_capacity ? long_count : index_tile_long_capacity;
+    for (uint32_t i = 0U; i < long_ranges_used; ++i) {
+        auto const range = long_ranges[i];
+        auto posting = range.x + static_cast<uint32_t>(threadIdx.x);
+        for (; posting + 3U * index_tile_block_size < range.y;
+             posting += 4U * index_tile_block_size) {
+            uint32_t ids[4];
+            _Pragma("unroll")
+            for (uint32_t j = 0U; j < 4U; ++j) {
+                ids[j] = postings[posting + j * index_tile_block_size];
+            }
+            _Pragma("unroll")
+            for (uint32_t j = 0U; j < 4U; ++j) {
+                count(ids[j]);
+            }
+        }
+        for (; posting < range.y; posting += index_tile_block_size) {
+            count(postings[posting]);
+        }
+    }
+    __syncthreads();
+    if (candidate_bits == nullptr) {
+        auto* const counts =
+            match_counts + static_cast<size_t>(query_index) * reference_count + low;
+        for (auto i = threadIdx.x; i < width; i += blockDim.x) {
+            counts[i] = (packed_counts[i / 2U] >> ((i % 2U) * 16U)) & 0xffffU;
+        }
+        return;
+    }
+    // Apply the selection predicate here and flush one bit per pair; tiles start on 64-reference
+    // boundaries, so every word belongs to this block.
+    auto* const bits = candidate_bits +
+                       static_cast<size_t>(query_index) * candidate_bit_words(reference_count) +
+                       low / 32U;
+    for (auto base = warp * warp_width; base < width; base += index_tile_block_size) {
+        auto const i = base + lane;
+        auto selected = false;
+        if (i < width) {
+            auto const count = (packed_counts[i / 2U] >> ((i % 2U) * 16U)) & 0xffffU;
+            selected = count >= minimum_matches &&
+                       (!all_to_all || query_id_offset + query_index < low + i);
+        }
+        auto const word = __ballot_sync(0xffffffffU, selected);
+        if (lane == 0U) {
+            bits[base / warp_width] = word;
+        }
     }
 }
 
-/// @brief Stable query-major selection predicate for external or all-to-all batch search.
-struct batch_minimum_match_predicate {
-    uint32_t const* match_counts;
-    uint32_t minimum_matches;
-    uint32_t reference_count;
-    uint32_t query_id_offset;
-    bool all_to_all;
-
-    [[nodiscard]] __host__ __device__ bool operator()(uint32_t pair_id) const noexcept {
-        auto const query_index = pair_id / reference_count;
-        auto const reference_id = pair_id % reference_count;
-        return (!all_to_all || query_id_offset + query_index < reference_id) &&
-               match_counts[pair_id] >= minimum_matches;
-    }
-};
-
-/// @brief Classifies one contiguous per-lane chunk of both rows.
+/// @brief Resolves every query's sparse posting range for one indexed bucket per block.
 ///
-/// With @p Use256 the chunk covers 16 buckets for 16-bit scores and 8 buckets for packed
-/// 32-bit registers, through cuddl::detail::load_256_global_nc: one 256-bit load per row on sm_100+
-/// and two 128-bit loads below, so it needs rows aligned to @ref load_256_alignment. Without it the
-/// chunk covers 8 or 4 buckets with per-element scalar loads, which are safe for rows aligned
-/// only to their score type (2 or 4 bytes).
-template <bool Use256, typename QueryScore, typename ReferenceScore>
-__device__ void classify_wide_chunk(
+/// Block b owns bucket b, so its lookups share the bucket's directory and keys through L1.
+/// @p ranges is query-major, one entry per (query, indexed bucket).
+template <size_t BucketCount, typename QueryRow>
+__global__ __launch_bounds__(block_size) void sparse_batch_posting_ranges_kernel(
+    QueryRow const* queries,
+    size_t query_row_offset,
+    uint32_t query_count,
+    uint16_t const* sorted_keys,
+    uint32_t const* directory,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint2* ranges
+) {
+    auto const bucket = static_cast<uint32_t>(blockIdx.x);
+    auto const key_count = static_cast<uint32_t>(key_mask) + 1U;
+    for (auto query = static_cast<uint32_t>(threadIdx.x); query < query_count;
+         query += block_size) {
+        auto const score =
+            reference_score(queries[(query_row_offset + query) * BucketCount + bucket]);
+        uint2 range{0U, 0U};
+        if (score != 0U) {
+            range = directory_posting_range(
+                sorted_keys,
+                directory,
+                reference_count,
+                bucket,
+                static_cast<uint32_t>(score & key_mask) + (key_count == 32768U ? 1U : 0U)
+            );
+        }
+        ranges[static_cast<size_t>(query) * indexed_bucket_count + bucket] = range;
+    }
+}
+
+/// @brief Classifies 16 buckets of an already loaded 16-bit query chunk against one
+/// @ref load_256_alignment aligned reference chunk.
+template <typename ReferenceScore>
+__device__ __forceinline__ void classify_query_words(
     pairwise_counts& target,
-    QueryScore const* query,
+    uint32_t const (&q)[8],
     ReferenceScore const* reference
 ) noexcept {
-    constexpr uint32_t chunk_buckets = Use256 ? wide_chunk_buckets<QueryScore, ReferenceScore>
-                                              : wide_chunk_buckets<QueryScore, ReferenceScore> / 2U;
-    if constexpr (Use256) {
-        if constexpr (sizeof(QueryScore) == 2U && sizeof(ReferenceScore) == 2U) {
-            uint32_t q[8];
-            uint32_t r[8];
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(query), q);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r);
-            auto const* qs = reinterpret_cast<uint16_t const*>(q);
-            auto const* rs = reinterpret_cast<uint16_t const*>(r);
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < chunk_buckets; ++i) {
-                classify(target, qs[i], rs[i]);
-            }
-        } else if constexpr (sizeof(QueryScore) == 2U) {
-            uint32_t q[8];
-            uint32_t r0[8];
-            uint32_t r1[8];
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(query), q);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r0);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(reference) + 8U, r1);
-            auto const* qs = reinterpret_cast<uint16_t const*>(q);
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < 8U; ++i) {
-                classify(target, qs[i], reference_score(r0[i]));
-            }
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < 8U; ++i) {
-                classify(target, qs[8U + i], reference_score(r1[i]));
-            }
-        } else if constexpr (sizeof(ReferenceScore) == 2U) {
-            uint32_t q0[8];
-            uint32_t q1[8];
-            uint32_t r[8];
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(query), q0);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(query) + 8U, q1);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r);
-            auto const* rs = reinterpret_cast<uint16_t const*>(r);
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < 8U; ++i) {
-                classify(target, reference_score(q0[i]), rs[i]);
-            }
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < 8U; ++i) {
-                classify(target, reference_score(q1[i]), rs[8U + i]);
-            }
-        } else {
-            uint32_t q[8];
-            uint32_t r[8];
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(query), q);
-            load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r);
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < chunk_buckets; ++i) {
-                classify(target, q[i], r[i]);
-            }
-        }
-    } else {
-        // Scalar fallback: callers only guarantee the score type's alignment (2 or 4 bytes),
-        // so no vector load is safe here.
+    auto const* qs = reinterpret_cast<uint16_t const*>(q);
+    if constexpr (sizeof(ReferenceScore) == 2U) {
+        uint32_t r[8];
+        load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r);
+        // Differences of zero-extended 16-bit scores carry the comparison in their sign bit,
+        // and a sum of two scores minus one is negative only when both are empty. Equal is
+        // whatever remains of the chunk's 16 buckets.
+        uint32_t lower = 0U;
+        uint32_t higher = 0U;
+        uint32_t empty = 0U;
         _Pragma("unroll")
-        for (uint32_t i = 0; i < chunk_buckets; ++i) {
-            classify(target, reference_score(query[i]), reference_score(reference[i]));
+        for (uint32_t i = 0; i < 8U; ++i) {
+            auto const q_low = q[i] & 0xffffU;
+            auto const q_high = q[i] >> 16U;
+            auto const r_low = r[i] & 0xffffU;
+            auto const r_high = r[i] >> 16U;
+            lower += ((q_low - r_low) >> 31U) + ((q_high - r_high) >> 31U);
+            higher += ((r_low - q_low) >> 31U) + ((r_high - q_high) >> 31U);
+            empty += ((q_low + r_low - 1U) >> 31U) + ((q_high + r_high - 1U) >> 31U);
+        }
+        target.lower += lower;
+        target.higher += higher;
+        target.both_empty += empty;
+        target.equal += 16U - lower - higher - empty;
+    } else {
+        uint32_t r0[8];
+        uint32_t r1[8];
+        load_256_global_nc(reinterpret_cast<uint32_t const*>(reference), r0);
+        load_256_global_nc(reinterpret_cast<uint32_t const*>(reference) + 8U, r1);
+        _Pragma("unroll")
+        for (uint32_t i = 0; i < 8U; ++i) {
+            classify(target, qs[i], reference_score(r0[i]));
+        }
+        _Pragma("unroll")
+        for (uint32_t i = 0; i < 8U; ++i) {
+            classify(target, qs[8U + i], reference_score(r1[i]));
         }
     }
 }
 
 /// @brief Warp-reduces one refined candidate and writes its stable result slot.
+///
+/// Each counter reduces with one `redux.sync` instruction instead of a shuffle tree.
 template <typename SearchResult>
 __device__ void refine_write_result(
     uint32_t index,
@@ -1250,117 +1099,698 @@ __device__ void refine_write_result(
     uint32_t const* match_counts,
     uint32_t pair_id,
     pairwise_counts local,
-    cub::WarpReduce<pairwise_counts>::TempStorage& storage,
     uint32_t lane,
     SearchResult* results,
     uint32_t* result_match_counts
 ) {
-    auto const total = cub::WarpReduce<pairwise_counts>(storage).Sum(local);
+    pairwise_counts const total{
+        .lower = __reduce_add_sync(0xffffffffU, local.lower),
+        .equal = __reduce_add_sync(0xffffffffU, local.equal),
+        .higher = __reduce_add_sync(0xffffffffU, local.higher),
+        .both_empty = __reduce_add_sync(0xffffffffU, local.both_empty),
+    };
     if (lane == 0U) {
         results[index].query_id = query_id_offset + query_index;
         results[index].reference_id = reference_id;
-        results[index].summary.counts = total;
-        results[index].summary.cardinality = 0.0;
+        results[index].counts = total;
         if (result_match_counts != nullptr) {
             result_match_counts[index] = match_counts[pair_id];
         }
     }
 }
 
-/// @brief Exactly refines one stable query-major candidate tile.
-template <size_t BucketCount, typename QueryRow, typename ReferenceRow, typename SearchResult>
-__global__ __launch_bounds__(block_size) void refine_batch_index_candidates_kernel(
-    QueryRow const* queries,
-    size_t query_row_offset,
-    uint32_t query_id_offset,
-    ReferenceRow const* rows,
-    uint32_t reference_count,
-    uint32_t const* match_counts,
-    uint32_t const* candidate_ids,
-    uint32_t const* candidate_count,
-    uint32_t const* result_offset,
-    uint32_t const* required_count,
-    uint32_t result_capacity,
-    SearchResult* results,
-    uint32_t* result_match_counts
-) {
-    constexpr uint32_t warp_width = 32;
-    constexpr uint32_t warps_per_block = block_size / warp_width;
-    using warp_reduce = cub::WarpReduce<pairwise_counts>;
-    __shared__ typename warp_reduce::TempStorage storage[warps_per_block];
+/// @brief Reference-row bytes one @ref refine_batch_index_candidates_kernel block spans.
+///
+/// Candidates are refined one (reference block, query) cell at a time, reference-block major,
+/// so the resident warps share a few blocks' rows through L2 instead of every query
+/// streaming every candidate reference row from DRAM.
+constexpr size_t refine_block_row_bytes = size_t{8} << 20U;
 
-    if (required_count != nullptr && *required_count > result_capacity) {
-        return;
-    }
-    auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto const candidate_stride = static_cast<uint32_t>(gridDim.x) * warps_per_block;
+/// @brief Bits per score, and so bit-planes per 32-bucket group.
+constexpr uint32_t score_planes = 16U;
 
-    // The wide load path needs rows aligned to @ref load_256_alignment; callers may hand over
-    // spans whose base breaks that, in which case the same chunking falls back to scalar loads.
-    auto const wide256 = wide_rows_aligned(queries, rows);
-    for (auto candidate_index = static_cast<uint32_t>(blockIdx.x) * warps_per_block + warp;
-         candidate_index < *candidate_count;
-         candidate_index += candidate_stride) {
-        auto const pair_id = candidate_ids[candidate_index];
-        auto const query_index = pair_id / reference_count;
-        auto const reference_id = pair_id % reference_count;
-        auto const query_offset =
-            (query_row_offset + static_cast<size_t>(query_index)) * BucketCount;
-        auto const reference_offset = static_cast<size_t>(reference_id) * BucketCount;
-        pairwise_counts local{};
-        if (wide256) {
-            constexpr uint32_t chunk_buckets =
-                (sizeof(QueryRow) == 2U || sizeof(ReferenceRow) == 2U) ? 16U : 8U;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (auto chunk = static_cast<uint32_t>(lane); chunk < chunks_per_row;
-                 chunk += warp_width) {
-                classify_wide_chunk<true>(
-                    local,
-                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
-        } else {
-            constexpr uint32_t chunk_buckets = wide_chunk_buckets<QueryRow, ReferenceRow> / 2U;
-            static_assert(BucketCount % chunk_buckets == 0U);
-            constexpr uint32_t chunks_per_row = BucketCount / chunk_buckets;
-            for (auto chunk = static_cast<uint32_t>(lane); chunk < chunks_per_row;
-                 chunk += warp_width) {
-                classify_wide_chunk<false>(
-                    local,
-                    queries + query_offset + static_cast<size_t>(chunk) * chunk_buckets,
-                    rows + reference_offset + static_cast<size_t>(chunk) * chunk_buckets
-                );
-            }
+/// @brief Position of plane @p plane of 32-bucket group @p group within a row's bit-planes.
+///
+/// A row of `BucketCount` 16-bit scores becomes `BucketCount / 2` plane words: word p of group g
+/// holds bit p of the group's 32 scores. Lane `g % 32` of a warp owns group g, and its 16 plane
+/// words form four consecutive uint4s at lane-contiguous positions, so a warp reads a row with
+/// coalesced 128-bit loads and shared copies with conflict-free 128-bit loads.
+__host__ __device__ constexpr uint32_t score_plane_index(uint32_t group, uint32_t plane) noexcept {
+    return (((group / 32U) * 4U + plane / 4U) * 32U + group % 32U) * 4U + plane % 4U;
+}
+
+/// @brief Writes the bit-planes of one 32-bucket group whose scores the warp holds, one per lane.
+__device__ __forceinline__ void
+write_score_planes(uint32_t score, uint32_t group, uint32_t lane, uint32_t* planes) {
+    uint32_t mine = 0U;
+    _Pragma("unroll")
+    for (uint32_t plane = 0; plane < score_planes; ++plane) {
+        auto const word = __ballot_sync(0xffffffffU, ((score >> plane) & 1U) != 0U);
+        if (lane == plane) {
+            mine = word;
         }
-        refine_write_result(
-            *result_offset + candidate_index,
-            query_index,
-            reference_id,
-            query_id_offset,
-            match_counts,
-            pair_id,
-            local,
-            storage[warp],
-            lane,
-            results,
-            result_match_counts
-        );
-        __syncwarp();
+    }
+    if (lane < score_planes) {
+        planes[score_plane_index(group, lane)] = mine;
     }
 }
 
-/// @brief Advances a tiled result offset after the preceding refinement completes.
-static __global__ void advance_indexed_result_count_kernel(
-    uint32_t const* tile_count,
-    uint32_t* result_offset,
-    uint32_t const* required_count,
-    uint32_t result_capacity
+/// @brief Transposes compact score rows into the bit-plane layout of @ref score_plane_index.
+template <size_t BucketCount>
+__global__ __launch_bounds__(
+    block_size
+) void build_score_planes_kernel(uint16_t const* rows, uint32_t row_count, uint32_t* planes) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t groups_per_row = static_cast<uint32_t>(BucketCount / warp_width);
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const total = static_cast<size_t>(row_count) * groups_per_row;
+    auto const stride = static_cast<size_t>(gridDim.x) * (block_size / warp_width);
+    for (auto item = (static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
+         item < total;
+         item += stride) {
+        auto const row = item / groups_per_row;
+        auto const group = static_cast<uint32_t>(item % groups_per_row);
+        write_score_planes(
+            rows[row * BucketCount + group * warp_width + lane],
+            group,
+            lane,
+            planes + row * (BucketCount / 2U)
+        );
+    }
+}
+
+/// @brief Loads group @p group of one bit-plane row (@ref score_plane_index layout).
+__device__ __forceinline__ void
+load_plane_group(uint4 const* row, uint32_t group, uint32_t (&words)[score_planes]) {
+    _Pragma("unroll")
+    for (uint32_t c = 0; c < score_planes / 4U; ++c) {
+        auto const v = row[((group / 32U) * 4U + c) * 32U + group % 32U];
+        words[4U * c] = v.x;
+        words[4U * c + 1U] = v.y;
+        words[4U * c + 2U] = v.z;
+        words[4U * c + 3U] = v.w;
+    }
+}
+
+/// @brief Bit-sliced pairwise counts of one 32-bucket group, accumulated per lane.
+///
+/// Differing and occupied buckets are counted rather than their equal and empty complements,
+/// so no complement is computed per plane group; the reduction recovers the complements.
+struct plane_counts {
+    uint32_t lower{};
+    /// Buckets whose scores differ.
+    uint32_t differ{};
+    /// Buckets whose scores differ or whose reference score is nonzero: all but both-empty.
+    uint32_t occupied{};
+    uint32_t matches{};
+
+    /// @brief Warp-reduces the counts into an exact pairwise summary.
+    template <size_t BucketCount>
+    [[nodiscard]] __device__ pairwise_counts reduce() const noexcept {
+        auto const total_lower = __reduce_add_sync(0xffffffffU, lower);
+        auto const total_differ = __reduce_add_sync(0xffffffffU, differ);
+        auto const total_occupied = __reduce_add_sync(0xffffffffU, occupied);
+        return {
+            .lower = total_lower,
+            .equal = total_occupied - total_differ,
+            .higher = total_differ - total_lower,
+            .both_empty = static_cast<uint32_t>(BucketCount) - total_occupied,
+        };
+    }
+};
+
+/// @brief Buckets of a plane group holding a nonzero score.
+[[nodiscard]] __device__ __forceinline__ uint32_t
+plane_any(uint32_t const (&planes)[score_planes]) noexcept {
+    uint32_t any = 0U;
+    _Pragma("unroll")
+    for (uint32_t p = 0; p < score_planes; ++p) {
+        any |= planes[p];
+    }
+    return any;
+}
+
+/// @brief Buckets of a plane group whose score is nonzero below the top plane.
+[[nodiscard]] __device__ __forceinline__ uint32_t
+plane_low_any(uint32_t const (&planes)[score_planes]) noexcept {
+    uint32_t any = 0U;
+    _Pragma("unroll")
+    for (uint32_t p = 0; p + 1U < score_planes; ++p) {
+        any |= planes[p];
+    }
+    return any;
+}
+
+/// @brief Adds one group's comparison of query planes @p q with reference planes @p r, whose
+/// nonzero buckets @p reference_any the caller hoists out of per-query loops.
+///
+/// From the least significant plane up, each plane's verdict overrides the lower planes' unless
+/// its bits are equal: one 3-input logic operation per plane for `lt`, one for `ne`. With
+/// @p count_matches, buckets whose masked keys agree and whose scores are both nonzero are
+/// counted too, as the index counts them.
+///
+/// With @p CountMatches, matches are counted in the buckets of @p match_lanes; the two stored
+/// key masks come from the plane chain: a full key
+/// matches exactly the equal nonempty buckets, and the folded 15-bit key those whose low planes
+/// agree and that are nonempty in both rows, which needs the reference's low-plane nonzero mask
+/// @p reference_low_any. Only those two masks pass score_compatibility validation.
+///
+/// @p SkipTop asserts both rows' top planes are zero, so the chain stops a plane early.
+template <bool CountMatches, bool SkipTop = false>
+__device__ __forceinline__ void compare_plane_group(
+    uint32_t const (&q)[score_planes],
+    uint32_t const (&r)[score_planes],
+    uint32_t reference_any,
+    uint32_t reference_low_any,
+    uint16_t key_mask,
+    uint32_t match_lanes,
+    plane_counts& counts
+) noexcept {
+    uint32_t lt = 0U;
+    uint32_t ne = 0U;
+    uint32_t low_ne = 0U;
+    _Pragma("unroll")
+    for (uint32_t p = 0; p < score_planes; ++p) {
+        if (p == score_planes - 1U) {
+            low_ne = ne;
+            if constexpr (SkipTop) {
+                break;
+            }
+        }
+        lt = (~q[p] & r[p]) | (~(q[p] ^ r[p]) & lt);
+        ne |= q[p] ^ r[p];
+    }
+    counts.lower += static_cast<uint32_t>(__popc(lt));
+    counts.differ += static_cast<uint32_t>(__popc(ne));
+    counts.occupied += static_cast<uint32_t>(__popc(ne | reference_any));
+    if constexpr (CountMatches) {
+        // Validated key masks cover the low planes and, for a full key, the top one. Where the
+        // compared planes agree, the low planes agree, so both rows are nonzero exactly when the
+        // shared low planes are or both top bits are set.
+        constexpr auto top = score_planes - 1U;
+        auto const top_keyed = 0U - (static_cast<uint32_t>(key_mask) >> top);
+        auto const key_differs = (ne & top_keyed) | (low_ne & ~top_keyed);
+        counts.matches += static_cast<uint32_t>(
+            __popc(~key_differs & (reference_low_any | (q[top] & r[top])) & match_lanes)
+        );
+    }
+}
+
+/// @brief Recovers row-major scores from bit-plane rows, one warp per 32-bucket group.
+template <size_t BucketCount>
+__global__ __launch_bounds__(
+    block_size
+) void decode_score_planes_kernel(uint32_t const* planes, size_t row_count, uint16_t* rows) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t groups_per_row = static_cast<uint32_t>(BucketCount / warp_width);
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const total = row_count * groups_per_row;
+    auto const stride = static_cast<size_t>(gridDim.x) * (block_size / warp_width);
+    for (auto item = (static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
+         item < total;
+         item += stride) {
+        auto const row = item / groups_per_row;
+        auto const group = static_cast<uint32_t>(item % groups_per_row);
+        uint32_t words[score_planes];
+        load_plane_group(
+            reinterpret_cast<uint4 const*>(planes + row * (BucketCount / 2U)), group, words
+        );
+        uint32_t score = 0U;
+        _Pragma("unroll")
+        for (uint32_t p = 0; p < score_planes; ++p) {
+            score |= ((words[p] >> lane) & 1U) << p;
+        }
+        rows[row * BucketCount + group * warp_width + lane] = static_cast<uint16_t>(score);
+    }
+}
+
+/// @brief Blocks for a grid-stride launch covering @p warps warps of @ref block_size threads.
+[[nodiscard]] inline uint32_t warp_grid_blocks(size_t warps) noexcept {
+    constexpr size_t warps_per_block = block_size / 32U;
+    return static_cast<uint32_t>(
+        cuda::std::min<size_t>((warps + warps_per_block - 1U) / warps_per_block, 65535U)
+    );
+}
+
+/// @brief Compares one query's bit-planes with every reference, or with the selected candidates.
+///
+/// One warp compares one reference; lane l takes groups l, l + 32, ... With @p candidate_ids,
+/// item i refines reference `candidate_ids[i]` for `*candidate_count` items; otherwise item i is
+/// reference i.
+template <size_t BucketCount, typename SearchResult>
+__global__ __launch_bounds__(block_size) void single_query_planes_kernel(
+    uint32_t const* query_planes,
+    uint32_t const* reference_planes,
+    uint32_t reference_count,
+    uint32_t const* candidate_ids,
+    uint32_t const* candidate_count,
+    SearchResult* results
 ) {
-    if (threadIdx.x == 0U && (required_count == nullptr || *required_count <= result_capacity)) {
-        *result_offset += *tile_count;
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t row_words = static_cast<uint32_t>(BucketCount / 2U);
+    constexpr uint32_t groups_per_row = static_cast<uint32_t>(BucketCount / warp_width);
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const items = candidate_ids == nullptr ? reference_count : *candidate_count;
+    auto const stride = static_cast<uint32_t>(gridDim.x) * (block_size / warp_width);
+    auto const* query = reinterpret_cast<uint4 const*>(query_planes);
+    for (auto item = (static_cast<uint32_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
+         item < items;
+         item += stride) {
+        auto const reference_id = candidate_ids == nullptr ? item : candidate_ids[item];
+        auto const* reference = reinterpret_cast<uint4 const*>(
+            reference_planes + static_cast<size_t>(reference_id) * row_words
+        );
+        plane_counts counts{};
+        for (auto group = lane; group < groups_per_row; group += warp_width) {
+            uint32_t q[score_planes];
+            uint32_t r[score_planes];
+            load_plane_group(query, group, q);
+            load_plane_group(reference, group, r);
+            compare_plane_group<false>(q, r, plane_any(r), 0U, 0U, 0U, counts);
+        }
+        auto const total = counts.reduce<BucketCount>();
+        if (lane == 0U) {
+            results[item].reference_id = reference_id;
+            results[item].counts = total;
+        }
+    }
+}
+
+/// @brief Counts every query/reference pair's index matches from bit-planes, one warp per pair.
+///
+/// Used when a search asks for index semantics without an index: the counts equal the ones the
+/// index postings would produce.
+template <size_t BucketCount>
+__global__ __launch_bounds__(block_size) void count_plane_matches_kernel(
+    uint32_t const* query_planes,
+    uint32_t query_count,
+    uint32_t const* reference_planes,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t* match_counts
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t row_words = static_cast<uint32_t>(BucketCount / 2U);
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const pairs = static_cast<uint64_t>(query_count) * reference_count;
+    auto const stride = static_cast<uint64_t>(gridDim.x) * (block_size / warp_width);
+    auto const indexed_groups = indexed_bucket_count / warp_width;
+    for (auto pair = (static_cast<uint64_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
+         pair < pairs;
+         pair += stride) {
+        auto const query_index = pair / reference_count;
+        auto const reference_id = pair % reference_count;
+        auto const* query = reinterpret_cast<uint4 const*>(query_planes + query_index * row_words);
+        auto const* reference =
+            reinterpret_cast<uint4 const*>(reference_planes + reference_id * row_words);
+        plane_counts counts{};
+        for (auto group = lane; group < indexed_groups; group += warp_width) {
+            uint32_t q[score_planes];
+            uint32_t r[score_planes];
+            load_plane_group(query, group, q);
+            load_plane_group(reference, group, r);
+            compare_plane_group<true>(q, r, plane_any(r), plane_low_any(r), key_mask, ~0U, counts);
+        }
+        auto const total = __reduce_add_sync(0xffffffffU, counts.matches);
+        if (lane == 0U) {
+            match_counts[pair] = total;
+        }
+    }
+}
+
+/// @brief Turns per-pair match counts into the query-major candidate bitmap.
+static __global__ __launch_bounds__(block_size) void candidate_bits_from_counts_kernel(
+    uint32_t const* match_counts,
+    uint32_t query_count,
+    uint32_t reference_count,
+    uint32_t minimum_matches,
+    uint32_t query_id_offset,
+    bool all_to_all,
+    uint32_t* candidate_bits
+) {
+    auto const words = candidate_bit_words(reference_count);
+    auto const total = static_cast<size_t>(query_count) * words;
+    for (auto item = static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x; item < total;
+         item += static_cast<size_t>(gridDim.x) * block_size) {
+        auto const query_index = static_cast<uint32_t>(item / words);
+        auto const first = static_cast<uint32_t>(item % words) * 32U;
+        uint32_t bits = 0U;
+        for (uint32_t bit = 0U; bit < 32U && first + bit < reference_count; ++bit) {
+            auto const reference_id = first + bit;
+            auto const selected =
+                match_counts[static_cast<size_t>(query_index) * reference_count + reference_id] >=
+                    minimum_matches &&
+                (!all_to_all || query_id_offset + query_index < reference_id);
+            bits |= static_cast<uint32_t>(selected) << bit;
+        }
+        candidate_bits[item] = bits;
+    }
+}
+
+/// @brief Threads per @ref refine_batch_bitmap_kernel block.
+constexpr uint32_t bitmap_refine_block_size = 1024U;
+
+/// @brief Shared bytes @ref refine_batch_bitmap_kernel may stage query planes in; one block
+/// per SM fits on every supported architecture.
+constexpr size_t bitmap_refine_shared_bytes = 96U * 1024U;
+
+/// @brief Whether a query group's planes fit @ref bitmap_refine_shared_bytes.
+template <size_t BucketCount>
+constexpr bool bitmap_refine_staged = bitmap_refine_shared_bytes >= BucketCount * sizeof(uint16_t);
+
+/// @brief Queries one @ref refine_batch_bitmap_kernel block refines together.
+///
+/// Each reference row is read once per group, so the group size divides the kernel's L2
+/// traffic. Rows too large to stage in shared memory are read from global memory in groups of 8.
+template <size_t BucketCount>
+constexpr uint32_t bitmap_refine_group =
+    bitmap_refine_staged<BucketCount>
+        ? static_cast<uint32_t>(cuda::std::min<size_t>(
+              24U,
+              bitmap_refine_shared_bytes / (BucketCount * sizeof(uint16_t))
+          ))
+        : 8U;
+
+/// @brief Shared bytes one @ref refine_batch_bitmap_kernel block stages.
+template <size_t BucketCount>
+constexpr size_t bitmap_refine_dynamic_bytes =
+    bitmap_refine_staged<BucketCount>
+        ? static_cast<size_t>(bitmap_refine_group<BucketCount>) * BucketCount * sizeof(uint16_t)
+        : 0U;
+
+/// @brief Pairs @ref refine_batch_bitmap_kernel compares.
+enum class refine_candidates {
+    /// Exactly the pairs set in a pass bitmap.
+    bitmap,
+    /// Every pair of the layout, or with pass bits requested, those meeting the threshold.
+    all,
+};
+
+/// @brief Position of the pair (@p query_index of the tile, @p reference_id) in a tile's
+/// results: rows of `reference_count` references per query, or for all-to-all tiles the packed
+/// strict upper triangle of pairs with `query_id < reference_id`, where query IDs start at
+/// @p query_id_offset.
+template <bool UpperTriangle>
+[[nodiscard]] __host__ __device__ inline uint64_t batch_result_slot(
+    uint32_t query_index,
+    uint32_t reference_id,
+    uint32_t query_id_offset,
+    uint32_t reference_count
+) noexcept {
+    if constexpr (UpperTriangle) {
+        auto const query = static_cast<uint64_t>(query_index);
+        auto const preceding = query * (reference_count - query_id_offset - 1U) -
+                               query * (query == 0U ? 0U : query - 1U) / 2U;
+        return preceding + reference_id - (query_id_offset + query_index) - 1U;
+    } else {
+        return static_cast<uint64_t>(query_index) * reference_count + reference_id;
+    }
+}
+
+/// @brief Popcount of one pass-bit word.
+struct word_popcount {
+    __host__ __device__ uint32_t operator()(uint32_t word) const noexcept {
+        return static_cast<uint32_t>(cuda::std::popcount(word));
+    }
+};
+
+/// @brief Packs a threshold tile's passing results in order.
+///
+/// One warp per pass-bit word in `[word_begin, word_end)`; lane l handles reference
+/// `32 * word + l`, so consecutive lanes read consecutive slots and write consecutive packed
+/// positions. @p word_offsets is the exclusive scan of the word popcounts; results land at their
+/// packed position minus @p packed_base.
+template <bool UpperTriangle, typename SearchResult>
+__global__ __launch_bounds__(block_size) void gather_passing_kernel(
+    SearchResult const* results,
+    uint32_t const* match_counts,
+    uint32_t const* pass_bits,
+    uint32_t const* word_offsets,
+    uint32_t first_query_id,
+    uint32_t reference_count,
+    size_t word_begin,
+    size_t word_end,
+    uint32_t packed_base,
+    SearchResult* packed,
+    uint32_t* packed_match_counts
+) {
+    constexpr uint32_t warp_width = 32;
+    auto const words_per_query = candidate_bit_words(reference_count);
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    for (auto w =
+             word_begin + (static_cast<size_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
+         w < word_end;
+         w += static_cast<size_t>(gridDim.x) * (block_size / warp_width)) {
+        auto const bits = pass_bits[w];
+        if (((bits >> lane) & 1U) == 0U) {
+            continue;
+        }
+        auto const query = static_cast<uint32_t>(w / words_per_query);
+        auto const reference = static_cast<uint32_t>(w % words_per_query) * warp_width + lane;
+        auto const slot =
+            batch_result_slot<UpperTriangle>(query, reference, first_query_id, reference_count);
+        auto const position = word_offsets[w] - packed_base +
+                              static_cast<uint32_t>(__popc(bits & ((1U << lane) - 1U)));
+        packed[position] = results[slot];
+        if (packed_match_counts != nullptr) {
+            packed_match_counts[position] = match_counts[slot];
+        }
+    }
+}
+
+/// @brief Exactly compares query bit-planes with references, sharing each reference row across
+/// a query group.
+///
+/// Block cells are (reference block, group of @ref bitmap_refine_group queries), reference-block
+/// major so resident blocks share reference rows through L2. A block stages its group's query
+/// bit-planes (@ref score_plane_index) in shared memory when they fit; warps then claim
+/// 32-reference words and, for every reference any group query selects, compare the reference's
+/// bit-planes with each selecting query. A row thus crosses L2 once per group rather than once
+/// per pair.
+///
+/// Each written result lands at its @ref batch_result_slot. @p Candidates selects which pairs are
+/// written: those in @p candidate_bits (one word per query and 32 references), or every pair of
+/// the layout. With @p pass_bits (counting kernels only), the all-pairs mode writes only pairs
+/// with at least @p minimum_matches index matches and records them in @p pass_bits, in the
+/// candidate-bitmap layout. With @p result_match_counts, results also get their index match
+/// counts, recomputed from the planes.
+template <
+    size_t BucketCount,
+    bool CountMatches,
+    typename SearchResult,
+    refine_candidates Candidates,
+    bool UpperTriangle>
+__global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_kernel(
+    uint32_t const* query_planes,
+    uint32_t query_id_offset,
+    uint32_t query_count,
+    uint32_t const* reference_planes,
+    uint32_t reference_count,
+    uint32_t indexed_bucket_count,
+    uint16_t key_mask,
+    uint32_t const* candidate_bits,
+    SearchResult* results,
+    uint32_t* result_match_counts,
+    uint32_t minimum_matches,
+    uint32_t* pass_bits
+) {
+    constexpr uint32_t warp_width = 32;
+    constexpr uint32_t group = bitmap_refine_group<BucketCount>;
+    static_assert(group >= 1U && group <= warp_width);
+    constexpr bool staged = bitmap_refine_staged<BucketCount>;
+    constexpr uint32_t row_words = static_cast<uint32_t>(BucketCount / 2U);
+    constexpr uint32_t groups_per_row = static_cast<uint32_t>(BucketCount / warp_width);
+    static_assert(groups_per_row % warp_width == 0U);
+    constexpr uint32_t lane_groups = groups_per_row / warp_width;
+    // Reference groups one lane keeps in registers across the selecting queries.
+    constexpr uint32_t cached_groups = lane_groups < 2U ? lane_groups : 2U;
+    constexpr uint32_t block_words = static_cast<uint32_t>(cuda::std::max<size_t>(
+        1U, refine_block_row_bytes / (BucketCount * sizeof(uint16_t)) / warp_width
+    ));
+    extern __shared__ uint4 query_plane_storage[];
+    __shared__ uint32_t next_word;
+
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const words_per_query = candidate_bit_words(reference_count);
+    auto const groups = (query_count + group - 1U) / group;
+    auto const reference_blocks = (words_per_query + block_words - 1U) / block_words;
+    auto const cell_count = groups * reference_blocks;
+    auto const indexed_groups = indexed_bucket_count / warp_width;
+    auto const thresholded =
+        CountMatches && Candidates == refine_candidates::all && pass_bits != nullptr;
+
+    for (auto cell = static_cast<uint32_t>(blockIdx.x); cell < cell_count; cell += gridDim.x) {
+        auto const first_query = (cell % groups) * group;
+        auto const group_size = cuda::std::min(group, query_count - first_query);
+        auto const first_word = (cell / groups) * block_words;
+        auto const last_word = cuda::std::min(first_word + block_words, words_per_query);
+        auto const* group_planes = reinterpret_cast<uint4 const*>(
+            query_planes + static_cast<size_t>(first_query) * row_words
+        );
+
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            next_word = first_word;
+        }
+        // The top score plane is almost never set in genomic sketches; the block notes whether
+        // any staged query uses it, so pairs where neither row does skip it.
+        uint32_t group_top = staged ? 0U : 1U;
+        if constexpr (staged) {
+            for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * (row_words / 4U);
+                 i += bitmap_refine_block_size) {
+                auto const planes = group_planes[i];
+                query_plane_storage[i] = planes;
+                if ((i / warp_width) % 4U == 3U) {
+                    group_top |= planes.w;
+                }
+            }
+        }
+        auto const group_uses_top = __syncthreads_or(static_cast<int>(group_top != 0U)) != 0;
+        uint4 const* const member_planes = staged ? query_plane_storage : group_planes;
+
+        // Words carry uneven candidate counts, so warps claim them one at a time.
+        for (;;) {
+            uint32_t word = 0U;
+            if (lane == 0U) {
+                word = atomicAdd(&next_word, 1U);
+            }
+            word = __shfl_sync(0xffffffffU, word, 0);
+            if (word >= last_word) {
+                break;
+            }
+            // Lane m holds query m's selected references in this word.
+            uint32_t bits = 0U;
+            if (lane < group_size) {
+                if constexpr (Candidates == refine_candidates::bitmap) {
+                    bits = candidate_bits
+                        [static_cast<size_t>(first_query + lane) * words_per_query + word];
+                } else {
+                    auto const first_reference = word * warp_width;
+                    auto const left = reference_count - first_reference;
+                    bits = left >= warp_width ? ~0U : (1U << left) - 1U;
+                    if constexpr (UpperTriangle) {
+                        auto const query_id = query_id_offset + first_query + lane;
+                        if (first_reference <= query_id) {
+                            auto const skipped = query_id - first_reference + 1U;
+                            bits &= skipped >= warp_width ? 0U : ~0U << skipped;
+                        }
+                    }
+                }
+            }
+            // Lane m collects query m's passing references in this word.
+            uint32_t passed = 0U;
+            auto remaining = __reduce_or_sync(0xffffffffU, bits);
+            while (remaining != 0U) {
+                auto const bit = static_cast<uint32_t>(__ffs(remaining) - 1);
+                remaining &= remaining - 1U;
+                auto const reference_id = word * warp_width + bit;
+                auto const selected = __ballot_sync(0xffffffffU, ((bits >> bit) & 1U) != 0U);
+                auto const* reference = reinterpret_cast<uint4 const*>(
+                    reference_planes + static_cast<size_t>(reference_id) * row_words
+                );
+                uint32_t r[cached_groups][score_planes];
+                uint32_t r_any[cached_groups];
+                uint32_t r_low_any[cached_groups];
+                _Pragma("unroll")
+                for (uint32_t j = 0; j < cached_groups; ++j) {
+                    load_plane_group(reference, j * warp_width + lane, r[j]);
+                    r_any[j] = plane_any(r[j]);
+                    r_low_any[j] = CountMatches ? plane_low_any(r[j]) : 0U;
+                }
+                uint32_t reference_top = 0U;
+                _Pragma("unroll")
+                for (uint32_t j = 0; j < cached_groups; ++j) {
+                    reference_top |= r[j][score_planes - 1U];
+                }
+                auto const skip_top = CountMatches && !group_uses_top &&
+                                      cached_groups == lane_groups &&
+                                      !__any_sync(0xffffffffU, reference_top != 0U);
+                // Lane m keeps member m's totals, so the selecting lanes store their records
+                // together once the reference is done.
+                uint32_t mine_lower = 0U;
+                uint32_t mine_equal = 0U;
+                uint32_t mine_empty = 0U;
+                uint32_t mine_matches = 0U;
+                auto const compare_members = [&](auto skip) {
+                    for (auto members = selected; members != 0U; members &= members - 1U) {
+                        auto const m = static_cast<uint32_t>(__ffs(members) - 1);
+                        auto const* member =
+                            member_planes + static_cast<size_t>(m) * (row_words / 4U);
+                        plane_counts counts{};
+                        auto const compare = [&](uint32_t bucket_group,
+                                                 uint32_t const(&rg)[score_planes],
+                                                 uint32_t rg_any,
+                                                 uint32_t rg_low_any) {
+                            uint32_t q[score_planes];
+                            load_plane_group(member, bucket_group, q);
+                            compare_plane_group<CountMatches, decltype(skip)::value>(
+                                q,
+                                rg,
+                                rg_any,
+                                rg_low_any,
+                                key_mask,
+                                bucket_group < indexed_groups ? ~0U : 0U,
+                                counts
+                            );
+                        };
+                        _Pragma("unroll")
+                        for (uint32_t j = 0; j < cached_groups; ++j) {
+                            compare(j * warp_width + lane, r[j], r_any[j], r_low_any[j]);
+                        }
+                        for (uint32_t j = cached_groups; j < lane_groups; ++j) {
+                            uint32_t rg[score_planes];
+                            load_plane_group(reference, j * warp_width + lane, rg);
+                            compare(
+                                j * warp_width + lane,
+                                rg,
+                                plane_any(rg),
+                                CountMatches ? plane_low_any(rg) : 0U
+                            );
+                        }
+                        auto const total = counts.reduce<BucketCount>();
+                        uint32_t counts_matches_total = 0U;
+                        if constexpr (CountMatches) {
+                            counts_matches_total = __reduce_add_sync(0xffffffffU, counts.matches);
+                        }
+                        if (lane == m) {
+                            mine_lower = total.lower;
+                            mine_equal = total.equal;
+                            mine_empty = total.both_empty;
+                            mine_matches = counts_matches_total;
+                        }
+                    }
+                };
+                // Only the longer counting chain gains enough to pay for a second copy.
+                if (skip_top) {
+                    compare_members(cuda::std::bool_constant<CountMatches>{});
+                } else {
+                    compare_members(cuda::std::false_type{});
+                }
+                auto const keep = !thresholded || mine_matches >= minimum_matches;
+                if (((selected >> lane) & 1U) != 0U && keep) {
+                    auto const slot = batch_result_slot<UpperTriangle>(
+                        first_query + lane, reference_id, query_id_offset, reference_count
+                    );
+                    // The slot implies the pair; only its counts are stored.
+                    results[slot] = SearchResult::pack(
+                        mine_lower,
+                        mine_equal,
+                        static_cast<uint32_t>(BucketCount) - mine_lower - mine_equal - mine_empty
+                    );
+                    if constexpr (CountMatches) {
+                        if (result_match_counts != nullptr) {
+                            result_match_counts[slot] = mine_matches;
+                        }
+                    }
+                    passed |= 1U << bit;
+                }
+            }
+            if (thresholded && lane < group_size) {
+                pass_bits[static_cast<size_t>(first_query + lane) * words_per_query + word] =
+                    passed;
+            }
+        }
     }
 }
 

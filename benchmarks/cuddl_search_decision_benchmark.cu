@@ -108,7 +108,7 @@ struct indexed_fixture_metrics {
 struct normalised_search_result {
     uint32_t query_id{};
     uint32_t reference_id{};
-    cuddl::pairwise_summary summary{};
+    cuddl::pairwise_counts counts{};
 };
 
 struct search_output {
@@ -121,7 +121,12 @@ struct minimum_matches_predicate {
 
     template <typename Result>
     [[nodiscard]] __host__ __device__ bool operator()(Result const& result) const {
-        return result.summary.counts.equal >= minimum_matches;
+        return result.counts.equal >= minimum_matches;
+    }
+
+    // Packed storage: the equal field does not depend on the bucket count.
+    [[nodiscard]] __host__ __device__ bool operator()(cuddl::packed_pairwise_counts counts) const {
+        return counts.unpack(0U).equal >= minimum_matches;
     }
 };
 
@@ -477,48 +482,10 @@ indexed_resident_bytes(uint32_t reference_count, cuddl::score_compatibility cons
     return metrics;
 }
 
-template <typename DeviceResult, typename Convert>
-[[nodiscard]] std::vector<normalised_search_result> copy_normalised_results(
-    cuda::device_buffer<DeviceResult> const& device_results,
-    uint32_t count,
-    Convert&& convert
-) {
-    std::vector<DeviceResult> host_results(count);
-    if (count != 0U) {
-        cuda::copy_bytes(
-            device_results.stream(),
-            cuda::std::span{device_results.data(), host_results.size()},
-            cuda::std::span{host_results.data(), host_results.size()}
-        );
-        device_results.stream().sync();
-    }
-    std::vector<normalised_search_result> results;
-    results.reserve(host_results.size());
-    std::transform(
-        host_results.begin(),
-        host_results.end(),
-        std::back_inserter(results),
-        std::forward<Convert>(convert)
-    );
-    return results;
-}
-
-[[nodiscard]] uint32_t read_result_count(cuda::device_buffer<uint32_t> const& result_count) {
-    uint32_t count = 0;
-    cuda::copy_bytes(
-        result_count.stream(),
-        cuda::std::span{result_count.data(), size_t{1}},
-        cuda::std::span{&count, size_t{1}}
-    );
-    result_count.stream().sync();
-    return count;
-}
-
 struct exhaustive_search_buffers {
     cuda::device_buffer<uint8_t> database_workspace;
-    cuda::device_buffer<cuddl::batch_search_result> exhaustive_results;
-    cuda::device_buffer<uint32_t> exhaustive_count;
-    cuda::device_buffer<cuddl::batch_search_result> selected_results;
+    cuda::device_buffer<cuddl::packed_pairwise_counts> exhaustive_results;
+    cuda::device_buffer<cuddl::packed_pairwise_counts> selected_results;
     cuda::device_buffer<uint32_t> selected_count;
     cuda::device_buffer<uint8_t> selection_workspace;
     size_t selection_workspace_bytes{};
@@ -529,10 +496,10 @@ struct exhaustive_search_buffers {
     uint32_t minimum_matches,
     cuda::stream_ref setup_stream
 ) {
-    auto const requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(setup_stream));
+    auto const requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
     size_t selection_workspace_bytes = 0;
-    cuddl::batch_search_result* input = nullptr;
-    cuddl::batch_search_result* output = nullptr;
+    cuddl::packed_pairwise_counts* input = nullptr;
+    cuddl::packed_pairwise_counts* output = nullptr;
     uint32_t* count = nullptr;
     CUDDL_CUDA_CALL(
         cub::DeviceSelect::If(
@@ -550,13 +517,10 @@ struct exhaustive_search_buffers {
         .database_workspace = cuda::make_device_buffer<uint8_t>(
             setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
         ),
-        .exhaustive_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        .exhaustive_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
             setup_stream, setup_stream.device(), requirements.maximum_pair_count, cuda::no_init
         ),
-        .exhaustive_count = cuda::make_device_buffer<uint32_t>(
-            setup_stream, setup_stream.device(), 1U, cuda::no_init
-        ),
-        .selected_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        .selected_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
             setup_stream, setup_stream.device(), requirements.maximum_pair_count, cuda::no_init
         ),
         .selected_count = cuda::make_device_buffer<uint32_t>(
@@ -581,8 +545,7 @@ template <typename Execute>
         CUDDL_UNWRAP(database.search_all_to_all_async(
             buffers.database_workspace,
             buffers.exhaustive_results,
-            buffers.exhaustive_count,
-            [&](uint32_t pair_count) {
+            [&](cuddl::batch_result_tile const& tile) {
                 CUDDL_CUDA_CALL(
                     cub::DeviceSelect::If(
                         buffers.selection_workspace.data(),
@@ -590,7 +553,7 @@ template <typename Execute>
                         buffers.exhaustive_results.data(),
                         buffers.selected_results.data(),
                         buffers.selected_count.data(),
-                        static_cast<int64_t>(pair_count),
+                        static_cast<int64_t>(tile.slot_count()),
                         minimum_matches_predicate{minimum_matches},
                         stream
                     )
@@ -619,35 +582,19 @@ template <typename Execute>
     CUDDL_UNWRAP(database.search_all_to_all_async(
         buffers.database_workspace,
         buffers.exhaustive_results,
-        buffers.exhaustive_count,
-        [&](uint32_t pair_count) {
-            CUDDL_CUDA_CALL(
-                cub::DeviceSelect::If(
-                    buffers.selection_workspace.data(),
-                    buffers.selection_workspace_bytes,
-                    buffers.exhaustive_results.data(),
-                    buffers.selected_results.data(),
-                    buffers.selected_count.data(),
-                    static_cast<int64_t>(pair_count),
-                    minimum_matches_predicate{minimum_matches},
-                    setup_stream.get()
-                )
-            );
-            setup_stream.sync();
-            auto tile = copy_normalised_results(
-                buffers.selected_results,
-                read_result_count(buffers.selected_count),
-                [](auto const& result) {
-                    return normalised_search_result{
-                        result.query_id, result.reference_id, result.summary
-                    };
+        [&](cuddl::batch_result_tile const& tile) {
+            // Device selection drops the pair IDs a packed result's slot implies, so the oracle
+            // filters the downloaded tile instead.
+            auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+            host.tile().for_each_passing([&](cuddl::batch_search_result const& result) {
+                if (minimum_matches_predicate{minimum_matches}(result)) {
+                    output.results.push_back(
+                        normalised_search_result{
+                            result.query_id, result.reference_id, result.counts
+                        }
+                    );
                 }
-            );
-            output.results.insert(
-                output.results.end(),
-                std::make_move_iterator(tile.begin()),
-                std::make_move_iterator(tile.end())
-            );
+            });
         },
         {},
         setup_stream
@@ -657,8 +604,7 @@ template <typename Execute>
 
 struct indexed_search_buffers {
     cuda::device_buffer<uint8_t> workspace;
-    cuda::device_buffer<cuddl::batch_search_result> results;
-    cuda::device_buffer<uint32_t> result_count;
+    cuda::device_buffer<cuddl::packed_pairwise_counts> results;
 };
 
 [[nodiscard]] indexed_search_buffers make_indexed_search_buffers(
@@ -666,17 +612,13 @@ struct indexed_search_buffers {
     index_type const& acceleration,
     cuda::stream_ref setup_stream
 ) {
-    auto const requirements =
-        CUDDL_UNWRAP(database.all_to_all_search_requirements(setup_stream, &acceleration));
+    auto const requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(&acceleration));
     return {
         .workspace = cuda::make_device_buffer<uint8_t>(
             setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
         ),
-        .results = cuda::make_device_buffer<cuddl::batch_search_result>(
+        .results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
             setup_stream, setup_stream.device(), requirements.maximum_pair_count, cuda::no_init
-        ),
-        .result_count = cuda::make_device_buffer<uint32_t>(
-            setup_stream, setup_stream.device(), 1U, cuda::no_init
         ),
     };
 }
@@ -694,8 +636,7 @@ template <typename Execute>
         CUDDL_UNWRAP(database.search_all_to_all_async(
             buffers.workspace,
             buffers.results,
-            buffers.result_count,
-            [](uint32_t) {},
+            [](cuddl::batch_result_tile const&) {},
             {},
             {.minimum_matches = minimum_matches},
             cuda::stream_ref{stream},
@@ -716,21 +657,13 @@ template <typename Execute>
     CUDDL_UNWRAP(database.search_all_to_all_async(
         buffers.workspace,
         buffers.results,
-        buffers.result_count,
-        [&](uint32_t) {
-            setup_stream.sync();
-            auto tile = copy_normalised_results(
-                buffers.results, read_result_count(buffers.result_count), [](auto const& result) {
-                    return normalised_search_result{
-                        result.query_id, result.reference_id, result.summary
-                    };
-                }
-            );
-            output.results.insert(
-                output.results.end(),
-                std::make_move_iterator(tile.begin()),
-                std::make_move_iterator(tile.end())
-            );
+        [&](cuddl::batch_result_tile const& tile) {
+            auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+            for (auto const& result : host.passing()) {
+                output.results.push_back(
+                    normalised_search_result{result.query_id, result.reference_id, result.counts}
+                );
+            }
         },
         {},
         {.minimum_matches = minimum_matches},
@@ -751,7 +684,7 @@ void validate_exhaustive_results(
         auto const id = std::pair{result.query_id, result.reference_id};
         if (result.query_id >= settings.query_count || result.query_id >= result.reference_id ||
             result.reference_id >= settings.reference_count ||
-            result.summary.counts.equal < minimum_matches || (!first && id <= previous_id)) {
+            result.counts.equal < minimum_matches || (!first && id <= previous_id)) {
             throw std::runtime_error("exhaustive search returned invalid or unstable results");
         }
         previous_id = id;
@@ -786,7 +719,7 @@ struct recall_metrics {
             result.reference_id >= settings.reference_count || (!first && id <= previous_id)) {
             throw std::runtime_error("indexed search returned invalid or unstable results");
         }
-        if (result.summary.counts.equal < minimum_matches) {
+        if (result.counts.equal < minimum_matches) {
             previous_id = id;
             first = false;
             continue;
@@ -798,7 +731,7 @@ struct recall_metrics {
         );
         if (oracle_result == oracle.end() ||
             std::pair{oracle_result->query_id, oracle_result->reference_id} != id ||
-            oracle_result->summary != result.summary) {
+            oracle_result->counts != result.counts) {
             throw std::runtime_error("indexed retained summary disagrees with exhaustive oracle");
         }
         ++recalled_pairs;
@@ -1278,11 +1211,9 @@ void refseq_exhaustive_search(nvbench::state& state) {
     auto workspace = cuda::make_device_buffer<uint8_t>(
         setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         setup_stream, setup_stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    auto result_count =
-        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1U, cuda::no_init);
     add_refseq_metadata(
         state, reference_count, context.compatibility, database.persistent_row_bytes()
     );
@@ -1296,16 +1227,9 @@ void refseq_exhaustive_search(nvbench::state& state) {
         0U,
         workspace,
         results,
-        result_count,
-        [&](uint32_t expected_count) {
-            uint32_t observed_count = 0U;
-            cuda::copy_bytes(
-                setup_stream,
-                cuda::std::span{result_count.data(), size_t{1}},
-                cuda::std::span{&observed_count, size_t{1}}
-            );
-            setup_stream.sync();
-            if (observed_count != expected_count) {
+        [&](cuddl::batch_result_tile const& tile) {
+            auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+            if (host.tile().count() != tile.slot_count()) {
                 throw std::runtime_error("RefSeq exhaustive tile returned the wrong pair count");
             }
         },
@@ -1320,8 +1244,7 @@ void refseq_exhaustive_search(nvbench::state& state) {
             0U,
             workspace,
             results,
-            result_count,
-            [](uint32_t) {},
+            [](cuddl::batch_result_tile const&) {},
             {},
             cuda::stream_ref{launch.get_stream()}
         ));
@@ -1360,11 +1283,9 @@ void refseq_indexed_search(nvbench::state& state) {
     auto workspace = cuda::make_device_buffer<uint8_t>(
         setup_stream, setup_stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         setup_stream, setup_stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    auto result_count =
-        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1U, cuda::no_init);
     add_refseq_metadata(
         state,
         reference_count,
@@ -1378,19 +1299,9 @@ void refseq_indexed_search(nvbench::state& state) {
         0U,
         workspace,
         results,
-        result_count,
-        [&](uint32_t maximum_count) {
-            uint32_t observed_count = 0U;
-            cuda::copy_bytes(
-                setup_stream,
-                cuda::std::span{result_count.data(), size_t{1}},
-                cuda::std::span{&observed_count, size_t{1}}
-            );
-            setup_stream.sync();
-            if (observed_count > maximum_count) {
-                throw std::runtime_error("RefSeq indexed tile exceeded its result capacity");
-            }
-            selected_candidates += observed_count;
+        [&](cuddl::batch_result_tile const& tile) {
+            auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+            selected_candidates += host.tile().count();
         },
         {},
         {.minimum_matches = k_minimum_matches},
@@ -1415,8 +1326,7 @@ void refseq_indexed_search(nvbench::state& state) {
             0U,
             workspace,
             results,
-            result_count,
-            [](uint32_t) {},
+            [](cuddl::batch_result_tile const&) {},
             {},
             {.minimum_matches = k_minimum_matches},
             cuda::stream_ref{launch.get_stream()},

@@ -5,7 +5,6 @@
 # ///
 """Run cuDDL variants and RabbitSketch sequentially into a report directory."""
 
-import itertools
 import json
 import random
 import shlex
@@ -257,11 +256,7 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     # GPU isolated-stage coverage requires a query even when the resident all-to-all path ignores it.
     gpu_queries = queries or references[:1]
-    cuddl_variants = (
-        list(itertools.product(("compact", "packed"), ("sparse", "dense")))
-        if "cuddl" in selected
-        else []
-    )
+    cuddl_variants = ("sparse", "dense") if "cuddl" in selected else ()
     with tempfile.TemporaryDirectory(prefix=".pipeline-", dir=output_dir) as temporary:
         configs = {}
         for implementation, query_files in (
@@ -296,8 +291,8 @@ def main(
                     "probe; pass explicit --resident-bytes for CPU-only runs"
                 )
             caps = []
-            for rows, index in cuddl_variants:
-                plan = Path(temporary) / f"plan-{rows}-{index}.json"
+            for index in cuddl_variants:
+                plan = Path(temporary) / f"plan-{index}.json"
                 run(
                     [
                         str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
@@ -309,8 +304,6 @@ def main(
                         "0",
                         "--resident-plan",
                         *(["--workers", str(workers)] if workers is not None else []),
-                        "--rows",
-                        rows,
                         "--index",
                         index,
                         "--minimum-matches",
@@ -329,7 +322,7 @@ def main(
             )
         commands = [
             (
-                f"cuddl-{rows}-{index}.json",
+                f"cuddl-{index}.json",
                 [
                     str(build_dir / "benchmarks/cuddl-pipeline-benchmark"),
                     *common,
@@ -338,15 +331,13 @@ def main(
                     "--resident-bytes",
                     str(effective_resident_bytes),
                     *(["--workers", str(workers)] if workers is not None else []),
-                    "--rows",
-                    rows,
                     "--index",
                     index,
                     "--minimum-matches",
                     "0",
                 ],
             )
-            for rows, index in cuddl_variants
+            for index in cuddl_variants
         ]
         if "rabbitsketch" in selected:
             commands.append(

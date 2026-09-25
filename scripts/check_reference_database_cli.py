@@ -32,8 +32,6 @@ def main(
         sequence = "ACGT" * 12
         second.write_text(f"@genome\n{sequence}\n+\n{'I' * len(sequence)}\n")
         (genomes / "notes.txt").write_text("not a genome")
-        (genomes / "nested").mkdir()
-        (genomes / "nested" / "ignored.fa").write_text(">nested\nACGT\n")
         output = genomes / "references.cuddl"
 
         def run(*arguments: str, succeeds: bool = True) -> None:
@@ -46,7 +44,7 @@ def main(
             run("--k", str(k), "--buckets", str(buckets), "--output", str(output))
             data = output.read_bytes()
             assert data[:8] == b"CUDDLDB\0"
-            assert struct.unpack_from("<III", data, 8) == (1, k, buckets)
+            assert struct.unpack_from("<III", data, 8) == (2, k, buckets)
             assert struct.unpack_from("<I", data, 62)[0] == 2
             assert struct.unpack_from("<I", data, len(data) - 4)[0] == zlib.crc32(data[:-4])
             offset = 66
@@ -55,9 +53,9 @@ def main(
                 offset += 4
                 assert data[offset : offset + length].decode() == str(expected)
                 offset += length
-            assert len(data) == offset + 2 * buckets * 4 + 2 * 4 + 4
+            assert len(data) == offset + 2 * buckets * 2 + 4
             if k == 3:
-                assert not any(data[offset : offset + buckets * 4])
+                assert not any(data[offset : offset + buckets * 2])
 
         saved = output.read_bytes()
         run("--k", "31", "--buckets", "4096", "--workers", "1", "-o", str(output))
@@ -100,7 +98,7 @@ def main(
         run("--k", "31", "--buckets", "2048", "-o", str(output))
         data = output.read_bytes()
         offset = 70 + struct.unpack_from("<I", data, 66)[0]
-        assert not any(data[offset : offset + 2048 * 4 + 4])
+        assert not any(data[offset : offset + 2048 * 2])
     print("Reference database CLI checks passed.")
 
 

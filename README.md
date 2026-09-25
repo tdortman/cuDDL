@@ -123,12 +123,12 @@ To compare the references with each other instead of with separate queries, repl
 Search writes a tab-separated table to standard output:
 
 ```text
-query_id    reference_id    lower    equal    higher    both_empty    cardinality
+query_id    reference_id    lower    equal    higher    both_empty
 ```
 
-The actual delimiter is a tab. Query IDs are zero-based in the order supplied to `--query`; reference IDs are zero-based in the builder's sorted file order. The remaining columns contain raw sketch comparison counts and a cardinality estimate. This CLI does not output ranked hits or ANI scores. Use the C++ metric helpers when you need derived metrics.
+The actual delimiter is a tab. Query IDs are zero-based in the order supplied to `--query`; reference IDs are zero-based in the builder's sorted file order. The remaining columns contain raw sketch comparison counts. This CLI does not output ranked hits or ANI scores. Use the C++ metric helpers when you need derived metrics.
 
-For large result sets, pass `--output results.bin` to skip text formatting. The file holds headerless 32-byte little-endian records with the same fields in the same order: six `uint32` values followed by a `float64` cardinality. Python reads it with `struct.iter_unpack("<6Id", data)`; NumPy reads it with a structured dtype of six `<u4` fields and one `<f8` field.
+For large result sets, pass `--output results.bin` to skip text formatting. The file holds headerless 24-byte little-endian records with the same six `uint32` fields in the same order. Python reads it with `struct.iter_unpack("<6I", data)`; NumPy reads it with a structured dtype of six `<u4` fields.
 
 ## C++ API
 

@@ -123,24 +123,24 @@ class ReferenceDatabaseTest : public ::testing::Test {
     cuda::stream stream_{cuda::devices[0]};
 };
 
-cuddl::pairwise_summary score_row_oracle(
+cuddl::pairwise_counts score_row_oracle(
     std::vector<uint16_t> const& query,
     std::vector<uint16_t> const& rows,
     size_t reference_id
 ) {
-    cuddl::pairwise_summary summary{};
+    cuddl::pairwise_counts summary{};
     auto const row_offset = reference_id * query.size();
     for (size_t bucket = 0; bucket < query.size(); ++bucket) {
         auto const query_score = query[bucket];
         auto const reference_score = rows[row_offset + bucket];
         if (query_score == 0U && reference_score == 0U) {
-            ++summary.counts.both_empty;
+            ++summary.both_empty;
         } else if (query_score < reference_score) {
-            ++summary.counts.lower;
+            ++summary.lower;
         } else if (query_score > reference_score) {
-            ++summary.counts.higher;
+            ++summary.higher;
         } else {
-            ++summary.counts.equal;
+            ++summary.equal;
         }
     }
     return summary;
@@ -163,6 +163,26 @@ bool copy_device_buffer(cuda::device_buffer<T> const& source, std::vector<T>& de
                }
     ).has_value();
 }
+
+/// @brief Batch-search tile callback appending every tile's passing results and, when
+/// requested, their match counts, in order.
+struct tile_collector {
+    cuda::stream_ref stream;
+    std::vector<cuddl::batch_search_result> results{};
+    std::vector<uint32_t> match_counts{};
+    uint32_t tiles{};
+
+    void operator()(cuddl::batch_result_tile const& tile) {
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const passing = host.passing();
+        results.insert(results.end(), passing.begin(), passing.end());
+        if (tile.match_counts != nullptr) {
+            auto const counts = host.passing_match_counts();
+            match_counts.insert(match_counts.end(), counts.begin(), counts.end());
+        }
+        ++tiles;
+    }
+};
 
 TEST(SketchTest, PublicMetadataUsesKBeforeBucket) {
     using sketch_type = cuddl::sketch<25, 2048>;
@@ -288,14 +308,15 @@ TEST_F(ReferenceDatabaseTest, BufferMoveAssignmentRetainsRowsAndMetadata) {
     );
     ASSERT_TRUE(source);
     ASSERT_TRUE(destination);
-    auto const* original_data = source->data().data();
     *destination = std::move(*source);
-    EXPECT_EQ(destination->data().data(), original_data);
     EXPECT_EQ(destination->reference_count(), 2U);
     EXPECT_EQ(source->reference_count(), 0U);
-    EXPECT_TRUE(source->data().empty());
+    EXPECT_EQ(source->persistent_row_bytes(), 0U);
+    auto decoded =
+        cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows.size(), cuda::no_init);
+    ASSERT_TRUE(destination->copy_scores_async({decoded.data(), decoded.size()}, stream));
     std::vector<uint16_t> copied(rows.size());
-    cuda::copy_bytes(stream_, destination->data(), copied);
+    cuda::copy_bytes(stream_, decoded, copied);
     stream_.sync();
     EXPECT_EQ(copied, std::vector<uint16_t>(rows.size(), uint16_t{7}));
 }
@@ -1002,7 +1023,7 @@ TEST(SketchTest, BatchComparisonMatchesScalarOracle) {
     for (size_t pair = 0; pair < pair_count; ++pair) {
         auto const begin = left_scores.begin() + static_cast<ptrdiff_t>(pair * b_default);
         std::vector<uint16_t> left_row(begin, begin + b_default);
-        EXPECT_EQ(outputs[pair], score_row_oracle(left_row, right_scores, pair));
+        EXPECT_EQ(outputs[pair].counts, score_row_oracle(left_row, right_scores, pair));
     }
 
     auto const unequal = cuddl::compare_batch_async<b_default>(
@@ -1154,23 +1175,18 @@ TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
     );
 }
 
-TEST_F(ReferenceDatabaseTest, SparseAndDenseIndexesAgreeAcrossLayoutsAndKeyWidths) {
+TEST_F(ReferenceDatabaseTest, SparseAndDenseIndexesAgreeAcrossKeyWidths) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
     constexpr uint32_t references = 33U;
     std::array<uint16_t, 7> const values{0U, 1U, 9U, 0x4000U, 0x8000U, 0xc000U, 0xffffU};
     std::vector<uint16_t> rows(references * b_default);
-    std::vector<uint32_t> packed(rows.size());
     for (size_t i = 0; i < rows.size(); ++i) {
         rows[i] = values[(i / b_default + i % b_default) % values.size()];
-        packed[i] = pack(rows[i], rows[i] == 0U ? 0U : 3U);
     }
     std::vector<uint16_t> query(rows.begin(), rows.begin() + b_default);
     auto compact_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
-    auto packed_rows = cuda::make_device_buffer<uint32_t>(stream, stream.device(), packed);
-    auto saturation =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), references, uint32_t{});
     auto device_query = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query);
     auto dense_results = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), references, cuda::no_init
@@ -1182,89 +1198,84 @@ TEST_F(ReferenceDatabaseTest, SparseAndDenseIndexesAgreeAcrossLayoutsAndKeyWidth
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init);
     auto sparse_count =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init);
-    for (bool use_packed : {false, true}) {
-        for (uint16_t mask : {uint16_t{0x7fffU}, uint16_t{0xffffU}}) {
-            for (uint32_t buckets : {uint32_t{b_default / 2U}, uint32_t{b_default}}) {
-                auto compatibility = cuddl::score_compatibility::current<k_default, b_default>();
-                compatibility.key_mask = mask;
-                compatibility.indexed_bucket_count = buckets;
-                auto rows_built =
-                    use_packed
-                        ? database_type::build_async(packed_rows, saturation, compatibility, stream)
-                        : database_type::build_async(compact_rows, compatibility, stream);
-                ASSERT_TRUE(rows_built);
-                auto database = std::move(*rows_built);
-                auto build = [&](cuddl::index_storage storage) {
-                    return index_type::build_async(database, stream, storage);
-                };
-                auto dense_built = build(cuddl::index_storage::dense);
-                auto sparse_built = build(cuddl::index_storage::sparse);
-                ASSERT_TRUE(dense_built) << dense_built.error().message();
-                ASSERT_TRUE(sparse_built) << sparse_built.error().message();
-                auto dense = std::move(*dense_built);
-                auto sparse = std::move(*sparse_built);
-                // Exercise move assignment with a live index allocation on both sides.
-                auto replacement = build(cuddl::index_storage::sparse);
-                ASSERT_TRUE(replacement);
-                sparse = std::move(*replacement);
-                EXPECT_EQ(
-                    sparse.persistent_index_bytes(),
-                    size_t{buckets} * references * (sizeof(uint16_t) + sizeof(uint32_t))
-                );
-                EXPECT_LT(sparse.persistent_index_bytes(), dense.persistent_index_bytes());
-                auto required = database.search_workspace_bytes(stream, &dense);
-                ASSERT_TRUE(required);
-                auto workspace = cuda::make_device_buffer<uint8_t>(
-                    stream, stream.device(), *required, cuda::no_init
-                );
-                for (uint32_t threshold : {0U, 1U, 5U, buckets}) {
-                    ASSERT_TRUE(database.search_async(
-                        device_query,
-                        compatibility,
-                        workspace,
-                        dense_results,
-                        dense_count,
-                        {.minimum_matches = threshold},
-                        stream,
-                        &dense
-                    ));
-                    ASSERT_TRUE(database.search_async(
-                        device_query,
-                        compatibility,
-                        workspace,
-                        sparse_results,
-                        sparse_count,
-                        {.minimum_matches = threshold},
-                        stream,
-                        &sparse
-                    ));
-                    std::vector<uint32_t> dc, sc;
-                    std::vector<cuddl::reference_search_result> dr, sr;
-                    ASSERT_TRUE(copy_device_buffer(dense_count, dc));
-                    ASSERT_TRUE(copy_device_buffer(sparse_count, sc));
-                    ASSERT_EQ(dc, sc);
-                    // Copy only the initialized result prefix.
-                    dr.resize(dc[0]);
-                    sr.resize(sc[0]);
-                    cuda::copy_bytes(stream, cuda::std::span{dense_results.data(), dr.size()}, dr);
-                    cuda::copy_bytes(stream, cuda::std::span{sparse_results.data(), sr.size()}, sr);
-                    stream.sync();
-                    EXPECT_EQ(dr, sr);
-                    ASSERT_TRUE(database.search_async(
-                        device_query,
-                        compatibility,
-                        workspace,
-                        sparse_results,
-                        sparse_count,
-                        {.minimum_matches = threshold},
-                        stream
-                    ));
-                    ASSERT_TRUE(copy_device_buffer(sparse_count, sc));
-                    ASSERT_EQ(dc, sc);
-                    cuda::copy_bytes(stream, cuda::std::span{sparse_results.data(), sr.size()}, sr);
-                    stream.sync();
-                    EXPECT_EQ(dr, sr);
-                }
+    for (uint16_t mask : {uint16_t{0x7fffU}, uint16_t{0xffffU}}) {
+        for (uint32_t buckets : {uint32_t{b_default / 2U}, uint32_t{b_default}}) {
+            auto compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+            compatibility.key_mask = mask;
+            compatibility.indexed_bucket_count = buckets;
+            auto rows_built = database_type::build_async(compact_rows, compatibility, stream);
+            ASSERT_TRUE(rows_built);
+            auto database = std::move(*rows_built);
+            auto build = [&](cuddl::index_storage storage) {
+                return index_type::build_async(database, stream, storage);
+            };
+            auto dense_built = build(cuddl::index_storage::dense);
+            auto sparse_built = build(cuddl::index_storage::sparse);
+            ASSERT_TRUE(dense_built) << dense_built.error().message();
+            ASSERT_TRUE(sparse_built) << sparse_built.error().message();
+            auto dense = std::move(*dense_built);
+            auto sparse = std::move(*sparse_built);
+            // Exercise move assignment with a live index allocation on both sides.
+            auto replacement = build(cuddl::index_storage::sparse);
+            ASSERT_TRUE(replacement);
+            sparse = std::move(*replacement);
+            EXPECT_EQ(
+                sparse.persistent_index_bytes(),
+                size_t{buckets} * references * (sizeof(uint16_t) + sizeof(uint32_t))
+            );
+            EXPECT_LT(sparse.persistent_index_bytes(), dense.persistent_index_bytes());
+            auto required = database.search_workspace_bytes(stream, &dense);
+            ASSERT_TRUE(required);
+            auto workspace = cuda::make_device_buffer<uint8_t>(
+                stream, stream.device(), *required, cuda::no_init
+            );
+            for (uint32_t threshold : {0U, 1U, 5U, buckets}) {
+                ASSERT_TRUE(database.search_async(
+                    device_query,
+                    compatibility,
+                    workspace,
+                    dense_results,
+                    dense_count,
+                    {.minimum_matches = threshold},
+                    stream,
+                    &dense
+                ));
+                ASSERT_TRUE(database.search_async(
+                    device_query,
+                    compatibility,
+                    workspace,
+                    sparse_results,
+                    sparse_count,
+                    {.minimum_matches = threshold},
+                    stream,
+                    &sparse
+                ));
+                std::vector<uint32_t> dc, sc;
+                std::vector<cuddl::reference_search_result> dr, sr;
+                ASSERT_TRUE(copy_device_buffer(dense_count, dc));
+                ASSERT_TRUE(copy_device_buffer(sparse_count, sc));
+                ASSERT_EQ(dc, sc);
+                // Copy only the initialized result prefix.
+                dr.resize(dc[0]);
+                sr.resize(sc[0]);
+                cuda::copy_bytes(stream, cuda::std::span{dense_results.data(), dr.size()}, dr);
+                cuda::copy_bytes(stream, cuda::std::span{sparse_results.data(), sr.size()}, sr);
+                stream.sync();
+                EXPECT_EQ(dr, sr);
+                ASSERT_TRUE(database.search_async(
+                    device_query,
+                    compatibility,
+                    workspace,
+                    sparse_results,
+                    sparse_count,
+                    {.minimum_matches = threshold},
+                    stream
+                ));
+                ASSERT_TRUE(copy_device_buffer(sparse_count, sc));
+                ASSERT_EQ(dc, sc);
+                cuda::copy_bytes(stream, cuda::std::span{sparse_results.data(), sr.size()}, sr);
+                stream.sync();
+                EXPECT_EQ(dr, sr);
             }
         }
     }
@@ -1314,7 +1325,14 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     auto device_results = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), reference_count, cuddl::reference_search_result{}
     );
-    auto workspace = cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream,
+        stream.device(),
+        cuddl::reference_database<k_default, b_default>::single_query_workspace_bytes(
+            reference_count
+        ),
+        cuda::no_init
+    );
 
     auto built = cuddl::reference_database<k_default, b_default>::build_async(
         device_rows, compatibility, stream
@@ -1342,11 +1360,11 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchMatchesScalarOracle) {
     ASSERT_NO_THROW(stream_.sync());
     for (size_t reference_id = 0; reference_id < reference_count; ++reference_id) {
         EXPECT_EQ(results[reference_id].reference_id, reference_id);
-        EXPECT_EQ(results[reference_id].summary, score_row_oracle(query, rows, reference_id));
+        EXPECT_EQ(results[reference_id].counts, score_row_oracle(query, rows, reference_id));
     }
 }
 
-TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearch) {
+TEST_F(ReferenceDatabaseTest, ExhaustiveAndIndexedSearchMatchScoreOracle) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
@@ -1355,8 +1373,6 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
 
     std::vector<uint16_t> query(b_default);
     std::vector<uint16_t> scores(reference_count * b_default);
-    std::vector<uint32_t> packed(scores.size());
-    std::vector<uint32_t> saturation{1U, 0U, 1U, 0U};
     for (size_t bucket = 0; bucket < b_default; ++bucket) {
         query[bucket] = std::array<uint16_t, 4>{0U, 7U, 5U, 9U}[bucket % 4];
         scores[bucket] = 0U;
@@ -1364,228 +1380,47 @@ TEST_F(ReferenceDatabaseTest, PackedRowsPreserveMultiplicityWithoutChangingSearc
         scores[2 * b_default + bucket] = query[bucket] == 0U ? 3U : query[bucket] + 1U;
         scores[3 * b_default + bucket] = query[bucket] == 0U ? 0U : query[bucket] - 1U;
     }
-    for (size_t offset = 0; offset < scores.size(); ++offset) {
-        auto const count =
-            scores[offset] == 0U ? uint16_t{0} : static_cast<uint16_t>(offset % k_counter_max + 1U);
-        packed[offset] = pack(scores[offset], count);
-    }
 
     auto device_query = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query);
     auto device_scores = cuda::make_device_buffer<uint16_t>(stream, stream.device(), scores);
-    auto device_packed = cuda::make_device_buffer<uint32_t>(stream, stream.device(), packed);
-    auto device_saturation =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), saturation);
-    auto compact_built = database_type::build_async(device_scores, compatibility, stream);
-    ASSERT_TRUE(compact_built.has_value()) << compact_built.error().message();
-    auto packed_built =
-        database_type::build_async(device_packed, device_saturation, compatibility, stream);
-    ASSERT_TRUE(packed_built.has_value()) << packed_built.error().message();
-    auto compact = std::move(*compact_built);
-    auto compact_index_built =
-        index_type::build_async(compact, stream, cuddl::index_storage::dense);
-    ASSERT_TRUE(compact_index_built) << compact_index_built.error().message();
-    auto compact_index = std::move(*compact_index_built);
-    auto packed_database = std::move(*packed_built);
-    auto packed_database_index_built =
-        index_type::build_async(packed_database, stream, cuddl::index_storage::dense);
-    ASSERT_TRUE(packed_database_index_built) << packed_database_index_built.error().message();
-    auto packed_database_index = std::move(*packed_database_index_built);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_scores, compatibility, stream));
+    auto database_index =
+        CUDDL_UNWRAP(index_type::build_async(database, stream, cuddl::index_storage::dense));
+    EXPECT_EQ(database.persistent_row_bytes(), reference_count * b_default * sizeof(uint16_t));
 
-    EXPECT_FALSE(compact.preserves_multiplicity());
-    EXPECT_TRUE(packed_database.preserves_multiplicity());
-    EXPECT_EQ(compact.persistent_row_bytes(), reference_count * b_default * sizeof(uint16_t));
-    EXPECT_EQ(
-        packed_database.persistent_row_bytes(),
-        reference_count * (b_default * sizeof(uint32_t) + sizeof(uint32_t))
-    );
-    EXPECT_TRUE(compact.packed_data().empty());
-    EXPECT_EQ(packed_database.packed_data().size(), packed.size());
-    EXPECT_EQ(packed_database.saturation_states().size(), saturation.size());
-
-    auto compact_exhaustive = cuda::make_device_buffer<cuddl::reference_search_result>(
+    auto exhaustive = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), reference_count, cuddl::reference_search_result{}
     );
-    auto packed_exhaustive = cuda::make_device_buffer<cuddl::reference_search_result>(
+    auto indexed = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), reference_count, cuddl::reference_search_result{}
     );
-    auto compact_indexed = cuda::make_device_buffer<cuddl::reference_search_result>(
-        stream, stream.device(), reference_count, cuddl::reference_search_result{}
+    auto result_count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, uint32_t{});
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream,
+        stream.device(),
+        CUDDL_UNWRAP(database.search_workspace_bytes(stream, &database_index)),
+        uint8_t{}
     );
-    auto packed_indexed = cuda::make_device_buffer<cuddl::reference_search_result>(
-        stream, stream.device(), reference_count, cuddl::reference_search_result{}
-    );
-    auto compact_result_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, uint32_t{});
-    auto packed_result_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, uint32_t{});
-    auto workspace_bytes = compact.search_workspace_bytes(stream, &compact_index);
-    ASSERT_TRUE(workspace_bytes.has_value()) << workspace_bytes.error().message();
-    auto compact_workspace =
-        cuda::make_device_buffer<uint8_t>(stream, stream.device(), *workspace_bytes, uint8_t{});
-    auto packed_workspace =
-        cuda::make_device_buffer<uint8_t>(stream, stream.device(), *workspace_bytes, uint8_t{});
+    ASSERT_TRUE(database.search_async(device_query, compatibility, workspace, exhaustive, stream));
+    ASSERT_TRUE(database.search_async(
+        device_query, compatibility, workspace, indexed, result_count, {}, stream, &database_index
+    ));
 
-    ASSERT_TRUE(compact
-                    .search_async(
-                        device_query, compatibility, compact_workspace, compact_exhaustive, stream
-                    )
-                    .has_value());
-    ASSERT_TRUE(
-        packed_database
-            .search_async(device_query, compatibility, packed_workspace, packed_exhaustive, stream)
-            .has_value()
-    );
-    ASSERT_TRUE(compact
-                    .search_async(
-                        device_query,
-                        compatibility,
-                        compact_workspace,
-                        compact_indexed,
-                        compact_result_count,
-                        {},
-                        stream,
-                        &compact_index
-                    )
-                    .has_value());
-    ASSERT_TRUE(packed_database
-                    .search_async(
-                        device_query,
-                        compatibility,
-                        packed_workspace,
-                        packed_indexed,
-                        packed_result_count,
-                        {},
-                        stream,
-                        &packed_database_index
-                    )
-                    .has_value());
-
-    std::vector<cuddl::reference_search_result> compact_exhaustive_host(reference_count);
-    std::vector<cuddl::reference_search_result> packed_exhaustive_host(reference_count);
-    std::vector<cuddl::reference_search_result> compact_indexed_host(reference_count);
-    std::vector<cuddl::reference_search_result> packed_indexed_host(reference_count);
-    std::vector<uint32_t> recovered_packed(packed.size());
-    std::vector<uint32_t> recovered_saturation(saturation.size());
-    uint32_t compact_count = 0;
-    uint32_t packed_count = 0;
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                compact_exhaustive.data(),
-                (compact_exhaustive_host.size() * sizeof(compact_exhaustive_host.front())) /
-                    sizeof(*(compact_exhaustive.data()))
-            },
-            cuda::std::span{
-                compact_exhaustive_host.data(),
-                (compact_exhaustive_host.size() * sizeof(compact_exhaustive_host.front())) /
-                    sizeof(*(compact_exhaustive.data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                packed_exhaustive.data(),
-                (packed_exhaustive_host.size() * sizeof(packed_exhaustive_host.front())) /
-                    sizeof(*(packed_exhaustive.data()))
-            },
-            cuda::std::span{
-                packed_exhaustive_host.data(),
-                (packed_exhaustive_host.size() * sizeof(packed_exhaustive_host.front())) /
-                    sizeof(*(packed_exhaustive.data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                compact_indexed.data(),
-                (compact_indexed_host.size() * sizeof(compact_indexed_host.front())) /
-                    sizeof(*(compact_indexed.data()))
-            },
-            cuda::std::span{
-                compact_indexed_host.data(),
-                (compact_indexed_host.size() * sizeof(compact_indexed_host.front())) /
-                    sizeof(*(compact_indexed.data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                packed_indexed.data(),
-                (packed_indexed_host.size() * sizeof(packed_indexed_host.front())) /
-                    sizeof(*(packed_indexed.data()))
-            },
-            cuda::std::span{
-                packed_indexed_host.data(),
-                (packed_indexed_host.size() * sizeof(packed_indexed_host.front())) /
-                    sizeof(*(packed_indexed.data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{compact_result_count.data(), size_t{1}},
-            cuda::std::span{&compact_count, size_t{1}}
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{packed_result_count.data(), size_t{1}},
-            cuda::std::span{&packed_count, size_t{1}}
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                packed_database.packed_data().data(),
-                (packed_database.packed_data().size_bytes()) /
-                    sizeof(*(packed_database.packed_data().data()))
-            },
-            cuda::std::span{
-                recovered_packed.data(),
-                (packed_database.packed_data().size_bytes()) /
-                    sizeof(*(packed_database.packed_data().data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(([&] {
-        cuda::copy_bytes(
-            cuda::stream_ref{stream_},
-            cuda::std::span{
-                packed_database.saturation_states().data(),
-                (packed_database.saturation_states().size_bytes()) /
-                    sizeof(*(packed_database.saturation_states().data()))
-            },
-            cuda::std::span{
-                recovered_saturation.data(),
-                (packed_database.saturation_states().size_bytes()) /
-                    sizeof(*(packed_database.saturation_states().data()))
-            }
-        );
-    }()));
-    ASSERT_NO_THROW(stream_.sync());
-
-    EXPECT_EQ(recovered_packed, packed);
-    EXPECT_EQ(recovered_saturation, saturation);
+    std::vector<cuddl::reference_search_result> exhaustive_host;
+    std::vector<cuddl::reference_search_result> indexed_host;
+    std::vector<uint32_t> count;
+    ASSERT_TRUE(copy_device_buffer(exhaustive, exhaustive_host));
+    ASSERT_TRUE(copy_device_buffer(indexed, indexed_host));
+    ASSERT_TRUE(copy_device_buffer(result_count, count));
     for (size_t reference_id = 0; reference_id < reference_count; ++reference_id) {
-        auto const expected = score_row_oracle(query, scores, reference_id);
-        EXPECT_EQ(compact_exhaustive_host[reference_id].reference_id, reference_id);
-        EXPECT_EQ(compact_exhaustive_host[reference_id].summary, expected);
-        EXPECT_EQ(packed_exhaustive_host[reference_id], compact_exhaustive_host[reference_id]);
+        EXPECT_EQ(exhaustive_host[reference_id].reference_id, reference_id);
+        EXPECT_EQ(
+            exhaustive_host[reference_id].counts, score_row_oracle(query, scores, reference_id)
+        );
     }
-    ASSERT_EQ(compact_count, 1U);
-    ASSERT_EQ(packed_count, compact_count);
-    EXPECT_EQ(compact_indexed_host[0].reference_id, 1U);
-    EXPECT_EQ(packed_indexed_host[0], compact_indexed_host[0]);
+    // The default threshold selects only reference 1, whose row equals the query.
+    ASSERT_EQ(count[0], 1U);
+    EXPECT_EQ(indexed_host[0], exhaustive_host[1]);
 }
 
 // Batches large enough for the tiled shared-counter kernel: many reference tiles with a ragged
@@ -1624,32 +1459,24 @@ TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
             auto workspace = cuda::make_device_buffer<uint8_t>(
                 stream, stream.device(), requirements.workspace_bytes, uint8_t{}
             );
-            auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
-                stream, stream.device(), pairs, cuddl::batch_search_result{}
+            auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+                stream, stream.device(), pairs, cuddl::packed_pairwise_counts{}
             );
             auto matches = cuda::make_device_buffer<uint32_t>(stream, stream.device(), pairs, 0U);
-            auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 0U);
+            tile_collector tiles{stream};
             CUDDL_UNWRAP(database.search_batch_async(
                 device_queries,
                 compatibility,
                 0U,
                 workspace,
                 results,
-                count,
-                [](uint32_t) {},
+                tiles,
                 matches,
                 {.minimum_matches = minimum_matches},
                 stream,
                 index
             ));
-            std::vector<cuddl::batch_search_result> host_results;
-            std::vector<uint32_t> host_matches, host_count;
-            EXPECT_TRUE(copy_device_buffer(results, host_results));
-            EXPECT_TRUE(copy_device_buffer(matches, host_matches));
-            EXPECT_TRUE(copy_device_buffer(count, host_count));
-            host_results.resize(host_count.front());
-            host_matches.resize(host_count.front());
-            return std::pair{host_results, host_matches};
+            return std::pair{tiles.results, tiles.match_counts};
         };
         auto [exhaustive, exhaustive_matches] = run(nullptr);
         std::vector<cuddl::batch_search_result> expected;
@@ -1671,7 +1498,7 @@ TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
     }
 }
 
-TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactAndPacked) {
+TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueries) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
@@ -1693,51 +1520,26 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
             scores[query_id * b_default + bucket] = patterns[query_id][bucket % 4U];
         }
     }
-    std::vector<uint32_t> packed(scores.size());
-    for (size_t offset = 0; offset < scores.size(); ++offset) {
-        auto const count =
-            scores[offset] == 0U ? uint16_t{0} : static_cast<uint16_t>(offset % 31U + 1U);
-        packed[offset] = pack(scores[offset], count);
-    }
 
     auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), queries);
     auto device_scores = cuda::make_device_buffer<uint16_t>(stream, stream.device(), scores);
-    auto device_packed = cuda::make_device_buffer<uint32_t>(stream, stream.device(), packed);
-    auto device_saturation =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), reference_count, 0U);
     auto compact_built = database_type::build_async(device_scores, compatibility, stream);
-    auto packed_built =
-        database_type::build_async(device_packed, device_saturation, compatibility, stream);
     ASSERT_TRUE(compact_built.has_value()) << compact_built.error().message();
-    ASSERT_TRUE(packed_built.has_value()) << packed_built.error().message();
     auto compact = std::move(*compact_built);
     auto compact_index_built =
         index_type::build_async(compact, stream, cuddl::index_storage::dense);
     ASSERT_TRUE(compact_index_built) << compact_index_built.error().message();
     auto compact_index = std::move(*compact_index_built);
-    auto packed_database = std::move(*packed_built);
-    auto packed_database_index_built =
-        index_type::build_async(packed_database, stream, cuddl::index_storage::dense);
-    ASSERT_TRUE(packed_database_index_built) << packed_database_index_built.error().message();
-    auto packed_database_index = std::move(*packed_database_index_built);
 
     auto compact_exhaustive_requirements = compact.batch_search_requirements(query_count, stream);
-    auto packed_exhaustive_requirements =
-        packed_database.batch_search_requirements(query_count, stream);
     auto compact_indexed_requirements =
         compact.batch_search_requirements(query_count, stream, &compact_index);
-    auto packed_indexed_requirements =
-        packed_database.batch_search_requirements(query_count, stream, &packed_database_index);
     ASSERT_TRUE(compact_exhaustive_requirements.has_value());
-    ASSERT_TRUE(packed_exhaustive_requirements.has_value());
     ASSERT_TRUE(compact_indexed_requirements.has_value());
-    ASSERT_TRUE(packed_indexed_requirements.has_value());
-    EXPECT_EQ(*compact_exhaustive_requirements, *packed_exhaustive_requirements);
-    EXPECT_EQ(*compact_indexed_requirements, *packed_indexed_requirements);
     EXPECT_EQ(compact_exhaustive_requirements->maximum_pair_count, query_count * reference_count);
     EXPECT_EQ(
         compact_exhaustive_requirements->result_bytes,
-        static_cast<size_t>(query_count * reference_count) * sizeof(cuddl::batch_search_result)
+        static_cast<size_t>(query_count * reference_count) * sizeof(cuddl::packed_pairwise_counts)
     );
     EXPECT_EQ(
         compact_exhaustive_requirements->match_count_bytes,
@@ -1749,43 +1551,21 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
     auto compact_exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), compact_exhaustive_requirements->workspace_bytes, uint8_t{}
     );
-    auto packed_exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
-        stream, stream.device(), packed_exhaustive_requirements->workspace_bytes, uint8_t{}
-    );
     auto compact_indexed_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), compact_indexed_requirements->workspace_bytes, uint8_t{}
     );
-    auto packed_indexed_workspace = cuda::make_device_buffer<uint8_t>(
-        stream, stream.device(), packed_indexed_requirements->workspace_bytes, uint8_t{}
-    );
     auto const pair_capacity = compact_exhaustive_requirements->maximum_pair_count;
-    auto compact_exhaustive = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
+    auto compact_exhaustive = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), pair_capacity, cuddl::packed_pairwise_counts{}
     );
-    auto packed_exhaustive = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
+    auto compact_indexed = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), pair_capacity, cuddl::packed_pairwise_counts{}
     );
-    auto compact_indexed = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
-    );
-    auto packed_indexed = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
-    );
-    auto compact_exhaustive_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto packed_exhaustive_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto compact_indexed_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto packed_indexed_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+    tile_collector compact_exhaustive_tiles{stream};
+    tile_collector compact_indexed_tiles{stream};
     auto compact_exhaustive_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
-    auto packed_exhaustive_matches =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
     auto compact_indexed_matches =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
-    auto packed_indexed_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
 
     ASSERT_TRUE(compact
@@ -1795,22 +1575,8 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         query_id_offset,
                         compact_exhaustive_workspace,
                         compact_exhaustive,
-                        compact_exhaustive_count,
-                        [](uint32_t) {},
+                        compact_exhaustive_tiles,
                         compact_exhaustive_matches,
-                        stream
-                    )
-                    .has_value());
-    ASSERT_TRUE(packed_database
-                    .search_batch_async(
-                        device_queries,
-                        compatibility,
-                        query_id_offset,
-                        packed_exhaustive_workspace,
-                        packed_exhaustive,
-                        packed_exhaustive_count,
-                        [](uint32_t) {},
-                        packed_exhaustive_matches,
                         stream
                     )
                     .has_value());
@@ -1821,35 +1587,18 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         query_id_offset,
                         compact_indexed_workspace,
                         compact_indexed,
-                        compact_indexed_count,
-                        [](uint32_t) {},
+                        compact_indexed_tiles,
                         compact_indexed_matches,
                         {.minimum_matches = 1U},
                         stream,
                         &compact_index
                     )
                     .has_value());
-    ASSERT_TRUE(packed_database
-                    .search_batch_async(
-                        device_queries,
-                        compatibility,
-                        query_id_offset,
-                        packed_indexed_workspace,
-                        packed_indexed,
-                        packed_indexed_count,
-                        [](uint32_t) {},
-                        packed_indexed_matches,
-                        {.minimum_matches = 1U},
-                        stream,
-                        &packed_database_index
-                    )
-                    .has_value());
 
-    auto no_diagnostic_results = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
+    auto no_diagnostic_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), pair_capacity, cuddl::packed_pairwise_counts{}
     );
-    auto no_diagnostic_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+    tile_collector no_diagnostic_tiles{stream};
     ASSERT_TRUE(compact
                     .search_batch_async(
                         device_queries,
@@ -1857,42 +1606,12 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                         query_id_offset,
                         compact_exhaustive_workspace,
                         no_diagnostic_results,
-                        no_diagnostic_count,
-                        [](uint32_t) {},
+                        no_diagnostic_tiles,
                         {},
                         stream
                     )
                     .has_value());
     ASSERT_NO_THROW(stream_.sync());
-
-    std::vector<cuddl::batch_search_result> compact_exhaustive_host;
-    std::vector<cuddl::batch_search_result> packed_exhaustive_host;
-    std::vector<cuddl::batch_search_result> compact_indexed_host;
-    std::vector<cuddl::batch_search_result> packed_indexed_host;
-    std::vector<cuddl::batch_search_result> no_diagnostic_host;
-    std::vector<uint32_t> compact_exhaustive_matches_host;
-    std::vector<uint32_t> packed_exhaustive_matches_host;
-    std::vector<uint32_t> compact_indexed_matches_host;
-    std::vector<uint32_t> packed_indexed_matches_host;
-    std::vector<uint32_t> compact_exhaustive_count_host;
-    std::vector<uint32_t> packed_exhaustive_count_host;
-    std::vector<uint32_t> compact_indexed_count_host;
-    std::vector<uint32_t> packed_indexed_count_host;
-    std::vector<uint32_t> no_diagnostic_count_host;
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive, compact_exhaustive_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive, packed_exhaustive_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed, compact_indexed_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed, packed_indexed_host));
-    ASSERT_TRUE(copy_device_buffer(no_diagnostic_results, no_diagnostic_host));
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive_matches, compact_exhaustive_matches_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive_matches, packed_exhaustive_matches_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed_matches, compact_indexed_matches_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed_matches, packed_indexed_matches_host));
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive_count, compact_exhaustive_count_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive_count, packed_exhaustive_count_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed_count, compact_indexed_count_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed_count, packed_indexed_count_host));
-    ASSERT_TRUE(copy_device_buffer(no_diagnostic_count, no_diagnostic_count_host));
 
     std::vector<cuddl::batch_search_result> expected_results;
     for (size_t query_id = 0; query_id < query_count; ++query_id) {
@@ -1903,7 +1622,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
             expected_results.push_back({
                 .query_id = query_id_offset + static_cast<uint32_t>(query_id),
                 .reference_id = static_cast<uint32_t>(reference_id),
-                .summary = score_row_oracle(query, scores, reference_id),
+                .counts = score_row_oracle(query, scores, reference_id),
             });
         }
     }
@@ -1924,24 +1643,11 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
         1536U,
     };
     std::vector<uint32_t> const expected_indexed_matches{1536U, 1536U, 1536U};
-    EXPECT_EQ(compact_exhaustive_count_host.front(), pair_capacity);
-    EXPECT_EQ(packed_exhaustive_count_host.front(), pair_capacity);
-    EXPECT_EQ(compact_indexed_count_host.front(), expected_indexed_results.size());
-    EXPECT_EQ(packed_indexed_count_host.front(), expected_indexed_results.size());
-    EXPECT_EQ(no_diagnostic_count_host.front(), pair_capacity);
-    compact_indexed_host.resize(compact_indexed_count_host.front());
-    packed_indexed_host.resize(packed_indexed_count_host.front());
-    compact_indexed_matches_host.resize(compact_indexed_count_host.front());
-    packed_indexed_matches_host.resize(packed_indexed_count_host.front());
-    EXPECT_EQ(compact_exhaustive_host, expected_results);
-    EXPECT_EQ(packed_exhaustive_host, expected_results);
-    EXPECT_EQ(compact_indexed_host, expected_indexed_results);
-    EXPECT_EQ(packed_indexed_host, expected_indexed_results);
-    EXPECT_EQ(compact_exhaustive_host, packed_exhaustive_host);
-    EXPECT_EQ(compact_exhaustive_matches_host, expected_matches);
-    EXPECT_EQ(packed_exhaustive_matches_host, expected_matches);
-    EXPECT_EQ(compact_indexed_matches_host, expected_indexed_matches);
-    EXPECT_EQ(packed_indexed_matches_host, expected_indexed_matches);
+    EXPECT_EQ(compact_exhaustive_tiles.results, expected_results);
+    EXPECT_EQ(compact_indexed_tiles.results, expected_indexed_results);
+    EXPECT_EQ(no_diagnostic_tiles.results, expected_results);
+    EXPECT_EQ(compact_exhaustive_tiles.match_counts, expected_matches);
+    EXPECT_EQ(compact_indexed_tiles.match_counts, expected_indexed_matches);
 
     auto collect_single = [&](auto const& database, auto const& database_index, bool indexed) {
         std::vector<cuddl::batch_search_result> concatenated;
@@ -1957,8 +1663,9 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
             auto one_results = cuda::make_device_buffer<cuddl::reference_search_result>(
                 stream, stream.device(), reference_count, cuddl::reference_search_result{}
             );
-            auto one_workspace =
-                cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+            auto one_workspace = cuda::make_device_buffer<uint8_t>(
+                stream, stream.device(), database.single_query_workspace_bytes(), cuda::no_init
+            );
             auto one_count =
                 cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
             if (indexed) {
@@ -2015,21 +1722,17 @@ TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueriesForCompactA
                 concatenated.push_back({
                     .query_id = query_id_offset + static_cast<uint32_t>(query_id),
                     .reference_id = result.reference_id,
-                    .summary = result.summary,
+                    .counts = result.counts,
                 });
             }
         }
         return concatenated;
     };
-    EXPECT_EQ(compact_exhaustive_host, collect_single(compact, compact_index, false));
-    EXPECT_EQ(compact_indexed_host, collect_single(compact, compact_index, true));
-    EXPECT_EQ(
-        packed_exhaustive_host, collect_single(packed_database, packed_database_index, false)
-    );
-    EXPECT_EQ(packed_indexed_host, collect_single(packed_database, packed_database_index, true));
+    EXPECT_EQ(compact_exhaustive_tiles.results, collect_single(compact, compact_index, false));
+    EXPECT_EQ(compact_indexed_tiles.results, collect_single(compact, compact_index, true));
 }
 
-TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesWorkspace) {
+TEST_F(ReferenceDatabaseTest, UndersizedBatchResultStorageIsRejectedUntouched) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
@@ -2064,43 +1767,36 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         stream, stream.device(), requirements->workspace_bytes, uint8_t{}
     );
 
-    cuddl::batch_search_result const result_sentinel{
-        .query_id = 0xdeadU,
-        .reference_id = 0xbeefU,
-        .summary = {.counts = {.lower = 7U, .equal = 8U, .higher = 9U, .both_empty = 10U}},
-    };
+    auto const result_sentinel = cuddl::packed_pairwise_counts::pack(7U, 8U, 9U);
     constexpr uint32_t match_sentinel = 0xabcdU;
-    auto short_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto short_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), short_capacity, result_sentinel
     );
     auto short_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), short_capacity, match_sentinel);
-    auto short_count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 31337U);
     auto indexed_short = database.search_batch_async(
         device_queries,
         compatibility,
         query_id_offset,
         workspace,
         short_results,
-        short_count,
-        [](uint32_t) {},
+        [](cuddl::batch_result_tile const&) {},
         short_matches,
         {.minimum_matches = 0U},
         stream,
         &database_index
     );
-    ASSERT_TRUE(indexed_short.has_value()) << indexed_short.error().message();
+    ASSERT_FALSE(indexed_short.has_value());
+    EXPECT_EQ(indexed_short.error().category(), cuddl::ErrorCategory::resource);
     ASSERT_NO_THROW(stream_.sync());
 
-    std::vector<cuddl::batch_search_result> short_results_host;
+    std::vector<cuddl::packed_pairwise_counts> short_results_host;
     std::vector<uint32_t> short_matches_host;
-    std::vector<uint32_t> short_count_host;
     ASSERT_TRUE(copy_device_buffer(short_results, short_results_host));
     ASSERT_TRUE(copy_device_buffer(short_matches, short_matches_host));
-    ASSERT_TRUE(copy_device_buffer(short_count, short_count_host));
-    EXPECT_EQ(short_count_host.front(), requirements->maximum_pair_count);
     EXPECT_EQ(
-        short_results_host, std::vector<cuddl::batch_search_result>(short_capacity, result_sentinel)
+        short_results_host,
+        std::vector<cuddl::packed_pairwise_counts>(short_capacity, result_sentinel)
     );
     EXPECT_EQ(short_matches_host, std::vector<uint32_t>(short_capacity, match_sentinel));
 
@@ -2109,11 +1805,9 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
     auto exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), exhaustive_requirements->workspace_bytes, uint8_t{}
     );
-    auto exhaustive_short_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto exhaustive_short_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), requirements->maximum_pair_count - 1U, result_sentinel
     );
-    auto exhaustive_short_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 2718U);
     auto exhaustive_short_matches = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), requirements->maximum_pair_count - 1U, match_sentinel
     );
@@ -2123,22 +1817,19 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         query_id_offset,
         exhaustive_workspace,
         exhaustive_short_results,
-        exhaustive_short_count,
-        [](uint32_t) {},
+        [](cuddl::batch_result_tile const&) {},
         exhaustive_short_matches,
         stream
     );
     ASSERT_FALSE(exhaustive_short.has_value());
     EXPECT_EQ(exhaustive_short.error().category(), cuddl::ErrorCategory::resource);
-    std::vector<cuddl::batch_search_result> exhaustive_short_host;
+    std::vector<cuddl::packed_pairwise_counts> exhaustive_short_host;
     std::vector<uint32_t> exhaustive_short_matches_host;
-    std::vector<uint32_t> exhaustive_short_count_host;
     ASSERT_TRUE(copy_device_buffer(exhaustive_short_results, exhaustive_short_host));
     ASSERT_TRUE(copy_device_buffer(exhaustive_short_matches, exhaustive_short_matches_host));
-    ASSERT_TRUE(copy_device_buffer(exhaustive_short_count, exhaustive_short_count_host));
     EXPECT_EQ(
         exhaustive_short_host,
-        std::vector<cuddl::batch_search_result>(
+        std::vector<cuddl::packed_pairwise_counts>(
             requirements->maximum_pair_count - 1U, result_sentinel
         )
     );
@@ -2146,16 +1837,14 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         exhaustive_short_matches_host,
         std::vector<uint32_t>(requirements->maximum_pair_count - 1U, match_sentinel)
     );
-    EXPECT_EQ(exhaustive_short_count_host.front(), 2718U);
 
-    auto successful_results = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), requirements->maximum_pair_count, cuddl::batch_search_result{}
+    auto successful_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements->maximum_pair_count, cuddl::packed_pairwise_counts{}
     );
     auto successful_matches = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), requirements->maximum_pair_count, uint32_t{}
     );
-    auto successful_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+    tile_collector successful_tiles{stream};
     ASSERT_TRUE(database
                     .search_batch_async(
                         device_queries,
@@ -2163,8 +1852,7 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
                         query_id_offset,
                         workspace,
                         successful_results,
-                        successful_count,
-                        [](uint32_t) {},
+                        successful_tiles,
                         successful_matches,
                         {.minimum_matches = 0U},
                         stream,
@@ -2173,12 +1861,6 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
                     .has_value());
     ASSERT_NO_THROW(stream_.sync());
 
-    std::vector<cuddl::batch_search_result> successful_host;
-    std::vector<uint32_t> successful_matches_host;
-    std::vector<uint32_t> successful_count_host;
-    ASSERT_TRUE(copy_device_buffer(successful_results, successful_host));
-    ASSERT_TRUE(copy_device_buffer(successful_matches, successful_matches_host));
-    ASSERT_TRUE(copy_device_buffer(successful_count, successful_count_host));
     std::vector<cuddl::batch_search_result> expected_results;
     for (size_t query_id = 0; query_id < query_count; ++query_id) {
         std::vector<uint16_t> query(
@@ -2188,7 +1870,7 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
             expected_results.push_back({
                 .query_id = query_id_offset + static_cast<uint32_t>(query_id),
                 .reference_id = static_cast<uint32_t>(reference_id),
-                .summary = score_row_oracle(query, rows, reference_id),
+                .counts = score_row_oracle(query, rows, reference_id),
             });
         }
     }
@@ -2200,9 +1882,8 @@ TEST_F(ReferenceDatabaseTest, IndexedBatchCapacityReportsRequiredPairsAndReusesW
         0U,
         0U,
     };
-    EXPECT_EQ(successful_count_host.front(), requirements->maximum_pair_count);
-    EXPECT_EQ(successful_host, expected_results);
-    EXPECT_EQ(successful_matches_host, expected_matches);
+    EXPECT_EQ(successful_tiles.results, expected_results);
+    EXPECT_EQ(successful_tiles.match_counts, expected_matches);
 }
 TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
     auto const stream = cuda::stream_ref{stream_};
@@ -2223,54 +1904,27 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
     auto const exhaustive_requirements = *database.batch_search_requirements(query_count, stream);
     auto const indexed_requirements =
         *database.batch_search_requirements(query_count, stream, &database_index);
-    // Tiles hold whole queries, and both paths bound them identically.
+    // Tiles hold whole queries and fit the storage the requirements describe.
     EXPECT_EQ(exhaustive_requirements.maximum_pair_count % reference_count, 0U);
-    EXPECT_EQ(indexed_requirements.maximum_pair_count, exhaustive_requirements.maximum_pair_count);
-    auto const tile_queries = exhaustive_requirements.maximum_pair_count / reference_count;
-    std::vector<uint32_t> expected_capacities;
-    for (uint32_t first = 0U; first < query_count; first += tile_queries) {
-        expected_capacities.push_back(
-            std::min(tile_queries, query_count - first) * reference_count
-        );
-    }
 
     auto collect = [&](bool indexed) {
         auto const& requirements = indexed ? indexed_requirements : exhaustive_requirements;
         auto workspace = cuda::make_device_buffer<uint8_t>(
             stream, stream.device(), requirements.workspace_bytes, uint8_t{}
         );
-        auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
-            stream, stream.device(), requirements.maximum_pair_count, cuddl::batch_search_result{}
+        auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+            stream,
+            stream.device(),
+            requirements.maximum_pair_count,
+            cuddl::packed_pairwise_counts{}
         );
-        auto result_count =
-            cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
         std::vector<cuddl::batch_search_result> collected;
         std::vector<uint32_t> tile_capacities;
-        auto on_tile = [&](uint32_t capacity) {
-            ASSERT_NO_THROW(stream_.sync());
-            uint32_t count = 0U;
-            ASSERT_NO_THROW(([&] {
-                cuda::copy_bytes(
-                    stream,
-                    cuda::std::span{result_count.data(), size_t{1}},
-                    cuda::std::span{&count, size_t{1}}
-                );
-                stream.sync();
-            }()));
-            ASSERT_LE(count, capacity);
-            std::vector<cuddl::batch_search_result> tile(count);
-            if (count != 0U) {
-                ASSERT_NO_THROW(([&] {
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{results.data(), count},
-                        cuda::std::span{tile.data(), count}
-                    );
-                    stream.sync();
-                }()));
-            }
-            tile_capacities.push_back(capacity);
-            collected.insert(collected.end(), tile.begin(), tile.end());
+        auto on_tile = [&](cuddl::batch_result_tile const& tile) {
+            auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+            auto const passing = tile_copy.passing();
+            tile_capacities.push_back(static_cast<uint32_t>(tile.slot_count()));
+            collected.insert(collected.end(), passing.begin(), passing.end());
         };
         auto const search = indexed ? database.search_batch_async(
                                           device_queries,
@@ -2278,7 +1932,6 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
                                           query_id_offset,
                                           workspace,
                                           results,
-                                          result_count,
                                           on_tile,
                                           {},
                                           {.minimum_matches = 0U},
@@ -2291,13 +1944,15 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
                                           query_id_offset,
                                           workspace,
                                           results,
-                                          result_count,
                                           on_tile,
                                           {},
                                           cuda::stream_ref{stream_}
                                       );
         EXPECT_TRUE(search.has_value()) << search.error().message();
-        EXPECT_EQ(tile_capacities, expected_capacities);
+        for (auto const capacity : tile_capacities) {
+            EXPECT_EQ(capacity % reference_count, 0U);
+            EXPECT_LE(capacity, requirements.maximum_pair_count);
+        }
         EXPECT_EQ(collected.size(), static_cast<size_t>(query_count) * reference_count);
         std::sort(collected.begin(), collected.end(), [](auto const& left, auto const& right) {
             return std::tie(left.query_id, left.reference_id) <
@@ -2328,40 +1983,22 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
         rows[2U * b_default + bucket] = std::array<uint16_t, 4>{1U, 0U, 3U, 0U}[bucket % 4U];
         rows[3U * b_default + bucket] = std::array<uint16_t, 4>{0U, 4U, 3U, 5U}[bucket % 4U];
     }
-    std::vector<uint32_t> packed(rows.size());
-    for (size_t offset = 0; offset < rows.size(); ++offset) {
-        auto const count =
-            rows[offset] == 0U ? uint16_t{0} : static_cast<uint16_t>(offset % 17U + 1U);
-        packed[offset] = pack(rows[offset], count);
-    }
 
     auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
-    auto device_packed = cuda::make_device_buffer<uint32_t>(stream, stream.device(), packed);
-    auto saturation =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), reference_count, 0U);
     auto compact_built = database_type::build_async(device_rows, compatibility, stream);
-    auto packed_built =
-        database_type::build_async(device_packed, saturation, compatibility, stream);
     ASSERT_TRUE(compact_built.has_value()) << compact_built.error().message();
-    ASSERT_TRUE(packed_built.has_value()) << packed_built.error().message();
     auto compact = std::move(*compact_built);
     auto compact_index_built =
         index_type::build_async(compact, stream, cuddl::index_storage::dense);
     ASSERT_TRUE(compact_index_built) << compact_index_built.error().message();
     auto compact_index = std::move(*compact_index_built);
-    auto packed_database = std::move(*packed_built);
-    auto packed_database_index_built =
-        index_type::build_async(packed_database, stream, cuddl::index_storage::dense);
-    ASSERT_TRUE(packed_database_index_built) << packed_database_index_built.error().message();
-    auto packed_database_index = std::move(*packed_database_index_built);
 
-    auto exhaustive_requirements = compact.all_to_all_search_requirements(stream);
-    auto indexed_requirements = compact.all_to_all_search_requirements(stream, &compact_index);
+    auto exhaustive_requirements = compact.all_to_all_search_requirements();
+    auto indexed_requirements = compact.all_to_all_search_requirements(&compact_index);
     ASSERT_TRUE(exhaustive_requirements.has_value()) << exhaustive_requirements.error().message();
     ASSERT_TRUE(indexed_requirements.has_value()) << indexed_requirements.error().message();
     ASSERT_EQ(exhaustive_requirements->maximum_pair_count, 6U);
 
-    EXPECT_GT(indexed_requirements->counter_bytes, 0U);
     EXPECT_GT(indexed_requirements->candidate_bytes, 0U);
     EXPECT_EQ(indexed_requirements->maximum_pair_count, 6U);
     auto large_indexed_requirements =
@@ -2377,62 +2014,29 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
     auto compact_exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), exhaustive_requirements->workspace_bytes, uint8_t{}
     );
-    auto packed_exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
-        stream, stream.device(), exhaustive_requirements->workspace_bytes, uint8_t{}
-    );
     auto compact_indexed_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), indexed_requirements->workspace_bytes, uint8_t{}
     );
-    auto packed_indexed_workspace = cuda::make_device_buffer<uint8_t>(
-        stream, stream.device(), indexed_requirements->workspace_bytes, uint8_t{}
-    );
     auto const pair_capacity = exhaustive_requirements->maximum_pair_count;
-    auto compact_exhaustive = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
+    auto compact_exhaustive = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), pair_capacity, cuddl::packed_pairwise_counts{}
     );
-    auto packed_exhaustive = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
+    auto compact_indexed = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), pair_capacity, cuddl::packed_pairwise_counts{}
     );
-    auto compact_indexed = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
-    );
-    auto packed_indexed = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), pair_capacity, cuddl::batch_search_result{}
-    );
-    auto compact_exhaustive_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto packed_exhaustive_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto compact_indexed_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-    auto packed_indexed_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+    tile_collector compact_exhaustive_tiles{stream};
+    tile_collector compact_indexed_tiles{stream};
     auto compact_exhaustive_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
-    auto packed_exhaustive_matches =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
     auto compact_indexed_matches =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
-    auto packed_indexed_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), pair_capacity, uint32_t{});
 
     ASSERT_TRUE(compact
                     .search_all_to_all_async(
                         compact_exhaustive_workspace,
                         compact_exhaustive,
-                        compact_exhaustive_count,
-                        [](uint32_t) {},
+                        compact_exhaustive_tiles,
                         compact_exhaustive_matches,
-                        stream
-                    )
-                    .has_value());
-    ASSERT_TRUE(packed_database
-                    .search_all_to_all_async(
-                        packed_exhaustive_workspace,
-                        packed_exhaustive,
-                        packed_exhaustive_count,
-                        [](uint32_t) {},
-                        packed_exhaustive_matches,
                         stream
                     )
                     .has_value());
@@ -2440,52 +2044,14 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                     .search_all_to_all_async(
                         compact_indexed_workspace,
                         compact_indexed,
-                        compact_indexed_count,
-                        [](uint32_t) {},
+                        compact_indexed_tiles,
                         compact_indexed_matches,
                         {.minimum_matches = 0U},
                         stream,
                         &compact_index
                     )
                     .has_value());
-    ASSERT_TRUE(packed_database
-                    .search_all_to_all_async(
-                        packed_indexed_workspace,
-                        packed_indexed,
-                        packed_indexed_count,
-                        [](uint32_t) {},
-                        packed_indexed_matches,
-                        {.minimum_matches = 0U},
-                        stream,
-                        &packed_database_index
-                    )
-                    .has_value());
     ASSERT_NO_THROW(stream_.sync());
-
-    std::vector<cuddl::batch_search_result> compact_exhaustive_host;
-    std::vector<cuddl::batch_search_result> packed_exhaustive_host;
-    std::vector<cuddl::batch_search_result> compact_indexed_host;
-    std::vector<cuddl::batch_search_result> packed_indexed_host;
-    std::vector<uint32_t> compact_exhaustive_matches_host;
-    std::vector<uint32_t> packed_exhaustive_matches_host;
-    std::vector<uint32_t> compact_indexed_matches_host;
-    std::vector<uint32_t> packed_indexed_matches_host;
-    std::vector<uint32_t> compact_exhaustive_count_host;
-    std::vector<uint32_t> packed_exhaustive_count_host;
-    std::vector<uint32_t> compact_indexed_count_host;
-    std::vector<uint32_t> packed_indexed_count_host;
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive, compact_exhaustive_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive, packed_exhaustive_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed, compact_indexed_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed, packed_indexed_host));
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive_matches, compact_exhaustive_matches_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive_matches, packed_exhaustive_matches_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed_matches, compact_indexed_matches_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed_matches, packed_indexed_matches_host));
-    ASSERT_TRUE(copy_device_buffer(compact_exhaustive_count, compact_exhaustive_count_host));
-    ASSERT_TRUE(copy_device_buffer(packed_exhaustive_count, packed_exhaustive_count_host));
-    ASSERT_TRUE(copy_device_buffer(compact_indexed_count, compact_indexed_count_host));
-    ASSERT_TRUE(copy_device_buffer(packed_indexed_count, packed_indexed_count_host));
 
     std::vector<cuddl::batch_search_result> expected_results;
     for (size_t query_id = 0; query_id < reference_count; ++query_id) {
@@ -2496,29 +2062,21 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
             expected_results.push_back({
                 .query_id = static_cast<uint32_t>(query_id),
                 .reference_id = static_cast<uint32_t>(reference_id),
-                .summary = score_row_oracle(query, rows, reference_id),
+                .counts = score_row_oracle(query, rows, reference_id),
             });
         }
     }
     std::vector<uint32_t> const expected_matches{0U, 0U, 0U, 0U, 0U, 512U};
-    EXPECT_EQ(compact_exhaustive_count_host.front(), pair_capacity);
-    EXPECT_EQ(packed_exhaustive_count_host.front(), pair_capacity);
-    EXPECT_EQ(compact_indexed_count_host.front(), pair_capacity);
-    EXPECT_EQ(packed_indexed_count_host.front(), pair_capacity);
-    EXPECT_EQ(compact_exhaustive_host, expected_results);
-    EXPECT_EQ(packed_exhaustive_host, expected_results);
-    EXPECT_EQ(compact_indexed_host, expected_results);
-    EXPECT_EQ(packed_indexed_host, expected_results);
-    EXPECT_EQ(compact_exhaustive_matches_host, expected_matches);
-    EXPECT_EQ(packed_exhaustive_matches_host, expected_matches);
-    EXPECT_EQ(compact_indexed_matches_host, expected_matches);
-    EXPECT_EQ(packed_indexed_matches_host, expected_matches);
-    for (auto const& result : compact_exhaustive_host) {
+    EXPECT_EQ(compact_exhaustive_tiles.results, expected_results);
+    EXPECT_EQ(compact_indexed_tiles.results, expected_results);
+    EXPECT_EQ(compact_exhaustive_tiles.match_counts, expected_matches);
+    EXPECT_EQ(compact_indexed_tiles.match_counts, expected_matches);
+    for (auto const& result : compact_exhaustive_tiles.results) {
         EXPECT_LT(result.query_id, result.reference_id);
     }
-    ASSERT_EQ(expected_results.front().summary.counts.both_empty, b_default);
+    ASSERT_EQ(expected_results.front().counts.both_empty, b_default);
     EXPECT_EQ(expected_matches.front(), 0U);
-    auto const& mixed = expected_results.back().summary.counts;
+    auto const& mixed = expected_results.back().counts;
     EXPECT_EQ(mixed.lower, b_default / 2U);
     EXPECT_EQ(mixed.higher, b_default / 4U);
     EXPECT_EQ(mixed.equal, b_default / 4U);
@@ -2528,10 +2086,10 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
         cuda::make_device_buffer<uint16_t>(stream, stream.device(), 0, cuda::no_init);
     auto empty_exhaustive_workspace =
         cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
-    auto empty_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto empty_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), 0, cuda::no_init
     );
-    auto empty_count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 77U);
+    tile_collector empty_tiles{stream};
     auto empty_matches =
         cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
     ASSERT_TRUE(compact
@@ -2541,8 +2099,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         55U,
                         empty_exhaustive_workspace,
                         empty_results,
-                        empty_count,
-                        [](uint32_t) {},
+                        empty_tiles,
                         empty_matches,
                         stream
                     )
@@ -2559,8 +2116,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         55U,
                         empty_indexed_workspace,
                         empty_results,
-                        empty_count,
-                        [](uint32_t) {},
+                        empty_tiles,
                         empty_matches,
                         {.minimum_matches = 0U},
                         stream,
@@ -2568,9 +2124,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                     )
                     .has_value());
     ASSERT_NO_THROW(stream_.sync());
-    std::vector<uint32_t> empty_count_host;
-    ASSERT_TRUE(copy_device_buffer(empty_count, empty_count_host));
-    EXPECT_EQ(empty_count_host.front(), 0U);
+    EXPECT_TRUE(empty_tiles.results.empty());
 
     constexpr uint32_t partial_query_count = 2U;
     auto partial_queries = cuda::make_device_buffer<uint16_t>(
@@ -2581,17 +2135,16 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
     auto partial_workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), partial_requirements->workspace_bytes, uint8_t{}
     );
-    auto partial_results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto partial_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream,
         stream.device(),
         partial_requirements->maximum_pair_count,
-        cuddl::batch_search_result{}
+        cuddl::packed_pairwise_counts{}
     );
     auto partial_matches = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), partial_requirements->maximum_pair_count, uint32_t{}
     );
-    auto partial_count =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
+    tile_collector partial_tiles{stream};
     ASSERT_TRUE(compact
                     .search_batch_async(
                         partial_queries,
@@ -2599,19 +2152,12 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
                         2U,
                         partial_workspace,
                         partial_results,
-                        partial_count,
-                        [](uint32_t) {},
+                        partial_tiles,
                         partial_matches,
                         stream
                     )
                     .has_value());
     ASSERT_NO_THROW(stream_.sync());
-    std::vector<cuddl::batch_search_result> partial_host;
-    std::vector<uint32_t> partial_matches_host;
-    std::vector<uint32_t> partial_count_host;
-    ASSERT_TRUE(copy_device_buffer(partial_results, partial_host));
-    ASSERT_TRUE(copy_device_buffer(partial_matches, partial_matches_host));
-    ASSERT_TRUE(copy_device_buffer(partial_count, partial_count_host));
     std::vector<cuddl::batch_search_result> expected_partial;
     for (size_t query_id = 2U; query_id < reference_count; ++query_id) {
         std::vector<uint16_t> query(
@@ -2621,7 +2167,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
             expected_partial.push_back({
                 .query_id = static_cast<uint32_t>(query_id),
                 .reference_id = static_cast<uint32_t>(reference_id),
-                .summary = score_row_oracle(query, rows, reference_id),
+                .counts = score_row_oracle(query, rows, reference_id),
             });
         }
     }
@@ -2635,15 +2181,16 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
         512U,
         1536U,
     };
-    EXPECT_EQ(partial_count_host.front(), partial_requirements->maximum_pair_count);
-    EXPECT_EQ(partial_host, expected_partial);
-    EXPECT_EQ(partial_matches_host, expected_partial_matches);
+    EXPECT_EQ(partial_tiles.results, expected_partial);
+    EXPECT_EQ(partial_tiles.match_counts, expected_partial_matches);
 }
 
 TEST_F(ReferenceDatabaseTest, ExhaustiveAllToAllOwnsBoundedTraversal) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
-    constexpr uint32_t reference_count = 130U;
+    // Tiles hold about 2^24 pairs and storage two tiles, so this many references need several
+    // tiles and more pairs than the storage holds.
+    constexpr uint32_t reference_count = 12000U;
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
     auto rows = cuda::make_device_buffer<uint16_t>(
         stream, stream.device(), static_cast<size_t>(reference_count) * b_default, 0U
@@ -2651,7 +2198,7 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveAllToAllOwnsBoundedTraversal) {
     auto built = database_type::build_async(rows, compatibility, stream);
     ASSERT_TRUE(built.has_value()) << built.error().message();
     auto database = std::move(*built);
-    auto requirements = database.all_to_all_search_requirements(stream);
+    auto requirements = database.all_to_all_search_requirements();
     ASSERT_TRUE(requirements.has_value()) << requirements.error().message();
 
     auto const total_pairs = static_cast<uint64_t>(reference_count) * (reference_count - 1U) / 2U;
@@ -2659,18 +2206,16 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveAllToAllOwnsBoundedTraversal) {
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements->workspace_bytes, uint8_t{}
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), requirements->maximum_pair_count, cuddl::batch_search_result{}
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements->maximum_pair_count, cuddl::packed_pairwise_counts{}
     );
-    auto result_count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
     uint64_t emitted_pairs = 0U;
     uint32_t callback_count = 0U;
     auto searched = database.search_all_to_all_async(
         workspace,
         results,
-        result_count,
-        [&](uint32_t pair_count) {
-            emitted_pairs += pair_count;
+        [&](cuddl::batch_result_tile const& tile) {
+            emitted_pairs += tile.slot_count();
             ++callback_count;
         },
         {},
@@ -2680,57 +2225,6 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveAllToAllOwnsBoundedTraversal) {
     ASSERT_NO_THROW(stream_.sync());
     EXPECT_GT(callback_count, 1U);
     EXPECT_EQ(emitted_pairs, total_pairs);
-}
-
-TEST_F(ReferenceDatabaseTest, PackedRowsShareConstructionFailureContract) {
-    auto const stream = cuda::stream_ref{stream_};
-    using database_type = cuddl::reference_database<k_default, b_default>;
-    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
-
-    auto malformed_scores =
-        cuda::make_device_buffer<uint16_t>(stream, stream.device(), b_default + 1U, 1U);
-    auto malformed_packed =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), b_default + 1U, pack(1U, 1U));
-    auto saturation = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, 0U);
-    auto compact_malformed = database_type::build_async(
-        cuddl::device_span<uint16_t const>{malformed_scores.data(), malformed_scores.size()},
-        compatibility,
-        stream
-    );
-    auto packed_malformed = database_type::build_async(
-        cuddl::device_span<uint32_t const>{malformed_packed.data(), malformed_packed.size()},
-        cuddl::device_span<uint32_t const>{saturation.data(), saturation.size()},
-        compatibility,
-        stream
-    );
-    ASSERT_FALSE(compact_malformed.has_value());
-    ASSERT_FALSE(packed_malformed.has_value());
-    EXPECT_EQ(packed_malformed.error().category(), compact_malformed.error().category());
-
-    auto incompatible = compatibility;
-    incompatible.key_mask = 0x3fffU;
-    auto compact_incompatible =
-        database_type::build_async(cuddl::device_span<uint16_t const>{}, incompatible, stream);
-    auto packed_incompatible = database_type::build_async(
-        cuddl::device_span<uint32_t const>{},
-        cuddl::device_span<uint32_t const>{},
-        incompatible,
-        stream
-    );
-    ASSERT_FALSE(compact_incompatible.has_value());
-    ASSERT_FALSE(packed_incompatible.has_value());
-    EXPECT_EQ(packed_incompatible.error().category(), compact_incompatible.error().category());
-
-    auto complete_packed =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 2U * b_default, pack(1U, 1U));
-    auto mismatched_saturation = database_type::build_async(
-        cuddl::device_span<uint32_t const>{complete_packed.data(), complete_packed.size()},
-        cuddl::device_span<uint32_t const>{saturation.data(), saturation.size()},
-        compatibility,
-        stream
-    );
-    ASSERT_FALSE(mismatched_saturation.has_value());
-    EXPECT_EQ(mismatched_saturation.error().category(), cuddl::ErrorCategory::invalid_argument);
 }
 
 TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
@@ -2750,7 +2244,6 @@ TEST_F(ReferenceDatabaseTest, EmptyDatabaseReportsSizesAndReturnsNoResults) {
     EXPECT_EQ(database.single_query_workspace_bytes(), 0U);
     EXPECT_EQ(database.single_query_result_count(), 0U);
     EXPECT_EQ(database_type::persistent_row_bytes(3), 3 * b_default * sizeof(uint16_t));
-    EXPECT_EQ(database_type::single_query_workspace_bytes(3), 0U);
     EXPECT_EQ(database_type::single_query_result_count(3), 3U);
 
     auto query = cuda::make_device_buffer<uint16_t>(stream, stream.device(), b_default, 0U);
@@ -2788,7 +2281,7 @@ TEST_F(ReferenceDatabaseTest, RejectsMalformedAndIncompatibleInputsWithoutOutput
 
     cuddl::reference_search_result sentinel{};
     sentinel.reference_id = 99U;
-    sentinel.summary.counts.lower = 123U;
+    sentinel.counts.lower = 123U;
     auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), 1, sentinel
     );
@@ -2910,7 +2403,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchDefaultThresholdMatchesOracle) {
     for (size_t index = 0; index < result_count; ++index) {
         auto const reference_id = default_ids[index];
         EXPECT_EQ(results[index].reference_id, reference_id);
-        EXPECT_EQ(results[index].summary, score_row_oracle(query, rows, reference_id));
+        EXPECT_EQ(results[index].counts, score_row_oracle(query, rows, reference_id));
     }
 
     auto threshold_search = database.search_async(
@@ -2950,7 +2443,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchDefaultThresholdMatchesOracle) {
     for (size_t index = 0; index < result_count; ++index) {
         auto const reference_id = threshold_ids[index];
         EXPECT_EQ(results[index].reference_id, reference_id);
-        EXPECT_EQ(results[index].summary, score_row_oracle(query, rows, reference_id));
+        EXPECT_EQ(results[index].counts, score_row_oracle(query, rows, reference_id));
     }
 }
 
@@ -3042,7 +2535,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchIsIndependentOfPostingOrder) {
         for (auto& result : results) {
             auto const physical_id = result.reference_id;
             auto const logical_id = row_orders[run][physical_id];
-            EXPECT_EQ(result.summary, score_row_oracle(query, rows, physical_id));
+            EXPECT_EQ(result.counts, score_row_oracle(query, rows, physical_id));
             result.reference_id = logical_id;
         }
         std::ranges::sort(results, {}, &cuddl::reference_search_result::reference_id);
@@ -3073,7 +2566,9 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchZeroThresholdExactlyMatchesExhaustive
     ASSERT_TRUE(database_index_built) << database_index_built.error().message();
     auto database_index = std::move(*database_index_built);
 
-    auto workspace = cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), database.single_query_workspace_bytes(), cuda::no_init
+    );
     auto indexed_results = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), reference_count, cuddl::reference_search_result{}
     );
@@ -3141,7 +2636,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchZeroThresholdExactlyMatchesExhaustive
     ASSERT_EQ(result_count, reference_count);
     EXPECT_EQ(indexed_host, exhaustive_host);
     for (size_t reference_id = 0; reference_id < reference_count; ++reference_id) {
-        EXPECT_EQ(indexed_host[reference_id].summary, score_row_oracle(query, rows, reference_id));
+        EXPECT_EQ(indexed_host[reference_id].counts, score_row_oracle(query, rows, reference_id));
     }
 }
 
@@ -3197,8 +2692,9 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchModesMatchExhaustiveAcrossThresholds)
         ASSERT_TRUE(workspace_bytes.has_value()) << workspace_bytes.error().message();
         auto workspace =
             cuda::make_device_buffer<uint8_t>(stream, stream.device(), *workspace_bytes, uint8_t{});
-        auto exhaustive_workspace =
-            cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+        auto exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
+            stream, stream.device(), database.single_query_workspace_bytes(), cuda::no_init
+        );
         auto device_results = cuda::make_device_buffer<cuddl::reference_search_result>(
             stream, stream.device(), reference_count, cuddl::reference_search_result{}
         );
@@ -3256,8 +2752,8 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchModesMatchExhaustiveAcrossThresholds)
             for (size_t index = 0; index < result_count; ++index) {
                 auto const reference_id = expected_ids[index];
                 EXPECT_EQ(results[index].reference_id, reference_id);
-                EXPECT_EQ(results[index].summary, exhaustive_results[reference_id].summary);
-                EXPECT_EQ(results[index].summary, score_row_oracle(query, rows, reference_id));
+                EXPECT_EQ(results[index].counts, exhaustive_results[reference_id].counts);
+                EXPECT_EQ(results[index].counts, score_row_oracle(query, rows, reference_id));
             }
         }
     }
@@ -3318,7 +2814,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchSharedCounterBoundariesMatchOracle) {
         ASSERT_EQ(count_host[0], reference_count - 1U);
         for (size_t index = 0; index < count_host[0]; ++index) {
             EXPECT_EQ(results[index].reference_id, static_cast<uint32_t>(index));
-            EXPECT_EQ(results[index].summary, score_row_oracle(query, rows, index));
+            EXPECT_EQ(results[index].counts, score_row_oracle(query, rows, index));
         }
         std::vector<uint16_t> empty_query(b_default, 0U);
         auto device_empty =
@@ -3435,7 +2931,7 @@ TEST_F(ReferenceDatabaseTest, MaskedKeysPreserveZeroAndExactCollisionSemantics) 
     ));
     ASSERT_EQ(folded_zero_results.size(), 1U);
     EXPECT_EQ(folded_zero_results[0].reference_id, 0U);
-    EXPECT_EQ(folded_zero_results[0].summary, score_row_oracle(folded_zero_query, rows, 0U));
+    EXPECT_EQ(folded_zero_results[0].counts, score_row_oracle(folded_zero_query, rows, 0U));
 
     auto collision_query = empty_query;
     collision_query[0] = 0x0001U;
@@ -3451,7 +2947,7 @@ TEST_F(ReferenceDatabaseTest, MaskedKeysPreserveZeroAndExactCollisionSemantics) 
     EXPECT_EQ(masked_results[0].reference_id, 2U);
     EXPECT_EQ(masked_results[1].reference_id, 3U);
     for (auto const& result : masked_results) {
-        EXPECT_EQ(result.summary, score_row_oracle(collision_query, rows, result.reference_id));
+        EXPECT_EQ(result.counts, score_row_oracle(collision_query, rows, result.reference_id));
     }
 }
 
@@ -3491,7 +2987,7 @@ TEST_F(ReferenceDatabaseTest, IndexedSearchRejectsInvalidInputsWithoutOutput) {
     );
     cuddl::reference_search_result const sentinel{
         .reference_id = 123U,
-        .summary = {.counts = {.lower = 4U, .equal = 5U, .higher = 6U}},
+        .counts = {.lower = 4U, .equal = 5U, .higher = 6U},
     };
     auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
         stream, stream.device(), reference_count, sentinel
@@ -3912,12 +3408,12 @@ TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
     auto& database = *uploaded;
     auto database_index =
         CUDDL_UNWRAP((cuddl::reference_index<3, buckets>::build_async(database, stream)));
-    EXPECT_TRUE(database.preserves_multiplicity());
-    std::vector<uint32_t> rows(paths.size() * buckets), saturation(paths.size());
-    cuda::copy_bytes(stream, database.packed_data(), rows);
-    cuda::copy_bytes(stream, database.saturation_states(), saturation);
+    std::vector<uint16_t> rows(paths.size() * buckets);
+    auto rows_device =
+        cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows.size(), cuda::no_init);
+    ASSERT_TRUE(database.copy_scores_async({rows_device.data(), rows_device.size()}, stream));
+    cuda::copy_bytes(stream, rows_device, rows);
     stream.sync();
-    EXPECT_EQ(saturation, (std::vector<uint32_t>{0, 0, 1, 0}));
 
     std::vector<scalar_sketch<buckets>> expected(paths.size());
     for (size_t i = 0; i < paths.size(); ++i) {
@@ -3926,9 +3422,7 @@ TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
         expected[i].pack_registers();
         EXPECT_TRUE(
             std::equal(
-                expected[i].registers.begin(),
-                expected[i].registers.end(),
-                rows.begin() + i * buckets
+                expected[i].winners.begin(), expected[i].winners.end(), rows.begin() + i * buckets
             )
         );
         std::filesystem::remove(paths[i]);
@@ -3962,7 +3456,7 @@ TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
     ASSERT_EQ(returned.front(), paths.size());
     for (size_t i = 0; i < hits.size(); ++i) {
         EXPECT_EQ(hits[i].reference_id, i);
-        EXPECT_EQ(hits[i].summary.counts, expected[1].compare(expected[i]));
+        EXPECT_EQ(hits[i].counts, expected[1].compare(expected[i]));
     }
     // Loaded archives are self-contained after the input files disappear; replacing a file works.
     ASSERT_TRUE(loaded->save(file));
@@ -3992,7 +3486,7 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     std::string bytes{std::istreambuf_iterator<char>(input), {}};
     ASSERT_GT(bytes.size(), 70U);
     EXPECT_EQ(bytes.substr(0, 8), std::string("CUDDLDB\0", 8));
-    EXPECT_EQ(static_cast<unsigned char>(bytes[8]), 1U);   // little-endian format version
+    EXPECT_EQ(static_cast<unsigned char>(bytes[8]), 2U);   // little-endian format version
     EXPECT_EQ(static_cast<unsigned char>(bytes[12]), 3U);  // k-mer length
     auto reject = [&](std::string const& corrupted) {
         {
@@ -4017,14 +3511,6 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     oversized = bytes;
     oversized.replace(66, 4, 4, '\xff');  // first label length, checked before allocation
     reject(oversized);
-    // Check structural validation independently of CRC failure.
-    auto invalid_flag = bytes;
-    invalid_flag[invalid_flag.size() - 8] = 2;
-    auto checksum = libdeflate_crc32(0, invalid_flag.data(), invalid_flag.size() - 4);
-    for (size_t i = 0; i < 4; ++i) {
-        invalid_flag[invalid_flag.size() - 4 + i] = static_cast<char>(checksum >> (8 * i));
-    }
-    reject(invalid_flag);
     {
         std::ofstream out(paths.front());
         out << "@broken\nACGT\n+\nII\n";
@@ -4050,10 +3536,13 @@ TEST(ReferenceDatabaseFileTest, GenomeLargerThanUploadBufferMatchesScalar) {
     expected.pack_registers();
     auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(paths, stream)));
     auto database = CUDDL_UNWRAP((archive.upload<25, 2048>(stream)));
-    std::vector<uint32_t> rows(2048);
-    cuda::copy_bytes(stream, database.packed_data(), rows);
+    std::vector<uint16_t> rows(2048);
+    auto rows_device =
+        cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows.size(), cuda::no_init);
+    ASSERT_TRUE(database.copy_scores_async({rows_device.data(), rows_device.size()}, stream));
+    cuda::copy_bytes(stream, rows_device, rows);
     stream.sync();
-    EXPECT_TRUE(std::equal(rows.begin(), rows.end(), expected.registers.begin()));
+    EXPECT_TRUE(std::equal(rows.begin(), rows.end(), expected.winners.begin()));
     std::filesystem::remove(paths.front());
 }
 
@@ -4085,7 +3574,6 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
         );
         ASSERT_TRUE(built) << built.error().message() << " staging=" << staging;
         ASSERT_EQ(built->rows().size(), paths.size() * buckets);
-        ASSERT_EQ(built->saturation().size(), paths.size());
         for (size_t i = 0; i < paths.size(); ++i) {
             auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[i].string(), 25));
             scalar_sketch<buckets> expected;
@@ -4093,14 +3581,12 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
             expected.pack_registers();
             EXPECT_TRUE(
                 std::equal(
-                    expected.registers.begin(),
-                    expected.registers.end(),
+                    expected.winners.begin(),
+                    expected.winners.end(),
                     built->rows().begin() + i * buckets
                 )
             ) << "staging="
               << staging << " genome=" << i;
-            EXPECT_EQ(expected.saturated, built->saturation()[i])
-                << "staging=" << staging << " genome=" << i;
         }
     }
     for (auto const& path : paths) std::filesystem::remove(path);
@@ -4127,9 +3613,8 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
                  .transfer = cuddl::transfer_mode::pinned}
             );
             ASSERT_TRUE(built) << built.error().message() << " k=" << k;
-            EXPECT_EQ(oracle.saturated, built->saturation().front()) << "k=" << k;
             EXPECT_TRUE(
-                std::equal(oracle.registers.begin(), oracle.registers.end(), built->rows().begin())
+                std::equal(oracle.winners.begin(), oracle.winners.end(), built->rows().begin())
             ) << "k="
               << k << " staging=" << staging;
         }
@@ -4172,14 +3657,6 @@ TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
             from_records.rows().begin(), from_records.rows().end(), from_files.rows().begin()
         )
     );
-    ASSERT_EQ(from_records.saturation().size(), from_files.saturation().size());
-    EXPECT_TRUE(
-        std::equal(
-            from_records.saturation().begin(),
-            from_records.saturation().end(),
-            from_files.saturation().begin()
-        )
-    );
     ASSERT_EQ(from_records.names().size(), paths.size());
     EXPECT_EQ(from_records.names()[0], "a");
     EXPECT_EQ(from_records.names()[1], "c");
@@ -4190,13 +3667,12 @@ TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
         expected.pack_registers();
         EXPECT_TRUE(
             std::equal(
-                expected.registers.begin(),
-                expected.registers.end(),
+                expected.winners.begin(),
+                expected.winners.end(),
                 from_records.rows().begin() + genome * buckets
             )
         ) << "genome="
           << genome;
-        EXPECT_EQ(expected.saturated, from_records.saturation()[genome]);
     }
     for (auto const& path : paths) std::filesystem::remove(path);
 }
@@ -4255,7 +3731,7 @@ TEST(QuerySketchBatchTest, ScoresMatchTheScalarOracleAndDriveASearch) {
     scalar_sketch<buckets> reference_oracle;
     reference_oracle.add(CUDDL_UNWRAP(cuddl::parse_fasta_file(references[1].string(), 25)).kmers);
     reference_oracle.pack_registers();
-    EXPECT_EQ(self->summary.counts, query_oracle.compare(reference_oracle));
+    EXPECT_EQ(self->counts, query_oracle.compare(reference_oracle));
     for (auto const& path : references) std::filesystem::remove(path);
     std::filesystem::remove(queries.front());
 }
@@ -4268,28 +3744,15 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
         write_tmp_fasta(">beta\n" + random_bases(12, 3000) + "\n"),
     };
     auto built = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, buckets>(paths, stream)));
-    // A store is what a build stages: one reference's registers followed by its saturation word,
-    // so adopting it is one copy for both.
-    std::vector<uint32_t> const store = [&] {
-        std::vector<uint32_t> packed(built.saturation().size() * (buckets + 1));
-        for (size_t reference = 0; reference < built.saturation().size(); ++reference) {
-            std::copy_n(
-                built.rows().begin() + reference * buckets,
-                buckets,
-                packed.begin() + reference * (buckets + 1)
-            );
-            packed[reference * (buckets + 1) + buckets] = built.saturation()[reference];
-        }
-        return packed;
-    }();
-    auto device_store = cuda::make_device_buffer<uint32_t>(stream, stream.device(), store);
+    // A store is what a build stages: each reference's registers followed by its saturation
+    // word. Adopting it keeps the same winner scores the build does.
+    auto device_store = CUDDL_UNWRAP((cuddl::build_sketch_store<25, buckets>(paths, stream)));
     std::vector<std::string> const labels{"alpha", "beta"};
     auto adopted = CUDDL_UNWRAP((cuddl::reference_database_file::from_store<25, buckets>(
         {device_store.data(), device_store.size()}, labels, stream
     )));
     EXPECT_EQ(adopted.metadata(), built.metadata());
     EXPECT_TRUE(same_elements(adopted.rows(), built.rows()));
-    EXPECT_TRUE(same_elements(adopted.saturation(), built.saturation()));
     ASSERT_EQ(adopted.names().size(), labels.size());
     EXPECT_EQ(adopted.names()[0], labels[0]);
     EXPECT_EQ(adopted.names()[1], labels[1]);
@@ -4298,7 +3761,6 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
     ASSERT_TRUE(adopted.save(file));
     auto loaded = CUDDL_UNWRAP(cuddl::reference_database_file::load(file));
     EXPECT_TRUE(same_elements(loaded.rows(), built.rows()));
-    EXPECT_TRUE(same_elements(loaded.saturation(), built.saturation()));
     EXPECT_EQ(loaded.names().size(), labels.size());
 
     // Counts that do not match the rows, and labels that match neither, are refused.
@@ -4311,22 +3773,6 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
         std::span<std::string const>{labels}.first(1),
         stream
     )));
-    // Words the file form would reject are refused wherever they sit in the store.
-    auto const rejects = [&](size_t index, uint32_t word) {
-        auto corrupted = store;
-        corrupted[index] = word;
-        auto device = cuda::make_device_buffer<uint32_t>(stream, stream.device(), corrupted);
-        auto const result = cuddl::reference_database_file::from_store<25, buckets>(
-            {device.data(), device.size()}, labels, stream
-        );
-        return !result;
-    };
-    // Second genome's saturation word.
-    EXPECT_TRUE(rejects(2 * (buckets + 1) - 1, 2U));
-    // A winner without a count, and a count without a winner, in the last register.
-    EXPECT_TRUE(rejects(2 * (buckets + 1) - 2, cuddl::detail::pack(7, 0)));
-    EXPECT_TRUE(rejects(buckets + 1, cuddl::detail::pack(0, 3)));
-    EXPECT_FALSE(rejects(0, cuddl::detail::pack(7, 3)));
     std::filesystem::remove(file);
     for (auto const& path : paths) std::filesystem::remove(path);
 }
@@ -4935,8 +4381,12 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
         );
         auto indexed_count =
             cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-        auto exhaustive_workspace =
-            cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
+        auto exhaustive_workspace = cuda::make_device_buffer<uint8_t>(
+            stream,
+            stream.device(),
+            exhaustive_database.single_query_workspace_bytes(),
+            cuda::no_init
+        );
 
         ASSERT_TRUE(database
                         .search_async(
@@ -4988,15 +4438,15 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
             auto const reference_id = indexed_host[i].reference_id;
             EXPECT_EQ(reference_id, expected_candidates[i]);
             // Index match count equals the DDLIndex oracle count and the exact `equal` class.
-            EXPECT_EQ(indexed_host[i].summary.counts.equal, oracle.match_counts[reference_id]);
+            EXPECT_EQ(indexed_host[i].counts.equal, oracle.match_counts[reference_id]);
             // Exact refinement == the independent exhaustive comparison over decoded rows.
             auto const& expected_summary = oracle.summaries[reference_id];
-            EXPECT_EQ(indexed_host[i].summary.counts.lower, expected_summary.lower);
-            EXPECT_EQ(indexed_host[i].summary.counts.equal, expected_summary.equal);
-            EXPECT_EQ(indexed_host[i].summary.counts.higher, expected_summary.higher);
-            EXPECT_EQ(indexed_host[i].summary.counts.both_empty, expected_summary.both_empty);
+            EXPECT_EQ(indexed_host[i].counts.lower, expected_summary.lower);
+            EXPECT_EQ(indexed_host[i].counts.equal, expected_summary.equal);
+            EXPECT_EQ(indexed_host[i].counts.higher, expected_summary.higher);
+            EXPECT_EQ(indexed_host[i].counts.both_empty, expected_summary.both_empty);
             // Exact refinement == the exhaustive GPU comparison over the same subset.
-            EXPECT_EQ(indexed_host[i].summary, exhaustive_host[reference_id].summary);
+            EXPECT_EQ(indexed_host[i].counts, exhaustive_host[reference_id].counts);
             EXPECT_EQ(reference_id, exhaustive_host[reference_id].reference_id);
         }
     }

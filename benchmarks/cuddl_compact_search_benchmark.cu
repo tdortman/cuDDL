@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -44,9 +46,11 @@ std::vector<std::string> const launch_shapes{
     "cg_8_warps",
 };
 
+// Like genomic winner scores, fixture scores leave the top bit clear, so the default folded
+// 15-bit index key (`key_mask`) is exact for them.
 uint16_t make_score(uint64_t value) {
     auto const hash = cuddl::detail::splitmix64(value);
-    return (hash & 7U) == 0U ? 0U : static_cast<uint16_t>((hash >> 48U) | 1U);
+    return (hash & 7U) == 0U ? 0U : static_cast<uint16_t>((hash >> 49U) | 1U);
 }
 struct indexed_fixture {
     std::vector<uint16_t> rows;
@@ -74,9 +78,7 @@ indexed_fixture make_indexed_fixture(size_t reference_count) {
         for (size_t bucket = 0; bucket < k_bucket_count; ++bucket) {
             auto score = make_score(seed + k_bucket_count + reference_id * k_bucket_count + bucket);
             if (score != 0U && score == fixture.query[bucket]) {
-                score = score == std::numeric_limits<uint16_t>::max()
-                            ? 1U
-                            : static_cast<uint16_t>(score + 1U);
+                score = static_cast<uint16_t>(score + 1U);
             }
             fixture.rows[reference_id * k_bucket_count + bucket] =
                 bucket < matches ? fixture.query[bucket] : score;
@@ -85,23 +87,23 @@ indexed_fixture make_indexed_fixture(size_t reference_count) {
     return fixture;
 }
 
-cuddl::pairwise_summary score_row_oracle_rows(uint16_t const* query, uint16_t const* reference) {
-    cuddl::pairwise_summary summary{};
+cuddl::pairwise_counts score_row_oracle_rows(uint16_t const* query, uint16_t const* reference) {
+    cuddl::pairwise_counts summary{};
     for (size_t bucket = 0; bucket < k_bucket_count; ++bucket) {
         if (query[bucket] == 0U && reference[bucket] == 0U) {
-            ++summary.counts.both_empty;
+            ++summary.both_empty;
         } else if (query[bucket] < reference[bucket]) {
-            ++summary.counts.lower;
+            ++summary.lower;
         } else if (query[bucket] > reference[bucket]) {
-            ++summary.counts.higher;
+            ++summary.higher;
         } else {
-            ++summary.counts.equal;
+            ++summary.equal;
         }
     }
     return summary;
 }
 
-cuddl::pairwise_summary score_row_oracle(
+cuddl::pairwise_counts score_row_oracle(
     std::vector<uint16_t> const& query,
     std::vector<uint16_t> const& references,
     size_t reference_id = 0
@@ -123,8 +125,7 @@ __device__ void write_search_result(
     cuddl::pairwise_counts counts
 ) {
     results[reference_id].reference_id = reference_id;
-    results[reference_id].summary.counts = counts;
-    results[reference_id].summary.cardinality = 0.0;
+    results[reference_id].counts = counts;
 }
 __global__ __launch_bounds__(k_launch_block_size) void cub_warp_exhaustive_search_kernel(
     uint16_t const* rows,
@@ -610,7 +611,7 @@ void compact_exhaustive_parameter_sweep(nvbench::state& state) {
     for (uint32_t reference_id = 0; reference_id < reference_count; ++reference_id) {
         expected_host[reference_id] = {
             .reference_id = reference_id,
-            .summary = score_row_oracle(fixture.query, fixture.rows, reference_id),
+            .counts = score_row_oracle(fixture.query, fixture.rows, reference_id),
         };
     }
 
@@ -651,8 +652,14 @@ void compact_exhaustive_search(nvbench::state& state) {
     auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
         setup_stream, setup_stream.device(), reference_count, cuda::no_init
     );
-    auto workspace =
-        cuda::make_device_buffer<uint8_t>(setup_stream, setup_stream.device(), 0, cuda::no_init);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        setup_stream,
+        setup_stream.device(),
+        cuddl::reference_database<k_kmer_length, k_bucket_count>::single_query_workspace_bytes(
+            reference_count
+        ),
+        cuda::no_init
+    );
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
@@ -669,7 +676,7 @@ void compact_exhaustive_search(nvbench::state& state) {
         setup_stream, cuda::std::span{results.data(), size_t{1}}, cuda::std::span{&first, size_t{1}}
     );
     setup_stream.sync();
-    if (first.reference_id != 0U || first.summary != score_row_oracle(query, rows)) {
+    if (first.reference_id != 0U || first.counts != score_row_oracle(query, rows)) {
         throw std::runtime_error("compact search disagrees with the scalar oracle");
     }
 
@@ -700,8 +707,14 @@ void compact_exhaustive_launch_shape(nvbench::state& state) {
     auto results = cuda::make_device_buffer<cuddl::reference_search_result>(
         setup_stream, setup_stream.device(), reference_count, cuda::no_init
     );
-    auto workspace =
-        cuda::make_device_buffer<uint8_t>(setup_stream, setup_stream.device(), 0, cuda::no_init);
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        setup_stream,
+        setup_stream.device(),
+        cuddl::reference_database<k_kmer_length, k_bucket_count>::single_query_workspace_bytes(
+            reference_count
+        ),
+        cuda::no_init
+    );
     auto const compatibility = cuddl::score_compatibility::current<k_kmer_length, k_bucket_count>();
     auto database =
         CUDDL_UNWRAP((cuddl::reference_database<k_kmer_length, k_bucket_count>::build_async(
@@ -885,7 +898,7 @@ void compact_indexed_search_impl(nvbench::state& state, uint32_t minimum_matches
         ++true_positives;
         ++result_index;
     }
-    if (observed_results.front().summary !=
+    if (observed_results.front().counts !=
         score_row_oracle(fixture.query, fixture.rows, observed_results.front().reference_id)) {
         throw std::runtime_error("indexed search disagrees with the scalar oracle");
     }
@@ -970,10 +983,9 @@ void compact_indexed_batch_search(nvbench::state& state) {
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init);
 
     // An independent scalar oracle checks completeness for the first and last queries.
     std::vector<uint32_t> expected_first, expected_last;
@@ -983,7 +995,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
                 query_rows.data() + static_cast<size_t>(query) * k_bucket_count,
                 fixture.rows.data() + static_cast<size_t>(reference) * k_bucket_count
             );
-            if (summary.counts.equal >= 5U) {
+            if (summary.equal >= 5U) {
                 (query == 0U ? expected_first : expected_last).push_back(reference);
             }
         }
@@ -998,18 +1010,10 @@ void compact_indexed_batch_search(nvbench::state& state) {
         0U,
         workspace,
         results,
-        count,
-        [&](uint32_t maximum_count) {
-            uint32_t actual = 0U;
-            cuda::copy_bytes(stream, count, cuda::std::span{&actual, size_t{1}});
-            stream.sync();
-            if (actual > maximum_count) {
-                throw std::runtime_error("indexed batch exceeded tile capacity");
-            }
-            std::vector<cuddl::batch_search_result> host(actual);
-            cuda::copy_bytes(stream, cuda::std::span{results.data(), host.size()}, host);
-            stream.sync();
-            auto const tile_queries = maximum_count / references;
+        [&](cuddl::batch_result_tile const& tile) {
+            auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+            auto const host = tile_copy.passing();
+            auto const tile_queries = tile.query_count;
             uint64_t previous = 0U;
             for (size_t i = 0U; i < host.size(); ++i) {
                 auto const& result = host[i];
@@ -1017,7 +1021,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
                     static_cast<uint64_t>(result.query_id) * references + result.reference_id;
                 if (result.query_id < next_query || result.query_id >= next_query + tile_queries ||
                     result.reference_id >= references || (i != 0U && pair <= previous) ||
-                    result.summary.counts.equal < 5U) {
+                    result.counts.equal < 5U) {
                     throw std::runtime_error("invalid or unordered indexed batch result");
                 }
                 previous = pair;
@@ -1032,12 +1036,12 @@ void compact_indexed_batch_search(nvbench::state& state) {
                         fixture.rows.data() +
                             static_cast<size_t>(result.reference_id) * k_bucket_count
                     );
-                    if (result.summary != expected) {
+                    if (result.counts != expected) {
                         throw std::runtime_error("indexed batch disagrees with scalar refinement");
                     }
                 }
             }
-            candidate_count += actual;
+            candidate_count += host.size();
             next_query += tile_queries;
         },
         {},
@@ -1058,8 +1062,7 @@ void compact_indexed_batch_search(nvbench::state& state) {
             0U,
             workspace,
             results,
-            count,
-            [](uint32_t) {},
+            [](cuddl::batch_result_tile const&) {},
             {},
             {.minimum_matches = 5U},
             cuda::stream_ref{launch.get_stream()},
@@ -1075,6 +1078,153 @@ void compact_indexed_batch_search(nvbench::state& state) {
         "Resident Bytes",
         static_cast<double>(database.persistent_row_bytes() + acceleration.persistent_index_bytes())
     );
+}
+
+// Real reference collections share winner scores between related genomes, so index posting
+// lists are long and most pairs pass the threshold; the synthetic fixtures above do neither.
+// `CUDDL_REFSEQ_DATABASE` names a k=25, 2048-bucket database file; the state is skipped
+// without it. Queries are 4096 evenly spaced database rows.
+void refseq_batch_search(nvbench::state& state) {
+    using database_type = cuddl::reference_database<k_kmer_length, k_bucket_count>;
+    using index_type = cuddl::reference_index<k_kmer_length, k_bucket_count>;
+    auto const* path = std::getenv("CUDDL_REFSEQ_DATABASE");
+    if (path == nullptr) {
+        state.skip("CUDDL_REFSEQ_DATABASE is not set");
+        return;
+    }
+    auto const stream = cuda::stream_ref{state.get_cuda_stream()};
+    auto const mode = state.get_string("Mode");
+    // "host" times what a caller waits for: every tile downloaded and each passing result read
+    // on the host, not just the search itself.
+    auto const deliver = state.get_string("Delivery") == "host";
+    auto const file = CUDDL_UNWRAP(cuddl::reference_database_file::load(path));
+    auto const host_rows = file.rows();
+    auto database = CUDDL_UNWRAP((file.upload<k_kmer_length, k_bucket_count>(stream)));
+    auto const references = database.reference_count();
+    auto const compatibility = database.metadata().compatibility;
+    constexpr uint32_t query_count = 4096U;
+    auto const all_to_all = mode == "all_to_all";
+    auto const queries = all_to_all ? references : std::min(query_count, references);
+    auto source_row = [&](uint32_t query) {
+        return all_to_all
+                   ? query
+                   : static_cast<uint32_t>(static_cast<uint64_t>(query) * references / queries);
+    };
+    std::vector<uint16_t> query_rows;
+    if (!all_to_all) {
+        query_rows.resize(static_cast<size_t>(queries) * k_bucket_count);
+        for (uint32_t query = 0; query < queries; ++query) {
+            std::copy_n(
+                host_rows.data() + static_cast<size_t>(source_row(query)) * k_bucket_count,
+                k_bucket_count,
+                query_rows.data() + static_cast<size_t>(query) * k_bucket_count
+            );
+        }
+    }
+    auto query_input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
+    std::optional<index_type> acceleration;
+    if (mode == "dense" || mode == "sparse") {
+        acceleration = CUDDL_UNWRAP((index_type::build_async(
+            database,
+            stream,
+            mode == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
+        )));
+    }
+    auto const* index = acceleration ? &*acceleration : nullptr;
+    auto const requirements =
+        all_to_all ? CUDDL_UNWRAP(database.all_to_all_search_requirements())
+                   : CUDDL_UNWRAP(database.batch_search_requirements(queries, stream, index));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+
+    auto const search = [&](cuda::stream_ref execution_stream, auto&& on_tile) {
+        if (all_to_all) {
+            CUDDL_UNWRAP(
+                database.search_all_to_all_async(workspace, results, on_tile, {}, execution_stream)
+            );
+        } else if (index != nullptr) {
+            CUDDL_UNWRAP(database.search_batch_async(
+                query_input,
+                compatibility,
+                0U,
+                workspace,
+                results,
+                on_tile,
+                {},
+                {.minimum_matches = 5U},
+                execution_stream,
+                index
+            ));
+        } else {
+            CUDDL_UNWRAP(database.search_batch_async(
+                query_input, compatibility, 0U, workspace, results, on_tile, {}, execution_stream
+            ));
+        }
+    };
+
+    // The first query's results are checked against a scalar oracle: every pair for the
+    // exhaustive modes, exactly the pairs with at least five equal buckets for the indexed ones.
+    std::vector<cuddl::batch_search_result> observed;
+    uint64_t result_total = 0U;
+    bool first_tile = true;
+    search(stream, [&](cuddl::batch_result_tile const& tile) {
+        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const host = tile_copy.passing();
+        result_total += host.size();
+        if (first_tile) {
+            for (auto const& result : host) {
+                if (result.query_id == 0U) observed.push_back(result);
+            }
+            first_tile = false;
+        }
+    });
+    std::vector<cuddl::batch_search_result> expected;
+    for (uint32_t reference = all_to_all ? 1U : 0U; reference < references; ++reference) {
+        auto const summary = score_row_oracle_rows(
+            host_rows.data() + static_cast<size_t>(source_row(0U)) * k_bucket_count,
+            host_rows.data() + static_cast<size_t>(reference) * k_bucket_count
+        );
+        if (index == nullptr || summary.equal >= 5U) {
+            expected.push_back({.query_id = 0U, .reference_id = reference, .counts = summary});
+        }
+    }
+    if (observed != expected) {
+        throw std::runtime_error("RefSeq batch search disagrees with the scalar oracle");
+    }
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+        auto const execution_stream = cuda::stream_ref{launch.get_stream()};
+        if (!deliver) {
+            search(execution_stream, [](cuddl::batch_result_tile const&) {});
+            return;
+        }
+        // Every passing result's IDs and counts are read on the host, as a consumer would.
+        uint64_t delivered = 0U;
+        uint64_t checksum = 0U;
+        search(execution_stream, [&](cuddl::batch_result_tile const& tile) {
+            CUDDL_UNWRAP(
+                cuddl::for_each_passing(
+                    tile, execution_stream, [&](cuddl::batch_search_result const& result) {
+                        ++delivered;
+                        checksum += result.query_id + result.reference_id + result.counts.equal +
+                                    result.counts.lower;
+                    }
+                )
+            );
+        });
+        do_not_optimise(checksum);
+        if (delivered != result_total) {
+            throw std::runtime_error("host delivery lost results");
+        }
+    });
+    add_value(
+        state, "Median GPU Time", state.get_summary("nv/cold/time/gpu/median").get_float64("value")
+    );
+    add_value(state, "Results", static_cast<double>(result_total));
 }
 
 void compact_batch_and_all_to_all_search(nvbench::state& state) {
@@ -1108,8 +1258,7 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
 
     auto const batch_requirements =
         CUDDL_UNWRAP(database.batch_search_requirements(batch_query_count, setup_stream));
-    auto const all_to_all_requirements =
-        CUDDL_UNWRAP(database.all_to_all_search_requirements(setup_stream));
+    auto const all_to_all_requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
     auto const workspace_bytes =
         std::max(batch_requirements.workspace_bytes, all_to_all_requirements.workspace_bytes);
     auto const maximum_pair_count = std::max(
@@ -1132,61 +1281,22 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
     auto workspace = cuda::make_device_buffer<uint8_t>(
         setup_stream, setup_stream.device(), workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         setup_stream, setup_stream.device(), result_capacity, cuda::no_init
     );
-    auto result_count =
-        cuda::make_device_buffer<uint32_t>(setup_stream, setup_stream.device(), 1, cuda::no_init);
     auto result_match_counts = cuda::make_device_buffer<uint32_t>(
         setup_stream, setup_stream.device(), match_count_capacity, cuda::no_init
     );
-    std::vector<cuddl::batch_search_result> observed_results(result_capacity);
-    std::vector<uint32_t> observed_match_counts(match_count_capacity);
 
-    auto read_result_count = [&] {
-        uint32_t count = 0;
-        cuda::copy_bytes(
-            setup_stream,
-            cuda::std::span{result_count.data(), size_t{1}},
-            cuda::std::span{&count, size_t{1}}
-        );
-        setup_stream.sync();
-        return count;
-    };
-    auto validate_batch = [&] {
-        auto const observed_count = read_result_count();
+    auto validate_batch = [&](cuddl::batch_result_tile const& tile) {
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+        auto const observed_results = host.passing();
+        auto const observed_match_counts = host.passing_match_counts();
+        auto const observed_count = static_cast<uint32_t>(observed_results.size());
         auto const expected_count = batch_query_count * reference_count;
         if (observed_count != expected_count) {
             throw std::runtime_error("batch search returned the wrong pair count");
         }
-        cuda::copy_bytes(
-            setup_stream,
-            cuda::std::span{
-                results.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
-                    sizeof(*(results.data()))
-            },
-            cuda::std::span{
-                observed_results.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
-                    sizeof(*(results.data()))
-            }
-        );
-        setup_stream.sync();
-        cuda::copy_bytes(
-            setup_stream,
-            cuda::std::span{
-                result_match_counts.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
-                    sizeof(*(result_match_counts.data()))
-            },
-            cuda::std::span{
-                observed_match_counts.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
-                    sizeof(*(result_match_counts.data()))
-            }
-        );
-        setup_stream.sync();
         for (uint32_t result_index = 0; result_index < observed_count; ++result_index) {
             auto const query_index = result_index / reference_count;
             auto const reference_id = result_index % reference_count;
@@ -1199,46 +1309,21 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
                 observed.reference_id != reference_id) {
                 throw std::runtime_error("batch search returned the wrong stable IDs");
             }
-            if (observed.summary != expected_summary ||
-                observed_match_counts[result_index] != expected_summary.counts.equal) {
+            if (observed.counts != expected_summary ||
+                observed_match_counts[result_index] != expected_summary.equal) {
                 throw std::runtime_error("batch search disagrees with the scalar oracle");
             }
         }
     };
-    auto validate_all_to_all = [&] {
-        auto const observed_count = read_result_count();
+    auto validate_all_to_all = [&](cuddl::batch_result_tile const& tile) {
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, setup_stream));
+        auto const observed_results = host.passing();
+        auto const observed_match_counts = host.passing_match_counts();
+        auto const observed_count = static_cast<uint32_t>(observed_results.size());
         auto const expected_count = reference_count * (reference_count - 1U) / 2U;
         if (observed_count != expected_count) {
             throw std::runtime_error("all-to-all search returned the wrong pair count");
         }
-        cuda::copy_bytes(
-            setup_stream,
-            cuda::std::span{
-                results.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
-                    sizeof(*(results.data()))
-            },
-            cuda::std::span{
-                observed_results.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_results.front())) /
-                    sizeof(*(results.data()))
-            }
-        );
-        setup_stream.sync();
-        cuda::copy_bytes(
-            setup_stream,
-            cuda::std::span{
-                result_match_counts.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
-                    sizeof(*(result_match_counts.data()))
-            },
-            cuda::std::span{
-                observed_match_counts.data(),
-                (static_cast<size_t>(observed_count) * sizeof(observed_match_counts.front())) /
-                    sizeof(*(result_match_counts.data()))
-            }
-        );
-        setup_stream.sync();
         uint32_t result_index = 0;
         for (uint32_t query_id = 0U; query_id < reference_count; ++query_id) {
             for (uint32_t reference_id = query_id + 1U; reference_id < reference_count;
@@ -1251,8 +1336,8 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
                 if (observed.query_id != query_id || observed.reference_id != reference_id) {
                     throw std::runtime_error("all-to-all search returned the wrong stable IDs");
                 }
-                if (observed.summary != expected_summary ||
-                    observed_match_counts[result_index] != expected_summary.counts.equal) {
+                if (observed.counts != expected_summary ||
+                    observed_match_counts[result_index] != expected_summary.equal) {
                     throw std::runtime_error("all-to-all search disagrees with the scalar oracle");
                 }
                 ++result_index;
@@ -1266,24 +1351,13 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
         batch_query_id_offset,
         workspace,
         results,
-        result_count,
-        [](uint32_t) {},
+        validate_batch,
         result_match_counts,
         setup_stream
     ));
-    setup_stream.sync();
-    validate_batch();
 
     CUDDL_UNWRAP(database.search_all_to_all_async(
-        workspace,
-        results,
-        result_count,
-        [&](uint32_t) {
-            setup_stream.sync();
-            validate_all_to_all();
-        },
-        result_match_counts,
-        setup_stream
+        workspace, results, validate_all_to_all, result_match_counts, setup_stream
     ));
 
     auto const total_pairs = static_cast<size_t>(batch_query_count) * reference_count +
@@ -1297,13 +1371,12 @@ void compact_batch_and_all_to_all_search(nvbench::state& state) {
             batch_query_id_offset,
             workspace,
             results,
-            result_count,
-            [](uint32_t) {},
+            [](cuddl::batch_result_tile const&) {},
             result_match_counts,
             stream
         ));
         CUDDL_UNWRAP(database.search_all_to_all_async(
-            workspace, results, result_count, [](uint32_t) {}, result_match_counts, stream
+            workspace, results, [](cuddl::batch_result_tile const&) {}, result_match_counts, stream
         ));
     });
 
@@ -1343,5 +1416,8 @@ NVBENCH_BENCH(compact_indexed_zero_threshold_search)
     .add_int64_power_of_two_axis("References", indexed_reference_powers)
     .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_batch_and_all_to_all_search);
+NVBENCH_BENCH(refseq_batch_search)
+    .add_string_axis("Mode", {"exhaustive", "dense", "sparse", "all_to_all"})
+    .add_string_axis("Delivery", {"device", "host"});
 
 NVBENCH_MAIN

@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <type_traits>
@@ -13,7 +12,7 @@
 namespace {
 
 // Binary output rows are raw little-endian batch_search_result records, documented in README.md.
-static_assert(sizeof(cuddl::batch_search_result) == 32);
+static_assert(sizeof(cuddl::batch_search_result) == 24);
 static_assert(std::is_trivially_copyable_v<cuddl::batch_search_result>);
 
 /// Query genomes sketched per batch; each batch then runs as one batched search.
@@ -33,7 +32,7 @@ void search(
     using query_type = cuddl::query_sketch_batch<K, Buckets, Layout>;
     auto const batch_capacity = std::min(query_batch_size, paths.size());
     auto const requirements = CUDDL_UNWRAP(
-        all_to_all ? database.all_to_all_search_requirements(stream, index)
+        all_to_all ? database.all_to_all_search_requirements(index)
                    : database.batch_search_requirements(
                          static_cast<uint32_t>(batch_capacity), stream, index
                      )
@@ -41,45 +40,32 @@ void search(
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
-    std::vector<cuddl::batch_search_result> host;
     std::ofstream binary;
     if (output.empty()) {
-        std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\tcardinality\n"
-                  << std::setprecision(17);
+        std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
     } else {
         binary.open(output, std::ios::binary | std::ios::trunc);
         if (!binary) throw std::runtime_error("cannot open " + output.string());
     }
     // Each tile's results are written before the next tile reuses the storage.
-    auto write_tile = [&](uint32_t) {
-        uint32_t found{};
-        cuda::copy_bytes(stream, count, cuda::std::span{&found, size_t{1}});
-        stream.sync();
-        host.resize(found);
-        if (found != 0) {
-            cuda::copy_bytes(
-                stream,
-                cuda::std::span{results.data(), static_cast<size_t>(found)},
-                cuda::std::span{host.data(), host.size()}
-            );
-            stream.sync();
-        }
+    auto write_tile = [&](cuddl::batch_result_tile const& tile) {
+        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const passing = tile_copy.passing();
         if (binary.is_open()) {
             binary.write(
-                reinterpret_cast<char const*>(host.data()),
-                static_cast<std::streamsize>(host.size() * sizeof(cuddl::batch_search_result))
+                reinterpret_cast<char const*>(passing.data()),
+                static_cast<std::streamsize>(passing.size() * sizeof(cuddl::batch_search_result))
             );
             return;
         }
-        for (auto const& result : host) {
-            auto const& counts = result.summary.counts;
+        for (auto const& result : passing) {
+            auto const& counts = result.counts;
             std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
                       << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
-                      << '\t' << result.summary.cardinality << '\n';
+                      << '\n';
         }
     };
     // Without an index or a threshold every pair is reported, so the dedicated exhaustive
@@ -91,7 +77,6 @@ void search(
             CUDDL_UNWRAP(database.search_all_to_all_async(
                 {workspace.data(), workspace.size()},
                 {results.data(), results.size()},
-                {count.data(), count.size()},
                 write_tile,
                 {},
                 stream
@@ -100,7 +85,6 @@ void search(
             CUDDL_UNWRAP(database.search_all_to_all_async(
                 {workspace.data(), workspace.size()},
                 {results.data(), results.size()},
-                {count.data(), count.size()},
                 write_tile,
                 {},
                 {.minimum_matches = minimum_matches},
@@ -123,7 +107,6 @@ void search(
                     static_cast<uint32_t>(first),
                     {workspace.data(), workspace.size()},
                     {results.data(), results.size()},
-                    {count.data(), count.size()},
                     write_tile,
                     {},
                     stream
@@ -135,7 +118,6 @@ void search(
                     static_cast<uint32_t>(first),
                     {workspace.data(), workspace.size()},
                     {results.data(), results.size()},
-                    {count.data(), count.size()},
                     write_tile,
                     {},
                     {.minimum_matches = minimum_matches},

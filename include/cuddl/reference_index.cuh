@@ -13,7 +13,6 @@ class reference_index {
     friend class reference_index_file;
     friend class reference_database<K, BucketCount, Layout>;
 
-    using register_type = typename database_type::register_type;
     using score_type = typename database_type::score_type;
 
    public:
@@ -28,7 +27,9 @@ class reference_index {
           index_offsets_(std::move(other.index_offsets_)),
           index_postings_(std::move(other.index_postings_)),
           index_keys_(std::move(other.index_keys_)),
+          key_directory_(std::move(other.key_directory_)),
           index_posting_capacity_(std::exchange(other.index_posting_capacity_, 0)),
+          pair_fraction_(std::exchange(other.pair_fraction_, 0.0)),
           indexed_(std::exchange(other.indexed_, false)) {}
 
     /// @brief Move-assigns the index, leaving the source empty.
@@ -38,7 +39,9 @@ class reference_index {
             index_offsets_ = std::move(other.index_offsets_);
             index_postings_ = std::move(other.index_postings_);
             index_keys_ = std::move(other.index_keys_);
+            key_directory_ = std::move(other.key_directory_);
             index_posting_capacity_ = std::exchange(other.index_posting_capacity_, 0);
+            pair_fraction_ = std::exchange(other.pair_fraction_, 0.0);
             indexed_ = std::exchange(other.indexed_, false);
         }
         return *this;
@@ -55,10 +58,16 @@ class reference_index {
         cuda::stream_ref stream,
         index_storage storage = index_storage::dense
     ) {
-        if (database.preserves_multiplicity()) {
-            return build_index<register_type>(database, stream, storage);
-        }
-        return build_index<score_type>(database, stream, storage);
+        auto index = CUDDL_TRY(build_index<score_type>(database, stream, storage));
+        CUDDL_TRY(index.measure_pair_fraction(database, stream));
+        return Result<reference_index>::ok(std::move(index));
+    }
+
+    /// @brief Fraction of all (query, reference, bucket) cells an index lookup visits for
+    /// queries resembling the references; searches fall back to comparing bit-planes when the
+    /// index would visit too many.
+    [[nodiscard]] double pair_fraction() const noexcept {
+        return pair_fraction_;
     }
 
     /// @brief Bytes the saved index file needs for offsets, postings, and keys.
@@ -68,24 +77,68 @@ class reference_index {
     }
 
    private:
+    /// @brief Measures @ref pair_fraction; synchronizes @p stream.
+    [[nodiscard]] Result<void>
+    measure_pair_fraction(database_type const& database, cuda::stream_ref stream) {
+        auto const reference_count = database.reference_count();
+        auto const compatibility = database.metadata().compatibility;
+        pair_fraction_ = 0.0;
+        if (reference_count == 0U || compatibility.indexed_bucket_count == 0U) {
+            return Ok();
+        }
+        auto work = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<unsigned long long>(stream, stream.device(), 1U, 0ULL)
+        );
+        detail::index_pair_work_kernel<<<
+            detail::
+                warp_grid_blocks(static_cast<size_t>(compatibility.indexed_bucket_count) * 1024U),
+            detail::block_size,
+            0,
+            stream.get()>>>(
+            index_offsets_.empty() ? nullptr : index_offsets_.data(),
+            index_keys_.empty() ? nullptr : index_keys_.data(),
+            reference_count,
+            compatibility.indexed_bucket_count,
+            static_cast<uint32_t>(compatibility.key_mask) + 1U,
+            work.data()
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+        unsigned long long host = 0U;
+        CUDDL_CUDA_TRY(cuda::copy_bytes(stream, work, cuda::std::span{&host, size_t{1}}));
+        CUDDL_CUDA_TRY(stream.sync());
+        pair_fraction_ =
+            static_cast<double>(host) / (static_cast<double>(reference_count) * reference_count *
+                                         compatibility.indexed_bucket_count);
+        return Ok();
+    }
+
     reference_index(database_type const& database, cuda::stream_ref stream)
         : identity_(database.identity_),
           index_offsets_(stream, cuda::device_default_memory_pool(stream.device())),
           index_postings_(stream, cuda::device_default_memory_pool(stream.device())),
-          index_keys_(stream, cuda::device_default_memory_pool(stream.device())) {}
+          index_keys_(stream, cuda::device_default_memory_pool(stream.device())),
+          key_directory_(stream, cuda::device_default_memory_pool(stream.device())) {}
 
     template <typename Row>
     [[nodiscard]] static Result<reference_index>
     build_index(database_type const& source, cuda::stream_ref stream, index_storage storage) {
         auto compatibility = source.metadata().compatibility;
-        auto rows = device_span<Row const>{
-            reinterpret_cast<Row const*>(source.rows_.data()), source.rows_.size() / sizeof(Row)
-        };
-        auto saturation_states = source.saturation_states();
+        // The database keeps only bit-planes; the index passes read decoded score rows, freed
+        // in stream order once the build's kernels have run.
+        auto decoded = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<Row>(
+                stream,
+                stream.device(),
+                static_cast<size_t>(source.reference_count()) * BucketCount,
+                cuda::no_init
+            )
+        );
+        CUDDL_TRY(source.copy_scores_async({decoded.data(), decoded.size()}, stream));
+        auto rows = device_span<Row const>{decoded.data(), decoded.size()};
         if (storage != index_storage::dense && storage != index_storage::sparse) {
             return Err(Error::invalid_argument("unsupported index storage"));
         }
-        auto const validated = database_type::validate_rows(rows, saturation_states, compatibility);
+        auto const validated = database_type::validate_rows(rows, compatibility);
         if (!validated) {
             return Err(validated.error());
         }
@@ -307,14 +360,40 @@ class reference_index {
                 stream
             )
         );
-        return Ok();
+        return build_key_directory(reference_count, compatibility.indexed_bucket_count, stream);
+    }
+
+    /// @brief Derives the sparse key directory that narrows batch posting-range lookups.
+    [[nodiscard]] Result<void> build_key_directory(
+        uint32_t reference_count,
+        uint32_t indexed_bucket_count,
+        cuda::stream_ref stream
+    ) {
+        auto const size = static_cast<size_t>(detail::sparse_directory_entries(reference_count)) *
+                          indexed_bucket_count;
+        if (index_keys_.empty() || size == 0U) {
+            return Ok();
+        }
+        key_directory_ = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(stream, stream.device(), size, cuda::no_init)
+        );
+        auto const blocks = static_cast<uint32_t>(
+            std::min<size_t>((size + detail::block_size - 1U) / detail::block_size, 65535U)
+        );
+        detail::build_sparse_directory_kernel<<<blocks, detail::block_size, 0, stream.get()>>>(
+            index_keys_.data(), reference_count, indexed_bucket_count, key_directory_.data()
+        );
+        return cuda_try(cudaGetLastError());
     }
 
     std::shared_ptr<char const> identity_;
     cuda::device_buffer<uint32_t> index_offsets_;
     cuda::device_buffer<uint32_t> index_postings_;
     cuda::device_buffer<uint16_t> index_keys_;
+    // Radix directory over index_keys_ for batch range lookups; derived, not persisted.
+    cuda::device_buffer<uint32_t> key_directory_;
     size_t index_posting_capacity_{};
+    double pair_fraction_{};
     bool indexed_{};
 };
 

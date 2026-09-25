@@ -88,7 +88,6 @@ def _reports(
         if cuddl_ingest == "sequence"
         else "packed_u64_actg_max",
         "resident_minimum_matches": 0,
-        "rows": "packed",
         "index": "sparse",
         "buckets": 2048,
         "indexed_buckets": 1024,
@@ -182,7 +181,7 @@ def _reports(
             datasets,
             cuddl_case,
             cuddl_timings,
-            {"name": "cuddl", "variant": "packed_sparse"},
+            {"name": "cuddl", "variant": "sparse"},
         ),
     )
     write_result(
@@ -286,12 +285,11 @@ def _run_runner(
             return subprocess.CompletedProcess(command, 0)
         target = Path(command[command.index("--output") + 1])
         if "--resident-plan" in command:
-            rows = command[command.index("--rows") + 1]
             index = command[command.index("--index") + 1]
             target.write_text(
                 json.dumps(
                     {
-                        "resident_batch_bytes": plans[f"{rows}_{index}"],
+                        "resident_batch_bytes": plans[index],
                         "free_bytes": 1,
                         "reserve_bytes": 2,
                     }
@@ -323,12 +321,7 @@ def _check_runner_probe(root: Path) -> None:
     query.write_text(">q0\nACGTACGTACGT\n", encoding="utf-8")
 
     calls: list = []
-    plans = {
-        "compact_sparse": 100000,
-        "compact_dense": 80000,
-        "packed_sparse": 120000,
-        "packed_dense": 90000,
-    }
+    plans = {"sparse": 100000, "dense": 80000}
     _run_runner(
         runner,
         calls,
@@ -347,14 +340,14 @@ def _check_runner_probe(root: Path) -> None:
         resident_bytes=0,
     )
     probes = [call for call in calls if "--resident-plan" in call]
-    assert len(probes) == 4
+    assert len(probes) == 2
     for probe in probes:
         assert probe[probe.index("--ingest") + 1] == "sequence"
         assert probe[probe.index("--resident-bytes") + 1] == "0"
         assert probe[probe.index("--topology") + 1] == "batch"
         assert "--config" in probe and "--output" in probe
     actuals = [call for call in calls if call[0] != "meson" and "--resident-plan" not in call]
-    assert len(actuals) == 5
+    assert len(actuals) == 3
     for command in actuals:
         assert command[command.index("--resident-bytes") + 1] == "80000"
 
@@ -378,7 +371,7 @@ def _check_runner_probe(root: Path) -> None:
     )
     assert not any("--resident-plan" in call for call in calls)
     actuals = [call for call in calls if call[0] != "meson"]
-    assert len(actuals) == 5
+    assert len(actuals) == 3
     for command in actuals:
         assert command[command.index("--resident-bytes") + 1] == "1048576"
 

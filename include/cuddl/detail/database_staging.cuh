@@ -24,6 +24,7 @@
 #include <cuda/stream>
 
 #include <cuddl/detail/fastx_sequence_file.hpp>
+#include <cuddl/detail/kernels.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
@@ -583,41 +584,26 @@ struct sequence_genome {
     std::string_view name;  // copied into the labels; may be empty
 };
 
-/// @brief Copies device store rows into separate packed rows and saturation words.
+/// @brief Copies the winner scores of device store rows into host score rows.
 ///
-/// The store pads each genome with its saturation word; two strided copies split that layout
-/// on the way out, so the host never rereads the rows to unpack them. @p rows and
-/// @p saturation must stay alive until @p stream reaches this point.
+/// Scores are extracted on the device, so only two bytes per bucket cross the bus. @p scores
+/// must stay alive until @p stream reaches this point.
 template <size_t BucketCount>
 [[nodiscard]] Result<void> download_store(
     device_span<uint32_t const> store,
-    std::span<uint32_t> rows,
-    std::span<uint32_t> saturation,
+    std::span<uint16_t> scores,
     cuda::stream_ref stream
 ) {
-    auto const genomes = saturation.size();
+    auto const genomes = scores.size() / BucketCount;
     if (genomes == 0) return Ok();
-    constexpr auto pitch = (BucketCount + 1) * sizeof(uint32_t);
-    CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
-        rows.data(),
-        BucketCount * sizeof(uint32_t),
-        store.data(),
-        pitch,
-        BucketCount * sizeof(uint32_t),
-        genomes,
-        cudaMemcpyDeviceToHost,
-        stream.get()
-    ));
-    CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
-        saturation.data(),
-        sizeof(uint32_t),
-        store.data() + BucketCount,
-        pitch,
-        sizeof(uint32_t),
-        genomes,
-        cudaMemcpyDeviceToHost,
-        stream.get()
-    ));
+    auto device_scores =
+        cuda::make_device_buffer<uint16_t>(stream, stream.device(), scores.size(), cuda::no_init);
+    batch_scores_kernel<BucketCount>
+        <<<static_cast<uint32_t>(genomes), block_size, 0, stream.get()>>>(
+            store.data(), static_cast<uint32_t>(genomes), device_scores.data()
+        );
+    CUDDL_CUDA_TRY(cudaGetLastError());
+    CUDDL_CUDA_TRY(cuda::copy_bytes(stream, device_scores, scores));
     return Ok();
 }
 

@@ -723,10 +723,6 @@ int main(int argc, char** argv) {
             }
             auto device_queries =
                 cuda::make_device_buffer<uint16_t>(stream, stream.device(), flat_queries);
-            auto batch_count =
-                cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
-            auto batch_exhaustive_count =
-                cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, uint32_t{});
 
             auto batch_workspace =
                 cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
@@ -735,8 +731,8 @@ int main(int argc, char** argv) {
                 cuda::make_device_buffer<batch_result_t>(stream, stream.device(), 0, cuda::no_init);
             auto batch_exhaustive_results =
                 cuda::make_device_buffer<batch_result_t>(stream, stream.device(), 0, cuda::no_init);
-            std::vector<batch_result_t> batch_host;
-            std::vector<batch_result_t> batch_exhaustive_host;
+            std::vector<cuddl::batch_search_result> batch_host;
+            std::vector<cuddl::batch_search_result> batch_exhaustive_host;
 
             for (uint32_t iteration = 0; iteration < warmup + runs; ++iteration) {
                 bool const measured = iteration >= warmup;
@@ -812,19 +808,23 @@ int main(int argc, char** argv) {
                 }
 
                 // Batched exhaustive pass: the exact-refinement bound for the whole tile.
-                auto batch_exhaustive_workspace =
-                    cuda::make_device_buffer<uint8_t>(stream, stream.device(), 0, cuda::no_init);
                 auto batch_exhaustive_match_counts =
                     cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
+                batch_exhaustive_host.clear();
                 auto const t_exhaustive_start = now_ms();
                 auto const exhaustive_batch_res = database.search_batch_async(
                     device_queries,
                     compatibility,
                     0U,
-                    batch_exhaustive_workspace,
+                    batch_workspace,
                     batch_exhaustive_results,
-                    batch_exhaustive_count,
-                    [](uint32_t) {},
+                    [&](cuddl::batch_result_tile const& tile) {
+                        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+                        auto const passing = tile_copy.passing();
+                        batch_exhaustive_host.insert(
+                            batch_exhaustive_host.end(), passing.begin(), passing.end()
+                        );
+                    },
                     batch_exhaustive_match_counts,
                     stream
                 );
@@ -837,26 +837,10 @@ int main(int argc, char** argv) {
                     );
                 }
 
-                uint32_t exhaustive_pair_count = 0;
-                cuda::copy_bytes(
-                    stream,
-                    cuda::std::span{batch_exhaustive_count.data(), size_t{1}},
-                    cuda::std::span{&exhaustive_pair_count, size_t{1}}
-                );
-                stream.sync();
-                batch_exhaustive_host.resize(exhaustive_pair_count);
-                if (exhaustive_pair_count != 0U) {
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{batch_exhaustive_results.data(), exhaustive_pair_count},
-                        cuda::std::span{batch_exhaustive_host.data(), exhaustive_pair_count}
-                    );
-                    stream.sync();
-                }
-
                 // Batched indexed search for the whole query tile.
                 auto batch_match_counts =
                     cuda::make_device_buffer<uint32_t>(stream, stream.device(), 0, cuda::no_init);
+                batch_host.clear();
                 auto const t_batch_start = now_ms();
                 auto const batch_res = database.search_batch_async(
                     device_queries,
@@ -864,8 +848,11 @@ int main(int argc, char** argv) {
                     0U,
                     batch_workspace,
                     batch_results,
-                    batch_count,
-                    [](uint32_t) {},
+                    [&](cuddl::batch_result_tile const& tile) {
+                        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+                        auto const passing = tile_copy.passing();
+                        batch_host.insert(batch_host.end(), passing.begin(), passing.end());
+                    },
                     batch_match_counts,
                     {.minimum_matches = min_hits},
                     stream,
@@ -879,23 +866,6 @@ int main(int argc, char** argv) {
                     );
                 }
 
-                uint32_t batch_pair_count = 0;
-                cuda::copy_bytes(
-                    stream,
-                    cuda::std::span{batch_count.data(), size_t{1}},
-                    cuda::std::span{&batch_pair_count, size_t{1}}
-                );
-                stream.sync();
-                batch_host.resize(batch_pair_count);
-                if (batch_pair_count != 0U) {
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{batch_results.data(), batch_pair_count},
-                        cuda::std::span{batch_host.data(), batch_pair_count}
-                    );
-                    stream.sync();
-                }
-
                 if (measured) {
                     query_runs.push_back(t_batch_end - t_batch_start);
                     exhaustive_batch_runs.push_back(t_exhaustive_end - t_exhaustive_start);
@@ -904,17 +874,17 @@ int main(int argc, char** argv) {
                         auto const reference_id = pair.reference_id;
                         auto const& oracle_summary = report.oracle_summaries[reference_id];
                         auto const counts_match =
-                            pair.summary.counts.lower == oracle_summary.lower &&
-                            pair.summary.counts.equal == oracle_summary.equal &&
-                            pair.summary.counts.higher == oracle_summary.higher &&
-                            pair.summary.counts.both_empty == oracle_summary.both_empty;
+                            pair.counts.lower == oracle_summary.lower &&
+                            pair.counts.equal == oracle_summary.equal &&
+                            pair.counts.higher == oracle_summary.higher &&
+                            pair.counts.both_empty == oracle_summary.both_empty;
                         if (!counts_match) {
                             report.summaries_match_oracle = false;
                         }
                         auto const dense_index =
                             static_cast<size_t>(pair.query_id) * db.records.size() + reference_id;
                         if (dense_index >= batch_exhaustive_host.size() ||
-                            pair.summary != batch_exhaustive_host[dense_index].summary) {
+                            pair.counts != batch_exhaustive_host[dense_index].counts) {
                             report.summaries_match_exhaustive = false;
                         }
                     }

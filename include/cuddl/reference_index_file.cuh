@@ -25,11 +25,12 @@ struct reference_index_digest {
         return bytes(&item, sizeof(item));
     }
 
-    Result<void> words(std::span<uint32_t const> items) {
+    template <typename T>
+    Result<void> words(std::span<T const> items) {
         if constexpr (std::endian::native == std::endian::little) {
             return bytes(items.data(), items.size_bytes());
         } else {
-            std::vector<uint32_t> little_endian(items.begin(), items.end());
+            std::vector<T> little_endian(items.begin(), items.end());
             for (auto& item : little_endian) {
                 item = database_file_little_endian(item);
             }
@@ -49,7 +50,6 @@ inline Result<uint64_t> reference_database_digest(reference_database_file const&
         CUDDL_TRY(hash.bytes(name.data(), name.size()));
     }
     CUDDL_TRY(hash.words(db.rows()));
-    CUDDL_TRY(hash.words(db.saturation()));
     return hash.digest;
 }
 
@@ -94,7 +94,7 @@ class reference_index_file {
                 return Err(Error::resource("cannot open temporary index file"));
             }
             CUDDL_TRY(writer.bytes("CUDDLIX\0", 8));
-            CUDDL_TRY(writer.value(uint32_t{1}));
+            CUDDL_TRY(writer.value(uint32_t{2}));
             CUDDL_TRY(writer.value(storage == index_storage::dense ? uint32_t{0} : uint32_t{1}));
             CUDDL_TRY(writer.value(digest));
             CUDDL_TRY(writer.value(static_cast<uint64_t>(postings.size())));
@@ -157,8 +157,13 @@ class reference_index_file {
                 )
             );
         }
+        CUDDL_TRY(index.build_key_directory(
+            database.reference_count(),
+            database.metadata().compatibility.indexed_bucket_count,
+            stream
+        ));
         index.indexed_ = true;
-        CUDDL_CUDA_TRY(stream.sync());
+        CUDDL_TRY(index.measure_pair_fraction(database, stream));
         return index;
     }
 
@@ -166,9 +171,6 @@ class reference_index_file {
     template <uint32_t K, size_t BucketCount, typename Layout>
     static Result<reference_database_file>
     snapshot(reference_database<K, BucketCount, Layout> const& source, cuda::stream_ref stream) {
-        if (!source.preserves_multiplicity()) {
-            return Err(Error::invalid_argument("index files require packed reference rows"));
-        }
         CUDDL_TRY((detail::validate_non_indexed_score_compatibility<K, BucketCount, Layout>(
             source.metadata().compatibility
         )));
@@ -178,11 +180,16 @@ class reference_index_file {
         if (database.names_.size() != source.reference_count()) {
             return Err(Error::invalid_argument("index files require named reference rows"));
         }
-        database.rows_ =
-            CUDDL_TRY(download(source.packed_data().data(), source.packed_data().size(), stream));
-        database.saturation_ = CUDDL_TRY(
-            download(source.saturation_states().data(), source.saturation_states().size(), stream)
+        auto scores = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint16_t>(
+                stream,
+                stream.device(),
+                static_cast<size_t>(source.reference_count()) * BucketCount,
+                cuda::no_init
+            )
         );
+        CUDDL_TRY(source.copy_scores_async({scores.data(), scores.size()}, stream));
+        database.rows_ = CUDDL_TRY(download(scores.data(), scores.size(), stream));
         return database;
     }
 
@@ -216,15 +223,14 @@ class reference_index_file {
             uint32_t version{}, kind{};
             CUDDL_TRY(reader.value(version));
             CUDDL_TRY(reader.value(kind));
-            if (version != 1 || kind > 1) {
+            if (version != 2 || kind > 1) {
                 return Err(Error::invalid_argument("unsupported reference index format"));
             }
             uint64_t digest{};
             CUDDL_TRY(reader.value(digest));
             auto const source = database.metadata();
-            if (database.rows().size() != static_cast<uint64_t>(source.reference_count) *
-                                              source.compatibility.bucket_count ||
-                database.saturation().size() != source.reference_count) {
+            if (database.rows().size() !=
+                static_cast<uint64_t>(source.reference_count) * source.compatibility.bucket_count) {
                 return Err(
                     Error::invalid_argument("reference database has no complete stored rows")
                 );
@@ -312,7 +318,7 @@ class reference_index_file {
         auto const check_bucket =
             [&](uint32_t bucket, std::vector<uint32_t>& seen, size_t& indexed) -> char const* {
             auto const score_of = [&](uint32_t id) {
-                return detail::winner(rows[static_cast<size_t>(id) * c.bucket_count + bucket]);
+                return rows[static_cast<size_t>(id) * c.bucket_count + bucket];
             };
             if (sparse) {
                 auto start = static_cast<size_t>(bucket) * m.reference_count;

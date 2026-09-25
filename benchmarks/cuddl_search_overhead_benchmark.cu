@@ -18,7 +18,6 @@ void run_search_overhead(nvbench::state& state) {
     auto const stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const references = static_cast<uint32_t>(state.get_int64("References"));
     auto const queries = static_cast<uint32_t>(state.get_int64("Queries"));
-    auto const mode = state.get_string("Mode");
     auto const index = state.get_string("Index");
     auto const storage =
         index == "sparse" ? cuddl::index_storage::sparse : cuddl::index_storage::dense;
@@ -47,21 +46,17 @@ void run_search_overhead(nvbench::state& state) {
     auto requirements = CUDDL_UNWRAP(
         database.batch_search_requirements(queries, stream, acceleration ? &*acceleration : nullptr)
     );
-    uint32_t const capacity = mode == "bounded-fit"        ? expected
-                              : mode == "bounded-overflow" ? expected - 1U
-                                                           : requirements.maximum_pair_count;
+    uint32_t const capacity = requirements.maximum_pair_count;
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
     );
-    cuddl::batch_search_result const sentinel{.query_id = 0xffffffffU, .reference_id = 0xffffffffU};
-    auto results = cuda::make_device_buffer<cuddl::batch_search_result>(
-        stream, stream.device(), capacity, sentinel
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), capacity, cuda::no_init
     );
-    auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init);
     auto matches = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), capacity, uint32_t{0xffffffffU}
     );
-    auto search = [&](cuda::stream_ref execution_stream) {
+    auto search = [&](cuda::stream_ref execution_stream, auto&& on_tile) {
         if constexpr (exhaustive) {
             CUDDL_UNWRAP(database.search_batch_async(
                 query_input,
@@ -69,8 +64,7 @@ void run_search_overhead(nvbench::state& state) {
                 0U,
                 workspace,
                 results,
-                count,
-                [](uint32_t) {},
+                on_tile,
                 matches,
                 execution_stream
             ));
@@ -81,8 +75,7 @@ void run_search_overhead(nvbench::state& state) {
                 0U,
                 workspace,
                 results,
-                count,
-                [](uint32_t) {},
+                on_tile,
                 matches,
                 {.minimum_matches = 5U},
                 execution_stream,
@@ -90,43 +83,38 @@ void run_search_overhead(nvbench::state& state) {
             ));
         }
     };
-    search(stream);
-    uint32_t actual = 0U;
-    std::vector<cuddl::batch_search_result> host_results(capacity);
-    std::vector<uint32_t> host_matches(capacity);
-    cuda::copy_bytes(stream, count, cuda::std::span{&actual, size_t{1}});
-    cuda::copy_bytes(stream, results, host_results);
-    cuda::copy_bytes(stream, matches, host_matches);
-    stream.sync();
-    if (actual != expected) {
+    std::vector<cuddl::batch_search_result> host_results;
+    std::vector<uint32_t> host_matches;
+    search(stream, [&](cuddl::batch_result_tile const& tile) {
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const passing = host.passing();
+        auto const counts = host.passing_match_counts();
+        host_results.insert(host_results.end(), passing.begin(), passing.end());
+        host_matches.insert(host_matches.end(), counts.begin(), counts.end());
+    });
+    if (host_results.size() != expected) {
         throw std::runtime_error("incorrect candidate count");
     }
-    if (mode == "bounded-overflow") {
-        for (uint32_t i = 0U; i < capacity; ++i) {
-            if (host_results[i] != sentinel || host_matches[i] != 0xffffffffU) {
-                throw std::runtime_error("overflow changed output storage");
+    uint32_t position = 0U;
+    for (uint32_t q = 0U; q < queries; ++q) {
+        for (uint32_t r = 0U; r < references; ++r) {
+            if (!exhaustive && q % 16U != r % 16U) {
+                continue;
             }
-        }
-    } else {
-        uint32_t index = 0U;
-        for (uint32_t q = 0U; q < queries; ++q) {
-            for (uint32_t r = 0U; r < references; ++r) {
-                if (!exhaustive && q % 16U != r % 16U) {
-                    continue;
-                }
-                auto const& result = host_results[index];
-                bool const equal = q % 16U == r % 16U;
-                if (result.query_id != q || result.reference_id != r ||
-                    result.summary.counts.equal != (equal ? buckets : 0U) ||
-                    host_matches[index] != (equal ? buckets : 0U)) {
-                    throw std::runtime_error("incorrect query/reference result");
-                }
-                ++index;
+            auto const& result = host_results[position];
+            bool const equal = q % 16U == r % 16U;
+            if (result.query_id != q || result.reference_id != r ||
+                result.counts.equal != (equal ? buckets : 0U) ||
+                host_matches[position] != (equal ? buckets : 0U)) {
+                throw std::runtime_error("incorrect query/reference result");
             }
+            ++position;
         }
     }
     state.add_element_count(size_t{references} * queries, "Pairs");
-    state.exec([&](nvbench::launch& launch) { search(cuda::stream_ref{launch.get_stream()}); });
+    state.exec([&](nvbench::launch& launch) {
+        search(cuda::stream_ref{launch.get_stream()}, [](cuddl::batch_result_tile const&) {});
+    });
 }
 
 void search_overhead(nvbench::state& state) {
@@ -140,7 +128,7 @@ void search_overhead(nvbench::state& state) {
 NVBENCH_BENCH(search_overhead)
     .add_int64_axis("References", {33, 4096})
     .add_int64_axis("Queries", {1, 8, 64})
-    .add_string_axis("Mode", {"exhaustive", "full", "bounded-fit", "bounded-overflow"})
+    .add_string_axis("Mode", {"exhaustive", "full"})
     .add_string_axis("Index", {"dense", "sparse"})
     .set_stopping_criterion("sample-count")
     .set_min_samples(30)

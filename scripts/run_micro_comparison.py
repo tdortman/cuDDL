@@ -433,11 +433,9 @@ def retrieval_phases(
     return phases
 
 
-# Database files store packed rows and index every bucket with 15-bit keys, so the pipeline runs
-# that supply resident timings and accuracy use the same geometry as the timed CLI.
+# Database files index every bucket with 15-bit keys, so the pipeline runs that supply resident
+# timings and accuracy use the same geometry as the timed CLI.
 _CUDDL_FILE_CONFIGURATION = [
-    "--rows",
-    "packed",
     "--indexed-buckets",
     "2048",
     "--key-bits",

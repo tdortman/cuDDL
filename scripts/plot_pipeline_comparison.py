@@ -82,12 +82,9 @@ def read_pipeline(path: Path) -> dict:
     if case.get("topology") not in {"batch", "all-to-all"}:
         raise ValueError(f"{path}: missing or unsupported topology")
     if implementation == "cuddl":
-        if case.get("rows") not in {"compact", "packed"} or case.get("index") not in {
-            "sparse",
-            "dense",
-        }:
-            raise ValueError(f"{path}: missing row/index configuration")
-        label = f"cuDDL\n{case['rows']} / {case['index']}"
+        if case.get("index") not in {"sparse", "dense"}:
+            raise ValueError(f"{path}: missing index configuration")
+        label = f"cuDDL\n{case['index']}"
     else:
         label = f"RabbitSketch\n{pipeline['implementation'].get('variant', 'CPU')}"
     return {

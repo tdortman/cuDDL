@@ -240,16 +240,13 @@ def main() -> None:
             listing = subprocess.run(
                 command, check=True, capture_output=True, text=True
             ).stdout.splitlines()[1:]
-            tsv = sorted(
-                (*map(int, row.split("\t")[:6]), float(row.split("\t")[6]))
-                for row in listing
-            )
+            tsv = sorted(tuple(map(int, row.split("\t"))) for row in listing)
             assert [row[:2] for row in tsv] == [(0, 1), (0, 2), (1, 2)], tsv
             binary = work / "cli-results.bin"
             subprocess.run(
                 [*command, "--output", str(binary)], check=True, capture_output=True
             )
-            assert sorted(struct.iter_unpack("<6Id", binary.read_bytes())) == tsv
+            assert sorted(struct.iter_unpack("<6I", binary.read_bytes())) == tsv
         print(
             "cuddl CLI: all-to-all searches each unordered pair once, TSV and binary agree"
         )
