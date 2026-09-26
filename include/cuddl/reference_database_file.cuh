@@ -151,6 +151,9 @@ namespace cuddl {
 /// @brief How a build gets its sequence bytes to the device.
 using transfer_mode = detail::transfer_mode;
 
+/// @brief Selects decompression independently of host transfers.
+using decompression_backend = detail::decompression_backend;
+
 /// @brief One record of a genome the caller already holds: bases only.
 using sequence_record = detail::sequence_record;
 
@@ -180,6 +183,7 @@ struct path_build_options {
     /// transfers. The `direct_bytes`, `staged_bytes` and `in_place` fields say which path a build
     /// actually took.
     transfer_mode transfer = transfer_mode::automatic;
+    decompression_backend decompression = decompression_backend::automatic;
 };
 
 /// @brief Knobs for a build the caller feeds with bases it already holds.
@@ -255,6 +259,7 @@ class reference_database_file {
                 options.staging_bytes,
                 options.parser_workers,
                 options.transfer,
+                options.decompression,
                 options.statistics,
                 result.download_rows<BucketCount>(stream)
             )));
@@ -545,6 +550,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             options.staging_bytes,
             options.parser_workers,
             options.transfer,
+            options.decompression,
             options.statistics,
             [&](device_span<uint32_t const> group, size_t base, size_t count) -> Result<void> {
                 CUDDL_CUDA_TRY(

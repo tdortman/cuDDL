@@ -26,12 +26,23 @@ cuda_args = [
 cccl_dep = subproject('cccl').get_variable('cccl_dep')
 libdeflate_dep = subproject('libdeflate').get_variable('libdeflate_dep')
 
-# nvCOMP inflates gzip references on the device.
-nvcomp_dep = meson.get_compiler('cuda').find_library('nvcomp')
+# nvCOMP is optional; sketch construction still requires CUDA.
+cuda_compiler = meson.get_compiler('cuda')
+nvcomp_dep = cuda_compiler.find_library('nvcomp', required: get_option('nvcomp'))
+nvcomp_enabled = nvcomp_dep.found() and cuda_compiler.compiles(
+    '''#include <nvcomp/gzip.h>
+int main() { return 0; }
+''',
+    name: 'nvCOMP headers',
+)
+if get_option('nvcomp').enabled() and not nvcomp_enabled
+    error('nvCOMP was enabled but its headers are unavailable')
+endif
 
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [cccl_dep, libdeflate_dep, nvcomp_dep],
+    dependencies: [cccl_dep, libdeflate_dep] + (nvcomp_enabled ? [nvcomp_dep] : []),
+    compile_args: ['-DCUDDL_HAS_NVCOMP=' + (nvcomp_enabled ? '1' : '0')],
 )
 
 build_examples = (

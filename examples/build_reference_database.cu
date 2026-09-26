@@ -4,6 +4,7 @@
 #include <cctype>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,18 +21,21 @@ void build_database(
     std::vector<std::filesystem::path> const& paths,
     std::filesystem::path const& output,
     cuda::stream_ref stream,
-    unsigned workers
+    unsigned workers,
+    cuddl::decompression_backend decompression
 ) {
     if (k != K) {
         if constexpr (K < 31) {
-            return build_database<K + 1>(k, buckets, exponent_bits, paths, output, stream, workers);
+            return build_database<K + 1>(
+                k, buckets, exponent_bits, paths, output, stream, workers, decompression
+            );
         }
         throw std::invalid_argument("k must be between 1 and 31");
     }
     auto save = [&]<size_t BucketCount, uint32_t ExponentBits>() {
         using layout = cuddl::register_layout<ExponentBits, 16U - ExponentBits>;
         auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<K, BucketCount, layout>(
-            paths, stream, {.parser_workers = workers}
+            paths, stream, {.parser_workers = workers, .decompression = decompression}
         )));
         CUDDL_UNWRAP(file.save(output));
     };
@@ -68,6 +72,7 @@ int main(int argc, char** argv) {
     uint32_t buckets{};
     uint32_t exponent_bits = 6;
     unsigned workers = cuddl::default_parser_workers();
+    auto decompression = cuddl::decompression_backend::automatic;
     CLI::App app{
         "Build one reference sketch per FASTA/FASTQ file in a folder, recursing into "
         "subdirectories. "
@@ -95,6 +100,20 @@ int main(int argc, char** argv) {
         workers,
         "Concurrent genome loaders (defaults to machine threads); 1 minimizes RAM"
     );
+    app.add_option(
+           "--decompression", decompression, "Decompression backend; GPU allows format fallbacks"
+    )
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::decompression_backend>{
+                    {"automatic", cuddl::decompression_backend::automatic},
+                    {"cpu", cuddl::decompression_backend::cpu},
+                    {"gpu", cuddl::decompression_backend::gpu},
+                    {"coherent", cuddl::decompression_backend::coherent}
+                }
+            )
+        )
+        ->default_str("automatic");
     CLI11_PARSE(app, argc, argv);
 
     try {
@@ -126,7 +145,7 @@ int main(int argc, char** argv) {
         }
         std::sort(paths.begin(), paths.end());
         cuda::stream stream{cuda::devices[0]};
-        build_database(k, buckets, exponent_bits, paths, output, stream, workers);
+        build_database(k, buckets, exponent_bits, paths, output, stream, workers, decompression);
         std::cout << "Saved " << paths.size() << " reference sketches to " << output << '\n';
     } catch (std::exception const& error) {
         std::cerr << "Error: " << error.what() << '\n';

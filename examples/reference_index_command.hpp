@@ -13,6 +13,7 @@ struct reference_index_command {
     bool all_to_all;
     uint32_t minimum_matches;
     unsigned workers;
+    cuddl::decompression_backend decompression;
     bool build;
     cuddl::index_storage storage;
 };

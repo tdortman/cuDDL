@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -20,6 +21,7 @@ int main(int argc, char** argv) try {
     int copies = 1, samples = 5;
     bool parse_only = false;
     std::string transfer = "automatic";
+    auto decompression = cuddl::decompression_backend::automatic;
     CLI::App app{
         "NVBench wall timing of FASTX -> reference sketches -> binary file "
         "(k=25, buckets=2048, 5-bit exponent + 11-bit mantissa)"
@@ -50,7 +52,21 @@ int main(int argc, char** argv) try {
     )
         ->check(CLI::IsMember({"automatic", "pinned", "staged", "in-place"}))
         ->capture_default_str();
-    app.set_config("--config", "TOML file with options, e.g. reference = [...]");
+    app.add_option(
+           "--decompression", decompression, "Decompression backend; GPU allows format fallbacks"
+    )
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::decompression_backend>{
+                    {"automatic", cuddl::decompression_backend::automatic},
+                    {"cpu", cuddl::decompression_backend::cpu},
+                    {"gpu", cuddl::decompression_backend::gpu},
+                    {"coherent", cuddl::decompression_backend::coherent}
+                }
+            )
+        )
+        ->default_str("automatic");
+    app.set_config("--config", "", "TOML file with options, e.g. reference = [...]");
     CLI11_PARSE(app, argc, argv);
     auto const requested_transfer = [&] {
         if (transfer == "pinned") return cuddl::transfer_mode::pinned;
@@ -90,7 +106,8 @@ int main(int argc, char** argv) try {
                         {.statistics = &statistics,
                          .parser_workers = workers,
                          .staging_bytes = staging_bytes,
-                         .transfer = requested_transfer}
+                         .transfer = requested_transfer,
+                         .decompression = decompression}
                     ))
                 );
                 CUDDL_UNWRAP(file.save(output));

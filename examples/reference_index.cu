@@ -1,6 +1,7 @@
 #include <CLI/CLI.hpp>
 
 #include <iostream>
+#include <map>
 #include <string>
 
 #include "reference_index_command.hpp"
@@ -49,6 +50,7 @@ int main(int argc, char** argv) {
     std::filesystem::path output;
     uint32_t minimum_matches = 1;
     unsigned workers = cuddl::default_parser_workers();
+    auto decompression = cuddl::decompression_backend::automatic;
     auto* build = app.add_subcommand(
         "build", "Create a dense or sparse index file from a reference database"
     );
@@ -92,6 +94,21 @@ int main(int argc, char** argv) {
     );
     query->add_option("--workers", workers, "Concurrent query genome loaders")
         ->check(CLI::PositiveNumber);
+    (*query)
+        .add_option(
+            "--decompression", decompression, "Decompression backend; GPU allows format fallbacks"
+        )
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::decompression_backend>{
+                    {"automatic", cuddl::decompression_backend::automatic},
+                    {"cpu", cuddl::decompression_backend::cpu},
+                    {"gpu", cuddl::decompression_backend::gpu},
+                    {"coherent", cuddl::decompression_backend::coherent}
+                }
+            )
+        )
+        ->default_str("automatic");
     app.set_config(
         "--config", "", "TOML options file; long query lists go under [search] as query = [...]"
     );
@@ -117,6 +134,7 @@ int main(int argc, char** argv) {
             all_to_all,
             minimum_matches,
             workers,
+            decompression,
             bool(*build),
             format == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
         };

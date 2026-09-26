@@ -1,4 +1,11 @@
 option(
+    'nvcomp',
+    type: 'feature',
+    value: 'auto',
+    description: 'Enable nvCOMP GPU and coherent hybrid decompression backends',
+)
+
+option(
     'benchmarks',
     type: 'feature',
     value: 'auto',

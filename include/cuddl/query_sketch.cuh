@@ -78,6 +78,7 @@ class query_sketch_batch {
                 options.staging_bytes,
                 options.parser_workers,
                 options.transfer,
+                options.decompression,
                 options.statistics,
                 batch.reduce_rows(stream)
             )));

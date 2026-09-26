@@ -25,7 +25,13 @@
 #include <cuda/memory_pool>
 #include <cuda/stream>
 
-#include <cuddl/detail/device_gzip.cuh>
+#ifndef CUDDL_HAS_NVCOMP
+    #define CUDDL_HAS_NVCOMP 0
+#endif
+
+#if CUDDL_HAS_NVCOMP
+    #include <cuddl/detail/device_gzip.cuh>
+#endif
 #include <cuddl/detail/fastx_sequence_file.hpp>
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
@@ -34,10 +40,19 @@
 
 namespace cuddl::detail {
 
+/// @brief Where inputs are decompressed; sketch construction always runs on the GPU.
+enum class decompression_backend {
+    automatic,
+    cpu,
+    /// nvCOMP for eligible gzip inputs; unsupported formats use host loaders.
+    gpu,
+    /// CPU/nvCOMP sharing on devices with coherent pageable host memory.
+    coherent,
+};
+
 /// @brief How a build gets its sequence bytes to the device.
 enum class transfer_mode {
-    /// GPU gzip inflation, shared with host loaders on coherent devices.
-    /// Other input formats use the host loader.
+    /// In-place host reads on coherent devices, page-locked transfers elsewhere.
     automatic,
     /// Decompress into page-locked buffers, which the transfer engine reads directly. Measured
     /// 2.1x faster than staging on an x86 host with a discrete GPU, and slower on a coherent
@@ -850,6 +865,7 @@ template <
     return stager.finish();
 }
 
+#if CUDDL_HAS_NVCOMP
 /// @brief Loads @p ids through host loaders and stages them, genome numbers relative to @p base.
 /// Starts at most one loader per input file.
 template <uint32_t K, size_t BucketCount, typename Layout>
@@ -858,18 +874,24 @@ template <uint32_t K, size_t BucketCount, typename Layout>
     std::span<std::filesystem::path const> paths,
     std::span<size_t const> ids,
     size_t base,
-    size_t workers
+    size_t workers,
+    sequence_buffer_pool& buffers,
+    bool page_locked
 ) {
     if (ids.empty()) return Ok();
     workers = std::min(workers, ids.size());
     std::vector<std::filesystem::path> subset;
     subset.reserve(ids.size());
     for (auto const id : ids) subset.push_back(paths[id]);
-    fastx_load_pool pool(subset, workers, {}, workers * 4);
+    fastx_load_pool pool(subset, workers, {acquire_sequence_target, &buffers}, workers * 4);
     for (size_t index = 0; index < ids.size(); ++index) {
         auto sequence = CUDDL_TRY(pool.take(index));
         auto const& extents = sequence->extents;
-        CUDDL_TRY(stager.add_genome(ids[index] - base, extents, nullptr, 0, std::move(sequence)));
+        auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
+        auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
+        CUDDL_TRY(stager.add_genome(
+            ids[index] - base, extents, pinned_base, pinned_size, std::move(sequence)
+        ));
     }
     return Ok();
 }
@@ -885,11 +907,14 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
+    bool hybrid,
+    transfer_mode transfer,
     reference_build_statistics* statistics,
     Sink&& sink
 ) {
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
-    bool const hybrid = device_reads_pageable_memory(stream.device());
+    bool const in_place = stages_in_place(transfer, stream.device());
+    bool const page_locked = pages_locked(transfer, stream.device());
     constexpr size_t device_stride = 8;
     auto const input_workers = hybrid ? std::max<size_t>(1, workers / 18) : workers;
     auto const host_workers = hybrid ? std::max<size_t>(1, workers - input_workers) : workers;
@@ -898,7 +923,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         if (!hybrid || id % device_stride == 0) probes[id] = probe_gzip_file(paths[id]);
     });
     std::optional<device_gzip_inflater> inflater;
-    sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, false);
+    sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked);
     host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
     auto const fits = [&](gzip_file_probe const& probe) {
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
@@ -964,8 +989,14 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 while (host_next < until) {
                     auto sequence = CUDDL_TRY(host_pool->take(host_next));
                     auto const& extents = sequence->extents;
+                    auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
+                    auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
                     CUDDL_TRY(stager.add_genome(
-                        host_ids[host_next] - base, extents, nullptr, 0, std::move(sequence)
+                        host_ids[host_next] - base,
+                        extents,
+                        pinned_base,
+                        pinned_size,
+                        std::move(sequence)
                     ));
                     ++host_next;
                 }
@@ -994,7 +1025,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                     CUDDL_TRY(drain_host(std::min(host_ids.size(), next * (device_stride - 1))));
                 }
                 CUDDL_TRY((stage_host_loaded<K, BucketCount, Layout>(
-                    stager, paths, handed_back, base, workers
+                    stager, paths, handed_back, base, workers, host_buffers, page_locked
                 )));
                 handed_back.clear();
                 auto const other = (lane + 1) % busy.size();
@@ -1012,18 +1043,21 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             }
             CUDDL_TRY(drain_host(host_ids.size()));
             return stage_host_loaded<K, BucketCount, Layout>(
-                stager, paths, handed_back, base, workers
+                stager, paths, handed_back, base, workers, host_buffers, page_locked
             );
         },
         sink,
-        hybrid
+        in_place
     )));
     if (statistics != nullptr) {
         statistics->workers = static_cast<unsigned>(workers);
-        statistics->in_place = hybrid;
+        statistics->in_place = in_place;
+        statistics->pinned_buffers = page_locked ? host_buffers.buffers() : 0;
     }
     return Ok();
 }
+
+#endif
 
 /// @brief Stages a path collection, handing each group's device rows to @p sink.
 ///
@@ -1040,12 +1074,22 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
     transfer_mode transfer,
+    decompression_backend decompression,
     reference_build_statistics* statistics,
     Sink&& sink
 ) {
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
     }
+#if !CUDDL_HAS_NVCOMP
+    if (decompression == decompression_backend::gpu ||
+        decompression == decompression_backend::coherent) {
+        return Err(
+            Error::invalid_argument("requested decompression backend requires nvCOMP support")
+        );
+    }
+    decompression = decompression_backend::cpu;
+#endif
     if (transfer == transfer_mode::in_place && !device_reads_pageable_memory(stream.device())) {
         return Err(
             Error::invalid_argument(
@@ -1053,14 +1097,33 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             )
         );
     }
-    if (paths.empty()) return Ok();
-    if (transfer == transfer_mode::automatic &&
-        (!device_reads_pageable_memory(stream.device()) ||
-         path_loaders::worker_count(paths.size(), parser_workers) > 1)) {
-        return stage_paths_inflating<K, BucketCount, Layout>(
-            paths, stream, staging_bytes, parser_workers, statistics, std::forward<Sink>(sink)
+    bool const coherent = device_reads_pageable_memory(stream.device());
+    if (decompression == decompression_backend::coherent && !coherent) {
+        return Err(
+            Error::invalid_argument("coherent decompression needs coherent pageable host memory")
         );
     }
+    if (paths.empty()) return Ok();
+    if (decompression == decompression_backend::automatic) {
+        decompression = !coherent ? decompression_backend::gpu
+                        : path_loaders::worker_count(paths.size(), parser_workers) > 1
+                            ? decompression_backend::coherent
+                            : decompression_backend::cpu;
+    }
+#if CUDDL_HAS_NVCOMP
+    if (decompression != decompression_backend::cpu) {
+        return stage_paths_inflating<K, BucketCount, Layout>(
+            paths,
+            stream,
+            staging_bytes,
+            parser_workers,
+            decompression == decompression_backend::coherent,
+            transfer,
+            statistics,
+            std::forward<Sink>(sink)
+        );
+    }
+#endif
     auto const in_place = stages_in_place(transfer, stream.device());
     auto const page_locked = pages_locked(transfer, stream.device());
     path_loaders loaders(stream, paths, parser_workers, page_locked);

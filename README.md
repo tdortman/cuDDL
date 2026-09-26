@@ -29,10 +29,12 @@ Each input file represents one genome, including all of its sequence records. Re
 
 - Linux and an NVIDIA GPU with a compatible driver.
 - A CUDA toolkit and host compiler with C++20 support. The supplied Nix environment uses CUDA 13.3.
-- nvCOMP 5, which the build links to inflate gzip genomes on the GPU.
+- Optional nvCOMP 5, used to inflate gzip genomes on the GPU.
 - Meson 1.3 or newer, Ninja, and Git.
 
 The default build targets `sm_80`, `sm_90`, and `sm_120`. Your toolkit must recognize all three targets. For a different GPU target, adjust `cuda_arch_args` in [meson.build](meson.build) before configuring.
+
+Meson enables nvCOMP when it finds the library and headers. Pass `-Dnvcomp=enabled` to require them or `-Dnvcomp=disabled` to build without nvCOMP entirely.
 
 Meson fetches the pinned dependencies, including CCCL, libdeflate, and CLI11. Use the supplied CCCL revision: cuDDL requires its CUB 3.6.0 headers rather than an arbitrary toolkit-bundled version. The initial setup needs network access.
 
@@ -81,7 +83,7 @@ The builder searches the folder recursively and sorts file paths to assign refer
 Supported input extensions are `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, case-insensitively. Gzip and BGZF files may add `.gz`, `.bgz`, or `.bgzf`.
 Files containing additional gzip member signatures use the host parser, even when the first and last member trailers match.
 Fallback parsing runs between GPU batch submissions so it can overlap queued device work.
-With the default `automatic` transfer, discrete GPUs inflate single-member gzip FASTA files and check each one's length and CRC32 against its trailer. Concurrent batches overlap file reads, inflation and sketch construction. Input sizes determine the split between compressed and decompressed GPU buffers within the available memory budget. Coherent-memory GPUs such as GH200 use CPU loading into pageable memory, avoiding the slower page-locked input buffers. The host loader also takes other formats and any file the GPU cannot verify. It checks member structure, DEFLATE decoding and uncompressed lengths, but skips CRC32. Check input integrity separately when that matters. Saved databases and indexes are always checksummed.
+With the default `automatic` transfer, discrete GPUs inflate single-member gzip FASTA files and check each one's length and CRC32 against its trailer. Concurrent batches overlap file reads, inflation and sketch construction. Input sizes determine the split between compressed and decompressed GPU buffers within the available memory budget. Coherent-memory GPUs such as GH200 use CPU loading into pageable memory, avoiding the slower page-locked input buffers, and split gzip inputs between the host loaders and nvCOMP, with the kernels reading the host-decoded buffers in place. The host loader also takes other formats and any file the GPU cannot verify. It checks member structure, DEFLATE decoding and uncompressed lengths, but skips CRC32. Check input integrity separately when that matters. Saved databases and indexes are always checksummed.
 
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -89,6 +91,7 @@ With the default `automatic` transfer, discrete GPUs inflate single-member gzip 
 | `--buckets`       | 2048, 4096, 8192, 16384, 32768, 65536, 131072                                                                                                                 |
 | `--exponent-bits` | 6 (default, 10-bit mantissa) for unbounded cardinality such as metagenomes; 5 (11-bit mantissa) halves false register matches for genome-to-genome comparison |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
+| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `coherent`. `cpu` inflates every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP, and `coherent` shares the work between both on a coherent GPU. `gpu` and `coherent` need nvCOMP. |
 
 ### 2. Search without an index
 
@@ -99,7 +102,7 @@ With the default `automatic` transfer, discrete GPUs inflate single-member gzip 
   > matches.tsv
 ```
 
-`--minimum-matches 0` compares each query against every reference. The database supplies the k-mer length and sketch configuration, so queries do not take separate `--k` or `--buckets` options.
+`--minimum-matches 0` compares each query against every reference. The database supplies the k-mer length and sketch configuration, so queries do not take separate `--k` or `--buckets` options. `--decompression automatic|cpu|gpu|coherent` selects how query genomes are inflated, with the same values as the builder.
 
 ### 3. Optionally build and use an index
 

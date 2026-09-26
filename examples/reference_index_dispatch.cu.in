@@ -27,6 +27,7 @@ void search(
     bool all_to_all,
     uint32_t minimum_matches,
     unsigned workers,
+    cuddl::decompression_backend decompression,
     cuda::stream_ref stream
 ) {
     using query_type = cuddl::query_sketch_batch<K, Buckets, Layout>;
@@ -97,7 +98,8 @@ void search(
             auto batch_size = std::min(query_batch_size, paths.size() - first);
             auto queries = CUDDL_UNWRAP(
                 query_type::sketch(
-                    std::span{paths.data() + first, batch_size}, stream, {.parser_workers = workers}
+                    std::span{paths.data() + first, batch_size}, stream,
+                    {.parser_workers = workers, .decompression = decompression}
                 )
             );
             if (exhaustive) {
@@ -160,6 +162,7 @@ void dispatch_reference_index(reference_index_command const& command) {
             command.all_to_all,
             command.minimum_matches,
             command.workers,
+            command.decompression,
             stream
         );
     }

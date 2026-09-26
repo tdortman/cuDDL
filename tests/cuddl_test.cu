@@ -4079,9 +4079,7 @@ TEST(FastaTest, GzipMembersValidateStructureAndLengthWithoutPayloadCrc) {
 }
 
 TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
-    // The default transfer inflates gzip FASTA on the device where the build supports it, and
-    // hands a file back to the host loader whenever it cannot vouch for it. Either way the
-    // database must equal the one the host loader builds.
+    // Backend and transfer choices must preserve rows and format fallbacks.
     cuda::stream stream{cuda::devices[0]};
     constexpr size_t buckets = 2048;
     auto bases = [](size_t count, uint64_t seed) {
@@ -4113,7 +4111,7 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
             6
         }
     );
-    std::vector<std::filesystem::path> const paths{
+    std::vector<std::filesystem::path> paths{
         write_tmp_gzip(
             "\n\njunk before any header\n>a desc\n" + bases(3000, 1) +
             ">b\r\nacgtAC>GTacgt\tACGT \r\nACGTACGTACGTACGTACGTACGTACGT\n>empty\n>c\nACGTACGTAC"
@@ -4128,22 +4126,57 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
         write_bytes("/tmp/cuddl_gzip_test_extra.fa.gz", extra_field),
         write_tmp_gzip(">z\n" + bases(5000, 3)),
     };
-    auto const device = cuddl::reference_database_file::build<25, buckets>(paths, stream);
+    for (size_t id = 0; id < 17; ++id) {
+        paths.push_back(write_tmp_gzip(">genome\n" + bases(1000 + id * 71, 100 + id)));
+    }
     auto const host = cuddl::reference_database_file::build<25, buckets>(
-        paths, stream, {.transfer = cuddl::transfer_mode::staged}
+        paths, stream, {.decompression = cuddl::decompression_backend::cpu}
     );
-    ASSERT_TRUE(device) << device.error().message();
     ASSERT_TRUE(host) << host.error().message();
-    ASSERT_EQ(device->rows().size(), host->rows().size());
-    for (size_t genome = 0; genome < paths.size(); ++genome) {
-        EXPECT_TRUE(
-            std::equal(
-                host->rows().begin() + genome * buckets,
-                host->rows().begin() + (genome + 1) * buckets,
-                device->rows().begin() + genome * buckets
-            )
-        ) << "genome="
-          << genome;
+    auto const headerless = write_tmp_gzip("ACGTACGTACGTACGTACGTACGTACGTACGT\n");
+    bool const coherent = cuddl::detail::device_reads_pageable_memory(stream.device());
+    for (auto backend :
+         {cuddl::decompression_backend::automatic,
+          cuddl::decompression_backend::cpu,
+          cuddl::decompression_backend::gpu,
+          cuddl::decompression_backend::coherent}) {
+        SCOPED_TRACE(static_cast<int>(backend));
+        for (auto transfer :
+             {cuddl::transfer_mode::automatic,
+              cuddl::transfer_mode::staged,
+              cuddl::transfer_mode::pinned,
+              cuddl::transfer_mode::in_place}) {
+            SCOPED_TRACE(static_cast<int>(transfer));
+            cuddl::path_build_options options{
+                .parser_workers = 4, .transfer = transfer, .decompression = backend
+            };
+            auto const built =
+                cuddl::reference_database_file::build<25, buckets>(paths, stream, options);
+            bool const unavailable =
+                (!CUDDL_HAS_NVCOMP && (backend == cuddl::decompression_backend::gpu ||
+                                       backend == cuddl::decompression_backend::coherent)) ||
+                (!coherent && (backend == cuddl::decompression_backend::coherent ||
+                               transfer == cuddl::transfer_mode::in_place));
+            if (unavailable) {
+                EXPECT_FALSE(built);
+                continue;
+            }
+            ASSERT_TRUE(built) << built.error().message();
+            EXPECT_TRUE(std::ranges::equal(host->rows(), built->rows()));
+            EXPECT_TRUE(std::ranges::equal(host->names(), built->names()));
+
+            auto queries = cuddl::query_sketch_batch<25, buckets>::sketch(paths, stream, options);
+            ASSERT_TRUE(queries) << queries.error().message();
+            std::vector<uint16_t> scores(queries->scores().size());
+            cuda::copy_bytes(stream, queries->scores(), scores);
+            stream.sync();
+            EXPECT_TRUE(std::ranges::equal(host->rows(), scores));
+
+            auto rejected = cuddl::reference_database_file::build<25, buckets>(
+                std::vector<std::filesystem::path>{headerless}, stream, options
+            );
+            EXPECT_FALSE(rejected);
+        }
     }
 
     auto const fallback_only = cuddl::reference_database_file::build<25, buckets>(
@@ -4159,12 +4192,6 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
         )
     );
 
-    // A file the host loader rejects fails the build the same way.
-    auto const headerless = write_tmp_gzip("ACGTACGTACGTACGTACGTACGTACGTACGT\n");
-    auto const rejected = cuddl::reference_database_file::build<25, buckets>(
-        std::vector<std::filesystem::path>{headerless}, stream
-    );
-    EXPECT_FALSE(rejected);
     std::filesystem::remove(headerless);
     for (auto const& path : paths) std::filesystem::remove(path);
 }
