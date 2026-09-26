@@ -167,6 +167,7 @@
                   - -fopenmp
                   - -D__INTELLISENSE__
                   - -D__CLANGD__
+                  - -DCUDDL_HAS_NVCOMP=1
                   - -I$(pwd)/subprojects/cccl/libcudacxx/include
                   - -I$(pwd)/subprojects/cccl/cub
                   - -I$(pwd)/subprojects/cccl/thrust
