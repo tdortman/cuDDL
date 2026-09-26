@@ -311,7 +311,7 @@ struct inflated_genome {
 
 /// @brief Inflates single-member gzip FASTA files on the device and compacts their sequence.
 ///
-/// Each of two lanes takes a batch of files: the host reads the compressed bytes, nvCOMP inflates
+/// Each lane takes a batch of files: the host reads the compressed bytes, nvCOMP inflates
 /// them into device slots, and a few kernels blank header text and leading bytes before an
 /// in-place select drops whitespace. A genome comes out as one run of bases with its records
 /// joined by the '>' that opened each one, a byte no k-mer window accepts, so it sketches exactly
@@ -346,7 +346,11 @@ class device_gzip_inflater {
         auto const options = nvcompBatchedGzipDecompressDefaultOpts;
         nvcomp_temp_bytes_ = 0;
         if (nvcompBatchedGzipDecompressGetTempSizeAsync(
-                max_files, slot_capacity_, options, &nvcomp_temp_bytes_, slot_capacity_
+                max_files,
+                std::min<size_t>(slot_capacity_, std::numeric_limits<uint32_t>::max()),
+                options,
+                &nvcomp_temp_bytes_,
+                slot_capacity_
             ) != nvcompSuccess) {
             throw std::bad_alloc();
         }

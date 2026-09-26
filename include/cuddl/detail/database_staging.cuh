@@ -1,10 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -34,7 +36,7 @@ namespace cuddl::detail {
 
 /// @brief How a build gets its sequence bytes to the device.
 enum class transfer_mode {
-    /// GPU gzip inflation on discrete devices, host loading on coherent devices.
+    /// GPU gzip inflation, shared with host loaders on coherent devices.
     /// Other input formats use the host loader.
     automatic,
     /// Decompress into page-locked buffers, which the transfer engine reads directly. Measured
@@ -63,12 +65,10 @@ enum class transfer_mode {
 
 /// @brief Whether a build in @p mode stages the caller's bytes in place.
 ///
-/// `in_place` is opt-in. Measured on Grace Hopper with the loaders running, it costs the same as
-/// a staging copy (1.27 s against 1.22 s for 2000 genomes) while holding the sources instead of
-/// an arena, so `automatic` leaves it alone.
+/// Automatic transfer reads CPU-decoded buffers in place on coherent devices.
 [[nodiscard]] inline bool stages_in_place(transfer_mode mode, cuda::device_ref device) noexcept {
-    static_cast<void>(device);
-    return mode == transfer_mode::in_place;
+    return mode == transfer_mode::in_place ||
+           (mode == transfer_mode::automatic && device_reads_pageable_memory(device));
 }
 
 /// @brief Whether a build in @p mode decompresses into page-locked buffers.
@@ -889,11 +889,17 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     Sink&& sink
 ) {
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
+    bool const hybrid = device_reads_pageable_memory(stream.device());
+    constexpr size_t device_stride = 8;
+    auto const input_workers = hybrid ? std::max<size_t>(1, workers / 18) : workers;
+    auto const host_workers = hybrid ? std::max<size_t>(1, workers - input_workers) : workers;
     std::vector<gzip_file_probe> probes(paths.size());
     parallel_for(paths.size(), workers, [&](size_t id) {
-        probes[id] = probe_gzip_file(paths[id]);
+        if (!hybrid || id % device_stride == 0) probes[id] = probe_gzip_file(paths[id]);
     });
     std::optional<device_gzip_inflater> inflater;
+    sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, false);
+    host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
     auto const fits = [&](gzip_file_probe const& probe) {
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
                probe.compressed <= inflater->compressed_capacity();
@@ -907,7 +913,8 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             compressed += probe.compressed;
         }
         auto const available = CUDDL_TRY(available_device_bytes(stream));
-        auto const per_lane = (available - available / 5) / device_gzip_inflater::lane_count;
+        auto const budget = (available - available / 5) / device_gzip_inflater::lane_count;
+        auto const per_lane = hybrid ? std::min<size_t>(budget, size_t{1} << 30) : budget;
         auto const overhead = device_gzip_inflater::lane_overhead(per_lane);
         auto const usable = per_lane > overhead ? per_lane - overhead : 0;
         auto const compressed_capacity =
@@ -923,7 +930,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                               ? per_lane - compressed_capacity - overhead
                               : 0;
         return cuda_try([&] {
-            inflater.emplace(stream, std::min(room, slots), compressed_capacity, workers);
+            inflater.emplace(stream, std::min(room, slots), compressed_capacity, input_workers);
         });
     };
     CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
@@ -936,9 +943,34 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             -> Result<void> {
             if (!inflater) CUDDL_TRY(make_inflater());
             std::vector<size_t> device_ids, host_ids, handed_back;
+            // ponytail: fixed 1:7 split on coherent hosts; use a shared work queue if CPU/GPU
+            // balance varies.
             for (size_t id = base; id < base + count; ++id) {
                 (fits(probes[id]) ? device_ids : host_ids).push_back(id);
             }
+            std::vector<std::filesystem::path> host_paths;
+            for (auto id : host_ids) host_paths.push_back(paths[id]);
+            std::optional<fastx_load_pool> host_pool;
+            if (!host_paths.empty()) {
+                host_pool.emplace(
+                    host_paths,
+                    std::min(host_workers, host_paths.size()),
+                    decompression_source{acquire_sequence_target, &host_buffers},
+                    host_workers * 4
+                );
+            }
+            size_t host_next = 0;
+            auto drain_host = [&](size_t until) -> Result<void> {
+                while (host_next < until) {
+                    auto sequence = CUDDL_TRY(host_pool->take(host_next));
+                    auto const& extents = sequence->extents;
+                    CUDDL_TRY(stager.add_genome(
+                        host_ids[host_next] - base, extents, nullptr, 0, std::move(sequence)
+                    ));
+                    ++host_next;
+                }
+                return Ok();
+            };
             std::vector<inflated_genome> genomes;
             std::array<bool, device_gzip_inflater::lane_count> busy{};
             size_t next = 0, lane = 0;
@@ -946,10 +978,20 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             while (next < device_ids.size() ||
                    std::ranges::any_of(busy, [](bool value) { return value; })) {
                 if (next < device_ids.size() && !busy[lane]) {
-                    next += CUDDL_TRY(
-                        inflater->submit(lane, std::span{device_ids}.subspan(next), paths, probes)
-                    );
+                    auto submitted = std::async(std::launch::async, [&]() -> Result<size_t> {
+                        CUDDL_CUDA_TRY(cudaSetDevice(stream.device().get()));
+                        return inflater->submit(
+                            lane, std::span{device_ids}.subspan(next), paths, probes
+                        );
+                    });
+                    while (host_next < host_ids.size() &&
+                           submitted.wait_for(std::chrono::seconds{0}) !=
+                               std::future_status::ready) {
+                        CUDDL_TRY(drain_host(std::min(host_ids.size(), host_next + 256)));
+                    }
+                    next += CUDDL_TRY(submitted.get());
                     busy[lane] = true;
+                    CUDDL_TRY(drain_host(std::min(host_ids.size(), next * (device_stride - 1))));
                 }
                 CUDDL_TRY((stage_host_loaded<K, BucketCount, Layout>(
                     stager, paths, handed_back, base, workers
@@ -968,16 +1010,18 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 }
                 lane = other;
             }
-            CUDDL_TRY(
-                (stage_host_loaded<K, BucketCount, Layout>(stager, paths, host_ids, base, workers))
-            );
+            CUDDL_TRY(drain_host(host_ids.size()));
             return stage_host_loaded<K, BucketCount, Layout>(
                 stager, paths, handed_back, base, workers
             );
         },
-        sink
+        sink,
+        hybrid
     )));
-    if (statistics != nullptr) statistics->workers = static_cast<unsigned>(workers);
+    if (statistics != nullptr) {
+        statistics->workers = static_cast<unsigned>(workers);
+        statistics->in_place = hybrid;
+    }
     return Ok();
 }
 
@@ -1010,7 +1054,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         );
     }
     if (paths.empty()) return Ok();
-    if (transfer == transfer_mode::automatic && !device_reads_pageable_memory(stream.device())) {
+    if (transfer == transfer_mode::automatic &&
+        (!device_reads_pageable_memory(stream.device()) ||
+         path_loaders::worker_count(paths.size(), parser_workers) > 1)) {
         return stage_paths_inflating<K, BucketCount, Layout>(
             paths, stream, staging_bytes, parser_workers, statistics, std::forward<Sink>(sink)
         );
