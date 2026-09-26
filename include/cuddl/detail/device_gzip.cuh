@@ -125,7 +125,7 @@ crc_combine(uint32_t first, uint32_t second, uint64_t second_bytes, uint32_t con
 }
 
 /// @brief Writes each slot's guard line ending and clears its first header.
-__global__ void slot_init_kernel(
+static __global__ void slot_init_kernel(
     char* buffer,
     uint64_t const* slots,
     uint32_t files,
@@ -143,7 +143,7 @@ __global__ void slot_init_kernel(
 ///
 /// Each thread checksums a contiguous chunk with slice-by-4 tables, and the chunks fold together
 /// in order with crc_combine.
-__global__ void slot_crc_kernel(char const* buffer, uint64_t const* slots, uint32_t* crcs) {
+static __global__ void slot_crc_kernel(char const* buffer, uint64_t const* slots, uint32_t* crcs) {
     __shared__ uint32_t table[4][256];
     __shared__ uint32_t x2n[32];
     __shared__ uint32_t crc[block_size];
@@ -203,7 +203,7 @@ __global__ void slot_crc_kernel(char const* buffer, uint64_t const* slots, uint3
 
 /// @brief Collects every '>' that starts a line: one past a line ending, which every slot's
 /// guard byte provides for its first line.
-__global__ void header_kernel(
+static __global__ void header_kernel(
     char const* buffer,
     uint64_t size,
     uint64_t* headers,
@@ -233,7 +233,7 @@ __global__ void header_kernel(
 
 /// @brief Blanks each header's text to line endings, keeping its '>' between records, and
 /// records each file's first header. One warp per header.
-__global__ void blank_header_kernel(
+static __global__ void blank_header_kernel(
     char* buffer,
     uint64_t const* headers,
     unsigned long long const* count,
@@ -272,7 +272,7 @@ __global__ void blank_header_kernel(
 
 /// @brief Per file: the first byte that is not a line ending, the bytes before the first header
 /// blanked, and the count of bytes compaction keeps. One block per file.
-__global__ void slot_finish_kernel(
+static __global__ void slot_finish_kernel(
     char* buffer,
     uint64_t const* slots,
     unsigned long long const* first_header,
