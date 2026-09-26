@@ -169,104 +169,6 @@ static const fastx_line_end_fn line_end = resolve_fastx_line_end();
     return line_end(data, position);
 }
 
-/**
- * @brief Collects the sequence extents of every FASTA record in @p data.
- *
- * Each extent spans from the byte after a `>` header line to the byte before the next `>`
- * header line (or the end of the buffer), header bytes excluded. Search directly for header
- * markers with string_view::find; only header lines need a line-end scan. Bytes outside extents are
- * not part of any extent.
- */
-[[nodiscard]] inline std::vector<fastx_sequence_extent> fastx_fasta_extents(std::string_view data) {
-    std::vector<fastx_sequence_extent> extents;
-    size_t sequence = std::string_view::npos;
-    size_t header = data.find('>');
-    while (header != std::string_view::npos) {
-        if (header != 0 && data[header - 1] != '\n' && data[header - 1] != '\r') {
-            header = data.find('>', header + 1);
-            continue;
-        }
-        if (sequence != std::string_view::npos && header > sequence) {
-            extents.push_back({data.data() + sequence, data.data() + header});
-        }
-        auto const end = fastx_line_end(data, header);
-        sequence = end < data.size() ? end + 1 : data.size();
-        header = data.find('>', sequence);
-    }
-    if (sequence != std::string_view::npos && sequence < data.size()) {
-        extents.push_back({data.data() + sequence, data.data() + data.size()});
-    }
-    return extents;
-}
-
-/// @brief Collects every '>' offset in data[begin, end): phase one of the parallel FASTA scan.
-inline void gather_header_candidates(
-    std::string_view data,
-    size_t begin,
-    size_t end,
-    std::vector<size_t>& out
-) {
-    auto const segment = data.substr(begin, end - begin);
-    size_t pos = 0;
-    while (true) {
-        auto const found = segment.find('>', pos);
-        if (found == std::string_view::npos) return;
-        out.push_back(begin + found);
-        pos = found + 1;
-    }
-}
-
-/// @brief Serial header walk over ascending '>' candidates, matching fastx_fasta_extents.
-inline std::vector<fastx_sequence_extent>
-walk_header_candidates(std::string_view data, std::vector<size_t> const& candidates) {
-    std::vector<fastx_sequence_extent> extents;
-    size_t sequence = std::string_view::npos;
-    size_t cursor = 0;
-    for (auto const header : candidates) {
-        if (header < cursor) continue;
-        if (header != 0 && data[header - 1] != '\n' && data[header - 1] != '\r') {
-            cursor = header + 1;
-            continue;
-        }
-        if (sequence != std::string_view::npos && header > sequence) {
-            extents.push_back({data.data() + sequence, data.data() + header});
-        }
-        auto const end = fastx_line_end(data, header);
-        sequence = end < data.size() ? end + 1 : data.size();
-        cursor = sequence;
-    }
-    if (sequence != std::string_view::npos && sequence < data.size()) {
-        extents.push_back({data.data() + sequence, data.data() + data.size()});
-    }
-    return extents;
-}
-
-/// @brief Parallel fastx_fasta_extents for large inputs; serial scan for small ones.
-inline std::vector<fastx_sequence_extent> parallel_fastx_fasta_extents(std::string_view data) {
-    auto const hardware = std::max(1U, std::thread::hardware_concurrency());
-    auto const shards =
-        std::min<size_t>(std::min<unsigned>(hardware, 8U), data.size() / (size_t{64} << 20) + 1);
-    if (shards <= 1) return fastx_fasta_extents(data);
-    std::vector<std::vector<size_t>> gathered(shards);
-    std::vector<std::thread> workers;
-    workers.reserve(shards - 1);
-    auto const span = (data.size() + shards - 1) / shards;
-    for (size_t shard = 1; shard < shards; ++shard) {
-        workers.emplace_back([&, shard] {
-            auto const begin = std::min(shard * span, data.size());
-            gather_header_candidates(
-                data, begin, std::min(begin + span, data.size()), gathered[shard]
-            );
-        });
-    }
-    gather_header_candidates(data, 0, std::min(span, data.size()), gathered[0]);
-    for (auto& worker : workers) worker.join();
-    std::vector<size_t> candidates;
-    for (auto const& shard : gathered)
-        candidates.insert(candidates.end(), shard.begin(), shard.end());
-    return walk_header_candidates(data, candidates);
-}
-
 /// @brief Read-only contiguous file payload for in-memory FASTX parsing.
 ///
 /// Plain files stay memory-mapped on Linux, so FASTA extents reference the mapping with no
@@ -832,13 +734,44 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
-/// @brief The same compaction two halves at a time over 32 bytes.
+/// @brief Writes the bytes of @p block whose @p flags bit is clear to @p out, two halves at a time.
 ///
 /// Measured level with the sixteen byte path on a desktop whose store bandwidth saturates first,
 /// and ahead of it where the machine has the width to spend.
 __attribute__((target("avx2"))) inline char*
-compact_sequence_whitespace_avx2(char const* first, char const* last, char* out) {
+compact_block_avx2(__m256i block, unsigned flags, char* out) {
     auto const& table = compact_impl::compact_shuffle();
+    auto const low_first = flags & 0xFFU;
+    auto const low_second = (flags >> 8U) & 0xFFU;
+    auto const high_first = (flags >> 16U) & 0xFFU;
+    auto const high_second = (flags >> 24U) & 0xFFU;
+    auto const control_first = _mm256_set_m128i(
+        _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_first])),
+        _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_first]))
+    );
+    auto const control_second = _mm256_set_m128i(
+        _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_second])),
+        _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_second]))
+    );
+    auto const packed_first = _mm256_shuffle_epi8(block, control_first);
+    auto const packed_second = _mm256_shuffle_epi8(_mm256_bsrli_epi128(block, 8), control_second);
+    // A lane holds the kept bytes of two halves, which are eight bytes apart in the vector and
+    // adjacent in the output. The halves leave the vector in the order 0-7, 16-23, 8-15, 24-31,
+    // and the output wants them in byte order, so each half is stored where its own count puts it.
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_first));
+    out += table.kept[low_first];
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_second));
+    out += table.kept[low_second];
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_first, 1));
+    out += table.kept[high_first];
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_second, 1));
+    out += table.kept[high_second];
+    return out;
+}
+
+/// @brief The same compaction 32 bytes at a time.
+__attribute__((target("avx2"))) inline char*
+compact_sequence_whitespace_avx2(char const* first, char const* last, char* out) {
     auto const newline = _mm256_set1_epi8('\n');
     auto const carriage = _mm256_set1_epi8('\r');
     auto const space = _mm256_set1_epi8(' ');
@@ -850,38 +783,8 @@ compact_sequence_whitespace_avx2(char const* first, char const* last, char* out)
             _mm256_or_si256(_mm256_cmpeq_epi8(block, newline), _mm256_cmpeq_epi8(block, carriage)),
             _mm256_or_si256(_mm256_cmpeq_epi8(block, space), _mm256_cmpeq_epi8(block, tab))
         );
-        auto const flags = static_cast<unsigned>(_mm256_movemask_epi8(whitespace));
-        auto const low_first = flags & 0xFFU;
-        auto const low_second = (flags >> 8U) & 0xFFU;
-        auto const high_first = (flags >> 16U) & 0xFFU;
-        auto const high_second = (flags >> 24U) & 0xFFU;
-        auto const control_first = _mm256_set_m128i(
-            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_first])),
-            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_first]))
-        );
-        auto const control_second = _mm256_set_m128i(
-            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[high_second])),
-            _mm_load_si128(reinterpret_cast<__m128i const*>(table.control[low_second]))
-        );
-        auto const packed_first = _mm256_shuffle_epi8(block, control_first);
-        auto const packed_second =
-            _mm256_shuffle_epi8(_mm256_bsrli_epi128(block, 8), control_second);
-        // A lane holds the kept bytes of two halves, which are eight bytes apart in the vector and
-        // adjacent in the output, so each half is stored where its own count puts it.
-        // The halves leave the vector in the order 0-7, 16-23, 8-15, 24-31, and the output wants
-        // them in byte order, so each half is stored where its own count puts it.
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_first));
-        out += table.kept[low_first];
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out), _mm256_castsi256_si128(packed_second));
-        out += table.kept[low_second];
-        _mm_storel_epi64(
-            reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_first, 1)
-        );
-        out += table.kept[high_first];
-        _mm_storel_epi64(
-            reinterpret_cast<__m128i*>(out), _mm256_extracti128_si256(packed_second, 1)
-        );
-        out += table.kept[high_second];
+        out =
+            compact_block_avx2(block, static_cast<unsigned>(_mm256_movemask_epi8(whitespace)), out);
         at += 32;
     }
     for (; at != last; ++at) {
@@ -934,6 +837,107 @@ inline char* compact_sequence_whitespace(char const* first, char const* last, ch
         if (!fastx_is_sequence_whitespace(*at)) *out++ = *at;
     }
     return out;
+}
+
+/// @brief First '>' in [@p first, @p last) that starts a line, or @p last.
+///
+/// The byte before @p first must be a line ending.
+[[nodiscard]] inline char const* fasta_next_header(char const* first, char const* last) {
+    for (auto const* at = first; at != last; ++at) {
+        at = static_cast<char const*>(std::memchr(at, '>', static_cast<size_t>(last - at)));
+        if (at == nullptr) return last;
+        if (at == first || at[-1] == '\n' || at[-1] == '\r') return at;
+    }
+    return last;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+/// @brief fasta_sequence_compact in one AVX2 pass: the header test rides on the whitespace test.
+__attribute__((target("avx2"))) inline char*
+fasta_sequence_compact_avx2(char const* first, char const* last, char* out, char const*& stop) {
+    auto const newline = _mm256_set1_epi8('\n');
+    auto const carriage = _mm256_set1_epi8('\r');
+    auto const space = _mm256_set1_epi8(' ');
+    auto const tab = _mm256_set1_epi8('\t');
+    auto const marker = _mm256_set1_epi8('>');
+    // Bit set when the byte before the block ends a line; @p first follows a line ending.
+    unsigned carry = 1;
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 32) {
+        auto const block = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(at));
+        auto const line_end =
+            _mm256_or_si256(_mm256_cmpeq_epi8(block, newline), _mm256_cmpeq_epi8(block, carriage));
+        auto const ends = static_cast<unsigned>(_mm256_movemask_epi8(line_end));
+        auto const markers =
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block, marker)));
+        auto const headers = markers & ((ends << 1U) | carry);
+        if (headers != 0) {
+            stop = at + std::countr_zero(headers);
+            return compact_sequence_whitespace(at, stop, out);
+        }
+        carry = ends >> 31U;
+        auto const whitespace = _mm256_or_si256(
+            line_end,
+            _mm256_or_si256(_mm256_cmpeq_epi8(block, space), _mm256_cmpeq_epi8(block, tab))
+        );
+        out =
+            compact_block_avx2(block, static_cast<unsigned>(_mm256_movemask_epi8(whitespace)), out);
+        at += 32;
+    }
+    bool line_start = carry != 0;
+    for (; at != last; ++at) {
+        char const ch = *at;
+        if (ch == '>' && line_start) break;
+        line_start = ch == '\n' || ch == '\r';
+        if (!fastx_is_sequence_whitespace(ch)) *out++ = ch;
+    }
+    stop = at;
+    return out;
+}
+#endif
+
+/// @brief Compacts one FASTA record's sequence from @p first to @p out, stopping at the next
+/// header.
+///
+/// The byte before @p first must be a line ending, and @p out may alias @p first. @p stop receives
+/// the next line-start '>' or @p last.
+/// @return The end of the written span.
+inline char*
+fasta_sequence_compact(char const* first, char const* last, char* out, char const*& stop) {
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) return fasta_sequence_compact_avx2(first, last, out, stop);
+#endif
+    stop = fasta_next_header(first, last);
+    return compact_sequence_whitespace(first, stop, out);
+}
+
+/// @brief Collects FASTA sequence extents with whitespace compacted out, in one pass over @p data.
+///
+/// An extent spans the bases between one line-start '>' header line and the next header (or the
+/// end of @p data); bytes before the first header belong to no extent. Bases of consecutive
+/// records are packed back to back from @p out, which may alias @p data.
+[[nodiscard]] inline std::vector<fastx_sequence_extent>
+fastx_fasta_compact_extents(std::string_view data, char* out) {
+    std::vector<fastx_sequence_extent> extents;
+    size_t header = data.find('>');
+    while (header != std::string_view::npos && header != 0 && data[header - 1] != '\n' &&
+           data[header - 1] != '\r') {
+        header = data.find('>', header + 1);
+    }
+    if (header == std::string_view::npos) return extents;
+    auto const* const last = data.data() + data.size();
+    while (true) {
+        auto const end = fastx_line_end(data, header);
+        if (end + 1 >= data.size()) break;
+        auto const* const sequence = data.data() + end + 1;
+        char const* stop = nullptr;
+        auto* const begin = out;
+        out = fasta_sequence_compact(sequence, last, out, stop);
+        if (stop != sequence) extents.push_back({begin, out});
+        if (stop == last) break;
+        header = static_cast<size_t>(stop - data.data());
+    }
+    return extents;
 }
 
 /// @brief Compacts sequence whitespace in place, leaving every extent a run of bases.
@@ -1060,16 +1064,22 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
         for (auto const& [begin, end] : records) {
             extents.push_back({sequence.data() + begin, sequence.data() + end});
         }
-    } else {
-        extents = parallel_fastx_fasta_extents(data);
-    }
-    if (extents.empty()) {
-        if (data.size() > 0) {
-            return Err(Error::invalid_argument("FASTX parse error near: " + path));
-        }
+        compact_fastx_sequence_extents(*result);
         return result;
     }
-    compact_fastx_sequence_extents(*result);
+    // Decompressed bytes are compacted in place; a memory-mapped plain file is read-only, so its
+    // bases go to `decompressed`, which is sized once so no pointer into it moves.
+    char* out = result->decompressed_target;
+    if (out == nullptr) {
+        if (data.data() != result->decompressed.data()) {
+            result->decompressed.resize(data.size());
+        }
+        out = result->decompressed.data();
+    }
+    extents = fastx_fasta_compact_extents(data, out);
+    if (extents.empty() && data.size() > 0) {
+        return Err(Error::invalid_argument("FASTX parse error near: " + path));
+    }
     return result;
 }
 
