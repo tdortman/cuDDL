@@ -23,6 +23,7 @@
 #include <cuda/memory_pool>
 #include <cuda/stream>
 
+#include <cuddl/detail/device_gzip.cuh>
 #include <cuddl/detail/fastx_sequence_file.hpp>
 #include <cuddl/detail/kernels.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
@@ -33,8 +34,8 @@ namespace cuddl::detail {
 
 /// @brief How a build gets its sequence bytes to the device.
 enum class transfer_mode {
-    /// Page-locked buffers where the host writes them well, in-place staging where the device
-    /// reads pageable memory itself, and a staging copy everywhere else.
+    /// GPU gzip inflation on discrete devices, host loading on coherent devices.
+    /// Other input formats use the host loader.
     automatic,
     /// Decompress into page-locked buffers, which the transfer engine reads directly. Measured
     /// 2.1x faster than staging on an x86 host with a discrete GPU, and slower on a coherent
@@ -94,6 +95,20 @@ struct staging_plan {
 /// build from 239 to 194 ms, and it cost nothing on a 24-thread RTX 5070 Ti host.
 inline constexpr size_t default_arena_ceiling = size_t{128} << 20;
 
+/// @brief Device bytes an allocation on @p stream can still get.
+///
+/// Storage the default pool caches from earlier allocations is reused by the next one, so it
+/// counts as available alongside what the device reports free.
+[[nodiscard]] inline Result<size_t> available_device_bytes(cuda::stream_ref stream) {
+    size_t free_bytes = 0, device_bytes = 0;
+    CUDDL_CUDA_TRY(cudaMemGetInfo(&free_bytes, &device_bytes));
+    auto const& device_pool = cuda::device_default_memory_pool(stream.device());
+    auto const pool_reserved =
+        device_pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
+    auto const pool_used = device_pool.attribute(cuda::memory_pool_attributes::used_mem_current);
+    return free_bytes + pool_reserved - std::min(pool_reserved, pool_used);
+}
+
 /// @brief Sizes the arena and the row store from free device memory and the corpus.
 ///
 /// @p staged_ceiling bounds the bytes the corpus can stage, which keeps a small collection from
@@ -106,14 +121,7 @@ template <uint32_t K, size_t BucketCount>
     std::optional<size_t> staging_bytes,
     cuda::stream_ref stream
 ) {
-    size_t free_bytes = 0, device_bytes = 0;
-    CUDDL_CUDA_TRY(cudaMemGetInfo(&free_bytes, &device_bytes));
-    auto const& device_pool = cuda::device_default_memory_pool(stream.device());
-    auto const pool_reserved =
-        device_pool.attribute(cuda::memory_pool_attributes::reserved_mem_current);
-    auto const pool_used = device_pool.attribute(cuda::memory_pool_attributes::used_mem_current);
-    // Cached pool storage is reused by the next allocation, so it counts as available.
-    size_t const available = free_bytes + pool_reserved - std::min(pool_reserved, pool_used);
+    size_t const available = CUDDL_TRY(available_device_bytes(stream));
     size_t const usable = available - available / 10;
     // (BucketCount + 1) words hold one genome's registers plus its saturation flag.
     size_t const row_bytes = (BucketCount + 1) * sizeof(uint32_t);
@@ -147,7 +155,7 @@ template <uint32_t K, size_t BucketCount>
         return Err(
             Error::resource(
                 "insufficient free device memory for reference staging (free " +
-                std::to_string(free_bytes >> 20) + " MiB)"
+                std::to_string(available >> 20) + " MiB)"
             )
         );
     }
@@ -368,6 +376,17 @@ class database_stager {
         return Ok();
     }
 
+    /// @brief Stages one genome's bases that already sit on the device, without a copy.
+    ///
+    /// The bytes must stay valid until the batch that reads them runs: through the next
+    /// @ref flush, whose kernel the caller then orders its reuse of them after.
+    [[nodiscard]] Result<void> add_resident(size_t genome, char const* bases, size_t size) {
+        if (size < K) return Ok();
+        if (staged_chunks_.size() >= bounds_.max_pieces) CUDDL_TRY(flush());
+        describe(bases, static_cast<uint32_t>(size - K + 1), genome);
+        return Ok();
+    }
+
     /// @brief Clears the register rows of the next group of genomes.
     [[nodiscard]] Result<void> begin_group(size_t genomes) {
         auto const resident = CUDDL_TRY(begin_resident());
@@ -478,6 +497,7 @@ class database_stager {
         return Ok();
     }
 
+   public:
     /// @brief One launch for everything staged so far.
     ///
     /// Copies queued after it land in the arena only once the device has finished reading it, so
@@ -529,6 +549,7 @@ class database_stager {
         return Ok();
     }
 
+   private:
     /// @brief Keeps one genome's bytes until the device has finished reading them.
     ///
     /// A copy is read by the transfer engine before the enqueue returns, so a ring of slots that
@@ -776,7 +797,6 @@ class path_loaders {
         pool_.reset();
     }
 
-   private:
     /// @brief Loaders to run: at most one per input, at most the requested workers, at most the
     /// hardware, and never none.
     static size_t worker_count(size_t paths, unsigned parser_workers) noexcept {
@@ -785,6 +805,7 @@ class path_loaders {
         return std::max<size_t>(1, std::min(paths, loaders));
     }
 
+   private:
     size_t workers_ = 1;
     sequence_buffer_pool buffers_;
     bool page_locked_ = false;
@@ -829,6 +850,137 @@ template <
     return stager.finish();
 }
 
+/// @brief Loads @p ids through host loaders and stages them, genome numbers relative to @p base.
+/// Starts at most one loader per input file.
+template <uint32_t K, size_t BucketCount, typename Layout>
+[[nodiscard]] Result<void> stage_host_loaded(
+    database_stager<K, BucketCount, Layout>& stager,
+    std::span<std::filesystem::path const> paths,
+    std::span<size_t const> ids,
+    size_t base,
+    size_t workers
+) {
+    if (ids.empty()) return Ok();
+    workers = std::min(workers, ids.size());
+    std::vector<std::filesystem::path> subset;
+    subset.reserve(ids.size());
+    for (auto const id : ids) subset.push_back(paths[id]);
+    fastx_load_pool pool(subset, workers, {}, workers * 4);
+    for (size_t index = 0; index < ids.size(); ++index) {
+        auto sequence = CUDDL_TRY(pool.take(index));
+        auto const& extents = sequence->extents;
+        CUDDL_TRY(stager.add_genome(ids[index] - base, extents, nullptr, 0, std::move(sequence)));
+    }
+    return Ok();
+}
+
+/// @brief @ref stage_paths with gzip FASTA inflated and compacted on the device.
+///
+/// The host only reads compressed bytes for the files the device takes. Everything else, and any
+/// file the device hands back, loads through host loaders exactly as the host path would load it,
+/// so results and errors match it.
+template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
+[[nodiscard]] Result<void> stage_paths_inflating(
+    std::span<std::filesystem::path const> paths,
+    cuda::stream_ref stream,
+    std::optional<size_t> staging_bytes,
+    unsigned parser_workers,
+    reference_build_statistics* statistics,
+    Sink&& sink
+) {
+    auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
+    std::vector<gzip_file_probe> probes(paths.size());
+    parallel_for(paths.size(), workers, [&](size_t id) {
+        probes[id] = probe_gzip_file(paths[id]);
+    });
+    std::optional<device_gzip_inflater> inflater;
+    auto const fits = [&](gzip_file_probe const& probe) {
+        return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
+               probe.compressed <= inflater->compressed_capacity();
+    };
+    // Sized once the stager holds its rows and arena, from what is left and what the inputs need.
+    auto const make_inflater = [&]() -> Result<void> {
+        size_t slots = 0, compressed = 0;
+        for (auto const& probe : probes) {
+            if (!probe.device) continue;
+            slots += probe.isize + size_t{1};
+            compressed += probe.compressed;
+        }
+        auto const available = CUDDL_TRY(available_device_bytes(stream));
+        auto const per_lane = (available - available / 5) / device_gzip_inflater::lane_count;
+        auto const overhead = device_gzip_inflater::lane_overhead(per_lane);
+        auto const usable = per_lane > overhead ? per_lane - overhead : 0;
+        auto const compressed_capacity =
+            slots + compressed == 0
+                ? size_t{0}
+                : std::min(
+                      compressed,
+                      static_cast<size_t>(
+                          static_cast<long double>(usable) * compressed / (slots + compressed)
+                      )
+                  );
+        auto const room = per_lane > compressed_capacity + overhead
+                              ? per_lane - compressed_capacity - overhead
+                              : 0;
+        return cuda_try([&] {
+            inflater.emplace(stream, std::min(room, slots), compressed_capacity, workers);
+        });
+    };
+    CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
+        paths.size(),
+        default_arena_ceiling,
+        staging_bytes,
+        stream,
+        statistics,
+        [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
+            -> Result<void> {
+            if (!inflater) CUDDL_TRY(make_inflater());
+            std::vector<size_t> device_ids, host_ids, handed_back;
+            for (size_t id = base; id < base + count; ++id) {
+                (fits(probes[id]) ? device_ids : host_ids).push_back(id);
+            }
+            std::vector<inflated_genome> genomes;
+            std::array<bool, device_gzip_inflater::lane_count> busy{};
+            size_t next = 0, lane = 0;
+            // Cycle through lanes, submitting a batch before consuming the oldest one.
+            while (next < device_ids.size() ||
+                   std::ranges::any_of(busy, [](bool value) { return value; })) {
+                if (next < device_ids.size() && !busy[lane]) {
+                    next += CUDDL_TRY(
+                        inflater->submit(lane, std::span{device_ids}.subspan(next), paths, probes)
+                    );
+                    busy[lane] = true;
+                }
+                CUDDL_TRY((stage_host_loaded<K, BucketCount, Layout>(
+                    stager, paths, handed_back, base, workers
+                )));
+                handed_back.clear();
+                auto const other = (lane + 1) % busy.size();
+                if (busy[other]) {
+                    genomes.clear();
+                    CUDDL_TRY(inflater->finish(other, probes, genomes, handed_back));
+                    for (auto const& genome : genomes) {
+                        CUDDL_TRY(stager.add_resident(genome.id - base, genome.bases, genome.size));
+                    }
+                    CUDDL_TRY(stager.flush());
+                    CUDDL_TRY(inflater->release(other, stream));
+                    busy[other] = false;
+                }
+                lane = other;
+            }
+            CUDDL_TRY(
+                (stage_host_loaded<K, BucketCount, Layout>(stager, paths, host_ids, base, workers))
+            );
+            return stage_host_loaded<K, BucketCount, Layout>(
+                stager, paths, handed_back, base, workers
+            );
+        },
+        sink
+    )));
+    if (statistics != nullptr) statistics->workers = static_cast<unsigned>(workers);
+    return Ok();
+}
+
 /// @brief Stages a path collection, handing each group's device rows to @p sink.
 ///
 /// @p parser_workers is a value, not a sentinel: the build clamps it to what the inputs and the
@@ -858,6 +1010,11 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         );
     }
     if (paths.empty()) return Ok();
+    if (transfer == transfer_mode::automatic && !device_reads_pageable_memory(stream.device())) {
+        return stage_paths_inflating<K, BucketCount, Layout>(
+            paths, stream, staging_bytes, parser_workers, statistics, std::forward<Sink>(sink)
+        );
+    }
     auto const in_place = stages_in_place(transfer, stream.device());
     auto const page_locked = pages_locked(transfer, stream.device());
     path_loaders loaders(stream, paths, parser_workers, page_locked);

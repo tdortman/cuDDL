@@ -26,9 +26,12 @@ cuda_args = [
 cccl_dep = subproject('cccl').get_variable('cccl_dep')
 libdeflate_dep = subproject('libdeflate').get_variable('libdeflate_dep')
 
+# nvCOMP inflates gzip references on the device.
+nvcomp_dep = meson.get_compiler('cuda').find_library('nvcomp')
+
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
-    dependencies: [cccl_dep, libdeflate_dep],
+    dependencies: [cccl_dep, libdeflate_dep, nvcomp_dep],
 )
 
 build_examples = (

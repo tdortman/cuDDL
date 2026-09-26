@@ -29,6 +29,7 @@ Each input file represents one genome, including all of its sequence records. Re
 
 - Linux and an NVIDIA GPU with a compatible driver.
 - A CUDA toolkit and host compiler with C++20 support. The supplied Nix environment uses CUDA 13.3.
+- nvCOMP 5, which the build links to inflate gzip genomes on the GPU.
 - Meson 1.3 or newer, Ninja, and Git.
 
 The default build targets `sm_80`, `sm_90`, and `sm_120`. Your toolkit must recognize all three targets. For a different GPU target, adjust `cuda_arch_args` in [meson.build](meson.build) before configuring.
@@ -78,7 +79,9 @@ The following commands assume reference genomes are under `genomes/references/` 
 The builder searches the folder recursively and sorts file paths to assign reference IDs. Keep that ordered input list if you need to map result IDs back to filenames.
 
 Supported input extensions are `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, case-insensitively. Gzip and BGZF files may add `.gz`, `.bgz`, or `.bgzf`.
-Gzip loading checks member structure, DEFLATE decoding, and uncompressed lengths, but skips CRC32 verification to avoid another pass over decompressed data. Check input integrity separately when needed; checksum validation for saved databases and indexes is unchanged.
+Files containing additional gzip member signatures use the host parser, even when the first and last member trailers match.
+Fallback parsing runs between GPU batch submissions so it can overlap queued device work.
+With the default `automatic` transfer, discrete GPUs inflate single-member gzip FASTA files and check each one's length and CRC32 against its trailer. Concurrent batches overlap file reads, inflation and sketch construction. Input sizes determine the split between compressed and decompressed GPU buffers within the available memory budget. Coherent-memory GPUs such as GH200 use CPU loading into pageable memory, avoiding the slower page-locked input buffers. The host loader also takes other formats and any file the GPU cannot verify. It checks member structure, DEFLATE decoding and uncompressed lengths, but skips CRC32. Check input integrity separately when that matters. Saved databases and indexes are always checksummed.
 
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |

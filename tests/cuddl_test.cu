@@ -4078,6 +4078,97 @@ TEST(FastaTest, GzipMembersValidateStructureAndLengthWithoutPayloadCrc) {
     EXPECT_FALSE(parse(oversized_extra).has_value());
 }
 
+TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
+    // The default transfer inflates gzip FASTA on the device where the build supports it, and
+    // hands a file back to the host loader whenever it cannot vouch for it. Either way the
+    // database must equal the one the host loader builds.
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    auto bases = [](size_t count, uint64_t seed) {
+        std::string out;
+        for (size_t i = 0; i < count; ++i) {
+            out.push_back("ACGT"[cuddl::detail::splitmix64(seed + i) & 3U]);
+            if (i % 60 == 59) out.push_back('\n');
+        }
+        return out + "\n";
+    };
+    auto read_bytes = [](std::string const& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>{input}, {}};
+    };
+    auto write_bytes = [](std::string const& path, std::string const& bytes) {
+        std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+        return path;
+    };
+    // Two members of equal inflated length: the trailer's ISIZE matches the first member alone.
+    auto const first_member = read_bytes(write_tmp_gzip(">m\n" + bases(1000, 7)));
+    auto const second_member = read_bytes(write_tmp_gzip(">m\n" + bases(1000, 1 << 20)));
+    auto extra_field = read_bytes(write_tmp_gzip(">x\n" + bases(500, 9)));
+    extra_field[3] = 4;
+    extra_field.insert(
+        10,
+        std::string{
+            "\x04\x00"
+            "BC\x00\x00",
+            6
+        }
+    );
+    std::vector<std::filesystem::path> const paths{
+        write_tmp_gzip(
+            "\n\njunk before any header\n>a desc\n" + bases(3000, 1) +
+            ">b\r\nacgtAC>GTacgt\tACGT \r\nACGTACGTACGTACGTACGTACGTACGT\n>empty\n>c\nACGTACGTAC"
+        ),
+        write_tmp_gzip(">only\n" + bases(700, 2) + ">header at end without newline"),
+        write_bytes("/tmp/cuddl_gzip_test_members.fa.gz", first_member + second_member),
+        write_bytes(
+            "/tmp/cuddl_gzip_test_repeated_trailer.fa.gz",
+            first_member + second_member + first_member
+        ),
+        write_tmp_gzip("@q\n" + std::string(80, 'A') + "\n+\n" + std::string(80, 'I') + "\n"),
+        write_bytes("/tmp/cuddl_gzip_test_extra.fa.gz", extra_field),
+        write_tmp_gzip(">z\n" + bases(5000, 3)),
+    };
+    auto const device = cuddl::reference_database_file::build<25, buckets>(paths, stream);
+    auto const host = cuddl::reference_database_file::build<25, buckets>(
+        paths, stream, {.transfer = cuddl::transfer_mode::staged}
+    );
+    ASSERT_TRUE(device) << device.error().message();
+    ASSERT_TRUE(host) << host.error().message();
+    ASSERT_EQ(device->rows().size(), host->rows().size());
+    for (size_t genome = 0; genome < paths.size(); ++genome) {
+        EXPECT_TRUE(
+            std::equal(
+                host->rows().begin() + genome * buckets,
+                host->rows().begin() + (genome + 1) * buckets,
+                device->rows().begin() + genome * buckets
+            )
+        ) << "genome="
+          << genome;
+    }
+
+    auto const fallback_only = cuddl::reference_database_file::build<25, buckets>(
+        std::vector<std::filesystem::path>{paths[2], paths[3]}, stream
+    );
+    ASSERT_TRUE(fallback_only) << fallback_only.error().message();
+    EXPECT_TRUE(
+        std::equal(
+            host->rows().begin() + 2 * buckets,
+            host->rows().begin() + 4 * buckets,
+            fallback_only->rows().begin(),
+            fallback_only->rows().end()
+        )
+    );
+
+    // A file the host loader rejects fails the build the same way.
+    auto const headerless = write_tmp_gzip("ACGTACGTACGTACGTACGTACGTACGTACGT\n");
+    auto const rejected = cuddl::reference_database_file::build<25, buckets>(
+        std::vector<std::filesystem::path>{headerless}, stream
+    );
+    EXPECT_FALSE(rejected);
+    std::filesystem::remove(headerless);
+    for (auto const& path : paths) std::filesystem::remove(path);
+}
+
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {
     auto const path = write_tmp_fasta("");
     auto const res = cuddl::parse_fasta_file(path, 3);
