@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <span>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -124,7 +125,7 @@ class ReferenceDatabaseTest : public ::testing::Test {
 };
 
 cuddl::pairwise_counts score_row_oracle(
-    std::vector<uint16_t> const& query,
+    std::span<uint16_t const> query,
     std::vector<uint16_t> const& rows,
     size_t reference_id
 ) {
@@ -1431,14 +1432,14 @@ TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
-    constexpr uint32_t minimum_matches = 390U;
+    constexpr uint32_t minimum_matches = 8U;
     for (auto [reference_count, query_count] : {std::pair{20000U, 7U}, std::pair{300U, 600U}}) {
         SCOPED_TRACE(reference_count);
-        // Few distinct scores per bucket, so keys are shared by many references and the
-        // match counts straddle the threshold.
+        // Sparse enough to use index counting rather than the plane-scan fallback, with
+        // match counts straddling the threshold.
         std::mt19937 random(reference_count);
         std::vector<uint16_t> scores(static_cast<size_t>(reference_count) * b_default);
-        for (auto& score : scores) score = static_cast<uint16_t>(random() % 4U);
+        for (auto& score : scores) score = static_cast<uint16_t>(random() % 256U);
         std::vector<uint16_t> queries(static_cast<size_t>(query_count) * b_default);
         for (uint32_t query = 0; query < query_count; ++query) {
             auto const source = (query * 7919U) % reference_count;
@@ -1495,6 +1496,125 @@ TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
             EXPECT_EQ(indexed, expected);
             EXPECT_EQ(indexed_matches, expected_matches);
         }
+    }
+}
+
+TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    constexpr uint32_t references = 8193U;
+    constexpr uint32_t query_count = 3U;
+    auto compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    compatibility.key_mask = 0x7fffU;
+    std::vector<uint16_t> rows(static_cast<size_t>(references) * b_default);
+    for (uint32_t reference = 0U; reference < references; ++reference) {
+        for (size_t bucket = 0U; bucket < b_default; ++bucket) {
+            auto& score = rows[static_cast<size_t>(reference) * b_default + bucket];
+            if (bucket == 0U) {
+                score = 0x8000U;
+            } else if (bucket < 16U) {
+                score = static_cast<uint16_t>(42U + ((reference + bucket) % 5U == 0U));
+            } else {
+                score = static_cast<uint16_t>(17U + ((reference * 79U + bucket * 31U) & 0x7fffU));
+            }
+        }
+    }
+    std::vector<uint16_t> queries(query_count * b_default);
+    constexpr std::array<uint32_t, query_count> ids{0U, 4U, references - 1U};
+    for (uint32_t q = 0U; q < query_count; ++q) {
+        std::copy_n(
+            rows.begin() + static_cast<size_t>(ids[q]) * b_default,
+            b_default,
+            queries.begin() + static_cast<size_t>(q) * b_default
+        );
+    }
+    queries[b_default] = 0U;
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), queries);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto index = CUDDL_UNWRAP(index_type::build_async(database, stream));
+    auto requirements =
+        CUDDL_UNWRAP(database.batch_search_requirements(query_count, stream, &index));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    auto matches = cuda::make_device_buffer<uint32_t>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    std::vector<cuddl::batch_search_result> oracle;
+    std::vector<uint32_t> oracle_matches;
+    for (uint32_t q = 0U; q < query_count; ++q) {
+        auto query = std::span<uint16_t const>{queries}.subspan(
+            static_cast<size_t>(q) * b_default, b_default
+        );
+        for (uint32_t reference = 0U; reference < references; ++reference) {
+            uint32_t count = 0U;
+            for (size_t bucket = 0U; bucket < compatibility.indexed_bucket_count; ++bucket) {
+                auto score = rows[static_cast<size_t>(reference) * b_default + bucket];
+                count +=
+                    query[bucket] != 0U && score != 0U &&
+                    (query[bucket] & compatibility.key_mask) == (score & compatibility.key_mask);
+            }
+            oracle.push_back({q, reference, score_row_oracle(query, rows, reference)});
+            oracle_matches.push_back(count);
+        }
+    }
+    for (uint32_t minimum :
+         {0U, 1U, 5U, 8U, 10U, 11U, 15U, 16U, 17U, 31U, 32U, 255U, 256U, 2048U}) {
+        SCOPED_TRACE(minimum);
+        tile_collector actual{stream};
+        CUDDL_UNWRAP(database.search_batch_async(
+            device_queries,
+            compatibility,
+            0U,
+            workspace,
+            results,
+            actual,
+            matches,
+            {.minimum_matches = minimum},
+            stream,
+            &index
+        ));
+        std::vector<cuddl::batch_search_result> expected;
+        std::vector<uint32_t> expected_matches;
+        for (size_t i = 0U; i < oracle.size(); ++i) {
+            if (oracle_matches[i] >= minimum) {
+                expected.push_back(oracle[i]);
+                expected_matches.push_back(oracle_matches[i]);
+            }
+        }
+        EXPECT_EQ(actual.results, expected);
+        EXPECT_EQ(actual.match_counts, expected_matches);
+    }
+    auto all_requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(&index));
+    workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), all_requirements.workspace_bytes, cuda::no_init
+    );
+    results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), all_requirements.maximum_pair_count, cuda::no_init
+    );
+    std::vector<uint32_t> per_query(references);
+    auto consume = [&](cuddl::batch_result_tile const& tile) {
+        CUDDL_UNWRAP(
+            cuddl::for_each_passing(tile, stream, [&](cuddl::batch_search_result const& result) {
+                ASSERT_LT(result.query_id, references);
+                ASSERT_LT(result.reference_id, references);
+                EXPECT_LT(result.query_id, result.reference_id);
+                EXPECT_EQ(result.query_id % 5U, result.reference_id % 5U);
+                EXPECT_EQ(result.counts.equal, 16U);
+                ++per_query[result.query_id];
+            })
+        );
+    };
+    CUDDL_UNWRAP(database.search_all_to_all_async(
+        workspace, results, consume, {}, {.minimum_matches = 16U}, stream, &index
+    ));
+    for (uint32_t query = 0U; query < references; ++query) {
+        EXPECT_EQ(per_query[query], (references - 1U - query) / 5U);
     }
 }
 
@@ -1889,12 +2009,21 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
     using index_type = cuddl::reference_index<k_default, b_default>;
-    constexpr uint32_t reference_count = 2U;
+    constexpr uint32_t reference_count = 4U;
     constexpr uint32_t query_count = 130U;
     constexpr uint32_t query_id_offset = 1000U;
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
     std::vector<uint16_t> host_rows(static_cast<size_t>(reference_count) * b_default, 7U);
     std::vector<uint16_t> host_queries(static_cast<size_t>(query_count) * b_default, 7U);
+    for (size_t bucket = 0; bucket < b_default; ++bucket) {
+        host_rows[b_default + bucket] = 0x8000U;
+        host_rows[3U * b_default + bucket] = 0U;
+        for (uint32_t query = 0; query < query_count; ++query) {
+            host_queries[static_cast<size_t>(query) * b_default + bucket] =
+                std::array<uint16_t, 5>{0U, 7U, 0x7fffU, 0x8000U, 0xffffU}[(query + bucket) % 5U];
+        }
+    }
+    host_rows[3U * b_default - 1U] = 0U;
     auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), host_rows);
     auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), host_queries);
     auto database = *database_type::build_async(device_rows, compatibility, stream);
@@ -1934,7 +2063,7 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
                                           results,
                                           on_tile,
                                           {},
-                                          {.minimum_matches = 0U},
+                                          {.minimum_matches = 5U},
                                           cuda::stream_ref{stream_},
                                           &database_index
                                       )
@@ -1953,17 +2082,22 @@ TEST_F(ReferenceDatabaseTest, BatchSearchOwnsBoundedTraversal) {
             EXPECT_EQ(capacity % reference_count, 0U);
             EXPECT_LE(capacity, requirements.maximum_pair_count);
         }
-        EXPECT_EQ(collected.size(), static_cast<size_t>(query_count) * reference_count);
+        auto const passing_references = indexed ? reference_count - 1U : reference_count;
+        ASSERT_EQ(collected.size(), static_cast<size_t>(query_count) * passing_references);
         std::sort(collected.begin(), collected.end(), [](auto const& left, auto const& right) {
             return std::tie(left.query_id, left.reference_id) <
                    std::tie(right.query_id, right.reference_id);
         });
         for (uint32_t query = 0U; query < query_count; ++query) {
-            for (uint32_t reference = 0U; reference < reference_count; ++reference) {
+            auto const query_row = std::span<uint16_t const>{host_queries}.subspan(
+                static_cast<size_t>(query) * b_default, b_default
+            );
+            for (uint32_t reference = 0U; reference < passing_references; ++reference) {
                 auto const& result =
-                    collected[static_cast<size_t>(query) * reference_count + reference];
+                    collected[static_cast<size_t>(query) * passing_references + reference];
                 EXPECT_EQ(result.query_id, query_id_offset + query);
                 EXPECT_EQ(result.reference_id, reference);
+                EXPECT_EQ(result.counts, score_row_oracle(query_row, host_rows, reference));
             }
         }
     };

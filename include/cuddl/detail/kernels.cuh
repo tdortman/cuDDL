@@ -818,6 +818,125 @@ constexpr uint32_t index_tile_max_references = 32768U;
     return ((reference_count + tiles - 1U) / tiles + 63U) / 64U * 64U;
 }
 
+/// @brief Selects posting lists whose bitmap uses no more storage than their reference IDs.
+struct posting_bitmap_cell {
+    uint32_t const* offsets;
+    uint32_t words;
+    __device__ bool operator()(uint32_t cell) const {
+        return offsets[cell + 1U] - offsets[cell] >= words;
+    }
+};
+
+/// @brief Materializes selected posting lists into zero-initialized reference bitmaps.
+static __global__ void build_posting_bitmaps_kernel(
+    uint32_t const* cells,
+    uint32_t const* offsets,
+    uint32_t const* postings,
+    uint32_t words,
+    uint32_t* bitmaps
+) {
+    auto const cell = cells[blockIdx.x];
+    auto* bitmap = bitmaps + static_cast<size_t>(blockIdx.x) * words;
+    for (auto i = static_cast<size_t>(offsets[cell]) + threadIdx.x; i < offsets[cell + 1U];
+         i += blockDim.x) {
+        auto const reference = postings[i];
+        atomicOr(bitmap + reference / 32U, 1U << (reference % 32U));
+    }
+}
+
+template <size_t BucketCount>
+__global__ void hybrid_posting_ranges_kernel(
+    uint16_t const* queries,
+    uint32_t const* offsets,
+    uint32_t const* bitmap_cells,
+    uint32_t bitmap_count,
+    uint32_t words,
+    uint32_t indexed_buckets,
+    uint16_t key_mask,
+    uint2* ranges,
+    uint32_t* bitmap_starts,
+    uint32_t* bitmap_counts
+) {
+    __shared__ uint32_t count;
+    if (threadIdx.x == 0U) {
+        count = 0U;
+    }
+    __syncthreads();
+    auto const query = static_cast<uint32_t>(blockIdx.x);
+    auto const base = static_cast<size_t>(query) * indexed_buckets;
+    for (auto bucket = threadIdx.x; bucket < indexed_buckets; bucket += blockDim.x) {
+        uint2 range{0U, 0U};
+        auto const score = queries[static_cast<size_t>(query) * BucketCount + bucket];
+        if (score != 0U) {
+            auto const cell = bucket * (static_cast<uint32_t>(key_mask) + 1U) + (score & key_mask);
+            range = {offsets[cell], offsets[cell + 1U]};
+            if (range.y - range.x >= words) {
+                uint32_t low = 0U, high = bitmap_count;
+                while (low < high) {
+                    auto const middle = low + (high - low) / 2U;
+                    if (bitmap_cells[middle] < cell) {
+                        low = middle + 1U;
+                    } else {
+                        high = middle;
+                    }
+                }
+                bitmap_starts[base + atomicAdd(&count, 1U)] = low * words;
+                range = {0U, 0U};
+            }
+        }
+        ranges[base + bucket] = range;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+        bitmap_counts[query] = count;
+    }
+}
+
+template <uint32_t CounterBits>
+__global__ void count_posting_bitmaps_kernel(
+    uint32_t const* bitmaps,
+    uint32_t const* starts,
+    uint32_t const* counts,
+    uint32_t query_count,
+    uint32_t reference_count,
+    uint32_t indexed_buckets,
+    uint32_t minimum_matches,
+    uint32_t* planes,
+    uint32_t* passes
+) {
+    auto const words = candidate_bit_words(reference_count);
+    auto const word_tiles = (words + blockDim.x - 1U) / blockDim.x;
+    for (size_t tile = blockIdx.x; tile < static_cast<size_t>(query_count) * word_tiles;
+         tile += gridDim.x) {
+        auto const query = tile % query_count;
+        auto const word = tile / query_count * blockDim.x + threadIdx.x;
+        if (word >= words) continue;
+        uint32_t counters[CounterBits]{};
+        uint32_t passed = minimum_matches == 0U ? ~0U : 0U;
+        for (uint32_t i = 0U; i < counts[query] && passed != ~0U; ++i) {
+            auto bits = bitmaps[starts[query * indexed_buckets + i] + word] & ~passed;
+            if (bits != 0U) {
+                uint32_t at_least = ~0U;
+                _Pragma("unroll")
+                for (uint32_t bit = 0U; bit < CounterBits; ++bit) {
+                    auto const carry = counters[bit] & bits;
+                    counters[bit] ^= bits;
+                    bits = carry;
+                    auto const key = 0U - ((minimum_matches >> bit) & 1U);
+                    at_least = (counters[bit] & ~key) | ((counters[bit] | ~key) & at_least);
+                }
+                passed |= at_least;
+            }
+        }
+        _Pragma("unroll")
+        for (uint32_t bit = 0U; bit < CounterBits; ++bit) {
+            planes[(query * CounterBits + bit) * words + word] = counters[bit];
+        }
+        auto const valid = reference_count - word * 32U;
+        passes[query * words + word] = passed & (valid >= 32U ? ~0U : (1U << valid) - 1U);
+    }
+}
+
 /// @brief Counts index matches for one query against one reference tile in shared memory.
 ///
 /// Block b owns query b / tiles and references [t * tile, (t + 1) * tile) for t = b % tiles,
@@ -825,11 +944,12 @@ constexpr uint32_t index_tile_max_references = 32768U;
 /// share its posting-range lookups through the caches. Postings ascend by reference within each
 /// key, so each posting list is narrowed to the tile with two binary searches. The flush writes
 /// every pair of the tile, so @p match_counts needs no zeroing.
+/// Seeded counting starts with saturated bitmap counts and adds the remaining posting lists.
 ///
 /// Launched with @ref index_tile_block_size threads: the shared counters, not the thread count,
 /// bound how many blocks fit on an SM, so larger blocks keep more warps resident to hide the
 /// posting loads' latency.
-template <size_t BucketCount, typename QueryRow>
+template <size_t BucketCount, bool Seeded, typename QueryRow>
 __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_kernel(
     QueryRow const* queries,
     size_t query_row_offset,
@@ -845,7 +965,9 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
     uint32_t minimum_matches,
     uint32_t query_id_offset,
     bool all_to_all,
-    uint32_t* candidate_bits
+    uint32_t* candidate_bits,
+    uint32_t const* initial_count_planes,
+    uint32_t initial_count_bits
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = index_tile_block_size / warp_width;
@@ -858,7 +980,30 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
     __shared__ uint2 long_ranges[index_tile_long_capacity];
     __shared__ uint32_t long_count;
     for (auto i = threadIdx.x; i < (width + 1U) / 2U; i += blockDim.x) {
-        packed_counts[i] = 0U;
+        uint32_t packed = 0U;
+        if constexpr (Seeded) {
+            auto const reference = low + 2U * i;
+            auto const words = candidate_bit_words(reference_count);
+            auto const shift = reference % 32U;
+            for (uint32_t plane = 0U; plane < initial_count_bits; ++plane) {
+                auto const bits =
+                    (initial_count_planes
+                         [(static_cast<size_t>(query_index) * initial_count_bits + plane) * words +
+                          reference / 32U] >>
+                     shift) &
+                    3U;
+                packed |= ((bits & 1U) | ((bits & 2U) << 15U)) << plane;
+            }
+            auto const passed =
+                candidate_bits[static_cast<size_t>(query_index) * words + reference / 32U] >> shift;
+            if (passed & 1U) {
+                packed = (packed & 0xffff0000U) | minimum_matches;
+            }
+            if (passed & 2U) {
+                packed = (packed & 0xffffU) | (minimum_matches << 16U);
+            }
+        }
+        packed_counts[i] = packed;
     }
     if (threadIdx.x == 0U) {
         long_count = 0U;
@@ -920,10 +1065,10 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
                 }
             }
         }
-        // Long ranges are recorded for the whole block to walk after this loop; without a free
-        // slot the owning warp walks them itself.
+        // Only ranges large enough to fill the block are queued; the owning warp walks smaller
+        // ranges and any that do not fit in the queue.
         uint32_t slot = index_tile_long_capacity;
-        if (!lane_walk) {
+        if (end - begin >= index_tile_block_size) {
             slot = atomicAdd(&long_count, 1U);
             if (slot < index_tile_long_capacity) {
                 long_ranges[slot] = make_uint2(begin, end);
@@ -1205,11 +1350,12 @@ struct plane_counts {
     uint32_t matches{};
 
     /// @brief Warp-reduces the counts into an exact pairwise summary.
-    template <size_t BucketCount>
+    template <size_t BucketCount, bool ReferenceFull = false>
     [[nodiscard]] __device__ pairwise_counts reduce() const noexcept {
         auto const total_lower = __reduce_add_sync(0xffffffffU, lower);
         auto const total_differ = __reduce_add_sync(0xffffffffU, differ);
-        auto const total_occupied = __reduce_add_sync(0xffffffffU, occupied);
+        auto const total_occupied = ReferenceFull ? static_cast<uint32_t>(BucketCount)
+                                                  : __reduce_add_sync(0xffffffffU, occupied);
         return {
             .lower = total_lower,
             .equal = total_occupied - total_differ,
@@ -1255,8 +1401,8 @@ plane_low_any(uint32_t const (&planes)[score_planes]) noexcept {
 /// agree and that are nonempty in both rows, which needs the reference's low-plane nonzero mask
 /// @p reference_low_any. Only those two masks pass score_compatibility validation.
 ///
-/// @p SkipTop asserts both rows' top planes are zero, so the chain stops a plane early.
-template <bool CountMatches, bool SkipTop = false>
+/// @p ReferenceFull asserts every reference score is nonzero, so no bucket is both empty.
+template <bool CountMatches, bool ReferenceFull = false>
 __device__ __forceinline__ void compare_plane_group(
     uint32_t const (&q)[score_planes],
     uint32_t const (&r)[score_planes],
@@ -1273,16 +1419,15 @@ __device__ __forceinline__ void compare_plane_group(
     for (uint32_t p = 0; p < score_planes; ++p) {
         if (p == score_planes - 1U) {
             low_ne = ne;
-            if constexpr (SkipTop) {
-                break;
-            }
         }
         lt = (~q[p] & r[p]) | (~(q[p] ^ r[p]) & lt);
         ne |= q[p] ^ r[p];
     }
     counts.lower += static_cast<uint32_t>(__popc(lt));
     counts.differ += static_cast<uint32_t>(__popc(ne));
-    counts.occupied += static_cast<uint32_t>(__popc(ne | reference_any));
+    if constexpr (!ReferenceFull) {
+        counts.occupied += static_cast<uint32_t>(__popc(ne | reference_any));
+    }
     if constexpr (CountMatches) {
         // Validated key masks cover the low planes and, for a full key, the top one. Where the
         // compared planes agree, the low planes agree, so both rows are nonzero exactly when the
@@ -1580,7 +1725,8 @@ template <
     bool CountMatches,
     typename SearchResult,
     refine_candidates Candidates,
-    bool UpperTriangle>
+    bool UpperTriangle,
+    uint32_t QueryGroup>
 __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_kernel(
     uint32_t const* query_planes,
     uint32_t query_id_offset,
@@ -1596,7 +1742,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     uint32_t* pass_bits
 ) {
     constexpr uint32_t warp_width = 32;
-    constexpr uint32_t group = bitmap_refine_group<BucketCount>;
+    constexpr uint32_t group = QueryGroup;
     static_assert(group >= 1U && group <= warp_width);
     constexpr bool staged = bitmap_refine_staged<BucketCount>;
     constexpr uint32_t row_words = static_cast<uint32_t>(BucketCount / 2U);
@@ -1633,20 +1779,13 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
         if (threadIdx.x == 0U) {
             next_word = first_word;
         }
-        // The top score plane is almost never set in genomic sketches; the block notes whether
-        // any staged query uses it, so pairs where neither row does skip it.
-        uint32_t group_top = staged ? 0U : 1U;
         if constexpr (staged) {
             for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * (row_words / 4U);
                  i += bitmap_refine_block_size) {
-                auto const planes = group_planes[i];
-                query_plane_storage[i] = planes;
-                if ((i / warp_width) % 4U == 3U) {
-                    group_top |= planes.w;
-                }
+                query_plane_storage[i] = group_planes[i];
             }
         }
-        auto const group_uses_top = __syncthreads_or(static_cast<int>(group_top != 0U)) != 0;
+        __syncthreads();
         uint4 const* const member_planes = staged ? query_plane_storage : group_planes;
 
         // Words carry uneven candidate counts, so warps claim them one at a time.
@@ -1698,21 +1837,20 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                     r_any[j] = plane_any(r[j]);
                     r_low_any[j] = CountMatches ? plane_low_any(r[j]) : 0U;
                 }
-                uint32_t reference_top = 0U;
+                uint32_t reference_nonzero = ~0U;
                 _Pragma("unroll")
                 for (uint32_t j = 0; j < cached_groups; ++j) {
-                    reference_top |= r[j][score_planes - 1U];
+                    reference_nonzero &= r_any[j];
                 }
-                auto const skip_top = CountMatches && !group_uses_top &&
-                                      cached_groups == lane_groups &&
-                                      !__any_sync(0xffffffffU, reference_top != 0U);
+                auto const reference_full = cached_groups == lane_groups &&
+                                            __all_sync(0xffffffffU, reference_nonzero == ~0U);
                 // Lane m keeps member m's totals, so the selecting lanes store their records
                 // together once the reference is done.
                 uint32_t mine_lower = 0U;
                 uint32_t mine_equal = 0U;
                 uint32_t mine_empty = 0U;
                 uint32_t mine_matches = 0U;
-                auto const compare_members = [&](auto skip) {
+                auto const compare_members = [&](auto full) {
                     for (auto members = selected; members != 0U; members &= members - 1U) {
                         auto const m = static_cast<uint32_t>(__ffs(members) - 1);
                         auto const* member =
@@ -1724,7 +1862,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                                                  uint32_t rg_low_any) {
                             uint32_t q[score_planes];
                             load_plane_group(member, bucket_group, q);
-                            compare_plane_group<CountMatches, decltype(skip)::value>(
+                            compare_plane_group<CountMatches, decltype(full)::value>(
                                 q,
                                 rg,
                                 rg_any,
@@ -1748,7 +1886,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                                 CountMatches ? plane_low_any(rg) : 0U
                             );
                         }
-                        auto const total = counts.reduce<BucketCount>();
+                        auto const total = counts.reduce<BucketCount, decltype(full)::value>();
                         uint32_t counts_matches_total = 0U;
                         if constexpr (CountMatches) {
                             counts_matches_total = __reduce_add_sync(0xffffffffU, counts.matches);
@@ -1761,9 +1899,8 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                         }
                     }
                 };
-                // Only the longer counting chain gains enough to pay for a second copy.
-                if (skip_top) {
-                    compare_members(cuda::std::bool_constant<CountMatches>{});
+                if (reference_full) {
+                    compare_members(cuda::std::true_type{});
                 } else {
                     compare_members(cuda::std::false_type{});
                 }

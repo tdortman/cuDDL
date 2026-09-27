@@ -158,7 +158,17 @@ For GPU-only pipelines, `cuddl::build_sketch_store<K, BucketCount>` loads genome
 
 The API uses CUDA streams. Keep the allocation stream alive longer than its sketches and keep asynchronous inputs alive and unchanged until the stream completes. `add_sequence_async` expects contiguous device-resident ASCII bases, not a FASTA file; use the file-loading APIs for FASTA and FASTQ input. Operations returning `cuddl::Result` require error handling; the examples use `CUDDL_UNWRAP`.
 
+Batch refinement on Hopper can stage up to 128 KiB of query rows per block to reuse each reference across more queries. Other architectures retain the 96 KiB staging limit. Rows that do not fit continue through the global-memory path.
+
+Refinement compares all 16 score bits, independently of the index key mask. It skips empty-bucket counting only after verifying that every reference score is nonzero; sparse rows retain the full calculation.
+
 Pairwise helpers include `wkid`, `ani`, `containment`, and `completeness`. ANI here is the k-th root of estimated weighted k-mer identity, not alignment-derived identity.
+
+Indexed counting walks short posting lists per lane and medium lists per warp. Only lists with enough postings to occupy every block thread enter the block-wide queue.
+
+Large dense indexes that use posting lookup also cache lists whose reference bitmaps are no larger than their posting arrays. Batch search first counts bitmap matches with saturating bit-sliced counters, then adds the remaining posting-list matches. The cache is rebuilt on load; the index file format is unchanged.
+
+Posting lists and cached bitmaps request CUDA transparent memory compression on supported Hopper and newer GPUs; other devices use ordinary device allocations. Compression affects device storage, not the on-disk representation.
 
 The root Meson project exposes `cuddl_dep` for subproject integration. Examples, tests, and benchmarks default to enabled in a standalone build and disabled when cuDDL is a subproject.
 

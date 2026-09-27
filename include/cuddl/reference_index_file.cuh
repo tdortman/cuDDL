@@ -144,9 +144,7 @@ class reference_index_file {
             database.reference_count(), database.metadata().compatibility
         ));
         index.index_postings_ = CUDDL_CUDA_TRY(
-            cuda::make_device_buffer<uint32_t>(
-                stream, stream.device(), index.index_posting_capacity_, cuda::no_init
-            )
+            detail::make_compressed_buffer<uint32_t>(stream, index.index_posting_capacity_)
         );
         if (!decoded.postings_.empty()) {
             CUDDL_CUDA_TRY(
@@ -164,6 +162,7 @@ class reference_index_file {
         ));
         index.indexed_ = true;
         CUDDL_TRY(index.measure_pair_fraction(database, stream));
+        CUDDL_TRY(index.build_posting_bitmaps(database, stream));
         return index;
     }
 

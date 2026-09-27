@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -895,7 +896,9 @@ class reference_database_view {
         bool indexed = false,
         device_span<uint16_t const> index_keys = {},
         device_span<uint32_t const> key_directory = {},
-        double index_pair_fraction = 0.0
+        double index_pair_fraction = 0.0,
+        device_span<uint32_t const> bitmap_cells = {},
+        device_span<uint32_t const> posting_bitmaps = {}
     ) noexcept
         : planes_(planes),
           metadata_(metadata),
@@ -903,6 +906,8 @@ class reference_database_view {
           index_postings_(index_postings),
           index_keys_(index_keys),
           key_directory_(key_directory),
+          bitmap_cells_(bitmap_cells),
+          posting_bitmaps_(posting_bitmaps),
           index_pair_fraction_(index_pair_fraction),
           indexed_(indexed) {}
 
@@ -1704,6 +1709,12 @@ class reference_database_view {
                                                metadata_.compatibility.indexed_bucket_count *
                                                sizeof(uint2);
             }
+            if (!bitmap_cells_.empty()) {
+                requirements.temporary_bytes = static_cast<size_t>(tile_query_count) *
+                                               (metadata_.compatibility.indexed_bucket_count *
+                                                    (sizeof(uint2) + sizeof(uint32_t)) +
+                                                sizeof(uint32_t));
+            }
         }
         constexpr size_t alignment_slack = alignof(uint32_t) - 1U + plane_alignment - 1U + 255U;
         requirements.workspace_bytes = requirements.counter_bytes + requirements.candidate_bytes +
@@ -1916,19 +1927,37 @@ class reference_database_view {
         uint32_t* pass_bits = nullptr
     ) const {
         auto const counting = !result_match_counts.empty() || pass_bits != nullptr;
-        auto const kernel = counting ? detail::refine_batch_bitmap_kernel<
-                                           BucketCount,
-                                           true,
-                                           batch_result_type,
-                                           Candidates,
-                                           UpperTriangle>
-                                     : detail::refine_batch_bitmap_kernel<
-                                           BucketCount,
-                                           false,
-                                           batch_result_type,
-                                           Candidates,
-                                           UpperTriangle>;
-        constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
+        auto const select_kernel = [&]<uint32_t Group>() {
+            return counting ? detail::refine_batch_bitmap_kernel<
+                                  BucketCount,
+                                  true,
+                                  batch_result_type,
+                                  Candidates,
+                                  UpperTriangle,
+                                  Group>
+                            : detail::refine_batch_bitmap_kernel<
+                                  BucketCount,
+                                  false,
+                                  batch_result_type,
+                                  Candidates,
+                                  UpperTriangle,
+                                  Group>;
+        };
+        auto kernel = select_kernel.template operator()<detail::bitmap_refine_group<BucketCount>>();
+        auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
+        if constexpr (detail::bitmap_refine_staged<BucketCount>) {
+            constexpr uint32_t hopper_group = static_cast<uint32_t>(
+                cuda::std::min<size_t>(32U, (128U * 1024U) / (BucketCount * sizeof(uint16_t)))
+            );
+            constexpr auto hopper_bytes = hopper_group * BucketCount * sizeof(uint16_t);
+            if (stream.device().attribute(cuda::device_attributes::compute_capability_major) == 9 &&
+                static_cast<size_t>(stream.device().attribute(
+                    cuda::device_attributes::max_shared_memory_per_block_optin
+                )) >= hopper_bytes + sizeof(uint32_t)) {
+                kernel = select_kernel.template operator()<hopper_group>();
+                shared_bytes = hopper_bytes;
+            }
+        }
         CUDDL_CUDA_TRY(cudaFuncSetAttribute(
             reinterpret_cast<void const*>(kernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2092,6 +2121,100 @@ class reference_database_view {
             // Sparse ranges are resolved bucket-major first: a block's lookups all search one
             // bucket's keys, so their shared upper search levels stay in L1.
             uint2* ranges = nullptr;
+            uint32_t counter_bits = 0U;
+            auto const hybrid = !bitmap_cells_.empty();
+            if (hybrid) {
+                ranges = static_cast<uint2*>(temporary_workspace);
+                auto const range_count = static_cast<size_t>(query_count) * indexed_bucket_count;
+                auto* starts = reinterpret_cast<uint32_t*>(ranges + range_count);
+                auto* counts = starts + range_count;
+                detail::hybrid_posting_ranges_kernel<BucketCount>
+                    <<<query_count, detail::block_size, 0, stream.get()>>>(
+                        query_scores,
+                        index_offsets_.data(),
+                        bitmap_cells_.data(),
+                        static_cast<uint32_t>(bitmap_cells_.size()),
+                        detail::candidate_bit_words(reference_count),
+                        indexed_bucket_count,
+                        key_mask,
+                        ranges,
+                        starts,
+                        counts
+                    );
+                CUDDL_CUDA_TRY(cudaGetLastError());
+                counter_bits = std::max<uint32_t>(1U, std::bit_width(options.minimum_matches));
+                auto const count_bitmaps = [&]<uint32_t Bits>() -> Result<void> {
+                    auto const words = detail::candidate_bit_words(reference_count);
+                    auto const blocks = static_cast<uint32_t>(std::min<size_t>(
+                        static_cast<size_t>(query_count) *
+                            ((words + detail::block_size - 1U) / detail::block_size),
+                        65535U
+                    ));
+                    detail::count_posting_bitmaps_kernel<Bits>
+                        <<<blocks, detail::block_size, 0, stream.get()>>>(
+                            posting_bitmaps_.data(),
+                            starts,
+                            counts,
+                            query_count,
+                            reference_count,
+                            indexed_bucket_count,
+                            options.minimum_matches,
+                            match_counts,
+                            candidate_bits
+                        );
+                    return cuda_try(cudaGetLastError());
+                };
+                switch (counter_bits) {
+                    case 1:
+                        CUDDL_TRY((count_bitmaps.template operator()<1>()));
+                        break;
+                    case 2:
+                        CUDDL_TRY((count_bitmaps.template operator()<2>()));
+                        break;
+                    case 3:
+                        CUDDL_TRY((count_bitmaps.template operator()<3>()));
+                        break;
+                    case 4:
+                        CUDDL_TRY((count_bitmaps.template operator()<4>()));
+                        break;
+                    case 5:
+                        CUDDL_TRY((count_bitmaps.template operator()<5>()));
+                        break;
+                    case 6:
+                        CUDDL_TRY((count_bitmaps.template operator()<6>()));
+                        break;
+                    case 7:
+                        CUDDL_TRY((count_bitmaps.template operator()<7>()));
+                        break;
+                    case 8:
+                        CUDDL_TRY((count_bitmaps.template operator()<8>()));
+                        break;
+                    case 9:
+                        CUDDL_TRY((count_bitmaps.template operator()<9>()));
+                        break;
+                    case 10:
+                        CUDDL_TRY((count_bitmaps.template operator()<10>()));
+                        break;
+                    case 11:
+                        CUDDL_TRY((count_bitmaps.template operator()<11>()));
+                        break;
+                    case 12:
+                        CUDDL_TRY((count_bitmaps.template operator()<12>()));
+                        break;
+                    case 13:
+                        CUDDL_TRY((count_bitmaps.template operator()<13>()));
+                        break;
+                    case 14:
+                        CUDDL_TRY((count_bitmaps.template operator()<14>()));
+                        break;
+                    case 15:
+                        CUDDL_TRY((count_bitmaps.template operator()<15>()));
+                        break;
+                    case 16:
+                        CUDDL_TRY((count_bitmaps.template operator()<16>()));
+                        break;
+                }
+            }
             if (!index_keys_.empty()) {
                 ranges = static_cast<uint2*>(temporary_workspace);
                 detail::sparse_batch_posting_ranges_kernel<BucketCount>
@@ -2108,35 +2231,44 @@ class reference_database_view {
                     );
                 CUDDL_CUDA_TRY(cudaGetLastError());
             }
-            CUDDL_CUDA_TRY(cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(
-                    detail::count_batch_index_tile_kernel<BucketCount, uint16_t>
-                ),
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(detail::index_tile_max_references / 2U * sizeof(uint32_t))
-            ));
-            detail::count_batch_index_tile_kernel<BucketCount>
-                <<<query_count * tiles,
-                   detail::index_tile_block_size,
-                   tile / 2U * sizeof(uint32_t),
-                   stream.get()>>>(
-                    query_scores,
-                    0U,
-                    index_offsets_.data(),
-                    index_postings_.data(),
-                    reference_count,
-                    indexed_bucket_count,
-                    key_mask,
-                    tile,
-                    match_counts,
-                    index_keys_.empty() ? nullptr : index_keys_.data(),
-                    ranges,
-                    options.minimum_matches,
-                    query_id_offset,
-                    AllToAll,
-                    candidate_bits
-                );
-            CUDDL_CUDA_TRY(cudaGetLastError());
+            auto const count_postings = [&]<bool Seeded>() -> Result<void> {
+                CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+                    reinterpret_cast<void const*>(
+                        detail::count_batch_index_tile_kernel<BucketCount, Seeded, uint16_t>
+                    ),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(detail::index_tile_max_references / 2U * sizeof(uint32_t))
+                ));
+                detail::count_batch_index_tile_kernel<BucketCount, Seeded>
+                    <<<query_count * tiles,
+                       detail::index_tile_block_size,
+                       tile / 2U * sizeof(uint32_t),
+                       stream.get()>>>(
+                        query_scores,
+                        0U,
+                        index_offsets_.data(),
+                        index_postings_.data(),
+                        reference_count,
+                        indexed_bucket_count,
+                        key_mask,
+                        tile,
+                        match_counts,
+                        index_keys_.empty() ? nullptr : index_keys_.data(),
+                        ranges,
+                        options.minimum_matches,
+                        query_id_offset,
+                        AllToAll,
+                        candidate_bits,
+                        Seeded ? match_counts : nullptr,
+                        counter_bits
+                    );
+                return cuda_try(cudaGetLastError());
+            };
+            if (hybrid) {
+                CUDDL_TRY((count_postings.template operator()<true>()));
+            } else {
+                CUDDL_TRY((count_postings.template operator()<false>()));
+            }
         } else {
             CUDDL_CUDA_TRY(
                 cuda::fill_bytes(
@@ -2192,6 +2324,8 @@ class reference_database_view {
     device_span<uint32_t const> index_postings_;
     device_span<uint16_t const> index_keys_;
     device_span<uint32_t const> key_directory_;
+    device_span<uint32_t const> bitmap_cells_;
+    device_span<uint32_t const> posting_bitmaps_;
     double index_pair_fraction_{};
     bool indexed_{};
 };
@@ -2505,7 +2639,9 @@ class reference_database {
             index->indexed_,
             index->index_keys_,
             index->key_directory_,
-            index->pair_fraction_
+            index->pair_fraction_,
+            {index->bitmap_cells_.data(), index->bitmap_count_},
+            index->posting_bitmaps_
         );
     }
 

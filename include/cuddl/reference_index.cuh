@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuddl/detail/compressed_memory.cuh>
 #include <cuddl/reference_database.cuh>
 
 namespace cuddl {
@@ -28,6 +29,9 @@ class reference_index {
           index_postings_(std::move(other.index_postings_)),
           index_keys_(std::move(other.index_keys_)),
           key_directory_(std::move(other.key_directory_)),
+          bitmap_cells_(std::move(other.bitmap_cells_)),
+          posting_bitmaps_(std::move(other.posting_bitmaps_)),
+          bitmap_count_(std::exchange(other.bitmap_count_, 0U)),
           index_posting_capacity_(std::exchange(other.index_posting_capacity_, 0)),
           pair_fraction_(std::exchange(other.pair_fraction_, 0.0)),
           indexed_(std::exchange(other.indexed_, false)) {}
@@ -40,6 +44,9 @@ class reference_index {
             index_postings_ = std::move(other.index_postings_);
             index_keys_ = std::move(other.index_keys_);
             key_directory_ = std::move(other.key_directory_);
+            bitmap_cells_ = std::move(other.bitmap_cells_);
+            posting_bitmaps_ = std::move(other.posting_bitmaps_);
+            bitmap_count_ = std::exchange(other.bitmap_count_, 0U);
             index_posting_capacity_ = std::exchange(other.index_posting_capacity_, 0);
             pair_fraction_ = std::exchange(other.pair_fraction_, 0.0);
             indexed_ = std::exchange(other.indexed_, false);
@@ -60,6 +67,7 @@ class reference_index {
     ) {
         auto index = CUDDL_TRY(build_index<score_type>(database, stream, storage));
         CUDDL_TRY(index.measure_pair_fraction(database, stream));
+        CUDDL_TRY(index.build_posting_bitmaps(database, stream));
         return Result<reference_index>::ok(std::move(index));
     }
 
@@ -117,7 +125,9 @@ class reference_index {
           index_offsets_(stream, cuda::device_default_memory_pool(stream.device())),
           index_postings_(stream, cuda::device_default_memory_pool(stream.device())),
           index_keys_(stream, cuda::device_default_memory_pool(stream.device())),
-          key_directory_(stream, cuda::device_default_memory_pool(stream.device())) {}
+          key_directory_(stream, cuda::device_default_memory_pool(stream.device())),
+          bitmap_cells_(stream, cuda::device_default_memory_pool(stream.device())),
+          posting_bitmaps_(stream, cuda::device_default_memory_pool(stream.device())) {}
 
     template <typename Row>
     [[nodiscard]] static Result<reference_index>
@@ -269,9 +279,7 @@ class reference_index {
         // Postings ascend by reference ID within each cell, so a search can restrict a cell to a
         // reference range with a binary search.
         auto sorted = CUDDL_CUDA_TRY(
-            cuda::make_device_buffer<uint32_t>(
-                stream, stream.device(), static_cast<size_t>(posting_capacity), cuda::no_init
-            )
+            detail::make_compressed_buffer<uint32_t>(stream, static_cast<size_t>(posting_capacity))
         );
         CUDDL_CUDA_TRY(
             cub::DeviceSegmentedSort::SortKeys(
@@ -305,8 +313,7 @@ class reference_index {
         auto const device = stream.device();
         index_keys_ =
             CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
-        index_postings_ =
-            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, device, size, cuda::no_init));
+        index_postings_ = CUDDL_CUDA_TRY(detail::make_compressed_buffer<uint32_t>(stream, size));
         auto keys =
             CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
         auto ids =
@@ -386,12 +393,65 @@ class reference_index {
         return cuda_try(cudaGetLastError());
     }
 
+    [[nodiscard]] Result<void>
+    build_posting_bitmaps(database_type const& database, cuda::stream_ref stream) {
+        auto const references = database.reference_count();
+        auto const buckets = database.metadata().compatibility.indexed_bucket_count;
+        if (references < 8192U || buckets == 0U || buckets > 65535U || index_offsets_.empty() ||
+            pair_fraction_ > detail::index_pair_fraction_limit) {
+            return Ok();
+        }
+        auto const words = detail::candidate_bit_words(references);
+        bitmap_cells_ = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), index_posting_capacity_ / words, cuda::no_init
+            )
+        );
+        auto selected = CUDDL_CUDA_TRY(
+            cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init)
+        );
+        auto const* offsets = index_offsets_.data();
+        CUDDL_CUDA_TRY(
+            cub::DeviceSelect::If(
+                cuda::make_counting_iterator(uint32_t{0}),
+                bitmap_cells_.data(),
+                selected.data(),
+                static_cast<int64_t>(index_offsets_.size() - 1U),
+                detail::posting_bitmap_cell{offsets, words},
+                stream
+            )
+        );
+        CUDDL_CUDA_TRY(
+            cuda::copy_bytes(stream, selected, cuda::std::span{&bitmap_count_, size_t{1}})
+        );
+        CUDDL_CUDA_TRY(stream.sync());
+        if (bitmap_count_ == 0U) return Ok();
+        posting_bitmaps_ = CUDDL_CUDA_TRY(
+            detail::make_compressed_buffer<uint32_t>(
+                stream, static_cast<size_t>(bitmap_count_) * words
+            )
+        );
+        CUDDL_CUDA_TRY(cuda::fill_bytes(stream, posting_bitmaps_, 0));
+        detail::
+            build_posting_bitmaps_kernel<<<bitmap_count_, detail::block_size, 0, stream.get()>>>(
+                bitmap_cells_.data(),
+                offsets,
+                index_postings_.data(),
+                words,
+                posting_bitmaps_.data()
+            );
+        return cuda_try(cudaGetLastError());
+    }
+
     std::shared_ptr<char const> identity_;
     cuda::device_buffer<uint32_t> index_offsets_;
     cuda::device_buffer<uint32_t> index_postings_;
     cuda::device_buffer<uint16_t> index_keys_;
     // Radix directory over index_keys_ for batch range lookups; derived, not persisted.
     cuda::device_buffer<uint32_t> key_directory_;
+    cuda::device_buffer<uint32_t> bitmap_cells_;
+    cuda::device_buffer<uint32_t> posting_bitmaps_;
+    uint32_t bitmap_count_{};
     size_t index_posting_capacity_{};
     double pair_fraction_{};
     bool indexed_{};
