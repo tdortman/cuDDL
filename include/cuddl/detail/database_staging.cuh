@@ -110,6 +110,10 @@ struct staging_plan {
 /// build from 239 to 194 ms, and it cost nothing on a 24-thread RTX 5070 Ti host.
 inline constexpr size_t default_arena_ceiling = size_t{128} << 20;
 
+/// Staging arenas the copy stream rotates through, so copies run ahead of the kernels that
+/// read earlier arenas while other work shares the device.
+inline constexpr size_t stager_arenas = 4;
+
 /// @brief Device bytes an allocation on @p stream can still get.
 ///
 /// Storage the default pool caches from earlier allocations is reused by the next one, so it
@@ -163,10 +167,12 @@ template <uint32_t K, size_t BucketCount>
     if (staging_bytes.has_value() && *staging_bytes < K + 1) {
         return Err(Error::invalid_argument("an explicit staging arena must hold one window"));
     }
-    size_t const staging =
-        staging_bytes.has_value() ? *staging_bytes : std::min(after_rows, arena_ceiling);
+    // Every arena gets the same share: one fills while kernels read the others.
+    size_t const staging = staging_bytes.has_value()
+                               ? *staging_bytes
+                               : std::min(after_rows / stager_arenas, arena_ceiling);
     // One piece of at least k bases plus its k - 1 byte overlap has to fit.
-    if (staging < K + 1 || staging > after_rows) {
+    if (staging < K + 1 || staging > after_rows / stager_arenas) {
         return Err(
             Error::resource(
                 "insufficient free device memory for reference staging (free " +
@@ -260,8 +266,16 @@ class database_stager {
                   cuda::no_init
               )
           ),
+          copy_stream_(stream.device()),
+          kernel_stream_(stream.device(), greatest_stream_priority()),
+          // The copy stream fills one arena while kernels read the others.
           arena_(
-              cuda::make_device_buffer<char>(stream, stream.device(), bounds.staging, cuda::no_init)
+              cuda::make_device_buffer<char>(
+                  stream,
+                  stream.device(),
+                  direct ? bounds.staging : stager_arenas * arena_stride(bounds.staging),
+                  cuda::no_init
+              )
           ),
           descriptors_(
               cuda::make_device_buffer<sequence_batch_chunk>(
@@ -286,7 +300,16 @@ class database_stager {
         }
         staged_chunks_.reserve(std::min<size_t>(bounds_.max_pieces, size_t{1} << 16));
         copied_chunks_.reserve(staged_chunks_.capacity());
+        // The arenas are allocated in order on the main stream.
+        copy_stream_.wait(stream_);
     }
+    /// Frees the arenas only after every copy into them.
+    ~database_stager() {
+        CUDDL_CUDA_ABORT(cudaEventRecord(copies_done_.get(), copy_stream_.get()));
+        CUDDL_CUDA_ABORT(cudaStreamWaitEvent(stream_.get(), copies_done_.get()));
+    }
+    database_stager(database_stager const&) = delete;
+    database_stager& operator=(database_stager const&) = delete;
 
     /// @brief Stages one genome. @p holder keeps its bytes alive until the device is done.
     ///
@@ -358,9 +381,9 @@ class database_stager {
             if (!direct_) {
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
-                        stream_,
+                        copy_stream_,
                         cuda::std::span{source, run_bytes},
-                        device_span<char>{arena_.data() + arena_used_, run_bytes}
+                        device_span<char>{arena() + arena_used_, run_bytes}
                     )
                 );
             }
@@ -369,7 +392,7 @@ class database_stager {
                 if (size < K) continue;  // no window to record
                 auto const* const bases =
                     direct_ ? records[index].begin
-                            : arena_.data() + arena_used_ +
+                            : arena() + arena_used_ +
                                   static_cast<size_t>(records[index].begin - source);
                 describe(bases, static_cast<uint32_t>(size - K + 1), genome);
             }
@@ -391,6 +414,82 @@ class database_stager {
         return Ok();
     }
 
+    /// @brief Stages one genome that @ref pack_fastx_sequence_file packed into two-bit runs.
+    ///
+    /// Runs keep their words together. One too large for a batch splits into pieces of whole
+    /// words whose window counts are multiples of sixteen, so every piece starts on a word.
+    [[nodiscard]] Result<void> add_packed_genome(
+        size_t genome,
+        std::unique_ptr<fastx_sequence_file> holder,
+        char const* pinned_base = nullptr,
+        size_t pinned_size = 0
+    ) {
+        constexpr size_t word_bases = 16;
+        auto const& file = *holder;
+        auto const& runs = file.packed;
+        auto const words = [&](size_t index) {
+            return (runs[index].bases + word_bases - 1) / word_bases;
+        };
+        size_t run = 0;
+        while (run < runs.size()) {
+            auto const room = direct_ ? std::numeric_limits<size_t>::max() : arena_room_words();
+            size_t last = run;
+            while (last < runs.size()) {
+                auto const span_words = runs[last].word + words(last) - runs[run].word;
+                if (span_words > room || words(last) * sizeof(uint32_t) > bounds_.max_piece ||
+                    staged_chunks_.size() + (last - run) >= bounds_.max_pieces) {
+                    break;
+                }
+                ++last;
+            }
+            if (last == run) {
+                if (arena_used_ != 0 || !staged_chunks_.empty()) {
+                    CUDDL_TRY(flush());
+                    continue;
+                }
+                auto const halo = (size_t{K} - 1 + word_bases - 1) / word_bases;
+                auto const capacity =
+                    std::min(bounds_.max_piece, bounds_.staging) / sizeof(uint32_t);
+                if (capacity <= halo) {
+                    return Err(Error::resource("staging arena too small for a packed run"));
+                }
+                auto const step = (capacity - halo) * word_bases;
+                auto const total = runs[run].bases - K + 1;
+                for (size_t start = 0; start < total; start += step) {
+                    auto const windows = std::min(step, total - start);
+                    auto const first = runs[run].word + start / word_bases;
+                    auto const count = (start + windows + K - 1 + word_bases - 1) / word_bases -
+                                       start / word_bases;
+                    if ((!direct_ && count > arena_room_words()) ||
+                        staged_chunks_.size() >= bounds_.max_pieces) {
+                        CUDDL_TRY(flush());
+                    }
+                    auto const* const bases =
+                        CUDDL_TRY(place_words(file.words + first, count, pinned_base, pinned_size));
+                    describe(bases, static_cast<uint32_t>(windows), genome, true);
+                }
+                ++run;
+                continue;
+            }
+            auto const first = runs[run].word;
+            auto const count = runs[last - 1].word + words(last - 1) - first;
+            auto const* const base =
+                CUDDL_TRY(place_words(file.words + first, count, pinned_base, pinned_size));
+            for (size_t index = run; index < last; ++index) {
+                describe(
+                    base + (runs[index].word - first) * sizeof(uint32_t),
+                    static_cast<uint32_t>(runs[index].bases - K + 1),
+                    genome,
+                    true
+                );
+            }
+            if (direct_ && held_bytes_ >= bounds_.staging / 2) CUDDL_TRY(flush());
+            run = last;
+        }
+        hold(std::move(holder));
+        return Ok();
+    }
+
     /// @brief Stages one genome's bases that already sit on the device, without a copy.
     ///
     /// The bytes must stay valid until the batch that reads them runs: through the next
@@ -404,13 +503,13 @@ class database_stager {
 
     /// @brief Clears the register rows of the next group of genomes.
     [[nodiscard]] Result<void> begin_group(size_t genomes) {
-        auto const resident = CUDDL_TRY(begin_resident());
+        auto const resident = CUDDL_TRY(begin_resident(stream_));
         CUDDL_CUDA_TRY(
             cuda::fill_bytes(
                 stream_, cuda::std::span{rows_.data(), genomes * row_words()}, uint32_t{0}
             )
         );
-        CUDDL_TRY(end_resident(resident));
+        CUDDL_TRY(end_resident(resident, stream_));
         return Ok();
     }
 
@@ -428,6 +527,7 @@ class database_stager {
     /// @brief Waits for the device and publishes the statistics.
     [[nodiscard]] Result<void> finish() {
         CUDDL_CUDA_TRY(stream_.sync());
+        CUDDL_CUDA_TRY(copy_stream_.sync());
         if (statistics_ != nullptr) {
             statistics_->staging_bytes = bounds_.staging;
             statistics_->batches = batches_;
@@ -442,29 +542,71 @@ class database_stager {
     }
 
    private:
-    [[nodiscard]] Result<size_t> begin_resident() {
+    /// Offset between arenas, aligned for the two-bit words a packed genome stages.
+    [[nodiscard]] static constexpr size_t arena_stride(size_t staging) noexcept {
+        return (staging + 15) & ~size_t{15};
+    }
+
+    [[nodiscard]] static int greatest_stream_priority() {
+        int least = 0, greatest = 0;
+        auto const status = cudaDeviceGetStreamPriorityRange(&least, &greatest);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        return greatest;
+    }
+
+    [[nodiscard]] Result<size_t> begin_resident(cuda::stream_ref stream) {
         if (statistics_ == nullptr || !statistics_->measure_resident) {
             return std::numeric_limits<size_t>::max();
         }
         resident_event_span span;
         CUDDL_CUDA_TRY(cudaEventCreate(&span.start));
         CUDDL_CUDA_TRY(cudaEventCreate(&span.stop));
-        CUDDL_CUDA_TRY(cudaEventRecord(span.start, stream_.get()));
+        CUDDL_CUDA_TRY(cudaEventRecord(span.start, stream.get()));
         resident_spans_.push_back(std::move(span));
         return resident_spans_.size() - 1;
     }
 
-    [[nodiscard]] Result<void> end_resident(size_t index) {
+    [[nodiscard]] Result<void> end_resident(size_t index, cuda::stream_ref stream) {
         if (index == std::numeric_limits<size_t>::max()) return Ok();
-        CUDDL_CUDA_TRY(cudaEventRecord(resident_spans_[index].stop, stream_.get()));
+        CUDDL_CUDA_TRY(cudaEventRecord(resident_spans_[index].stop, stream.get()));
         return Ok();
     }
 
     /// @brief Records one piece of sequence for the kernel, naming its bytes.
-    void describe(char const* bases, uint32_t windows, size_t genome) {
+    void describe(char const* bases, uint32_t windows, size_t genome, bool packed = false) {
         auto const blocks = std::min(sm_ * 2, (static_cast<size_t>(windows) + 2047) / 2048);
         block_end_ += blocks;
-        staged_chunks_.push_back({bases, block_end_, static_cast<uint32_t>(genome), windows});
+        staged_chunks_.push_back(
+            {bases, block_end_, static_cast<uint32_t>(genome), windows, packed ? 1U : 0U}
+        );
+    }
+
+    /// @brief Two-bit words the arena still takes, from the next word-aligned byte.
+    [[nodiscard]] size_t arena_room_words() const noexcept {
+        auto const aligned = (arena_used_ + 3) & ~size_t{3};
+        return aligned < bounds_.staging ? (bounds_.staging - aligned) / sizeof(uint32_t) : 0;
+    }
+
+    /// @brief Makes @p count two-bit words readable by the kernel and returns where they are.
+    [[nodiscard]] Result<char const*>
+    place_words(uint32_t const* words, size_t count, char const* pinned_base, size_t pinned_size) {
+        auto const* const source = reinterpret_cast<char const*>(words);
+        auto const bytes = count * sizeof(uint32_t);
+        account(source, bytes, pinned_base, pinned_size);
+        if (direct_) {
+            held_bytes_ += bytes;
+            return source;
+        }
+        arena_used_ = (arena_used_ + 3) & ~size_t{3};
+        auto* const target = arena() + arena_used_;
+        CUDDL_CUDA_TRY(
+            cuda::copy_bytes(
+                copy_stream_, cuda::std::span{source, bytes}, device_span<char>{target, bytes}
+            )
+        );
+        arena_used_ += bytes;
+        ++transfers_;
+        return static_cast<char const*>(target);
     }
 
     void account(char const* source, size_t size, char const* pinned_base, size_t pinned_size) {
@@ -501,12 +643,12 @@ class database_stager {
         }
         CUDDL_CUDA_TRY(
             cuda::copy_bytes(
-                stream_,
+                copy_stream_,
                 cuda::std::span{source, size},
-                device_span<char>{arena_.data() + arena_used_, size}
+                device_span<char>{arena() + arena_used_, size}
             )
         );
-        describe(arena_.data() + arena_used_, windows, genome);
+        describe(arena() + arena_used_, windows, genome);
         arena_used_ += size;
         ++transfers_;
         return Ok();
@@ -528,24 +670,34 @@ class database_stager {
         }
         copied_consumed_.sync();
         copied_chunks_.swap(staged_chunks_);
+        // The sketch kernel runs ahead of lower-priority work sharing the device, such as
+        // nvCOMP inflation: the copies that feed the next batch wait on it.
+        queued_.record(stream_);
+        kernel_stream_.wait(queued_);
+        if (!direct_) {
+            copies_done_.record(copy_stream_);
+            kernel_stream_.wait(copies_done_);
+        }
         CUDDL_CUDA_TRY(
             cuda::copy_bytes(
-                stream_,
+                kernel_stream_,
                 cuda::std::span{copied_chunks_.data(), copied_chunks_.size()},
                 device_span<sequence_batch_chunk>{descriptors_.data(), copied_chunks_.size()}
             )
         );
-        copied_consumed_.record(stream_);
+        copied_consumed_.record(kernel_stream_);
         auto const grid = std::min(block_end_, max_grid_);
         if (grid != 0) {
-            auto const resident = CUDDL_TRY(begin_resident());
+            auto const resident = CUDDL_TRY(begin_resident(kernel_stream_));
             add_sequence_batch_kernel<BucketCount, Layout>
-                <<<static_cast<uint32_t>(grid), 256, 0, stream_.get()>>>(
+                <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
                     descriptors_.data(), copied_chunks_.size(), block_end_, K, rows_.data()
                 );
             CUDDL_CUDA_TRY(cudaGetLastError());
-            CUDDL_TRY(end_resident(resident));
+            CUDDL_TRY(end_resident(resident, kernel_stream_));
         }
+        kernel_done_.record(kernel_stream_);
+        stream_.wait(kernel_done_);
         if (direct_ && !batch_files_.empty()) {
             // The launch above is what reads those buffers, so they wait on this batch's event.
             released_.push_back({cuda::event{stream_}, std::move(batch_files_)});
@@ -556,6 +708,12 @@ class database_stager {
                 released_.pop_front();
             }
         }
+        if (!direct_) {
+            // The next batch fills the other arena once the kernel that last read it is done.
+            arena_done_[arena_index_].record(stream_);
+            arena_index_ = (arena_index_ + 1) % stager_arenas;
+            copy_stream_.wait(arena_done_[arena_index_]);
+        }
         ++batches_;
         staged_chunks_.clear();
         arena_used_ = 0;
@@ -564,7 +722,21 @@ class database_stager {
         return Ok();
     }
 
+    /// @brief Waits until the next genome staged by copy can be held without blocking.
+    ///
+    /// The thread that stages copied genomes may call this outside any lock it shares with
+    /// other staging threads, so waiting on the transfers does not hold them up.
+    void wait_hold_slot() {
+        if (direct_) return;
+        auto const slot = held_count_ % held_.size();
+        if (held_[slot]) held_consumed_[slot].sync();
+    }
+
    private:
+    [[nodiscard]] char* arena() noexcept {
+        return arena_.data() + arena_index_ * arena_stride(bounds_.staging);
+    }
+
     /// @brief Keeps one genome's bytes until the device has finished reading them.
     ///
     /// A copy is read by the transfer engine before the enqueue returns, so a ring of slots that
@@ -581,7 +753,7 @@ class database_stager {
             held_consumed_[slot].sync();
             held_[slot].reset();
         }
-        held_consumed_[slot].record(stream_);
+        held_consumed_[slot].record(copy_stream_);
         held_[slot] = std::move(holder);
     }
 
@@ -590,7 +762,17 @@ class database_stager {
     reference_build_statistics* statistics_;
     bool direct_ = false;
     cuda::device_buffer<uint32_t> rows_;
+    cuda::stream copy_stream_;
+    cuda::stream kernel_stream_;
     cuda::device_buffer<char> arena_;
+    cuda::event copies_done_{stream_};
+    cuda::event queued_{stream_};
+    cuda::event kernel_done_{stream_};
+    std::array<cuda::event, stager_arenas> arena_done_ =
+        [&]<size_t... I>(std::index_sequence<I...>) {
+            return std::array<cuda::event, stager_arenas>{((void)I, cuda::event{stream_})...};
+        }(std::make_index_sequence<stager_arenas>{});
+    size_t arena_index_ = 0;
     cuda::device_buffer<sequence_batch_chunk> descriptors_;
     /// Batches whose kernels may still be reading a held buffer.
     static constexpr size_t held_batches = 1;
@@ -1019,26 +1201,28 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         }
         return Ok();
     };
-    std::optional<Result<void>> staged;
     // Capture errors before draining GPU work so pending input owners remain alive.
     std::exception_ptr failure;
-    try {
-        staged = stage_groups<K, BucketCount, Layout>(
-            paths.size(),
-            default_arena_ceiling,
-            staging_bytes,
-            stream,
-            statistics,
-            fill,
-            sink,
-            in_place
-        );
-    } catch (...) {
-        failure = std::current_exception();
-    }
+    auto staged = [&]() -> Result<void> {
+        try {
+            return stage_groups<K, BucketCount, Layout>(
+                paths.size(),
+                default_arena_ceiling,
+                staging_bytes,
+                stream,
+                statistics,
+                fill,
+                sink,
+                in_place
+            );
+        } catch (...) {
+            failure = std::current_exception();
+            return Ok();
+        }
+    }();
     if (normaliser) CUDDL_TRY(normaliser->wait_lanes(stream));
     if (failure) std::rethrow_exception(failure);
-    CUDDL_TRY(*staged);
+    if (!staged) return staged;
     if (statistics != nullptr) {
         statistics->workers = static_cast<unsigned>(workers);
         statistics->in_place = in_place;
@@ -1097,8 +1281,10 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                           static_cast<long double>(usable) * compressed / (slots + compressed)
                       )
                   );
-        auto const room =
-            budget > compressed_capacity + overhead ? budget - compressed_capacity - overhead : 0;
+        auto const room = std::min(
+            usable / 2,
+            budget > compressed_capacity + overhead ? budget - compressed_capacity - overhead : 0
+        );
         return cuda_try([&] {
             inflater.emplace(stream, std::min(room, slots), compressed_capacity, workers);
         });
@@ -1112,64 +1298,86 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
             -> Result<void> {
             if (!inflater) CUDDL_TRY(make_inflater());
-            std::vector<size_t> device_ids, host_ids, handed_back;
+            // Host loaders take `order` from the front: files the device cannot hold, then the
+            // device candidates from the back. nvCOMP takes candidates from the front and caps
+            // the loaders before each batch, so whichever side is faster on this host takes more.
+            // Candidates run smallest first: one thread block inflates a whole file, so large
+            // files suit the CPU, and a batch of similar sizes has no straggler holding it open.
+            std::vector<size_t> device_ids, order, handed_back;
             for (size_t id = base; id < base + count; ++id) {
-                (fits(probes[id]) ? device_ids : host_ids).push_back(id);
+                (fits(probes[id]) ? device_ids : order).push_back(id);
             }
+            std::ranges::stable_sort(device_ids, {}, [&](size_t id) { return probes[id].compressed; });
+            order.insert(order.end(), device_ids.rbegin(), device_ids.rend());
             std::vector<std::filesystem::path> host_paths;
-            for (auto id : host_ids) host_paths.push_back(paths[id]);
-            std::optional<fastx_load_pool> host_pool;
-            if (!host_paths.empty()) {
-                host_pool.emplace(
-                    host_paths,
-                    std::min(workers, host_paths.size()),
-                    decompression_source{acquire_sequence_target, &host_buffers},
-                    workers * 4
-                );
-            }
-            size_t host_next = 0;
-            auto drain_host = [&](size_t until) -> Result<void> {
-                while (host_next < until) {
-                    auto sequence = CUDDL_TRY(host_pool->take(host_next));
-                    auto const& extents = sequence->extents;
+            host_paths.reserve(order.size());
+            for (auto id : order) host_paths.push_back(paths[id]);
+            fastx_load_pool host_pool(
+                host_paths,
+                std::min(workers, host_paths.size()),
+                decompression_source{acquire_sequence_target, &host_buffers},
+                workers * 4,
+                false,
+                true,
+                K
+            );
+            // The host path stages on its own thread: it waits on copies over the bus, which
+            // must not hold up the nvCOMP lanes this thread drives. The stager is shared.
+            std::mutex staging;
+            auto host_staged = std::async(std::launch::async, [&]() -> Result<void> {
+                CUDDL_CUDA_TRY(cudaSetDevice(stream.device().get()));
+                while (true) {
+                    auto loaded = CUDDL_TRY(host_pool.take_ready_until_limit());
+                    if (!loaded) return Ok();
+                    auto& [index, sequence] = *loaded;
                     auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
                     auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
+                    auto const genome = order[index] - base;
+                    stager.wait_hold_slot();
+                    std::lock_guard lock(staging);
+                    if (sequence->words != nullptr) {
+                        CUDDL_TRY(stager.add_packed_genome(
+                            genome, std::move(sequence), pinned_base, pinned_size
+                        ));
+                        continue;
+                    }
+                    auto const& extents = sequence->extents;
                     CUDDL_TRY(stager.add_genome(
-                        host_ids[host_next] - base,
-                        extents,
-                        pinned_base,
-                        pinned_size,
-                        std::move(sequence)
+                        genome, extents, pinned_base, pinned_size, std::move(sequence)
                     ));
-                    ++host_next;
                 }
-                return Ok();
-            };
+            });
+            // On an early return, stop the loaders at what they claimed so the host thread ends.
+            struct stop_loaders {
+                fastx_load_pool& pool;
+                ~stop_loaders() {
+                    pool.cap(0);
+                }
+            } stop{host_pool};
             std::vector<inflated_genome> genomes;
             std::array<bool, device_fasta_pipeline::lane_count> busy{};
             size_t next = 0, lane = 0;
+            bool device_open = !device_ids.empty();
             // Cycle through lanes, submitting a batch before consuming the oldest one.
-            while (next < device_ids.size() ||
-                   std::ranges::any_of(busy, [](bool value) { return value; })) {
-                if (next < device_ids.size() && !busy[lane]) {
-                    auto submitted = std::async(std::launch::async, [&]() -> Result<size_t> {
-                        CUDDL_CUDA_TRY(cudaSetDevice(stream.device().get()));
-                        return inflater->submit(
-                            lane, std::span{device_ids}.subspan(next), paths, probes
+            while (device_open || std::ranges::any_of(busy, [](bool value) { return value; })) {
+                if (device_open && !busy[lane]) {
+                    auto const remaining = std::span{device_ids}.subspan(next);
+                    auto const wanted = inflater->batch_files(remaining, probes);
+                    auto const limit = host_pool.cap(order.size() - next - wanted);
+                    auto const files = order.size() - next - limit;
+                    device_open = files == wanted && next + files < device_ids.size();
+                    if (files != 0) {
+                        next += CUDDL_TRY(
+                            inflater->submit(lane, remaining.first(files), paths, probes)
                         );
-                    });
-                    while (host_next < host_ids.size() &&
-                           submitted.wait_for(std::chrono::seconds{0}) !=
-                               std::future_status::ready) {
-                        CUDDL_TRY(drain_host(std::min(host_ids.size(), host_next + 256)));
+                        busy[lane] = true;
                     }
-                    next += CUDDL_TRY(submitted.get());
-                    busy[lane] = true;
                 }
                 auto const other = (lane + 1) % busy.size();
                 if (busy[other]) {
                     genomes.clear();
                     CUDDL_TRY(inflater->finish(other, probes, genomes, handed_back));
+                    std::lock_guard lock(staging);
                     for (auto const& genome : genomes) {
                         CUDDL_TRY(stager.add_resident(genome.id - base, genome.bases, genome.size));
                     }
@@ -1179,7 +1387,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 }
                 lane = other;
             }
-            CUDDL_TRY(drain_host(host_ids.size()));
+            CUDDL_TRY(host_staged.get());
             // ponytail: one fallback pool per group; pipeline it if fallback-heavy inputs dominate.
             return stage_host_loaded<K, BucketCount, Layout>(
                 stager, paths, handed_back, base, workers, host_buffers, page_locked

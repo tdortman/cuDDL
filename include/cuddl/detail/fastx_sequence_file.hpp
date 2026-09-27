@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuddl/detail/dna.hpp>
 #include <cuddl/error.hpp>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -45,6 +46,12 @@ namespace cuddl::detail {
 struct fastx_sequence_extent {
     char const* begin;
     char const* end;
+};
+
+/// @brief One run of bases packed two bits each: its first word and its length in bases.
+struct fastx_packed_record {
+    uint64_t word;
+    uint64_t bases;
 };
 
 /// @brief True for bytes that FASTA sequence consumers conventionally skip between bases.
@@ -86,8 +93,8 @@ DEALINGS IN THE SOFTWARE.
     return position;
 }
 
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__) && !defined(__CUDACC__)
-[[gnu::target("avx2")]] [[nodiscard]] inline size_t
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+[[nodiscard]] __attribute__((target("avx2"))) inline size_t
 fastx_line_end_avx2(std::string_view data, size_t position) {
     const __m256i newline = _mm256_set1_epi8('\n');
     const __m256i carriage_return = _mm256_set1_epi8('\r');
@@ -101,6 +108,20 @@ fastx_line_end_avx2(std::string_view data, size_t position) {
             return position + static_cast<size_t>(__builtin_ctz(mask));
         }
         position += 32;
+    }
+    return fastx_line_end_scalar(data, position);
+}
+#endif
+
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+[[nodiscard]] __attribute__((target("avx512f,avx512bw"))) inline size_t
+fastx_line_end_avx512(std::string_view data, size_t position) {
+    while (data.size() - position >= 64) {
+        auto const bytes = _mm512_loadu_si512(data.data() + position);
+        auto const mask = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\n')) |
+                          _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8('\r'));
+        if (mask != 0) return position + std::countr_zero(mask);
+        position += 64;
     }
     return fastx_line_end_scalar(data, position);
 }
@@ -156,7 +177,8 @@ using fastx_line_end_fn = decltype(&fastx_line_end_scalar);
     return fastx_line_end_sve;
 #elif defined(__aarch64__) || defined(_M_ARM64)
     return fastx_line_end_neon;
-#elif (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__) && !defined(__CUDACC__)
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    if (__builtin_cpu_supports("avx512bw")) return fastx_line_end_avx512;
     return __builtin_cpu_supports("avx2") ? fastx_line_end_avx2 : fastx_line_end_scalar;
 #else
     return fastx_line_end_scalar;
@@ -172,8 +194,8 @@ static const fastx_line_end_fn line_end = resolve_fastx_line_end();
 
 /// @brief Read-only contiguous file payload for in-memory FASTX parsing.
 ///
-/// Plain files stay memory-mapped on Linux, so FASTA extents reference the mapping with no
-/// copy. Other platforms read the file into memory.
+/// On Linux a plain file is memory-mapped by default, so FASTA extents reference the mapping
+/// with no copy, or read into memory it owns on request. Other platforms always read.
 class fastx_mapped_file {
    public:
     fastx_mapped_file() = default;
@@ -206,14 +228,19 @@ class fastx_mapped_file {
     }
 
     /**
-     * @brief Loads a file via mmap (Linux) or read into memory.
+     * @brief Maps or reads a file.
      *
      * Empty files succeed with empty data. Any failure carries the reason; the FASTX loader
      * maps it to its stable "cannot open" error.
+     * @param read Read into owned memory instead of mapping. Unmapping write-locks the address
+     *             space and shoots down TLBs on every core, which serialises a consumer that
+     *             frees files loaded by dozens of threads; a single thread mapping ahead of
+     *             others is better off mapping.
      */
-    [[nodiscard]] static Result<std::unique_ptr<fastx_mapped_file>> load(std::string const& path) {
+    [[nodiscard]] static Result<std::unique_ptr<fastx_mapped_file>>
+    load(std::string const& path, bool read = false) {
         auto buffer = std::make_unique<fastx_mapped_file>();
-        auto loaded = buffer->load_from_path(path);
+        auto loaded = buffer->load_from_path(path, read);
         if (!loaded) return Err(loaded.error());
         return buffer;
     }
@@ -229,7 +256,7 @@ class fastx_mapped_file {
     }
 
    private:
-    std::vector<char> owned_storage_;
+    std::unique_ptr<char[]> owned_storage_;
     char const* data_{nullptr};
     size_t size_{0};
 
@@ -246,12 +273,12 @@ class fastx_mapped_file {
             mapped_size_ = 0;
         }
 #endif
-        owned_storage_.clear();
+        owned_storage_.reset();
         data_ = nullptr;
         size_ = 0;
     }
 
-    [[nodiscard]] Result<void> load_from_path(std::string const& path) {
+    [[nodiscard]] Result<void> load_from_path(std::string const& path, [[maybe_unused]] bool read) {
 #if defined(__linux__)
         int const fd = ::open(path.c_str(), O_RDONLY);
         if (fd == -1) {
@@ -269,17 +296,34 @@ class fastx_mapped_file {
             return Ok();
         }
 
-        mapped_size_ = static_cast<size_t>(file_status.st_size);
-        mapped_ = ::mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        ::close(fd);
-        if (mapped_ == MAP_FAILED) {
-            mapped_ = nullptr;
-            mapped_size_ = 0;
-            return Err(Error::invalid_argument("Failed to mmap FASTA/FASTQ file: " + path));
+        auto const size = static_cast<size_t>(file_status.st_size);
+        if (!read) {
+            mapped_ = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd);
+            if (mapped_ == MAP_FAILED) {
+                mapped_ = nullptr;
+                return Err(Error::invalid_argument("Failed to mmap FASTA/FASTQ file: " + path));
+            }
+            mapped_size_ = size;
+            data_ = static_cast<char const*>(mapped_);
+            size_ = size;
+            return Ok();
         }
-
-        data_ = static_cast<char const*>(mapped_);
-        size_ = mapped_size_;
+        owned_storage_.reset(new char[size]);
+        size_t done = 0;
+        while (done < size) {
+            auto const got =
+                ::pread(fd, owned_storage_.get() + done, size - done, static_cast<off_t>(done));
+            if (got <= 0) break;
+            done += static_cast<size_t>(got);
+        }
+        ::close(fd);
+        if (done != size) {
+            owned_storage_.reset();
+            return Err(Error::invalid_argument("Failed to read FASTA/FASTQ file: " + path));
+        }
+        data_ = owned_storage_.get();
+        size_ = size;
         return Ok();
 #else
         std::ifstream input(path, std::ios::binary);
@@ -291,16 +335,16 @@ class fastx_mapped_file {
         if (file_size < 0) {
             return Err(Error::invalid_argument("Failed to size FASTA/FASTQ file: " + path));
         }
-        owned_storage_.resize(static_cast<size_t>(file_size));
+        owned_storage_.reset(new char[static_cast<size_t>(file_size)]);
         input.seekg(0, std::ios::beg);
-        if (!owned_storage_.empty()) {
-            input.read(owned_storage_.data(), static_cast<std::streamsize>(owned_storage_.size()));
+        if (file_size > 0) {
+            input.read(owned_storage_.get(), static_cast<std::streamsize>(file_size));
             if (!input) {
                 return Err(Error::invalid_argument("Failed to read FASTA/FASTQ file: " + path));
             }
         }
-        data_ = owned_storage_.data();
-        size_ = owned_storage_.size();
+        data_ = owned_storage_.get();
+        size_ = static_cast<size_t>(file_size);
         return Ok();
 #endif
     }
@@ -450,7 +494,221 @@ struct fastx_sequence_file {
     char* decompressed_target = nullptr;
     size_t decompressed_size = 0;
     std::shared_ptr<void> storage_owner;
+    // Set by pack_fastx_sequence_file, which consumes `extents`: runs of at least k bases as
+    // two-bit words, sixteen bases each, every run starting on a word of its own.
+    uint32_t const* words = nullptr;
+    std::vector<fastx_packed_record> packed;
 };
+
+/// @brief Packs up to sixteen bases into a two-bit word, base @c j in bits @c 2j and @c 2j+1.
+///
+/// Codes are those of @ref encode_base. A byte that is not a base gets a meaningless code.
+/// @return A mask with bit @c j set when byte @c j is not a base, or is past @p count.
+[[nodiscard]] inline uint32_t pack_bases16_portable(char const* bases, size_t count, uint32_t& word) {
+    if (count < 16) {
+        uint32_t bad = 0;
+        word = 0;
+        for (uint32_t j = 0; j < 16; ++j) {
+            auto const symbol = j < count ? encode_base(bases[j]) : uint8_t{0xFF};
+            word |= static_cast<uint32_t>(symbol & 3U) << (2 * j);
+            bad |= static_cast<uint32_t>(symbol == 0xFFU) << j;
+        }
+        return bad;
+    }
+    uint32_t bad = 0;
+    word = 0;
+    for (uint32_t half = 0; half < 2; ++half) {
+        uint64_t x;
+        std::memcpy(&x, bases + 8 * half, sizeof(x));
+        constexpr uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL;
+        // High bit of each byte of v that is zero, without carries between bytes.
+        auto const zero = [](uint64_t v) { return ~(((v & low7) + low7) | v | low7); };
+        auto const upper = x & 0xDFDFDFDFDFDFDFDFULL;
+        auto const valid = zero(upper ^ 0x4141414141414141ULL) |
+                           zero(upper ^ 0x4343434343434343ULL) |
+                           zero(upper ^ 0x4747474747474747ULL) | zero(upper ^ 0x5454545454545454ULL);
+        auto codes = (x >> 1) & 0x0303030303030303ULL;
+        codes = (codes | (codes >> 6)) & 0x000F000F000F000FULL;
+        codes = (codes | (codes >> 12)) & 0x000000FF000000FFULL;
+        codes = (codes | (codes >> 24)) & 0xFFFFULL;
+        word |= static_cast<uint32_t>(codes) << (16 * half);
+        // Byte j's flag lands on bit j.
+        bad |= static_cast<uint32_t>(
+                   ((~valid & 0x8080808080808080ULL) >> 7) * 0x0102040810204080ULL >> 56
+               )
+               << (8 * half);
+    }
+    return bad;
+}
+
+/// @brief Packs @p width bases from sixteen-base pieces, for a tail shorter than a full step.
+inline uint64_t pack_bases_pieces(char const* bases, size_t count, uint32_t* words, size_t width) {
+    uint64_t bad = 0;
+    for (size_t piece = 0; piece < width / 16; ++piece) {
+        auto const left = count > 16 * piece ? count - 16 * piece : 0;
+        bad |= uint64_t{pack_bases16_portable(bases + 16 * piece, left, words[piece])} << (16 * piece);
+    }
+    return bad;
+}
+
+inline uint64_t pack_bases_portable(char const* bases, size_t count, uint32_t* words) {
+    return pack_bases16_portable(bases, count, words[0]);
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+/// @brief Packs 32 bases into two words: one compare per letter, multiply-adds for the codes.
+__attribute__((target("avx2"))) inline uint64_t
+pack_bases_avx2(char const* bases, size_t count, uint32_t* words) {
+    if (count < 32) return pack_bases_pieces(bases, count, words, 32);
+    auto const x = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(bases));
+    auto const upper = _mm256_and_si256(x, _mm256_set1_epi8(static_cast<char>(0xDF)));
+    auto const valid = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(upper, _mm256_set1_epi8('A')),
+            _mm256_cmpeq_epi8(upper, _mm256_set1_epi8('C'))
+        ),
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(upper, _mm256_set1_epi8('G')),
+            _mm256_cmpeq_epi8(upper, _mm256_set1_epi8('T'))
+        )
+    );
+    // Codes weighted 1, 4, 16, 64 and summed: every four bases make one byte.
+    auto const codes = _mm256_and_si256(_mm256_srli_epi16(x, 1), _mm256_set1_epi8(3));
+    auto const pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0401));
+    auto const quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x00100001));
+    // Each lane's four bytes, then both lanes into one quadword.
+    auto const gathered = _mm256_shuffle_epi8(
+        quads, _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+    );
+    auto const both = _mm256_permutevar8x32_epi32(gathered, _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(words), _mm256_castsi256_si128(both));
+    return ~static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(valid))) &
+           0xFFFFFFFFULL;
+}
+
+/// @brief Packs 64 bases into four words with byte-mask compares.
+__attribute__((target("avx2,avx512f,avx512bw"))) inline uint64_t
+pack_bases_avx512(char const* bases, size_t count, uint32_t* words) {
+    if (count < 64) {
+        // A short tail packs as two AVX2 halves.
+        auto const low = pack_bases_avx2(bases, count, words);
+        auto const high = pack_bases_avx2(bases + 32, count > 32 ? count - 32 : 0, words + 2);
+        return low | (high << 32);
+    }
+    auto const x = _mm512_loadu_si512(bases);
+    auto const upper = _mm512_and_si512(x, _mm512_set1_epi8(static_cast<char>(0xDF)));
+    auto const valid = _mm512_cmpeq_epi8_mask(upper, _mm512_set1_epi8('A')) |
+                       _mm512_cmpeq_epi8_mask(upper, _mm512_set1_epi8('C')) |
+                       _mm512_cmpeq_epi8_mask(upper, _mm512_set1_epi8('G')) |
+                       _mm512_cmpeq_epi8_mask(upper, _mm512_set1_epi8('T'));
+    // Codes weighted 1, 4, 16, 64 and summed: every four bases make one byte.
+    auto const codes = _mm512_and_si512(_mm512_srli_epi16(x, 1), _mm512_set1_epi8(3));
+    auto const pairs = _mm512_maddubs_epi16(codes, _mm512_set1_epi16(0x0401));
+    auto const quads = _mm512_madd_epi16(pairs, _mm512_set1_epi32(0x00100001));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(words), _mm512_cvtepi32_epi8(quads));
+    return ~static_cast<uint64_t>(valid);
+}
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// @brief Packs 64 bases into four words, sixteen bytes per vector.
+///
+/// The mask sets every bit from the first byte that is not a base on.
+inline uint64_t pack_bases_neon(char const* bases, size_t count, uint32_t* words) {
+    if (count < 64) return pack_bases_pieces(bases, count, words, 64);
+    static constexpr int8_t shift_table[16] = {0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6};
+    auto const shifts = vld1q_s8(shift_table);
+    for (size_t piece = 0; piece < 4; ++piece) {
+        auto const x = vld1q_u8(reinterpret_cast<uint8_t const*>(bases) + 16 * piece);
+        auto const upper = vandq_u8(x, vdupq_n_u8(0xDF));
+        auto const valid = vorrq_u8(
+            vorrq_u8(vceqq_u8(upper, vdupq_n_u8('A')), vceqq_u8(upper, vdupq_n_u8('C'))),
+            vorrq_u8(vceqq_u8(upper, vdupq_n_u8('G')), vceqq_u8(upper, vdupq_n_u8('T')))
+        );
+        // One nibble per byte: set when the byte is not a base.
+        auto const invalid = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(vmvnq_u8(valid)), 4)), 0
+        );
+        // Shift each code into its slot, then add four neighbours: their bits are disjoint.
+        auto const codes = vshlq_u8(vandq_u8(vshrq_n_u8(x, 1), vdupq_n_u8(3)), shifts);
+        auto const pairs = vpaddq_u8(codes, codes);
+        words[piece] = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(pairs, pairs)), 0);
+        if (invalid != 0) {
+            return ~uint64_t{0} << (16 * piece + static_cast<size_t>(std::countr_zero(invalid)) / 4);
+        }
+    }
+    return 0;
+}
+#endif
+
+/// @brief A base packer and the bases it takes per step, a multiple of sixteen up to 64.
+///
+/// The packer returns a mask whose lowest set bit is the first byte that is not a base, or
+/// the first byte past @c count; zero when all @c width bytes are bases.
+struct bases_packer {
+    uint64_t (*pack)(char const* bases, size_t count, uint32_t* words);
+    size_t width;
+};
+
+/// @brief Selects the widest base packer the host supports.
+[[nodiscard]] inline bases_packer resolve_bases_packer() {
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx512bw")) return {pack_bases_avx512, 64};
+    if (__builtin_cpu_supports("avx2")) return {pack_bases_avx2, 32};
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return {pack_bases_neon, 64};
+#else
+    return {pack_bases_portable, 16};
+#endif
+}
+
+static const bases_packer packer = resolve_bases_packer();
+
+/// @brief Packs a parsed file's records in place into two-bit words, run by run.
+///
+/// A record splits at every byte that is not a base, and runs shorter than @p k are dropped:
+/// no k-mer holding such a byte is hashed, so the k-mers are those of the records. Output never
+/// passes unread input: words are written only after the packer has read their bytes, a full
+/// step writes a quarter of what it read, and a partial step writes only for a run of at least
+/// @p k >= 16 bases, whose words take at most half of the bytes it read.
+inline void pack_fastx_sequence_file(fastx_sequence_file& result, uint32_t k) {
+    if (result.extents.empty() || k < 16) return;
+    auto* const out = const_cast<char*>(result.extents.front().begin);
+    uint64_t written = 0;
+    for (auto const& extent : result.extents) {
+        auto const* next = extent.begin;
+        auto const* const end = extent.end;
+        while (next < end) {
+            while (next < end && encode_base(*next) == 0xFF) ++next;
+            auto const* const start = next;
+            auto const first = written;
+            while (next < end) {
+                uint32_t words[4];
+                auto const bad = packer.pack(next, static_cast<size_t>(end - next), words);
+                auto const bases =
+                    bad == 0 ? packer.width : static_cast<size_t>(std::countr_zero(bad));
+                // A partial step ends the run; a short run's partial words are never written.
+                if (bases == packer.width || static_cast<size_t>(next + bases - start) >= k) {
+                    auto const count = (bases + 15) / 16;
+                    std::memcpy(out + written * sizeof(uint32_t), words, count * sizeof(uint32_t));
+                    written += count;
+                }
+                next += bases;
+                if (bases != packer.width) break;
+            }
+            auto const bases = static_cast<uint64_t>(next - start);
+            if (bases >= k) {
+                result.packed.push_back({first, bases});
+            } else {
+                written = first;
+            }
+        }
+    }
+    result.words = reinterpret_cast<uint32_t const*>(out);
+    result.extents.clear();
+}
 
 /// @brief Host-visible buffer a caller offers for decompressed bytes.
 ///
@@ -701,8 +959,25 @@ struct compact_shuffle_table {
 }  // namespace compact_impl
 
 #if defined(__ARM_NEON)
-inline char* compact_sequence_whitespace_neon(char const* first, char const* last, char* out) {
+inline char* compact_block_neon(uint8x16_t block, uint8x16_t whitespace, char* out) {
+    if (vmaxvq_u8(whitespace) == 0) {
+        vst1q_u8(reinterpret_cast<uint8_t*>(out), block);
+        return out + 16;
+    }
     auto const& table = compact_impl::compact_shuffle();
+    auto const flags = compact_impl::compact_mask(whitespace);
+    auto const low = flags & 0xFFU;
+    auto const high = (flags >> 8U) & 0xFFU;
+    auto const packed_low = vqtbl1q_u8(block, vld1q_u8(table.control[low]));
+    auto const packed_high = vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
+    // Half-width stores cannot overwrite input beyond the loaded block when compacting in place.
+    vst1_u8(reinterpret_cast<uint8_t*>(out), vget_low_u8(packed_low));
+    out += table.kept[low];
+    vst1_u8(reinterpret_cast<uint8_t*>(out), vget_low_u8(packed_high));
+    return out + table.kept[high];
+}
+
+inline char* compact_sequence_whitespace_neon(char const* first, char const* last, char* out) {
     auto const newline = vdupq_n_u8('\n');
     auto const carriage = vdupq_n_u8('\r');
     auto const space = vdupq_n_u8(' ');
@@ -714,24 +989,7 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
             vorrq_u8(vceqq_u8(block, newline), vceqq_u8(block, carriage)),
             vorrq_u8(vceqq_u8(block, space), vceqq_u8(block, tab))
         );
-        if (vmaxvq_u8(whitespace) == 0) {
-            vst1q_u8(reinterpret_cast<uint8_t*>(out), block);
-            out += 16;
-            at += 16;
-            continue;
-        }
-        auto const flags = compact_impl::compact_mask(whitespace);
-        auto const low = flags & 0xFFU;
-        auto const high = (flags >> 8U) & 0xFFU;
-        auto const packed_low = vqtbl1q_u8(block, vld1q_u8(table.control[low]));
-        auto const packed_high =
-            vqtbl1q_u8(vextq_u8(block, block, 8), vld1q_u8(table.control[high]));
-        // Eight bytes per half, like the x86 path: a wider store would write past the block
-        // being read, over the next block when compacting in place.
-        vst1_u8(reinterpret_cast<std::uint8_t*>(out), vget_low_u8(packed_low));
-        out += table.kept[low];
-        vst1_u8(reinterpret_cast<std::uint8_t*>(out), vget_low_u8(packed_high));
-        out += table.kept[high];
+        out = compact_block_neon(block, whitespace, out);
         at += 16;
     }
     for (; at != last; ++at) {
@@ -802,6 +1060,31 @@ compact_sequence_whitespace_avx2(char const* first, char const* last, char* out)
 }
 #endif
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+static bool const compact_avx512 =
+    __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi2");
+
+__attribute__((target("avx512f,avx512bw,avx512vbmi2,popcnt"))) inline char*
+compact_sequence_whitespace_avx512(char const* first, char const* last, char* out) {
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 64) {
+        auto const block = _mm512_loadu_si512(at);
+        auto const keep =
+            ~(_mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8('\n')) |
+              _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8('\r')) |
+              _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8(' ')) |
+              _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8('\t')));
+        _mm512_storeu_si512(out, _mm512_maskz_compress_epi8(keep, block));
+        out += std::popcount(keep);
+        at += 64;
+    }
+    for (; at != last; ++at) {
+        if (!fastx_is_sequence_whitespace(*at)) *out++ = *at;
+    }
+    return out;
+}
+#endif
+
 /// @brief Copies bases from [@p first, @p last) to @p out, dropping sequence whitespace.
 ///
 /// A sequence line is a long run of bases closed by a line ending, so a test per byte is the bulk
@@ -815,7 +1098,10 @@ inline char* compact_sequence_whitespace(char const* first, char const* last, ch
 #if defined(__ARM_NEON)
         return compact_sequence_whitespace_neon(first, last, out);
 #elif defined(__x86_64__) || defined(__i386__)
-        return compact_sequence_whitespace_avx2(first, last, out);
+        if (compact_avx512) return compact_sequence_whitespace_avx512(first, last, out);
+        if (__builtin_cpu_supports("avx2")) {
+            return compact_sequence_whitespace_avx2(first, last, out);
+        }
 #endif
     }
     constexpr uint64_t ones = 0x0101010101010101ULL;
@@ -861,6 +1147,47 @@ inline char* compact_sequence_whitespace(char const* first, char const* last, ch
 
 #if defined(__x86_64__) || defined(__i386__)
 /// @brief fasta_sequence_compact in one AVX2 pass: the header test rides on the whitespace test.
+/// @brief @ref fasta_sequence_compact_avx2 on 64-byte blocks, compacting with vpcompressb.
+///
+/// A block's kept bytes are written as one full 64-byte store: @p out never passes the block
+/// being read, so the store lands on bytes already loaded.
+__attribute__((target("avx512f,avx512bw,avx512vbmi2,popcnt"))) inline char*
+fasta_sequence_compact_avx512(char const* first, char const* last, char* out, char const*& stop) {
+    auto const newline = _mm512_set1_epi8('\n');
+    auto const carriage = _mm512_set1_epi8('\r');
+    auto const space = _mm512_set1_epi8(' ');
+    auto const tab = _mm512_set1_epi8('\t');
+    auto const marker = _mm512_set1_epi8('>');
+    // Bit set when the byte before the block ends a line; @p first follows a line ending.
+    uint64_t carry = 1;
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 64) {
+        auto const block = _mm512_loadu_si512(at);
+        auto const ends =
+            _mm512_cmpeq_epi8_mask(block, newline) | _mm512_cmpeq_epi8_mask(block, carriage);
+        auto const headers = _mm512_cmpeq_epi8_mask(block, marker) & ((ends << 1U) | carry);
+        if (headers != 0) {
+            stop = at + std::countr_zero(headers);
+            return compact_sequence_whitespace(at, stop, out);
+        }
+        carry = ends >> 63U;
+        auto const keep =
+            ~(ends | _mm512_cmpeq_epi8_mask(block, space) | _mm512_cmpeq_epi8_mask(block, tab));
+        _mm512_storeu_si512(out, _mm512_maskz_compress_epi8(keep, block));
+        out += std::popcount(keep);
+        at += 64;
+    }
+    bool line_start = carry != 0;
+    for (; at != last; ++at) {
+        char const ch = *at;
+        if (ch == '>' && line_start) break;
+        line_start = ch == '\n' || ch == '\r';
+        if (!fastx_is_sequence_whitespace(ch)) *out++ = ch;
+    }
+    stop = at;
+    return out;
+}
+
 __attribute__((target("avx2"))) inline char*
 fasta_sequence_compact_avx2(char const* first, char const* last, char* out, char const*& stop) {
     auto const newline = _mm256_set1_epi8('\n');
@@ -904,6 +1231,41 @@ fasta_sequence_compact_avx2(char const* first, char const* last, char* out, char
 }
 #endif
 
+#if defined(__ARM_NEON)
+inline char*
+fasta_sequence_compact_neon(char const* first, char const* last, char* out, char const*& stop) {
+    unsigned carry = 1;
+    auto const* at = first;
+    while (static_cast<size_t>(last - at) >= 16) {
+        auto const block = vld1q_u8(reinterpret_cast<uint8_t const*>(at));
+        auto const line_end =
+            vorrq_u8(vceqq_u8(block, vdupq_n_u8('\n')), vceqq_u8(block, vdupq_n_u8('\r')));
+        auto const ends = compact_impl::compact_mask(line_end);
+        auto const markers = compact_impl::compact_mask(vceqq_u8(block, vdupq_n_u8('>')));
+        auto const headers = markers & ((ends << 1U) | carry);
+        if (headers != 0) {
+            stop = at + std::countr_zero(headers);
+            return compact_sequence_whitespace(at, stop, out);
+        }
+        carry = ends >> 15U;
+        auto const whitespace = vorrq_u8(
+            line_end, vorrq_u8(vceqq_u8(block, vdupq_n_u8(' ')), vceqq_u8(block, vdupq_n_u8('\t')))
+        );
+        out = compact_block_neon(block, whitespace, out);
+        at += 16;
+    }
+    bool line_start = carry != 0;
+    for (; at != last; ++at) {
+        char const ch = *at;
+        if (ch == '>' && line_start) break;
+        line_start = ch == '\n' || ch == '\r';
+        if (!fastx_is_sequence_whitespace(ch)) *out++ = ch;
+    }
+    stop = at;
+    return out;
+}
+#endif
+
 /// @brief Compacts one FASTA record's sequence from @p first to @p out, stopping at the next
 /// header.
 ///
@@ -913,7 +1275,11 @@ fasta_sequence_compact_avx2(char const* first, char const* last, char* out, char
 inline char*
 fasta_sequence_compact(char const* first, char const* last, char* out, char const*& stop) {
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if (compact_avx512) return fasta_sequence_compact_avx512(first, last, out, stop);
     if (__builtin_cpu_supports("avx2")) return fasta_sequence_compact_avx2(first, last, out, stop);
+#endif
+#if defined(__ARM_NEON)
+    return fasta_sequence_compact_neon(first, last, out, stop);
 #endif
     stop = fasta_next_header(first, last);
     return compact_sequence_whitespace(first, stop, out);
@@ -1046,11 +1412,81 @@ parse_fastx_sequence_file(fastx_sequence_file& result, std::string const& path) 
     return Ok();
 }
 
+/// @brief Compact and pack one cache-sized block at a time, without a genome-sized ASCII write.
+/// Blocks end at line boundaries so header detection keeps its line-start invariant.
+/// Carrying k - 1 compacted bytes preserves every window without duplicating one.
+inline Result<void> pack_fasta_chunks(
+    fastx_sequence_file& result,
+    std::string_view data,
+    char* out,
+    uint32_t k,
+    std::string const& path
+) {
+    size_t header = data.find('>');
+    while (header != std::string_view::npos && header != 0 && data[header - 1] != '\n' &&
+           data[header - 1] != '\r') {
+        header = data.find('>', header + 1);
+    }
+    if (header == std::string_view::npos) {
+        if (!data.empty()) return Err(Error::invalid_argument("FASTX parse error near: " + path));
+        return Ok();
+    }
+    std::string scratch, carry;
+    fastx_sequence_file chunk;
+    uint64_t written = 0;
+    bool has_sequence = false;
+    auto const* const last = data.data() + data.size();
+    while (true) {
+        auto const end = fastx_line_end(data, header);
+        if (end + 1 >= data.size()) break;
+        auto const* at = data.data() + end + 1;
+        carry.clear();
+        while (at != last) {
+            auto const offset = static_cast<size_t>(at - data.data());
+            auto const boundary = offset + std::min<size_t>(16384, data.size() - offset);
+            auto const limit = boundary == data.size()
+                                   ? boundary
+                                   : std::min(data.size(), fastx_line_end(data, boundary) + 1);
+            auto const* const chunk_end = data.data() + limit;
+            scratch.resize(carry.size() + static_cast<size_t>(chunk_end - at));
+            std::memcpy(scratch.data(), carry.data(), carry.size());
+            char const* stop = nullptr;
+            auto* compact_end =
+                fasta_sequence_compact(at, chunk_end, scratch.data() + carry.size(), stop);
+            has_sequence |= stop != at;
+            auto const bases = static_cast<size_t>(compact_end - scratch.data());
+            carry.assign(compact_end - std::min<size_t>(k - 1, bases), compact_end);
+            chunk.extents.push_back({scratch.data(), compact_end});
+            pack_fastx_sequence_file(chunk, k);
+            uint64_t words = 0;
+            for (auto record : chunk.packed) {
+                words = record.word + (record.bases + 15) / 16;
+                record.word += written;
+                result.packed.push_back(record);
+            }
+            std::memcpy(out + written * sizeof(uint32_t), scratch.data(), words * sizeof(uint32_t));
+            written += words;
+            chunk.packed.clear();
+            at = stop;
+            if (stop != chunk_end || stop == last) break;
+        }
+        if (at == last) break;
+        header = static_cast<size_t>(at - data.data());
+    }
+    if (!has_sequence && !data.empty()) {
+        return Err(Error::invalid_argument("FASTX parse error near: " + path));
+    }
+    result.words = reinterpret_cast<uint32_t const*>(out);
+    result.input = {};
+    return Ok();
+}
+
 inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
     std::unique_ptr<fastx_mapped_file> file,
     std::string const& path,
     decompression_source source,
-    bool defer_fasta
+    bool defer_fasta,
+    uint32_t pack_k = 0
 ) {
     auto result = std::make_unique<fastx_sequence_file>();
     result->file = std::move(file);
@@ -1100,6 +1536,19 @@ inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
             if (end + 1 < data.size() && data[end + 1] != '>') return result;
         }
     }
+    if (pack_k >= 16) {
+        auto const first = data.find_first_not_of("\r\n");
+        if (first == std::string_view::npos || data[first] != '@') {
+            char* out = result->decompressed_target;
+            if (out == nullptr) {
+                if (data.data() != result->decompressed.data())
+                    result->decompressed.resize(data.size());
+                out = result->decompressed.data();
+            }
+            CUDDL_TRY(pack_fasta_chunks(*result, data, out, pack_k, path));
+            return result;
+        }
+    }
     CUDDL_TRY(parse_fastx_sequence_file(*result, path));
     return result;
 }
@@ -1107,11 +1556,13 @@ inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
 inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     std::string const& path,
     decompression_source source = {},
-    bool defer_fasta = false
+    bool defer_fasta = false,
+    bool read = false,
+    uint32_t pack_k = 0
 ) {
-    auto file = fastx_mapped_file::load(path);
+    auto file = fastx_mapped_file::load(path, read);
     if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
-    return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta);
+    return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
 }
 
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
@@ -1130,19 +1581,22 @@ class fastx_load_pool {
     ///                straggler while the other loaders sit idle.
     /// @param defer_fasta Leave eligible FASTA bytes for a GPU normaliser.
     /// @param completion_order Collect through take_ready instead of take(id).
+    /// @param pack_k Nonzero packs each loaded file into two-bit runs for k-mers this long.
     fastx_load_pool(
         std::span<std::filesystem::path const> paths,
         size_t workers,
         decompression_source source = {},
         size_t window = 0,
         bool defer_fasta = false,
-        bool completion_order = false
+        bool completion_order = false,
+        uint32_t pack_k = 0
     )
         : paths_(paths),
           workers_(std::max(size_t{1}, workers)),
           window_(std::max({size_t{1}, window, workers_})),
           source_(source),
           defer_fasta_(defer_fasta),
+          pack_k_(pack_k),
           results_(paths.size()),
           errors_(paths.size()),
           ready_(completion_order ? window_ : 0),
@@ -1202,6 +1656,38 @@ class fastx_load_pool {
         lock.unlock();
         if (errors_[id] != nullptr) std::rethrow_exception(errors_[id]);
         return std::pair{id, CUDDL_TRY(std::move(*results_[id]))};
+    }
+
+    /// @brief @ref take_ready, or nothing once every id below the @ref cap limit is taken.
+    [[nodiscard]] Result<std::optional<std::pair<size_t, std::unique_ptr<fastx_sequence_file>>>>
+    take_ready_until_limit() {
+        {
+            std::unique_lock lock(mutex_);
+            filled_.wait(lock, [&] { return ready_count_ != 0 || taken_ >= limit_; });
+            if (ready_count_ == 0) return std::nullopt;
+        }
+        return CUDDL_TRY(take_ready());
+    }
+
+    /// @brief Completion-order results waiting to be taken.
+    [[nodiscard]] size_t ready() {
+        std::lock_guard lock(mutex_);
+        return ready_count_;
+    }
+
+    /// @brief Stops the loaders before id @p limit, or after the ids they already claimed.
+    ///
+    /// A second consumer can own the ids past the returned limit without racing the loaders.
+    /// @return How many ids the pool loads in total.
+    size_t cap(size_t limit) {
+        {
+            std::lock_guard lock(mutex_);
+            limit_ = std::clamp(limit, next_, limit_);
+            limit = limit_;
+        }
+        assign_.notify_all();
+        filled_.notify_all();
+        return limit;
     }
 
    private:
@@ -1274,22 +1760,25 @@ class fastx_load_pool {
                     });
                 } else {
                     assign_.wait(lock, [&] {
-                        return stop_ || next_ >= paths_.size() || next_ - taken_ < window_;
+                        return stop_ || next_ >= limit_ || next_ - taken_ < window_;
                     });
                 }
-                if (stop_ || next_ >= paths_.size()) return;
+                if (stop_ || next_ >= limit_) return;
                 id = next_++;
                 if (defer_fasta_) input = std::move(mapped_[id % mapped_.size()]);
             }
             try {
                 auto const path = paths_[id].string();
                 auto loaded = [&]() -> Result<std::unique_ptr<fastx_sequence_file>> {
-                    if (!defer_fasta_) return load_fastx_sequence_file(path, source_);
+                    // Loaders free their files on the consumer, so they read rather than map.
+                    if (!defer_fasta_)
+                        return load_fastx_sequence_file(path, source_, false, true, pack_k_);
                     if (input.error) std::rethrow_exception(input.error);
                     if (!*input.file)
                         return Err(Error::invalid_argument("cannot open FASTX file: " + path));
                     return decode_fastx_sequence_file(std::move(**input.file), path, source_, true);
                 }();
+                if (pack_k_ != 0 && loaded) pack_fastx_sequence_file(**loaded, pack_k_);
                 // Inflated or copied bytes no longer reference the file mapping.
                 if (defer_fasta_ && loaded && (*loaded)->file &&
                     ((*loaded)->decompressed_target != nullptr ||
@@ -1318,6 +1807,7 @@ class fastx_load_pool {
     size_t window_;
     decompression_source source_;
     bool defer_fasta_;
+    uint32_t pack_k_;
     std::vector<std::optional<Result<std::unique_ptr<fastx_sequence_file>>>> results_;
     std::vector<std::exception_ptr> errors_;
     std::vector<size_t> ready_;
@@ -1331,7 +1821,7 @@ class fastx_load_pool {
     std::condition_variable assign_, filled_;
     std::condition_variable retired_ready_, retired_space_;
     std::condition_variable mapped_ready_;
-    size_t next_ = 0, taken_ = 0;
+    size_t next_ = 0, taken_ = 0, limit_ = paths_.size();
     size_t ready_head_ = 0, ready_count_ = 0;
     size_t retired_head_ = 0, retired_count_ = 0;
     size_t mapped_next_ = 0;

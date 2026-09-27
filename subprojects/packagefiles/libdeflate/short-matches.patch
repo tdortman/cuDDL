@@ -1,6 +1,8 @@
+diff --git a/lib/decompress_template.h b/lib/decompress_template.h
+index 6c105a3..ed32574 100644
 --- a/lib/decompress_template.h
 +++ b/lib/decompress_template.h
-@@ -575,6 +575,8 @@
+@@ -586,6 +586,8 @@ match_decoded:
  		 * Copy the match.  On most CPUs the fastest method is a
  		 * word-at-a-time copy, unconditionally copying about 5 words
  		 * since this is enough for most matches without being too much.
@@ -9,7 +11,7 @@
  		 *
  		 * The normal word-at-a-time copy works for offset >= WORDBYTES,
  		 * which is most cases.  The case of offset == 1 is also common
-@@ -594,6 +596,7 @@
+@@ -605,6 +607,7 @@ match_decoded:
  			store_word_unaligned(load_word_unaligned(src), dst);
  			src += WORDBYTES;
  			dst += WORDBYTES;
@@ -17,7 +19,7 @@
  			store_word_unaligned(load_word_unaligned(src), dst);
  			src += WORDBYTES;
  			dst += WORDBYTES;
-@@ -620,6 +623,7 @@
+@@ -631,6 +634,7 @@ match_decoded:
  				src += WORDBYTES;
  				dst += WORDBYTES;
  			}

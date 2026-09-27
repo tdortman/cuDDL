@@ -1,0 +1,45 @@
+--- a/lib/deflate_decompress.c
++++ b/lib/deflate_decompress.c
+@@ -1067,6 +1067,7 @@
+ }
+ 
+ #define HUFFDEC_PAIR 0x40000000U
++#define HUFFDEC_LITERAL_PAIR 0x20000000U
+ 
+ static void build_pair_decode_table(struct libdeflate_decompressor *d)
+ {
+@@ -1089,6 +1090,20 @@
+ 			}
+ 		}
+ 		d->pair_decode_table[key] = result;
++	}
++	/* Fuse a literal and a short match when their prefixes fit one lookup. */
++	for (key = 0; key < (1U << LITLEN_TABLEBITS); key++) {
++		u64 entry = d->pair_decode_table[key];
++		if (entry & HUFFDEC_LITERAL) {
++			unsigned bits = (u8)entry;
++			u64 next = d->pair_decode_table[key >> bits];
++			unsigned prefix = bits + (u8)next - ((next >> 8) & 0xf);
++			if ((next & (HUFFDEC_PAIR | HUFFDEC_LITERAL_PAIR)) == HUFFDEC_PAIR &&
++			    prefix <= LITLEN_TABLEBITS) {
++				d->pair_decode_table[key] = (next + bits) | HUFFDEC_LITERAL_PAIR |
++					((u64)((entry >> 16) & 0xff) << 48);
++			}
++		}
+ 	}
+ }
+ 
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -443,7 +443,10 @@
+ 		if (entry & HUFFDEC_PAIR) {
+ 			unsigned extra = (entry >> 8) & 0xf;
+ 			length = (entry >> 16) & 0x1ff;
+-			offset = (entry >> 32) +
++			if (entry & HUFFDEC_LITERAL_PAIR) {
++				*out_next++ = entry >> 48;
++			}
++			offset = (u16)(entry >> 32) +
+ 				 ((saved_bitbuf >> ((u8)entry - extra)) & BITMASK(extra));
+ 			if (unlikely((u8)bitsleft < LITLEN_TABLEBITS))
+ 				REFILL_BITS_IN_FASTLOOP();

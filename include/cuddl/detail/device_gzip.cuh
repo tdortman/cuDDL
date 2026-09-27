@@ -5,10 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -29,6 +32,12 @@
 #include <cuda/iterator>
 #include <cuda/memory_pool>
 #include <cuda/stream>
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #include <arm_neon.h>
+#endif
 
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
@@ -87,6 +96,181 @@ void parallel_for(size_t count, size_t workers, Work&& work) {
     for (size_t thread = 0; thread < helpers; ++thread) threads.emplace_back(run);
     run();
 }
+
+/// @brief True when @p data holds what could start another gzip member: 1f 8b 08, then a flag
+/// byte with its reserved bits clear.
+///
+/// A member with reserved flag bits set fails to decode, so it cannot be one the host path
+/// would inflate. Compressed data holds the three-byte signature alone in about one file in
+/// eleven, which would send those files back to the host.
+[[nodiscard]] inline bool has_gzip_signature_portable(char const* data, size_t size) {
+    for (size_t at = 0; size - at >= 4;) {
+        auto const* const found =
+            static_cast<char const*>(::memmem(data + at, size - at - 1, "\x1f\x8b\x08", 3));
+        if (found == nullptr) return false;
+        if ((static_cast<uint8_t>(found[3]) & 0xe0U) == 0) return true;
+        at = static_cast<size_t>(found - data) + 1;
+    }
+    return false;
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+/// @brief @ref has_gzip_signature_portable comparing 64 starting positions per step.
+__attribute__((target("avx512f,avx512bw"))) inline bool
+has_gzip_signature_avx512(char const* data, size_t size) {
+    size_t at = 0;
+    for (; at + 67 <= size; at += 64) {
+        auto const first = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(data + at), _mm512_set1_epi8(0x1f));
+        if (first == 0) continue;
+        auto const second = _mm512_cmpeq_epi8_mask(
+            _mm512_loadu_si512(data + at + 1), _mm512_set1_epi8(static_cast<char>(0x8b))
+        );
+        auto const third =
+            _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(data + at + 2), _mm512_set1_epi8(0x08));
+        auto const flags = _mm512_testn_epi8_mask(
+            _mm512_loadu_si512(data + at + 3), _mm512_set1_epi8(static_cast<char>(0xe0))
+        );
+        if ((first & second & third & flags) != 0) return true;
+    }
+    return has_gzip_signature_portable(data + at, size - at);
+}
+
+/// @brief @ref has_gzip_signature_portable comparing 32 starting positions per step.
+__attribute__((target("avx2"))) inline bool has_gzip_signature_avx2(char const* data, size_t size) {
+    size_t at = 0;
+    for (; at + 35 <= size; at += 32) {
+        auto const* const block = reinterpret_cast<__m256i const*>(data + at);
+        auto const first = _mm256_cmpeq_epi8(_mm256_loadu_si256(block), _mm256_set1_epi8(0x1f));
+        if (_mm256_testz_si256(first, first)) continue;
+        auto const second = _mm256_cmpeq_epi8(
+            _mm256_loadu_si256(reinterpret_cast<__m256i const*>(data + at + 1)),
+            _mm256_set1_epi8(static_cast<char>(0x8b))
+        );
+        auto const third = _mm256_cmpeq_epi8(
+            _mm256_loadu_si256(reinterpret_cast<__m256i const*>(data + at + 2)),
+            _mm256_set1_epi8(0x08)
+        );
+        auto const flags = _mm256_cmpeq_epi8(
+            _mm256_and_si256(
+                _mm256_loadu_si256(reinterpret_cast<__m256i const*>(data + at + 3)),
+                _mm256_set1_epi8(static_cast<char>(0xe0))
+            ),
+            _mm256_setzero_si256()
+        );
+        auto const all =
+            _mm256_and_si256(_mm256_and_si256(first, flags), _mm256_and_si256(second, third));
+        if (!_mm256_testz_si256(all, all)) return true;
+    }
+    return has_gzip_signature_portable(data + at, size - at);
+}
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// @brief @ref has_gzip_signature_portable comparing 16 starting positions per step.
+inline bool has_gzip_signature_neon(char const* data, size_t size) {
+    size_t at = 0;
+    auto const* bytes = reinterpret_cast<uint8_t const*>(data);
+    for (; at + 19 <= size; at += 16) {
+        auto const first = vceqq_u8(vld1q_u8(bytes + at), vdupq_n_u8(0x1f));
+        if (vmaxvq_u8(first) == 0) continue;
+        auto const second = vceqq_u8(vld1q_u8(bytes + at + 1), vdupq_n_u8(0x8b));
+        auto const third = vceqq_u8(vld1q_u8(bytes + at + 2), vdupq_n_u8(8));
+        auto const flags =
+            vceqq_u8(vandq_u8(vld1q_u8(bytes + at + 3), vdupq_n_u8(0xe0)), vdupq_n_u8(0));
+        if (vmaxvq_u8(vandq_u8(vandq_u8(first, flags), vandq_u8(second, third))) != 0) {
+            return true;
+        }
+    }
+    return has_gzip_signature_portable(data + at, size - at);
+}
+#endif
+
+/// @brief Selects the widest signature scanner the host supports.
+[[nodiscard]] inline auto resolve_gzip_signature_scanner() -> bool (*)(char const*, size_t) {
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx512bw")) return has_gzip_signature_avx512;
+    if (__builtin_cpu_supports("avx2")) return has_gzip_signature_avx2;
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return has_gzip_signature_neon;
+#endif
+    return has_gzip_signature_portable;
+}
+
+static bool (*const has_gzip_signature)(char const*, size_t) = resolve_gzip_signature_scanner();
+
+/// @brief Fixed threads that run indexed work with the caller, for work repeated per batch.
+///
+/// Spawning and joining threads for every batch cost the thread submitting batches more time
+/// than the reads it spread over them.
+class worker_pool {
+   public:
+    explicit worker_pool(size_t workers) {
+        auto const helpers = workers > 0 ? workers - 1 : 0;
+        threads_.reserve(helpers);
+        for (size_t thread = 0; thread < helpers; ++thread) {
+            threads_.emplace_back([this] { serve(); });
+        }
+    }
+    worker_pool(worker_pool const&) = delete;
+    worker_pool& operator=(worker_pool const&) = delete;
+    ~worker_pool() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        start_.notify_all();
+        for (auto& thread : threads_) thread.join();
+    }
+
+    /// @brief Runs @p work(index) for every index below @p count; one call at a time.
+    template <typename Work>
+    void for_each(size_t count, Work&& work) {
+        if (count == 0) return;
+        auto run = [&](size_t index) { work(index); };
+        {
+            std::lock_guard lock(mutex_);
+            job_ = run;
+            count_ = count;
+            next_ = 0;
+            active_ = threads_.size();
+            ++generation_;
+        }
+        start_.notify_all();
+        drain();
+        std::unique_lock lock(mutex_);
+        done_.wait(lock, [&] { return active_ == 0; });
+        job_ = nullptr;
+    }
+
+   private:
+    void drain() {
+        for (size_t index = next_++; index < count_; index = next_++) job_(index);
+    }
+
+    void serve() {
+        size_t seen = 0;
+        while (true) {
+            {
+                std::unique_lock lock(mutex_);
+                start_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+            }
+            drain();
+            std::lock_guard lock(mutex_);
+            if (--active_ == 0) done_.notify_one();
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable start_, done_;
+    std::function<void(size_t)> job_;
+    std::atomic<size_t> next_{0};
+    size_t count_ = 0, active_ = 0, generation_ = 0;
+    bool stop_ = false;
+};
 
 namespace device_gzip {
 
@@ -317,8 +501,9 @@ struct decoded_fasta {
 /// @brief Normalises FASTA batches supplied compressed or already inflated.
 ///
 /// Each lane receives raw bytes through a batched copy or inflates gzip through nvCOMP.
-/// Kernels blank header text and leading bytes before an
-/// in-place select drops whitespace. A genome comes out as one run of bases with its records
+/// Kernels blank header text and leading bytes, then compaction drops whitespace.
+/// GPU-inflated data reuses compressed-input storage. CPU-inflated data compacts in place.
+/// One genome comes out as one run of bases with its records
 /// joined by the '>' that opened each one, a byte no k-mer window accepts, so it sketches exactly
 /// as its separate records would.
 ///
@@ -377,15 +562,26 @@ class device_fasta_pipeline {
             stream.get()
         );
         if (counted != cudaSuccess) throw std::runtime_error(cudaGetErrorString(counted));
-        cub::DeviceSelect::If(
-            nullptr,
-            select_temp_bytes_,
-            static_cast<char*>(nullptr),
-            static_cast<int64_t*>(nullptr),
-            static_cast<int64_t>(slot_capacity_),
-            device_gzip::kept_byte{},
-            stream.get()
-        );
+        auto const selected = compressed_capacity_ == 0 ? cub::DeviceSelect::If(
+                                                              nullptr,
+                                                              select_temp_bytes_,
+                                                              static_cast<char*>(nullptr),
+                                                              static_cast<int64_t*>(nullptr),
+                                                              static_cast<int64_t>(slot_capacity_),
+                                                              device_gzip::kept_byte{},
+                                                              stream.get()
+                                                          )
+                                                        : cub::DeviceSelect::If(
+                                                              nullptr,
+                                                              select_temp_bytes_,
+                                                              static_cast<char*>(nullptr),
+                                                              static_cast<char*>(nullptr),
+                                                              static_cast<int64_t*>(nullptr),
+                                                              static_cast<int64_t>(slot_capacity_),
+                                                              device_gzip::kept_byte{},
+                                                              stream.get()
+                                                          );
+        if (selected != cudaSuccess) throw std::runtime_error(cudaGetErrorString(selected));
 #if CUDART_VERSION < 13030
         if (compressed_capacity_ == 0) {
             auto const copied = cub::DeviceCopy::Batched(
@@ -420,8 +616,10 @@ class device_fasta_pipeline {
                 lane.pinned.emplace(
                     s, cuda::pinned_default_memory_pool(), compressed_capacity_, cuda::no_init
                 );
-                lane.compressed.emplace(
-                    cuda::make_device_buffer<char>(s, device, compressed_capacity_, cuda::no_init)
+                lane.payload.emplace(
+                    cuda::make_device_buffer<char>(
+                        s, device, std::max(compressed_capacity_, slot_capacity_), cuda::no_init
+                    )
                 );
             }
             lane.host.emplace(
@@ -477,20 +675,11 @@ class device_fasta_pipeline {
         return slot_capacity / 4096 * sizeof(uint64_t) + (size_t{64} << 20);
     }
 
-    /// @brief Starts inflating files from the front of @p ids on @p lane.
-    ///
-    /// Every id must be a device candidate that fits one lane on its own.
-    /// Files with extra member signatures reach @ref finish without device inflation.
-    /// @return How many ids the batch took.
-    [[nodiscard]] Result<size_t> submit(
-        size_t lane_index,
+    /// @brief How many ids from the front of @p ids one lane holds.
+    [[nodiscard]] size_t batch_files(
         std::span<size_t const> ids,
-        std::span<std::filesystem::path const> paths,
         std::span<gzip_file_probe const> probes
-    ) {
-        auto& lane = lanes_[lane_index];
-        lane.decoded = false;
-        if (ids.empty()) return Err(Error::invalid_argument("an inflate batch needs a file"));
+    ) const noexcept {
         size_t files = 0, compressed = 0, slots = 0;
         while (files < ids.size() && files < max_files) {
             auto const& probe = probes[ids[files]];
@@ -502,6 +691,24 @@ class device_fasta_pipeline {
             slots += probe.isize + 1;
             ++files;
         }
+        return files;
+    }
+
+    /// @brief Starts inflating files from the front of @p ids on @p lane.
+    ///
+    /// Every id must be a device candidate that fits one lane on its own.
+    /// Files with extra member signatures reach @ref finish without device inflation.
+    /// @return How many ids the batch took: @ref batch_files of them.
+    [[nodiscard]] Result<size_t> submit(
+        size_t lane_index,
+        std::span<size_t const> ids,
+        std::span<std::filesystem::path const> paths,
+        std::span<gzip_file_probe const> probes
+    ) {
+        auto& lane = lanes_[lane_index];
+        lane.decoded = false;
+        if (ids.empty()) return Err(Error::invalid_argument("an inflate batch needs a file"));
+        auto const files = batch_files(ids, probes);
         // The pinned bytes are rewritten below, so the previous batch's upload must be done.
         CUDDL_CUDA_TRY(lane.uploaded->sync());
         auto table = host_table(lane);
@@ -513,7 +720,7 @@ class device_fasta_pipeline {
             compressed_at += probe.compressed;
         }
         std::atomic<bool> failed{false};
-        parallel_for(files, workers_, [&](size_t file) {
+        readers_.for_each(files, [&](size_t file) {
             auto const* const path = paths[ids[file]].c_str();
             auto* const out = lane.pinned->data() + table.compressed_offsets[file];
             auto const bytes = table.compressed_bytes[file];
@@ -532,7 +739,7 @@ class device_fasta_pipeline {
             // A matching trailer cannot distinguish repeated first and last members.
             // A signature inside compressed data is ambiguous too, so use the host parser.
             lane.possible_members[file] =
-                done > 10 && ::memmem(out + 10, done - 10, "\x1f\x8b\x08", 3) != nullptr;
+                done > 10 && has_gzip_signature(out + 10, done - 10);
         });
         if (failed) return Err(Error::invalid_argument("cannot read gzip reference inputs"));
         lane.files.clear();
@@ -544,8 +751,7 @@ class device_fasta_pipeline {
             }
             auto const target = lane.files.size();
             auto const& probe = probes[ids[file]];
-            table.compressed_ptrs[target] =
-                lane.compressed->data() + table.compressed_offsets[file];
+            table.compressed_ptrs[target] = lane.payload->data() + table.compressed_offsets[file];
             table.compressed_bytes[target] = probe.compressed;
             table.slots[target] = slot_at;
             table.output_ptrs[target] = lane.slots->data() + slot_at + 1;
@@ -566,7 +772,7 @@ class device_fasta_pipeline {
             cuda::copy_bytes(
                 s,
                 cuda::std::span{lane.pinned->data(), compressed_at},
-                device_span<char>{lane.compressed->data(), compressed_at}
+                device_span<char>{lane.payload->data(), compressed_at}
             )
         );
         CUDDL_CUDA_TRY(
@@ -658,17 +864,33 @@ class device_fasta_pipeline {
             )
         );
         auto temp_bytes = select_temp_bytes_;
-        CUDDL_CUDA_TRY(
-            cub::DeviceSelect::If(
-                lane.temp->data(),
-                temp_bytes,
-                lane.slots->data(),
-                device_table.selected,
-                static_cast<int64_t>(slot_at),
-                device_gzip::kept_byte{},
-                stream
-            )
-        );
+        if (lane.decoded) {
+            CUDDL_CUDA_TRY(
+                cub::DeviceSelect::If(
+                    lane.temp->data(),
+                    temp_bytes,
+                    lane.slots->data(),
+                    device_table.selected,
+                    static_cast<int64_t>(slot_at),
+                    device_gzip::kept_byte{},
+                    stream
+                )
+            );
+        } else {
+            // Inflation has consumed the compressed bytes; reuse their storage for compacted FASTA.
+            CUDDL_CUDA_TRY(
+                cub::DeviceSelect::If(
+                    lane.temp->data(),
+                    temp_bytes,
+                    lane.slots->data(),
+                    lane.payload->data(),
+                    device_table.selected,
+                    static_cast<int64_t>(slot_at),
+                    device_gzip::kept_byte{},
+                    stream
+                )
+            );
+        }
         CUDDL_CUDA_TRY(
             cuda::copy_bytes(
                 s,
@@ -787,6 +1009,7 @@ class device_fasta_pipeline {
         CUDDL_CUDA_TRY(lane.classified->sync());
         auto const table = host_table(lane);
         auto const overflow = *table.header_count > header_capacity_;
+        auto const* bases = lane.decoded ? lane.slots->data() : lane.payload->data();
         uint64_t offset = 0;
         for (size_t file = 0; file < lane.files.size(); ++file) {
             auto const id = lane.files[file];
@@ -800,7 +1023,7 @@ class device_fasta_pipeline {
             // ponytail: CPU-validate shorter outputs; count per-file headers if this dominates.
             auto const has_sequence = size > *table.header_count;
             if (!overflow && intact && fasta && has_sequence) {
-                genomes.push_back({id, lane.slots->data() + offset, size});
+                genomes.push_back({id, bases + offset, size});
             } else {
                 fallback.push_back(id);
             }
@@ -880,7 +1103,7 @@ class device_fasta_pipeline {
         std::optional<cuda::event> uploaded, classified, released;
         std::optional<cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>>
             pinned, host;
-        std::optional<cuda::device_buffer<char>> compressed, slots, tables, temp;
+        std::optional<cuda::device_buffer<char>> payload, slots, tables, temp;
         std::optional<cuda::device_buffer<uint64_t>> headers;
         std::vector<size_t> files, fallback;
         std::array<bool, max_files> possible_members;
@@ -896,6 +1119,7 @@ class device_fasta_pipeline {
     }
 
     size_t workers_;
+    worker_pool readers_{workers_};
     size_t compressed_capacity_ = 0, slot_capacity_ = 0;
     size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, copy_temp_bytes_ = 0,
            count_temp_bytes_ = 0;

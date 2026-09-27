@@ -1,15 +1,118 @@
+diff --git a/lib/decompress_template.h b/lib/decompress_template.h
+index 8c874c3..6c105a3 100644
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -67,7 +67,7 @@ FUNCNAME(struct libdeflate_decompressor * restrict d,
+ 	unsigned num_litlen_syms;
+ 	unsigned num_offset_syms;
+ 	bitbuf_t litlen_tablemask;
+-	u32 entry;
++	u64 entry;
+ 
+ next_block:
+ 	/* Starting to read the next block */
+@@ -330,6 +330,7 @@ next_block:
+ 
+ 	SAFETY_CHECK(build_offset_decode_table(d, num_litlen_syms, num_offset_syms));
+ 	SAFETY_CHECK(build_litlen_decode_table(d, num_litlen_syms, num_offset_syms));
++	build_pair_decode_table(d);
+ have_decode_tables:
+ 	litlen_tablemask = BITMASK(d->litlen_tablebits);
+ 
+@@ -344,7 +345,7 @@ have_decode_tables:
+ 	if (in_next >= in_fastloop_end || out_next >= out_fastloop_end)
+ 		goto generic_loop;
+ 	REFILL_BITS_IN_FASTLOOP();
+-	entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++	entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 	do {
+ 		u32 length, offset, lit;
+ 		const u8 *src;
+@@ -388,7 +389,7 @@ have_decode_tables:
+ 							 LITLEN_TABLEBITS)) {
+ 				/* 1st extra fast literal */
+ 				lit = entry >> 16;
+-				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 				saved_bitbuf = bitbuf;
+ 				bitbuf >>= (u8)entry;
+ 				bitsleft -= entry;
+@@ -396,7 +397,7 @@ have_decode_tables:
+ 				if (entry & HUFFDEC_LITERAL) {
+ 					/* 2nd extra fast literal */
+ 					lit = entry >> 16;
+-					entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++					entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 					saved_bitbuf = bitbuf;
+ 					bitbuf >>= (u8)entry;
+ 					bitsleft -= entry;
+@@ -409,7 +410,7 @@ have_decode_tables:
+ 						 * count as one of the extras.
+ 						 */
+ 						lit = entry >> 16;
+-						entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++						entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 						REFILL_BITS_IN_FASTLOOP();
+ 						*out_next++ = lit;
+ 						continue;
+@@ -427,7 +428,7 @@ have_decode_tables:
+ 				STATIC_ASSERT(CAN_CONSUME_AND_THEN_PRELOAD(
+ 						LITLEN_TABLEBITS, LITLEN_TABLEBITS));
+ 				lit = entry >> 16;
+-				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 				REFILL_BITS_IN_FASTLOOP();
+ 				*out_next++ = lit;
+ 				continue;
+@@ -439,6 +440,15 @@ have_decode_tables:
+ 		 * subtable pointer entry, or an end-of-block entry.  Detect the
+ 		 * two unlikely cases by testing the HUFFDEC_EXCEPTIONAL flag.
+ 		 */
++		if (entry & HUFFDEC_PAIR) {
++			unsigned extra = (entry >> 8) & 0xf;
++			length = (entry >> 16) & 0x1ff;
++			offset = (entry >> 32) +
++				 ((saved_bitbuf >> ((u8)entry - extra)) & BITMASK(extra));
++			if (unlikely((u8)bitsleft < LITLEN_TABLEBITS))
++				REFILL_BITS_IN_FASTLOOP();
++			goto match_decoded;
++		}
+ 		if (unlikely(entry & HUFFDEC_EXCEPTIONAL)) {
+ 			/* Subtable pointer or end-of-block entry */
+ 
+@@ -546,6 +556,7 @@ have_decode_tables:
+ 		offset = entry >> 16;
+ 		offset += EXTRACT_VARBITS8(saved_bitbuf, entry) >> (u8)(entry >> 8);
+ 
++match_decoded:
+ 		/* Validate the match offset; needed even in the fastloop. */
+ 		SAFETY_CHECK(offset <= out_next - (const u8 *)out);
+ 		src = out_next - offset;
+@@ -568,7 +579,7 @@ have_decode_tables:
+ 			LITLEN_TABLEBITS) &&
+ 		    unlikely((u8)bitsleft < LITLEN_TABLEBITS - PRELOAD_SLACK))
+ 			REFILL_BITS_IN_FASTLOOP();
+-		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++		entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+ 		REFILL_BITS_IN_FASTLOOP();
+ 
+ 		/*
+diff --git a/lib/deflate_decompress.c b/lib/deflate_decompress.c
+index d5af5eb..7e5a54e 100644
 --- a/lib/deflate_decompress.c
 +++ b/lib/deflate_decompress.c
-@@ -667,1 +667,2 @@
--	u32 offset_decode_table[OFFSET_ENOUGH];
-+	u32 offset_decode_table[OFFSET_ENOUGH];
+@@ -665,6 +665,7 @@ struct libdeflate_decompressor {
+ 	} u;
+ 
+ 	u32 offset_decode_table[OFFSET_ENOUGH];
 +	u64 pair_decode_table[1U << LITLEN_TABLEBITS];
---- a/lib/deflate_decompress.c
-+++ b/lib/deflate_decompress.c
-@@ -1068,3 +1068,29 @@
--/*****************************************************************************
-- *                         Main decompression routine
-- *****************************************************************************/
+ 
+ 	/* used only during build_decode_table() */
+ 	u16 sorted_syms[DEFLATE_MAX_NUM_SYMS];
+@@ -1065,6 +1066,32 @@ build_offset_decode_table(struct libdeflate_decompressor *d,
+ 				  NULL);
+ }
+ 
 +#define HUFFDEC_PAIR 0x40000000U
 +
 +static void build_pair_decode_table(struct libdeflate_decompressor *d)
@@ -36,69 +139,6 @@
 +	}
 +}
 +
-+/*****************************************************************************
-+ *                         Main decompression routine
-+ *****************************************************************************/
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -70,1 +70,1 @@
--	u32 entry;
-+	u64 entry;
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -332,1 +332,2 @@
--	SAFETY_CHECK(build_litlen_decode_table(d, num_litlen_syms, num_offset_syms));
-+	SAFETY_CHECK(build_litlen_decode_table(d, num_litlen_syms, num_offset_syms));
-+	build_pair_decode_table(d);
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -347,1 +347,1 @@
--	entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+	entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -391,1 +391,1 @@
--				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -399,1 +399,1 @@
--					entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+					entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -412,1 +412,1 @@
--						entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+						entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -430,1 +430,1 @@
--				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -571,1 +571,1 @@
--		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
-+		entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -442,2 +442,11 @@
--		if (unlikely(entry & HUFFDEC_EXCEPTIONAL)) {
--			/* Subtable pointer or end-of-block entry */
-+		if (entry & HUFFDEC_PAIR) {
-+			unsigned extra = (entry >> 8) & 0xf;
-+			length = (entry >> 16) & 0x1ff;
-+			offset = (entry >> 32) +
-+				 ((saved_bitbuf >> ((u8)entry - extra)) & BITMASK(extra));
-+			if (unlikely((u8)bitsleft < LITLEN_TABLEBITS))
-+				REFILL_BITS_IN_FASTLOOP();
-+			goto match_decoded;
-+		}
-+		if (unlikely(entry & HUFFDEC_EXCEPTIONAL)) {
-+			/* Subtable pointer or end-of-block entry */
---- a/lib/decompress_template.h
-+++ b/lib/decompress_template.h
-@@ -549,1 +549,2 @@
--		/* Validate the match offset; needed even in the fastloop. */
-+match_decoded:
-+		/* Validate the match offset; needed even in the fastloop. */
+ /*****************************************************************************
+  *                         Main decompression routine
+  *****************************************************************************/

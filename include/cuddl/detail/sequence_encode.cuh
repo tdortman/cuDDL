@@ -30,7 +30,8 @@ __device__ __forceinline__ void add_sequence_windows(
     size_t tile_stride,
     uint32_t k,
     uint32_t* registers,
-    uint32_t& saturation
+    uint32_t& saturation,
+    bool packed_input = false
 ) {
     constexpr uint32_t tile_size = 256 * 8;
     constexpr bool shared_sketch = BucketCount <= 8192;
@@ -69,7 +70,23 @@ __device__ __forceinline__ void add_sequence_windows(
         auto const count = cuda::std::min(tile_size, windows - static_cast<uint32_t>(tile));
         // Four extra cells cover the k-1 halo, including the last partial cell.
         auto const padded = (count + 7) / 8 + 4;
-        for (uint32_t cell = threadIdx.x; cell < padded; cell += blockDim.x) {
+        if (packed_input) {
+            // Two-bit words hold sixteen bases, base j in bits 2j, and no ambiguous base. Tiles
+            // start on a multiple of sixteen bases, so a tile's cells are whole halves of words.
+            auto const* const words = reinterpret_cast<uint32_t const*>(sequence);
+            auto const total = (static_cast<size_t>(windows) + k - 1 + 7) / 8;
+            for (uint32_t cell = threadIdx.x; cell < padded; cell += blockDim.x) {
+                auto const index = tile / 8 + cell;
+                if (index >= total) {
+                    cells[cell] = missing_cell;
+                    continue;
+                }
+                // A cell holds its first base in its highest bits: reverse the codes' order.
+                auto const reversed = __brev((words[index / 2] >> (16 * (index % 2))) << 16);
+                cells[cell] = ((reversed & 0x5555U) << 1) | ((reversed >> 1) & 0x5555U);
+            }
+        }
+        for (uint32_t cell = threadIdx.x; !packed_input && cell < padded; cell += blockDim.x) {
             auto const pos = cell * 8;
             uint32_t ascii[2] = {};
             if ((reinterpret_cast<uintptr_t>(sequence + tile) & 7U) == 0 &&
@@ -199,6 +216,7 @@ struct sequence_batch_chunk {
     size_t block_end;
     uint32_t genome;
     uint32_t windows;
+    uint32_t packed;  // nonzero: @p bases holds two-bit words, not ASCII
 };
 
 /// @brief Batch kernel covering every staged chunk in one launch, including short records.
@@ -235,7 +253,8 @@ __global__ void add_sequence_batch_kernel(
             (chunk.block_end - first_block) * 2048,
             k,
             target,
-            target[BucketCount]
+            target[BucketCount],
+            chunk.packed != 0
         );
         __syncthreads();
     }

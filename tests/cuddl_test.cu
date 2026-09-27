@@ -3367,6 +3367,105 @@ std::string write_tmp_fasta(std::string const& content) {
     return path;
 }
 
+TEST(FastaTest, SimdScannersAndCompactorsPreserveBoundaries) {
+    using namespace cuddl::detail;
+    std::vector<fastx_line_end_fn> scanners{fastx_line_end};
+    using compact_fn = char* (*)(char const*, char const*, char*);
+    using fasta_fn = char* (*)(char const*, char const*, char*, char const*&);
+    std::vector<compact_fn> compactors{compact_sequence_whitespace};
+    std::vector<fasta_fn> fasta_compactors{fasta_sequence_compact};
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) {
+        scanners.push_back(fastx_line_end_avx2);
+        compactors.push_back(compact_sequence_whitespace_avx2);
+        fasta_compactors.push_back(fasta_sequence_compact_avx2);
+    }
+    if (__builtin_cpu_supports("avx512bw")) scanners.push_back(fastx_line_end_avx512);
+    if (compact_avx512) {
+        compactors.push_back(compact_sequence_whitespace_avx512);
+        fasta_compactors.push_back(fasta_sequence_compact_avx512);
+    }
+#endif
+#if defined(__ARM_NEON)
+    scanners.push_back(fastx_line_end_neon);
+    compactors.push_back(compact_sequence_whitespace_neon);
+    fasta_compactors.push_back(fasta_sequence_compact_neon);
+#endif
+    for (size_t length = 0; length <= 130; ++length) {
+        for (size_t boundary = 0; boundary <= length; ++boundary) {
+            std::string input(length, 'A');
+            constexpr std::string_view alphabet = "AcGTN>\t \r\n";
+            for (size_t i = 0; i < boundary; ++i) input[i] = alphabet[i % alphabet.size()];
+            if (boundary < length) input[boundary] = '\n';
+            for (auto scan : scanners) {
+                for (auto start : {size_t{0}, boundary, length}) {
+                    auto const found = input.find_first_of("\r\n", start);
+                    EXPECT_EQ(scan(input, start), found == std::string::npos ? length : found);
+                }
+            }
+            std::string expected;
+            for (char ch : input) {
+                if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t') expected += ch;
+            }
+            for (auto compact : compactors) {
+                auto copy = input;
+                auto* end = compact(copy.data(), copy.data() + copy.size(), copy.data());
+                EXPECT_EQ(std::string_view(copy.data(), end - copy.data()), expected);
+            }
+            if (boundary != 0) input[boundary - 1] = '\r';
+            if (boundary < length) input[boundary] = '>';
+            expected.clear();
+            size_t stop = 0;
+            for (; stop < input.size(); ++stop) {
+                char const ch = input[stop];
+                if (ch == '>' &&
+                    (stop == 0 || input[stop - 1] == '\n' || input[stop - 1] == '\r')) {
+                    break;
+                }
+                if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t') expected += ch;
+            }
+            for (auto compact : fasta_compactors) {
+                for (bool in_place : {false, true}) {
+                    auto copy = input;
+                    std::string output(input.size(), '!');
+                    auto* out = in_place ? copy.data() : output.data();
+                    char const* stopped = nullptr;
+                    auto* end = compact(copy.data(), copy.data() + copy.size(), out, stopped);
+                    EXPECT_EQ(stopped - copy.data(), stop);
+                    EXPECT_EQ(std::string_view(out, end - out), expected);
+                }
+            }
+        }
+    }
+}
+
+#if CUDDL_HAS_NVCOMP
+TEST(FastaTest, GzipSignatureScannersRespectBoundariesAndReservedFlags) {
+    using namespace cuddl::detail;
+    std::vector<bool (*)(char const*, size_t)> scanners{
+        has_gzip_signature_portable, has_gzip_signature
+    };
+    #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) scanners.push_back(has_gzip_signature_avx2);
+    if (__builtin_cpu_supports("avx512bw")) scanners.push_back(has_gzip_signature_avx512);
+    #endif
+    #if defined(__aarch64__) || defined(_M_ARM64)
+    scanners.push_back(has_gzip_signature_neon);
+    #endif
+    for (size_t offset = 0; offset < 130; ++offset) {
+        for (unsigned flags = 0; flags < 256; ++flags) {
+            std::string input(134, '\0');
+            input.replace(offset, 4, {char(0x1f), char(0x8b), char(8), static_cast<char>(flags)});
+            for (auto scan : scanners) {
+                EXPECT_EQ(scan(input.data(), input.size()), (flags & 0xe0U) == 0);
+                EXPECT_EQ(scan(input.data(), offset + 4), (flags & 0xe0U) == 0);
+                EXPECT_FALSE(scan(input.data(), offset + 3));
+            }
+        }
+    }
+}
+#endif
+
 TEST(FastaTest, ParsesSimpleSeedIntoExpectedKmers) {
     // 8 bases, k=3: valid windows = N-k+1 = 6.
     auto const path = write_tmp_fasta(">seq\nACGTACGT\n");
@@ -4010,6 +4109,58 @@ TEST(FastaTest, HeaderEdgeCasesParseThroughPublicApi) {
     EXPECT_FALSE(rejected.has_value());
 }
 
+TEST(FastaTest, CompressedLiteralMatchesPreserveSequence) {
+    std::string content = ">literal-match\n";
+    uint32_t state = 1;
+    for (size_t i = 0; i < 1024; ++i) {
+        state = state * 1664525U + 1013904223U;
+        content += "ACGT"[state >> 30];
+    }
+    content += "\n>repeat\n" + std::string(128, 'A') + "\n";
+    // Compressed member of content, exercising dynamic Huffman literals and short matches.
+    constexpr char compressed[] =
+        "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xc5\x93\x51\x6a\x03\x41"
+        "\x0c\x43\xff\x73\x97\x5e\x21\x20\xf4\xe1\x0b\xe8\x02\xa1\x04\x5a"
+        "\x48\xa1\x84\xdc\x9f\xf2\xe4\xc9\x19\xba\x10\x32\x6b\x8f\x65\x49"
+        "\xf6\x5e\x1f\xdf\xaf\xfb\xf3\xf6\xf8\xf8\xb9\xbd\x3e\xbf\x2e\xf2"
+        "\x8c\x9c\xd1\xd8\x13\x25\xbc\x4b\xd6\x8c\x9d\xc8\xf1\x38\x19\x8e"
+        "\x43\x38\x56\x14\x59\x56\x78\x8d\x28\xf2\x64\x6c\x65\x06\xb8\x89"
+        "\x63\xa2\x07\xc6\x5b\xdb\x74\xec\xcc\x78\x44\x65\xdb\x82\x42\x9c"
+        "\x2a\x9a\x0f\x90\x72\xeb\x34\x00\x68\x28\xf5\x21\x99\xc4\x11\x2c"
+        "\x67\x3b\x35\x2e\x09\xee\x76\x39\x93\x18\xca\x80\x17\x42\x00\x20"
+        "\xc6\x1d\x68\x14\x66\x2c\x13\x40\x11\xc2\x8c\x8a\x44\x44\x90\x94"
+        "\xc2\x70\xd3\x4b\xac\xbd\x12\x7e\x6f\x72\x9b\x87\x70\xad\x40\xca"
+        "\xe0\x99\x32\x6f\x73\x09\xa2\x1e\x8a\xb5\x85\x4c\xe1\xda\xbc\x8c"
+        "\x54\xd0\x81\x08\xd2\x9a\x82\xd6\x4a\x6e\x13\xd1\xb8\x57\x43\x71"
+        "\xd9\xc2\x6c\xcd\x63\x48\x40\xe2\x4a\x1d\xa3\x11\x6c\x44\x62\xef"
+        "\xb7\x03\xac\xd7\xc5\x56\x62\x23\xe7\x4e\x53\x25\xcc\xc0\xaa\x9f"
+        "\xe4\x56\x70\x6e\xcd\x5a\xfa\x06\xe0\x7e\x1f\xc3\x0f\xa9\xa0\xe1"
+        "\xc4\x4a\xe8\x8c\xc9\x75\x33\x90\x5d\xc9\xe0\x9e\x0c\x49\x7a\x80"
+        "\x5b\x3b\xf1\xae\x2d\xe9\x4d\x3b\xa6\xb8\xc3\xc5\x58\xf6\x88\x7a"
+        "\x62\x58\xd5\x19\x1c\x50\x4e\x2c\x58\x07\xc5\x7f\x57\xb2\x73\x29"
+        "\xa1\x3a\x50\xf7\xfb\x4f\x64\x5f\x4b\xb6\x73\x62\xef\x7a\xb7\xeb"
+        "\x46\xb4\xb6\x94\x22\x52\xd7\xe4\xf3\x81\x74\x04\xad\x40\x06\x0a"
+        "\x30\xa7\x12\x58\x0e\x56\xa9\x8b\x08\x32\x3c\xba\xfd\xdd\x98\xf5"
+        "\xa9\xfb\x88\x10\x43\x92\xd5\xe2\x22\x43\x3f\xe3\xec\x6e\x74\x79"
+        "\x0b\x71\xd6\x82\xe6\x78\xb3\x1f\xc1\xee\x37\xe7\x12\xd9\xdd\xa3"
+        "\x49\xb7\x7c\xc7\x51\x68\xfc\x44\xf5\xf6\x3e\xdf\xcc\xe5\xfa\xbc"
+        "\xff\xde\x6f\xaf\xcb\x8e\xf1\xff\x9e\xcb\x1f\xfe\x30\x23\x33\x99"
+        "\x04\x00\x00";
+    auto const plain = write_tmp_fasta(content);
+    auto const zipped = plain + ".gz";
+    std::ofstream(zipped, std::ios::binary).write(compressed, sizeof(compressed) - 1);
+    auto const expected = cuddl::parse_fasta_file(plain, 25);
+    auto const actual = cuddl::parse_fasta_file(zipped, 25);
+    std::remove(plain.c_str());
+    std::remove(zipped.c_str());
+    ASSERT_TRUE(expected.has_value());
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->kmers, expected->kmers);
+    EXPECT_EQ(actual->bases, expected->bases);
+    EXPECT_EQ(actual->valid_kmers, expected->valid_kmers);
+    EXPECT_EQ(actual->invalid_windows, expected->invalid_windows);
+}
+
 TEST(FastaTest, GzipMatchesPlainAndRejectsTruncated) {
     std::string const content = ">a\nACGTNACGT\n>b\nTTGGCCAA\n";
     auto const plain = write_tmp_fasta(content);
@@ -4130,6 +4281,12 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
         paths.push_back(write_tmp_gzip(">genome\n" + bases(1000 + id * 71, 100 + id)));
     }
     paths.push_back(write_tmp_fasta(">plain\r\n" + bases(1000, 77) + ">next\n" + bases(900, 78)));
+    // Wrapped records cross several compact-and-pack blocks. Ambiguities and headers must
+    // still break windows, while line endings must not. Plain input forces the host path.
+    paths.push_back(write_tmp_fasta(
+        ">wrapped\r\n" + bases(17000, 81) + "NN\t" + bases(34000, 82) + ">short\nACGT\n>last\n" +
+        bases(33000, 83)
+    ));
     paths.push_back(write_tmp_gzip(">whitespace\n \t\n"));
     auto const host = cuddl::reference_database_file::build<25, buckets>(
         paths, stream, {.decompression = cuddl::decompression_backend::cpu}
