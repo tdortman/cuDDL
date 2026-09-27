@@ -1,0 +1,104 @@
+--- a/lib/deflate_decompress.c
++++ b/lib/deflate_decompress.c
+@@ -667,1 +667,2 @@
+-	u32 offset_decode_table[OFFSET_ENOUGH];
++	u32 offset_decode_table[OFFSET_ENOUGH];
++	u64 pair_decode_table[1U << LITLEN_TABLEBITS];
+--- a/lib/deflate_decompress.c
++++ b/lib/deflate_decompress.c
+@@ -1068,3 +1068,29 @@
+-/*****************************************************************************
+- *                         Main decompression routine
+- *****************************************************************************/
++#define HUFFDEC_PAIR 0x40000000U
++
++static void build_pair_decode_table(struct libdeflate_decompressor *d)
++{
++	unsigned key;
++	for (key = 0; key < (1U << LITLEN_TABLEBITS); key++) {
++		u32 le = d->u.litlen_decode_table[key & BITMASK(d->litlen_tablebits)];
++		u64 result = le;
++		unsigned length_bits = (u8)le;
++		if (!(le & (HUFFDEC_LITERAL | HUFFDEC_EXCEPTIONAL)) &&
++		    length_bits <= LITLEN_TABLEBITS) {
++			u32 de = d->offset_decode_table[(key >> length_bits) & BITMASK(OFFSET_TABLEBITS)];
++			unsigned prefix = length_bits + ((de >> 8) & 0x3f);
++			if (!(de & HUFFDEC_EXCEPTIONAL) && prefix <= LITLEN_TABLEBITS) {
++				unsigned length = (le >> 16) + ((key & BITMASK(length_bits)) >> (u8)(le >> 8));
++				unsigned extra = (u8)de - ((de >> 8) & 0x3f);
++				if (length <= 32) {
++					result = ((u64)(de >> 16) << 32) | HUFFDEC_PAIR |
++						 ((u64)length << 16) | (extra << 8) | (prefix + extra);
++				}
++			}
++		}
++		d->pair_decode_table[key] = result;
++	}
++}
++
++/*****************************************************************************
++ *                         Main decompression routine
++ *****************************************************************************/
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -70,1 +70,1 @@
+-	u32 entry;
++	u64 entry;
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -332,1 +332,2 @@
+-	SAFETY_CHECK(build_litlen_decode_table(d, num_litlen_syms, num_offset_syms));
++	SAFETY_CHECK(build_litlen_decode_table(d, num_litlen_syms, num_offset_syms));
++	build_pair_decode_table(d);
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -347,1 +347,1 @@
+-	entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++	entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -391,1 +391,1 @@
+-				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -399,1 +399,1 @@
+-					entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++					entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -412,1 +412,1 @@
+-						entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++						entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -430,1 +430,1 @@
+-				entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++				entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -571,1 +571,1 @@
+-		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
++		entry = d->pair_decode_table[bitbuf & BITMASK(LITLEN_TABLEBITS)];
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -442,2 +442,11 @@
+-		if (unlikely(entry & HUFFDEC_EXCEPTIONAL)) {
+-			/* Subtable pointer or end-of-block entry */
++		if (entry & HUFFDEC_PAIR) {
++			unsigned extra = (entry >> 8) & 0xf;
++			length = (entry >> 16) & 0x1ff;
++			offset = (entry >> 32) +
++				 ((saved_bitbuf >> ((u8)entry - extra)) & BITMASK(extra));
++			if (unlikely((u8)bitsleft < LITLEN_TABLEBITS))
++				REFILL_BITS_IN_FASTLOOP();
++			goto match_decoded;
++		}
++		if (unlikely(entry & HUFFDEC_EXCEPTIONAL)) {
++			/* Subtable pointer or end-of-block entry */
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -549,1 +549,2 @@
+-		/* Validate the match offset; needed even in the fastloop. */
++match_decoded:
++		/* Validate the match offset; needed even in the fastloop. */

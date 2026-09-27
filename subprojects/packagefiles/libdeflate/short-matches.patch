@@ -1,0 +1,27 @@
+--- a/lib/decompress_template.h
++++ b/lib/decompress_template.h
+@@ -575,6 +575,8 @@
+ 		 * Copy the match.  On most CPUs the fastest method is a
+ 		 * word-at-a-time copy, unconditionally copying about 5 words
+ 		 * since this is enough for most matches without being too much.
++		 * Short matches copy only two words to avoid redundant
++		 * loads and stores when the match fits within those words.
+ 		 *
+ 		 * The normal word-at-a-time copy works for offset >= WORDBYTES,
+ 		 * which is most cases.  The case of offset == 1 is also common
+@@ -594,6 +596,7 @@
+ 			store_word_unaligned(load_word_unaligned(src), dst);
+ 			src += WORDBYTES;
+ 			dst += WORDBYTES;
++			if (length > 2 * WORDBYTES) {
+ 			store_word_unaligned(load_word_unaligned(src), dst);
+ 			src += WORDBYTES;
+ 			dst += WORDBYTES;
+@@ -620,6 +623,7 @@
+ 				src += WORDBYTES;
+ 				dst += WORDBYTES;
+ 			}
++			}
+ 		} else if (UNALIGNED_ACCESS_IS_FAST && offset == 1) {
+ 			machine_word_t v;
+ 
