@@ -46,11 +46,11 @@ enum class decompression_backend {
     cpu,
     /// nvCOMP for eligible gzip inputs; unsupported formats use host loaders.
     gpu,
-    /// CPU/nvCOMP sharing on devices with coherent pageable host memory.
+    /// CPU inflation, followed by GPU FASTA normalisation through coherent host memory.
     coherent,
 };
 
-/// @brief How a build gets its sequence bytes to the device.
+/// @brief How a build gets CPU-parsed sequence bytes to the device.
 enum class transfer_mode {
     /// In-place host reads on coherent devices, page-locked transfers elsewhere.
     automatic,
@@ -648,12 +648,13 @@ template <size_t BucketCount>
 // Releasing records that point on the stream; the next loader to take the slot waits for it
 // there, so a buffer is never rewritten under a DMA and the build never has to drain.
 class sequence_buffer_pool {
+    struct slot;
+
    public:
     /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
     sequence_buffer_pool(cuda::stream_ref stream, size_t buffers, size_t limit, bool page_locked)
         : stream_(stream), limit_(limit), page_locked_(page_locked) {
         slots_.reserve(buffers);
-        in_use_.reserve(buffers);
     }
 
     /// @brief Number of buffers the pool may grow to.
@@ -669,13 +670,11 @@ class sequence_buffer_pool {
     /// @brief Returns reusable bytes, or a null target when the pool cannot serve.
     [[nodiscard]] decompression_target acquire(size_t bytes) {
         if (bytes == 0 || bytes > limit_) return {};
-        size_t index = 0;
         slot* owner = nullptr;
         {
             std::lock_guard lock(mutex_);
-            index = claim(bytes);
-            if (index == slots_.size()) return {};
-            owner = slots_[index].get();
+            owner = claim(bytes);
+            if (owner == nullptr) return {};
         }
         // Wait on the loader thread rather than the build loop: the slot is already reserved,
         // so this blocks only the genome that needs it. A failing wait throws out of the loader,
@@ -688,21 +687,20 @@ class sequence_buffer_pool {
             }
             owner->resize(stream_, grown, page_locked_);
         }
-        return lease(index, owner);
+        return lease(owner);
     }
 
    private:
-    /// @brief Reserves a free slot, or returns slots_.size() when the pool is full.
-    [[nodiscard]] size_t claim(size_t bytes) {
-        for (size_t i = 0; i < slots_.size(); ++i) {
-            if (in_use_[i]) continue;
-            in_use_[i] = true;
-            return i;
+    /// @brief Reserves the oldest released slot, or returns null when the pool is full.
+    [[nodiscard]] slot* claim(size_t bytes) {
+        if (free_head_ != nullptr) {
+            auto* owner = free_head_;
+            free_head_ = owner->next_free;
+            return owner;
         }
-        if (slots_.size() >= capacity_) return slots_.size();
+        if (slots_.size() >= capacity_) return nullptr;
         slots_.push_back(std::make_unique<slot>(stream_, bytes, page_locked_));
-        in_use_.push_back(true);
-        return slots_.size() - 1;
+        return slots_.back().get();
     }
 
    private:
@@ -712,6 +710,7 @@ class sequence_buffer_pool {
         std::unique_ptr<char[]> heap;
         size_t size = 0;
         cuda::event consumed;
+        slot* next_free = nullptr;
 
         slot(cuda::stream_ref stream, size_t bytes, bool page_locked) : consumed(stream) {
             resize(stream, bytes, page_locked);
@@ -731,17 +730,21 @@ class sequence_buffer_pool {
         }
     };
 
-    [[nodiscard]] decompression_target lease(size_t index, slot* owner) {
+    [[nodiscard]] decompression_target lease(slot* owner) {
         auto* pool = this;
-        return {
-            owner->data(), owner->size, std::shared_ptr<void>(owner, [pool, index, owner](void*) {
-                std::lock_guard lock(pool->mutex_);
-                // Record before publishing the slot: a loader that takes it must see the
-                // event of every copy the previous lease fed.
-                owner->consumed.record(pool->stream_);
-                pool->in_use_[index] = false;
-            })
-        };
+        return {owner->data(), owner->size, std::shared_ptr<void>(owner, [pool, owner](void*) {
+                    std::lock_guard lock(pool->mutex_);
+                    // Record before publishing the slot: a loader that takes it must see the
+                    // event of every copy the previous lease fed.
+                    owner->consumed.record(pool->stream_);
+                    owner->next_free = nullptr;
+                    if (pool->free_head_ == nullptr) {
+                        pool->free_head_ = owner;
+                    } else {
+                        pool->free_tail_->next_free = owner;
+                    }
+                    pool->free_tail_ = owner;
+                })};
     }
 
     cuda::stream_ref stream_;
@@ -749,7 +752,8 @@ class sequence_buffer_pool {
     bool page_locked_;
     size_t capacity_{1};
     std::vector<std::unique_ptr<slot>> slots_;
-    std::vector<bool> in_use_;
+    slot* free_head_ = nullptr;
+    slot* free_tail_ = nullptr;
     std::mutex mutex_;
 };
 
@@ -896,6 +900,153 @@ template <uint32_t K, size_t BucketCount, typename Layout>
     return Ok();
 }
 
+/// @brief Inflates on CPU workers, then normalises FASTA and sketches it in device memory.
+template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
+[[nodiscard]] Result<void> stage_paths_normalising(
+    std::span<std::filesystem::path const> paths,
+    cuda::stream_ref stream,
+    std::optional<size_t> staging_bytes,
+    unsigned parser_workers,
+    transfer_mode transfer,
+    reference_build_statistics* statistics,
+    Sink&& sink
+) {
+    auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
+    auto const in_place = stages_in_place(transfer, stream.device());
+    auto const page_locked = pages_locked(transfer, stream.device());
+    auto const window = workers * 8;
+    auto const batch_limit = std::min(workers * 4, device_fasta_pipeline::max_files);
+    sequence_buffer_pool buffers(stream, workers, size_t{32} << 20, page_locked);
+    buffers.set_capacity(
+        window + batch_limit * device_fasta_pipeline::lane_count + stager_hold_slots + 2
+    );
+    std::optional<device_fasta_pipeline> normaliser;
+    struct loaded_fasta {
+        size_t id;
+        std::unique_ptr<fastx_sequence_file> sequence;
+    };
+    std::array<std::vector<loaded_fasta>, device_fasta_pipeline::lane_count> batches;
+    for (auto& batch : batches) {
+        batch.reserve(batch_limit);
+    }
+    auto fill = [&](database_stager<K, BucketCount, Layout>& stager,
+                    size_t base,
+                    size_t count) -> Result<void> {
+        if (!normaliser) {
+            auto const available = CUDDL_TRY(available_device_bytes(stream));
+            auto const budget = (available - available / 5) / device_fasta_pipeline::lane_count;
+            auto const wanted = staging_bytes.value_or(default_arena_ceiling);
+            auto const overhead = device_fasta_pipeline::lane_overhead(wanted);
+            auto const capacity = std::min(wanted, budget > overhead ? budget - overhead : 0);
+            if (capacity < 2) return Err(Error::resource("no room for FASTA normalisation"));
+            CUDDL_TRY(cuda_try([&] { normaliser.emplace(stream, capacity, 0, workers); }));
+        }
+        fastx_load_pool pool(
+            paths.subspan(base, count),
+            workers,
+            {acquire_sequence_target, &buffers},
+            window,
+            true,
+            true
+        );
+        std::vector<decoded_fasta> sources;
+        sources.reserve(batch_limit);
+        std::vector<inflated_genome> genomes;
+        std::vector<size_t> fallback;
+        auto stage_host = [&](size_t id,
+                              std::unique_ptr<fastx_sequence_file> sequence) -> Result<void> {
+            if (!sequence->input.empty()) {
+                CUDDL_TRY(parse_fastx_sequence_file(*sequence, paths[base + id].string()));
+            }
+            auto const& extents = sequence->extents;
+            auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
+            auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
+            return stager.add_genome(id, extents, pinned_base, pinned_size, std::move(sequence));
+        };
+        auto finish_lane = [&](size_t lane) -> Result<void> {
+            auto& batch = batches[lane];
+            if (batch.empty()) return Ok();
+            genomes.clear();
+            fallback.clear();
+            CUDDL_TRY(normaliser->finish(lane, {}, genomes, fallback));
+            for (auto const& genome : genomes) {
+                CUDDL_TRY(stager.add_resident(genome.id, genome.bases, genome.size));
+            }
+            size_t rejected = 0;
+            for (auto& loaded : batch) {
+                if (rejected < fallback.size() && loaded.id == fallback[rejected]) {
+                    CUDDL_TRY(stage_host(loaded.id, std::move(loaded.sequence)));
+                    ++rejected;
+                }
+            }
+            CUDDL_TRY(stager.flush());
+            CUDDL_TRY(normaliser->release(lane, stream));
+            batch.clear();
+            return Ok();
+        };
+        size_t next = 0, lane = 0;
+        std::optional<loaded_fasta> pending;
+        while (next < count || pending) {
+            CUDDL_TRY(finish_lane(lane));
+            sources.clear();
+            size_t bytes = 0;
+            auto& batch = batches[lane];
+            while (next < count || pending) {
+                if (!pending) {
+                    auto loaded = CUDDL_TRY(pool.take_ready());
+                    pending.emplace(loaded_fasta{loaded.first, std::move(loaded.second)});
+                    ++next;
+                }
+                auto const input = pending->sequence->input;
+                if (input.empty() || input.size() >= normaliser->slot_capacity()) {
+                    CUDDL_TRY(stage_host(pending->id, std::move(pending->sequence)));
+                    pending.reset();
+                    continue;
+                }
+                if (batch.size() == batch_limit ||
+                    input.size() >= normaliser->slot_capacity() - bytes)
+                    break;
+                bytes += input.size() + 1;
+                sources.push_back({pending->id, input});
+                batch.push_back(std::move(*pending));
+                pending.reset();
+            }
+            if (!batch.empty()) CUDDL_TRY(normaliser->submit_decoded(lane, sources));
+            lane = (lane + 1) % batches.size();
+        }
+        for (size_t offset = 0; offset < batches.size(); ++offset) {
+            CUDDL_TRY(finish_lane((lane + offset) % batches.size()));
+        }
+        return Ok();
+    };
+    std::optional<Result<void>> staged;
+    // Capture errors before draining GPU work so pending input owners remain alive.
+    std::exception_ptr failure;
+    try {
+        staged = stage_groups<K, BucketCount, Layout>(
+            paths.size(),
+            default_arena_ceiling,
+            staging_bytes,
+            stream,
+            statistics,
+            fill,
+            sink,
+            in_place
+        );
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (normaliser) CUDDL_TRY(normaliser->wait_lanes(stream));
+    if (failure) std::rethrow_exception(failure);
+    CUDDL_TRY(*staged);
+    if (statistics != nullptr) {
+        statistics->workers = static_cast<unsigned>(workers);
+        statistics->in_place = in_place;
+        statistics->pinned_buffers = page_locked ? buffers.buffers() : 0;
+    }
+    return Ok();
+}
+
 /// @brief @ref stage_paths with gzip FASTA inflated and compacted on the device.
 ///
 /// The host only reads compressed bytes for the files the device takes. Everything else, and any
@@ -907,7 +1058,6 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
-    bool hybrid,
     transfer_mode transfer,
     reference_build_statistics* statistics,
     Sink&& sink
@@ -915,14 +1065,11 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
     bool const in_place = stages_in_place(transfer, stream.device());
     bool const page_locked = pages_locked(transfer, stream.device());
-    constexpr size_t device_stride = 8;
-    auto const input_workers = hybrid ? std::max<size_t>(1, workers / 18) : workers;
-    auto const host_workers = hybrid ? std::max<size_t>(1, workers - input_workers) : workers;
     std::vector<gzip_file_probe> probes(paths.size());
     parallel_for(paths.size(), workers, [&](size_t id) {
-        if (!hybrid || id % device_stride == 0) probes[id] = probe_gzip_file(paths[id]);
+        probes[id] = probe_gzip_file(paths[id]);
     });
-    std::optional<device_gzip_inflater> inflater;
+    std::optional<device_fasta_pipeline> inflater;
     sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked);
     host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
     auto const fits = [&](gzip_file_probe const& probe) {
@@ -938,10 +1085,9 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             compressed += probe.compressed;
         }
         auto const available = CUDDL_TRY(available_device_bytes(stream));
-        auto const budget = (available - available / 5) / device_gzip_inflater::lane_count;
-        auto const per_lane = hybrid ? std::min<size_t>(budget, size_t{1} << 30) : budget;
-        auto const overhead = device_gzip_inflater::lane_overhead(per_lane);
-        auto const usable = per_lane > overhead ? per_lane - overhead : 0;
+        auto const budget = (available - available / 5) / device_fasta_pipeline::lane_count;
+        auto const overhead = device_fasta_pipeline::lane_overhead(budget);
+        auto const usable = budget > overhead ? budget - overhead : 0;
         auto const compressed_capacity =
             slots + compressed == 0
                 ? size_t{0}
@@ -951,11 +1097,10 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                           static_cast<long double>(usable) * compressed / (slots + compressed)
                       )
                   );
-        auto const room = per_lane > compressed_capacity + overhead
-                              ? per_lane - compressed_capacity - overhead
-                              : 0;
+        auto const room =
+            budget > compressed_capacity + overhead ? budget - compressed_capacity - overhead : 0;
         return cuda_try([&] {
-            inflater.emplace(stream, std::min(room, slots), compressed_capacity, input_workers);
+            inflater.emplace(stream, std::min(room, slots), compressed_capacity, workers);
         });
     };
     CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
@@ -968,8 +1113,6 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             -> Result<void> {
             if (!inflater) CUDDL_TRY(make_inflater());
             std::vector<size_t> device_ids, host_ids, handed_back;
-            // ponytail: fixed 1:7 split on coherent hosts; use a shared work queue if CPU/GPU
-            // balance varies.
             for (size_t id = base; id < base + count; ++id) {
                 (fits(probes[id]) ? device_ids : host_ids).push_back(id);
             }
@@ -979,9 +1122,9 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             if (!host_paths.empty()) {
                 host_pool.emplace(
                     host_paths,
-                    std::min(host_workers, host_paths.size()),
+                    std::min(workers, host_paths.size()),
                     decompression_source{acquire_sequence_target, &host_buffers},
-                    host_workers * 4
+                    workers * 4
                 );
             }
             size_t host_next = 0;
@@ -1003,7 +1146,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 return Ok();
             };
             std::vector<inflated_genome> genomes;
-            std::array<bool, device_gzip_inflater::lane_count> busy{};
+            std::array<bool, device_fasta_pipeline::lane_count> busy{};
             size_t next = 0, lane = 0;
             // Cycle through lanes, submitting a batch before consuming the oldest one.
             while (next < device_ids.size() ||
@@ -1022,12 +1165,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                     }
                     next += CUDDL_TRY(submitted.get());
                     busy[lane] = true;
-                    CUDDL_TRY(drain_host(std::min(host_ids.size(), next * (device_stride - 1))));
                 }
-                CUDDL_TRY((stage_host_loaded<K, BucketCount, Layout>(
-                    stager, paths, handed_back, base, workers, host_buffers, page_locked
-                )));
-                handed_back.clear();
                 auto const other = (lane + 1) % busy.size();
                 if (busy[other]) {
                     genomes.clear();
@@ -1042,6 +1180,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 lane = other;
             }
             CUDDL_TRY(drain_host(host_ids.size()));
+            // ponytail: one fallback pool per group; pipeline it if fallback-heavy inputs dominate.
             return stage_host_loaded<K, BucketCount, Layout>(
                 stager, paths, handed_back, base, workers, host_buffers, page_locked
             );
@@ -1111,13 +1250,23 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                             : decompression_backend::cpu;
     }
 #if CUDDL_HAS_NVCOMP
+    if (decompression == decompression_backend::coherent) {
+        return stage_paths_normalising<K, BucketCount, Layout>(
+            paths,
+            stream,
+            staging_bytes,
+            parser_workers,
+            transfer,
+            statistics,
+            std::forward<Sink>(sink)
+        );
+    }
     if (decompression != decompression_backend::cpu) {
         return stage_paths_inflating<K, BucketCount, Layout>(
             paths,
             stream,
             staging_bytes,
             parser_workers,
-            decompression == decompression_backend::coherent,
             transfer,
             statistics,
             std::forward<Sink>(sink)

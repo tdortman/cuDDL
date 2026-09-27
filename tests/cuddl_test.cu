@@ -4129,11 +4129,20 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     for (size_t id = 0; id < 17; ++id) {
         paths.push_back(write_tmp_gzip(">genome\n" + bases(1000 + id * 71, 100 + id)));
     }
+    paths.push_back(write_tmp_fasta(">plain\r\n" + bases(1000, 77) + ">next\n" + bases(900, 78)));
+    paths.push_back(write_tmp_gzip(">whitespace\n \t\n"));
     auto const host = cuddl::reference_database_file::build<25, buckets>(
         paths, stream, {.decompression = cuddl::decompression_backend::cpu}
     );
     ASSERT_TRUE(host) << host.error().message();
     auto const headerless = write_tmp_gzip("ACGTACGTACGTACGTACGTACGTACGTACGT\n");
+    auto const empty_header = write_tmp_gzip(">only\n");
+    auto invalid_tail = paths;
+    invalid_tail.push_back(empty_header);
+    auto const missing = write_tmp_gzip(">missing\nACGT\n");
+    ASSERT_TRUE(std::filesystem::remove(missing));
+    auto missing_tail = paths;
+    missing_tail.push_back(missing);
     bool const coherent = cuddl::detail::device_reads_pageable_memory(stream.device());
     for (auto backend :
          {cuddl::decompression_backend::automatic,
@@ -4176,6 +4185,22 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
                 std::vector<std::filesystem::path>{headerless}, stream, options
             );
             EXPECT_FALSE(rejected);
+            auto const rejected_header = cuddl::reference_database_file::build<25, buckets>(
+                std::vector<std::filesystem::path>{empty_header}, stream, options
+            );
+            EXPECT_FALSE(rejected_header);
+            auto const rejected_tail =
+                cuddl::reference_database_file::build<25, buckets>(invalid_tail, stream, options);
+            ASSERT_FALSE(rejected_tail);
+            EXPECT_EQ(rejected_tail.error().category(), cuddl::ErrorCategory::invalid_argument);
+            auto const missing_input =
+                cuddl::reference_database_file::build<25, buckets>(missing_tail, stream, options);
+            ASSERT_FALSE(missing_input);
+            EXPECT_EQ(missing_input.error().category(), cuddl::ErrorCategory::invalid_argument);
+            auto const recovered =
+                cuddl::reference_database_file::build<25, buckets>(paths, stream, options);
+            ASSERT_TRUE(recovered) << recovered.error().message();
+            EXPECT_TRUE(std::ranges::equal(host->rows(), recovered->rows()));
         }
     }
 
@@ -4193,7 +4218,10 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     );
 
     std::filesystem::remove(headerless);
-    for (auto const& path : paths) std::filesystem::remove(path);
+    std::filesystem::remove(empty_header);
+    for (auto const& path : paths) {
+        std::filesystem::remove(path);
+    }
 }
 
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {

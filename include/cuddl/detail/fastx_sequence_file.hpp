@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuddl/error.hpp>
@@ -440,6 +441,7 @@ class fastx_fastq_reader {
 // Heap ownership keeps extent addresses stable, including short decompressed strings.
 struct fastx_sequence_file {
     std::unique_ptr<fastx_mapped_file> file;
+    std::string_view input;
     std::string decompressed;
     std::string sequence;
     std::vector<fastx_sequence_extent> extents;
@@ -712,6 +714,12 @@ inline char* compact_sequence_whitespace_neon(char const* first, char const* las
             vorrq_u8(vceqq_u8(block, newline), vceqq_u8(block, carriage)),
             vorrq_u8(vceqq_u8(block, space), vceqq_u8(block, tab))
         );
+        if (vmaxvq_u8(whitespace) == 0) {
+            vst1q_u8(reinterpret_cast<uint8_t*>(out), block);
+            out += 16;
+            at += 16;
+            continue;
+        }
         auto const flags = compact_impl::compact_mask(whitespace);
         auto const low = flags & 0xFFU;
         auto const high = (flags >> 8U) & 0xFFU;
@@ -1002,14 +1010,50 @@ inline void compact_fastx_sequence_extents(fastx_sequence_file& result) {
     }
 }
 
-inline Result<std::unique_ptr<fastx_sequence_file>>
-load_fastx_sequence_file(std::string const& path, decompression_source source = {}) {
-    auto file = fastx_mapped_file::load(path);
-    if (!file) {
-        return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+inline Result<void>
+parse_fastx_sequence_file(fastx_sequence_file& result, std::string const& path) {
+    auto const data = std::exchange(result.input, {});
+    auto& sequence = result.sequence;
+    auto& extents = result.extents;
+    auto const first = data.find_first_not_of("\r\n");
+    if (first != std::string_view::npos && data[first] == '@') {
+        fastx_fastq_reader reader{data, path};
+        std::vector<std::pair<size_t, size_t>> records;
+        while (true) {
+            auto const begin = sequence.size();
+            auto next = reader.append_next_record(sequence);
+            if (!next) return Err(Error::invalid_argument(next.error().message()));
+            if (!*next) break;
+            if (sequence.size() > begin) records.emplace_back(begin, sequence.size());
+        }
+        if (sequence.empty()) return Ok();
+        for (auto const& [begin, end] : records) {
+            extents.push_back({sequence.data() + begin, sequence.data() + end});
+        }
+        compact_fastx_sequence_extents(result);
+        return Ok();
     }
+    // Mapped plain bytes are read-only; decompressed bytes can be compacted in place.
+    char* out = result.decompressed_target;
+    if (out == nullptr) {
+        if (data.data() != result.decompressed.data()) result.decompressed.resize(data.size());
+        out = result.decompressed.data();
+    }
+    extents = fastx_fasta_compact_extents(data, out);
+    if (extents.empty() && !data.empty()) {
+        return Err(Error::invalid_argument("FASTX parse error near: " + path));
+    }
+    return Ok();
+}
+
+inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
+    std::unique_ptr<fastx_mapped_file> file,
+    std::string const& path,
+    decompression_source source,
+    bool defer_fasta
+) {
     auto result = std::make_unique<fastx_sequence_file>();
-    result->file = std::move(*file);
+    result->file = std::move(file);
     auto data = result->file->data();
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
@@ -1047,46 +1091,33 @@ load_fastx_sequence_file(std::string const& path, decompression_source source = 
         }
     }
 
-    auto& sequence = result->sequence;
-    auto& extents = result->extents;
-    auto const first = data.find_first_not_of("\r\n");
-    if (first != std::string_view::npos && data[first] == '@') {
-        fastx_fastq_reader reader{data, path};
-        std::vector<std::pair<size_t, size_t>> records;
-        while (true) {
-            auto const begin = sequence.size();
-            auto next = reader.append_next_record(sequence);
-            if (!next) return Err(Error::invalid_argument(next.error().message()));
-            if (!*next) break;
-            if (sequence.size() > begin) records.emplace_back(begin, sequence.size());
+    result->input = data;
+    if (defer_fasta) {
+        auto const first = data.find_first_not_of("\r\n");
+        if (first != std::string_view::npos && data[first] == '>') {
+            auto const end = fastx_line_end(data, first);
+            // Empty first records and malformed inputs stay with the CPU parser.
+            if (end + 1 < data.size() && data[end + 1] != '>') return result;
         }
-        if (sequence.empty()) return result;
-        for (auto const& [begin, end] : records) {
-            extents.push_back({sequence.data() + begin, sequence.data() + end});
-        }
-        compact_fastx_sequence_extents(*result);
-        return result;
     }
-    // Decompressed bytes are compacted in place; a memory-mapped plain file is read-only, so its
-    // bases go to `decompressed`, which is sized once so no pointer into it moves.
-    char* out = result->decompressed_target;
-    if (out == nullptr) {
-        if (data.data() != result->decompressed.data()) {
-            result->decompressed.resize(data.size());
-        }
-        out = result->decompressed.data();
-    }
-    extents = fastx_fasta_compact_extents(data, out);
-    if (extents.empty() && data.size() > 0) {
-        return Err(Error::invalid_argument("FASTX parse error near: " + path));
-    }
+    CUDDL_TRY(parse_fastx_sequence_file(*result, path));
     return result;
+}
+
+inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
+    std::string const& path,
+    decompression_source source = {},
+    bool defer_fasta = false
+) {
+    auto file = fastx_mapped_file::load(path);
+    if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+    return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta);
 }
 
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
 // per genome costs tens of microseconds and dominates at high file counts. Workers pull
-// ids in order while the main thread takes results in order, so at most depth loads are
-// in flight and output order never depends on completion order. Loader exceptions are
+// ids in order with a bounded number of outstanding loads. Consumers may collect by ID
+// or by completion, retaining each input's ID. Loader exceptions are
 // rethrown by take, matching std::async propagation into the build error handlers.
 class fastx_load_pool {
    public:
@@ -1094,22 +1125,34 @@ class fastx_load_pool {
     /// @param workers Loader threads.
     /// @param source Decompression buffer source; the default detects gzip by magic bytes.
     /// @param window  Files the loaders may hold ahead of the consumer, at least one per worker.
-    ///                Results are taken in order, so the window is what hides a slow file: with a
+    ///                With ordered collection, the window hides a slow file: with a
     ///                window of one worker-worth there is no slack, and the consumer waits on the
     ///                straggler while the other loaders sit idle.
+    /// @param defer_fasta Leave eligible FASTA bytes for a GPU normaliser.
+    /// @param completion_order Collect through take_ready instead of take(id).
     fastx_load_pool(
         std::span<std::filesystem::path const> paths,
         size_t workers,
         decompression_source source = {},
-        size_t window = 0
+        size_t window = 0,
+        bool defer_fasta = false,
+        bool completion_order = false
     )
         : paths_(paths),
           workers_(std::max(size_t{1}, workers)),
           window_(std::max({size_t{1}, window, workers_})),
           source_(source),
+          defer_fasta_(defer_fasta),
           results_(paths.size()),
-          errors_(paths.size()) {
+          errors_(paths.size()),
+          ready_(completion_order ? window_ : 0),
+          retired_(defer_fasta ? window_ : 0),
+          mapped_(defer_fasta ? window_ : 0) {
         threads_.reserve(workers_);
+        if (defer_fasta_) {
+            retirer_ = std::thread([this] { retire_files(); });
+            mapper_ = std::thread([this] { map_files(); });
+        }
         for (size_t i = 0; i < workers_; ++i) threads_.emplace_back([this] { work(); });
     }
     ~fastx_load_pool() {
@@ -1118,7 +1161,18 @@ class fastx_load_pool {
             stop_ = true;
         }
         assign_.notify_all();
+        mapped_ready_.notify_all();
+        if (mapper_.joinable()) mapper_.join();
         for (auto& thread : threads_) thread.join();
+        // Loaders may be waiting for retirement space, so stop the reaper only after joining them.
+        if (retirer_.joinable()) {
+            {
+                std::lock_guard lock(retired_mutex_);
+                retire_stop_ = true;
+            }
+            retired_ready_.notify_one();
+            retirer_.join();
+        }
     }
     fastx_load_pool(fastx_load_pool const&) = delete;
     fastx_load_pool& operator=(fastx_load_pool const&) = delete;
@@ -1135,26 +1189,126 @@ class fastx_load_pool {
         return std::move(*results_[id]);
     }
 
+    [[nodiscard]] Result<std::pair<size_t, std::unique_ptr<fastx_sequence_file>>> take_ready() {
+        if (ready_.empty())
+            return Err(Error::invalid_argument("completion-order loading is disabled"));
+        std::unique_lock lock(mutex_);
+        filled_.wait(lock, [&] { return ready_count_ != 0; });
+        auto const id = ready_[ready_head_];
+        ready_head_ = (ready_head_ + 1) % ready_.size();
+        --ready_count_;
+        ++taken_;
+        assign_.notify_one();
+        lock.unlock();
+        if (errors_[id] != nullptr) std::rethrow_exception(errors_[id]);
+        return std::pair{id, CUDDL_TRY(std::move(*results_[id]))};
+    }
+
    private:
-    void work() {
+    struct mapped_input {
+        std::optional<Result<std::unique_ptr<fastx_mapped_file>>> file;
+        std::exception_ptr error;
+    };
+
+    void map_files() {
         while (true) {
             size_t id;
             {
                 std::unique_lock lock(mutex_);
                 assign_.wait(lock, [&] {
-                    return stop_ || next_ >= paths_.size() || next_ - taken_ < window_;
+                    return stop_ || mapped_next_ >= paths_.size() ||
+                           mapped_next_ - taken_ < window_;
                 });
+                if (stop_ || mapped_next_ >= paths_.size()) return;
+                id = mapped_next_;
+            }
+            mapped_input input;
+            try {
+                input.file = fastx_mapped_file::load(paths_[id].string());
+            } catch (...) {
+                input.error = std::current_exception();
+            }
+            {
+                std::lock_guard lock(mutex_);
+                mapped_[id % mapped_.size()] = std::move(input);
+                ++mapped_next_;
+            }
+            mapped_ready_.notify_one();
+        }
+    }
+
+    void retire(std::unique_ptr<fastx_mapped_file> file) {
+        std::unique_lock lock(retired_mutex_);
+        retired_space_.wait(lock, [&] { return retired_count_ < retired_.size(); });
+        retired_[(retired_head_ + retired_count_) % retired_.size()] = std::move(file);
+        ++retired_count_;
+        lock.unlock();
+        retired_ready_.notify_one();
+    }
+
+    void retire_files() {
+        while (true) {
+            std::unique_ptr<fastx_mapped_file> file;
+            {
+                std::unique_lock lock(retired_mutex_);
+                retired_ready_.wait(lock, [&] { return retire_stop_ || retired_count_ != 0; });
+                if (retired_count_ == 0) return;
+                file = std::move(retired_[retired_head_]);
+                retired_head_ = (retired_head_ + 1) % retired_.size();
+                --retired_count_;
+            }
+            retired_space_.notify_one();
+        }
+    }
+
+    void work() {
+        while (true) {
+            size_t id;
+            mapped_input input;
+            {
+                std::unique_lock lock(mutex_);
+                // The mapper owns the prefetch window; decoders wait for published mappings.
+                if (defer_fasta_) {
+                    mapped_ready_.wait(lock, [&] {
+                        return stop_ || next_ >= paths_.size() || next_ < mapped_next_;
+                    });
+                } else {
+                    assign_.wait(lock, [&] {
+                        return stop_ || next_ >= paths_.size() || next_ - taken_ < window_;
+                    });
+                }
                 if (stop_ || next_ >= paths_.size()) return;
-                if (next_ - taken_ >= window_) continue;
                 id = next_++;
+                if (defer_fasta_) input = std::move(mapped_[id % mapped_.size()]);
             }
             try {
-                auto loaded = load_fastx_sequence_file(paths_[id].string(), source_);
+                auto const path = paths_[id].string();
+                auto loaded = [&]() -> Result<std::unique_ptr<fastx_sequence_file>> {
+                    if (!defer_fasta_) return load_fastx_sequence_file(path, source_);
+                    if (input.error) std::rethrow_exception(input.error);
+                    if (!*input.file)
+                        return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+                    return decode_fastx_sequence_file(std::move(**input.file), path, source_, true);
+                }();
+                // Inflated or copied bytes no longer reference the file mapping.
+                if (defer_fasta_ && loaded && (*loaded)->file &&
+                    ((*loaded)->decompressed_target != nullptr ||
+                     !(*loaded)->decompressed.empty())) {
+                    retire(std::move((*loaded)->file));
+                }
                 std::lock_guard lock(mutex_);
                 results_[id] = std::move(loaded);
+                if (!ready_.empty()) {
+                    ready_[(ready_head_ + ready_count_) % ready_.size()] = id;
+                    ++ready_count_;
+                }
             } catch (...) {
                 std::lock_guard lock(mutex_);
                 errors_[id] = std::current_exception();
+                if (!ready_.empty()) {
+                    ready_[(ready_head_ + ready_count_) % ready_.size()] = id;
+                    ++ready_count_;
+                }
             }
             filled_.notify_all();
         }
@@ -1163,13 +1317,26 @@ class fastx_load_pool {
     size_t workers_;
     size_t window_;
     decompression_source source_;
+    bool defer_fasta_;
     std::vector<std::optional<Result<std::unique_ptr<fastx_sequence_file>>>> results_;
     std::vector<std::exception_ptr> errors_;
+    std::vector<size_t> ready_;
+    std::vector<std::unique_ptr<fastx_mapped_file>> retired_;
+    std::vector<mapped_input> mapped_;
     std::vector<std::thread> threads_;
+    std::thread retirer_;
+    std::thread mapper_;
     std::mutex mutex_;
+    std::mutex retired_mutex_;
     std::condition_variable assign_, filled_;
+    std::condition_variable retired_ready_, retired_space_;
+    std::condition_variable mapped_ready_;
     size_t next_ = 0, taken_ = 0;
+    size_t ready_head_ = 0, ready_count_ = 0;
+    size_t retired_head_ = 0, retired_count_ = 0;
+    size_t mapped_next_ = 0;
     bool stop_ = false;
+    bool retire_stop_ = false;
 };
 
 }  // namespace cuddl::detail

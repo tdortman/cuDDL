@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -12,9 +13,11 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <libdeflate.h>
 #include <unistd.h>
 
@@ -412,10 +415,38 @@ class reference_database_file {
             CUDDL_TRY(writer.value(database_file_version));
             auto metadata = metadata_;
             CUDDL_TRY(detail::database_file_metadata(writer, metadata));
+            auto const prefix = ::ftello(writer.output);
+            auto const limit = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+            if (prefix < 0 || static_cast<uint64_t>(prefix) > limit - sizeof(uint32_t)) {
+                return Err(Error::resource("cannot size temporary database file"));
+            }
+            uint64_t bytes = static_cast<uint64_t>(prefix) + sizeof(uint32_t);
+            if (rows_.size() > (limit - bytes) / sizeof(uint16_t)) {
+                return Err(Error::resource("database exceeds file size capacity"));
+            }
+            bytes += rows_.size() * sizeof(uint16_t);
             for (auto const& name : names_) {
                 if (name.size() > std::numeric_limits<uint32_t>::max()) {
                     return Err(Error::resource("reference label exceeds binary format capacity"));
                 }
+                if (bytes > limit - sizeof(uint32_t) ||
+                    name.size() > limit - bytes - sizeof(uint32_t)) {
+                    return Err(Error::resource("database exceeds file size capacity"));
+                }
+                bytes += sizeof(uint32_t) + name.size();
+            }
+            // Allocate before names spill from stdio, avoiding delayed extent allocation when
+            // the completed temporary file atomically replaces an existing database.
+            auto const allocation = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
+            if (allocation != 0 && allocation != EOPNOTSUPP && allocation != ENOSYS) {
+                return Err(
+                    Error::resource(
+                        "cannot allocate database file: " +
+                        std::generic_category().message(allocation)
+                    )
+                );
+            }
+            for (auto const& name : names_) {
                 CUDDL_TRY(writer.value(static_cast<uint32_t>(name.size())));
                 CUDDL_TRY(writer.bytes(name.data(), name.size()));
             }

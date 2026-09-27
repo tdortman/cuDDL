@@ -11,7 +11,9 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -19,10 +21,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_copy.cuh>
+#include <cub/device/device_segmented_reduce.cuh>
 #include <cub/device/device_select.cuh>
 #include <cuda/algorithm>
 #include <cuda/buffer>
+#include <cuda/iterator>
 #include <cuda/memory_pool>
 #include <cuda/stream>
 
@@ -97,6 +101,12 @@ __device__ __forceinline__ bool is_whitespace(char c) {
 struct kept_byte {
     __device__ bool operator()(char c) const {
         return !is_whitespace(c);
+    }
+};
+
+struct kept_byte_count {
+    __device__ unsigned long long operator()(char c) const {
+        return kept_byte{}(c);
     }
 };
 
@@ -271,16 +281,13 @@ static __global__ void blank_header_kernel(
 }
 
 /// @brief Per file: the first byte that is not a line ending, the bytes before the first header
-/// blanked, and the count of bytes compaction keeps. One block per file.
+/// blanked. One block per file.
 static __global__ void slot_finish_kernel(
     char* buffer,
     uint64_t const* slots,
     unsigned long long const* first_header,
-    char* first_char,
-    unsigned long long* kept
+    char* first_char
 ) {
-    using reduce = cub::BlockReduce<unsigned long long, block_size>;
-    __shared__ typename reduce::TempStorage storage;
     auto const begin = slots[blockIdx.x] + 1;
     auto const end = slots[blockIdx.x + 1];
     if (threadIdx.x == 0) {
@@ -291,13 +298,6 @@ static __global__ void slot_finish_kernel(
     __syncthreads();
     auto const head = cuda::std::min<uint64_t>(first_header[blockIdx.x], end);
     for (auto at = begin + threadIdx.x; at < head; at += block_size) buffer[at] = '\n';
-    __syncthreads();
-    unsigned long long count = 0;
-    for (auto at = begin + threadIdx.x; at < end; at += block_size) {
-        count += is_whitespace(buffer[at]) ? 0 : 1;
-    }
-    auto const total = reduce(storage).Sum(count);
-    if (threadIdx.x == 0) kept[blockIdx.x] = total;
 }
 
 }  // namespace device_gzip
@@ -309,10 +309,15 @@ struct inflated_genome {
     size_t size;
 };
 
-/// @brief Inflates single-member gzip FASTA files on the device and compacts their sequence.
+struct decoded_fasta {
+    size_t id;
+    std::string_view bytes;
+};
+
+/// @brief Normalises FASTA batches supplied compressed or already inflated.
 ///
-/// Each lane takes a batch of files: the host reads the compressed bytes, nvCOMP inflates
-/// them into device slots, and a few kernels blank header text and leading bytes before an
+/// Each lane receives raw bytes through a batched copy or inflates gzip through nvCOMP.
+/// Kernels blank header text and leading bytes before an
 /// in-place select drops whitespace. A genome comes out as one run of bases with its records
 /// joined by the '>' that opened each one, a byte no k-mer window accepts, so it sketches exactly
 /// as its separate records would.
@@ -321,13 +326,16 @@ struct inflated_genome {
 /// whose size or CRC32 disagrees with the trailer (a multi-member stream inflates only its first
 /// member here), FASTQ content, or no header. The host loader then gives it its usual result or
 /// error.
-class device_gzip_inflater {
+class device_fasta_pipeline {
+    struct lane_state;
+
    public:
     static constexpr size_t lane_count = 6;
+    static constexpr size_t max_files = 4096;
 
     /// @param slot_capacity Inflated bytes one lane holds, one guard byte per file included.
-    /// @param compressed_capacity Compressed bytes one lane reads per batch.
-    device_gzip_inflater(
+    /// @param compressed_capacity Compressed bytes per lane; zero selects decoded input.
+    device_fasta_pipeline(
         cuda::stream_ref stream,
         size_t slot_capacity,
         size_t compressed_capacity,
@@ -345,7 +353,8 @@ class device_gzip_inflater {
           ) {
         auto const options = nvcompBatchedGzipDecompressDefaultOpts;
         nvcomp_temp_bytes_ = 0;
-        if (nvcompBatchedGzipDecompressGetTempSizeAsync(
+        if (compressed_capacity_ != 0 &&
+            nvcompBatchedGzipDecompressGetTempSizeAsync(
                 max_files,
                 std::min<size_t>(slot_capacity_, std::numeric_limits<uint32_t>::max()),
                 options,
@@ -355,6 +364,19 @@ class device_gzip_inflater {
             throw std::bad_alloc();
         }
         select_temp_bytes_ = 0;
+        auto const counted = cub::DeviceSegmentedReduce::Sum(
+            nullptr,
+            count_temp_bytes_,
+            cuda::make_transform_iterator(
+                static_cast<char*>(nullptr), device_gzip::kept_byte_count{}
+            ),
+            static_cast<unsigned long long*>(nullptr),
+            max_files,
+            static_cast<uint64_t*>(nullptr),
+            static_cast<uint64_t*>(nullptr),
+            stream.get()
+        );
+        if (counted != cudaSuccess) throw std::runtime_error(cudaGetErrorString(counted));
         cub::DeviceSelect::If(
             nullptr,
             select_temp_bytes_,
@@ -364,26 +386,62 @@ class device_gzip_inflater {
             device_gzip::kept_byte{},
             stream.get()
         );
+#if CUDART_VERSION < 13030
+        if (compressed_capacity_ == 0) {
+            auto const copied = cub::DeviceCopy::Batched(
+                nullptr,
+                copy_temp_bytes_,
+                static_cast<char**>(nullptr),
+                static_cast<char**>(nullptr),
+                static_cast<uint64_t*>(nullptr),
+                static_cast<int64_t>(max_files),
+                stream
+            );
+            if (copied != cudaSuccess) throw std::runtime_error(cudaGetErrorString(copied));
+        }
+#endif
         auto const device = stream.device();
+        auto const streaming_window =
+            compressed_capacity_ == 0
+                ? std::min(
+                      slot_capacity_,
+                      static_cast<size_t>(
+                          device.attribute(cuda::device_attributes::max_access_policy_window_size)
+                      )
+                  )
+                : size_t{0};
         for (auto& lane : lanes_) {
             lane.stream.emplace(device);
             auto const s = cuda::stream_ref{*lane.stream};
             lane.uploaded.emplace(s);
             lane.classified.emplace(s);
             lane.released.emplace(stream);
-            lane.pinned.emplace(
-                s, cuda::pinned_default_memory_pool(), compressed_capacity_, cuda::no_init
-            );
+            if (compressed_capacity_ != 0) {
+                lane.pinned.emplace(
+                    s, cuda::pinned_default_memory_pool(), compressed_capacity_, cuda::no_init
+                );
+                lane.compressed.emplace(
+                    cuda::make_device_buffer<char>(s, device, compressed_capacity_, cuda::no_init)
+                );
+            }
             lane.host.emplace(
                 s, cuda::pinned_default_memory_pool(), host_table_bytes(), cuda::no_init
-            );
-            lane.compressed.emplace(
-                cuda::make_device_buffer<char>(s, device, compressed_capacity_, cuda::no_init)
             );
             // Sixteen bytes of tail padding let the header scan read whole words.
             lane.slots.emplace(
                 cuda::make_device_buffer<char>(s, device, slot_capacity_ + 16, cuda::no_init)
             );
+            if (streaming_window != 0) {
+                cudaStreamAttrValue policy{};
+                policy.accessPolicyWindow.base_ptr = lane.slots->data();
+                policy.accessPolicyWindow.num_bytes = streaming_window;
+                policy.accessPolicyWindow.hitRatio = 0.0f;
+                policy.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+                policy.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+                auto const status =
+                    cudaStreamSetAttribute(s.get(), cudaStreamAttributeAccessPolicyWindow, &policy);
+                if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+            }
             lane.tables.emplace(
                 cuda::make_device_buffer<char>(s, device, host_table_bytes(), cuda::no_init)
             );
@@ -392,7 +450,15 @@ class device_gzip_inflater {
             );
             lane.temp.emplace(
                 cuda::make_device_buffer<char>(
-                    s, device, std::max(nvcomp_temp_bytes_, select_temp_bytes_) + 1, cuda::no_init
+                    s,
+                    device,
+                    std::max(
+                        {nvcomp_temp_bytes_,
+                         select_temp_bytes_,
+                         copy_temp_bytes_,
+                         count_temp_bytes_}
+                    ) + 1,
+                    cuda::no_init
                 )
             );
         }
@@ -423,6 +489,7 @@ class device_gzip_inflater {
         std::span<gzip_file_probe const> probes
     ) {
         auto& lane = lanes_[lane_index];
+        lane.decoded = false;
         if (ids.empty()) return Err(Error::invalid_argument("an inflate batch needs a file"));
         size_t files = 0, compressed = 0, slots = 0;
         while (files < ids.size() && files < max_files) {
@@ -539,6 +606,16 @@ class device_gzip_inflater {
             lane.slots->data(), device_table.slots, device_table.crcs
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
+        CUDDL_TRY(normalise(lane, slot_at));
+        return files;
+    }
+
+   private:
+    [[nodiscard]] Result<void> normalise(lane_state& lane, uint64_t slot_at) {
+        auto const s = cuda::stream_ref{*lane.stream};
+        auto const stream = s.get();
+        auto const device_table = device_tables(lane);
+        auto const count = static_cast<uint32_t>(lane.files.size());
         auto const grid = static_cast<uint32_t>(
             s.device().attribute(cuda::device_attributes::multiprocessor_count) * 8
         );
@@ -564,10 +641,22 @@ class device_gzip_inflater {
             lane.slots->data(),
             device_table.slots,
             device_table.first_header,
-            device_table.first_char,
-            device_table.kept
+            device_table.first_char
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
+        auto count_temp_bytes = count_temp_bytes_;
+        CUDDL_CUDA_TRY(
+            cub::DeviceSegmentedReduce::Sum(
+                lane.temp->data(),
+                count_temp_bytes,
+                cuda::make_transform_iterator(lane.slots->data(), device_gzip::kept_byte_count{}),
+                device_table.kept,
+                count,
+                device_table.slots,
+                device_table.slots + 1,
+                stream
+            )
+        );
         auto temp_bytes = select_temp_bytes_;
         CUDDL_CUDA_TRY(
             cub::DeviceSelect::If(
@@ -588,7 +677,97 @@ class device_gzip_inflater {
             )
         );
         CUDDL_CUDA_TRY(lane.classified->record(s));
-        return files;
+        return Ok();
+    }
+
+   public:
+    /// @brief Copies CPU-inflated FASTA into a lane and enqueues GPU normalisation.
+    /// Retain the source bytes until this lane finishes, or until @ref wait_lanes returns.
+    [[nodiscard]] Result<void>
+    submit_decoded(size_t lane_index, std::span<decoded_fasta const> sources) {
+        if (sources.empty() || sources.size() > max_files || compressed_capacity_ != 0) {
+            return Err(Error::invalid_argument("invalid decoded FASTA batch"));
+        }
+        auto& lane = lanes_[lane_index];
+        lane.uploaded->sync();
+        lane.decoded = true;
+        lane.files.clear();
+        lane.fallback.clear();
+        auto const table = host_table(lane);
+        uint64_t bytes = 0;
+        for (auto const& source : sources) {
+            if (source.bytes.size() >= slot_capacity_ - bytes) {
+                return Err(Error::invalid_argument("decoded FASTA batch exceeds its lane"));
+            }
+            auto const file = lane.files.size();
+            table.slots[file] = bytes;
+            table.compressed_ptrs[file] = const_cast<char*>(source.bytes.data());
+            table.compressed_bytes[file] = source.bytes.size();
+            table.output_ptrs[file] = lane.slots->data() + bytes + 1;
+            bytes += source.bytes.size() + 1;
+            lane.files.push_back(source.id);
+        }
+        table.slots[sources.size()] = bytes;
+        auto const s = cuda::stream_ref{*lane.stream};
+        auto const device_table = device_tables(lane);
+        CUDDL_CUDA_TRY(s.wait(*lane.released));
+        CUDDL_CUDA_TRY(
+            cuda::copy_bytes(
+                s,
+                cuda::std::span{lane.host->data(), inputs_bytes()},
+                device_span<char>{lane.tables->data(), inputs_bytes()}
+            )
+        );
+        auto const count = static_cast<uint32_t>(sources.size());
+        device_gzip::slot_init_kernel<<<(count + 255) / 256, 256, 0, s.get()>>>(
+            lane.slots->data(),
+            device_table.slots,
+            count,
+            device_table.first_header,
+            device_table.header_count
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
+#if CUDART_VERSION >= 13030
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+        attributes.srcLocHint = {cudaMemLocationTypeHost, 0};
+        attributes.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+        size_t attributes_index = 0;
+        CUDDL_CUDA_TRY(cudaMemcpyBatchAsync(
+            reinterpret_cast<void* const*>(table.output_ptrs),
+            reinterpret_cast<void const* const*>(table.compressed_ptrs),
+            table.compressed_bytes,
+            count,
+            &attributes,
+            &attributes_index,
+            1,
+            s.get()
+        ));
+#else
+        auto temporary_bytes = copy_temp_bytes_;
+        CUDDL_CUDA_TRY(
+            cub::DeviceCopy::Batched(
+                lane.temp->data(),
+                temporary_bytes,
+                device_table.compressed_ptrs,
+                device_table.output_ptrs,
+                device_table.compressed_bytes,
+                count,
+                s
+            )
+        );
+#endif
+        CUDDL_CUDA_TRY(lane.uploaded->record(s));
+        return normalise(lane, bytes);
+    }
+
+    /// @brief Completes lane work before callers release outstanding input buffers.
+    [[nodiscard]] Result<void> wait_lanes(cuda::stream_ref consumer) {
+        for (auto& lane : lanes_) {
+            CUDDL_CUDA_TRY(lane.stream->sync());
+        }
+        CUDDL_CUDA_TRY(consumer.sync());
+        return Ok();
     }
 
     /// @brief Waits for @p lane's batch and splits it into genomes the device holds and ids
@@ -611,14 +790,16 @@ class device_gzip_inflater {
         uint64_t offset = 0;
         for (size_t file = 0; file < lane.files.size(); ++file) {
             auto const id = lane.files[file];
-            auto const& probe = probes[id];
             auto const size = table.kept[file];
-            auto const intact = table.statuses[file] == nvcompSuccess &&
-                                table.inflated_bytes[file] == probe.isize &&
-                                table.crcs[file] == probe.crc;
+            bool const intact = lane.decoded || (table.statuses[file] == nvcompSuccess &&
+                                                 table.inflated_bytes[file] == probes[id].isize &&
+                                                 table.crcs[file] == probes[id].crc);
             auto const fasta =
                 table.first_char[file] != '@' && table.first_header[file] < table.slots[file + 1];
-            if (!overflow && intact && fasta) {
+            // Each header contributes one separator, including the first header.
+            // ponytail: CPU-validate shorter outputs; count per-file headers if this dominates.
+            auto const has_sequence = size > *table.header_count;
+            if (!overflow && intact && fasta && has_sequence) {
                 genomes.push_back({id, lane.slots->data() + offset, size});
             } else {
                 fallback.push_back(id);
@@ -638,8 +819,6 @@ class device_gzip_inflater {
     }
 
    private:
-    static constexpr size_t max_files = 4096;
-
     /// Per-batch tables. Inputs go host to device, outputs come back; one copy each way.
     struct table_view {
         uint64_t* compressed_offsets;  // host only
@@ -696,6 +875,7 @@ class device_gzip_inflater {
     }
 
     struct lane_state {
+        bool decoded = false;
         std::optional<cuda::stream> stream;
         std::optional<cuda::event> uploaded, classified, released;
         std::optional<cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible>>
@@ -717,7 +897,8 @@ class device_gzip_inflater {
 
     size_t workers_;
     size_t compressed_capacity_ = 0, slot_capacity_ = 0;
-    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0;
+    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, copy_temp_bytes_ = 0,
+           count_temp_bytes_ = 0;
     uint32_t header_capacity_ = 0;
     std::array<lane_state, lane_count> lanes_;
 };
