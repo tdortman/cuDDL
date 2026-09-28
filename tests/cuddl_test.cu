@@ -27,23 +27,18 @@
 namespace {
 
 using cuddl::detail::hash_kmer;
-using cuddl::detail::pack;
 using cuddl::detail::restore;
 using cuddl::detail::restore_midpoint;
 using cuddl::detail::score;
-using cuddl::detail::winner;
 
 constexpr uint32_t k_default = 25;
 constexpr size_t b_default = 2048;
-constexpr uint16_t k_counter_max = 65535;
 
 /// @brief Scalar, sequential CPU oracle for DDL construction and comparison.
 template <size_t BucketCount, typename Layout = cuddl::default_register_layout>
 struct scalar_sketch {
     std::vector<uint32_t> registers = std::vector<uint32_t>(BucketCount, 0U);
     std::vector<uint16_t> winners = std::vector<uint16_t>(BucketCount, 0U);
-    std::vector<uint32_t> counts = std::vector<uint32_t>(BucketCount, 0U);
-    bool saturated = false;
 
     void add(std::vector<uint64_t> const& inputs) {
         for (auto const input : inputs) {
@@ -52,28 +47,16 @@ struct scalar_sketch {
             auto const s = score<Layout>(h);
             if (s > winners[b]) {
                 winners[b] = s;
-                counts[b] = 1;
-            } else if (s == winners[b]) {
-                if (counts[b] == k_counter_max) {
-                    saturated = true;
-                } else {
-                    ++counts[b];
-                }
+                registers[b] = s;
             }
-        }
-    }
-
-    void pack_registers() {
-        for (size_t b = 0; b < BucketCount; ++b) {
-            registers[b] = pack(winners[b], static_cast<uint16_t>(counts[b]));
         }
     }
 
     [[nodiscard]] cuddl::pairwise_counts compare(scalar_sketch const& other) const {
         cuddl::pairwise_counts out{};
         for (size_t b = 0; b < BucketCount; ++b) {
-            auto const left = winner(this->registers[b]);
-            auto const right = winner(other.registers[b]);
+            auto const left = winners[b];
+            auto const right = other.winners[b];
             if (left == 0 && right == 0) {
                 ++out.both_empty;
             } else if (left < right) {
@@ -91,7 +74,7 @@ struct scalar_sketch {
         uint64_t empty = 0;
         double sum = 0.0;
         for (size_t b = 0; b < BucketCount; ++b) {
-            auto const w = winner(this->registers[b]);
+            auto const w = winners[b];
             if (w == 0) {
                 ++empty;
             } else {
@@ -228,24 +211,21 @@ TEST(SketchTest, BufferMovesAndResultsAcrossNonblockingStreams) {
     assigned = std::move(moved);
     EXPECT_EQ(moved.data().data(), nullptr);
 
-    auto counts = assigned.winner_counts(consumer);
-    ASSERT_TRUE(counts);
-    EXPECT_FALSE(counts->second);
+    std::vector<uint32_t> registers(b_default);
+    cuda::copy_bytes(consumer, std::as_const(assigned).data(), registers);
+    consumer.sync();
     scalar_sketch<b_default> oracle;
     oracle.add(host);
-    oracle.pack_registers();
-    for (size_t i = 0; i < b_default; ++i) {
-        EXPECT_EQ(counts->first[i], static_cast<uint16_t>(oracle.registers[i]));
-    }
+    EXPECT_EQ(registers, oracle.registers);
     ASSERT_TRUE(assigned.clear(consumer));
-    auto cleared = assigned.winner_counts(consumer);
-    ASSERT_TRUE(cleared);
-    EXPECT_EQ(cleared->first, std::vector<uint16_t>(b_default, 0));
+    cuda::copy_bytes(consumer, std::as_const(assigned).data(), registers);
+    consumer.sync();
+    EXPECT_EQ(registers, std::vector<uint32_t>(b_default, 0U));
     producer.wait(consumer);
     producer.sync();
 }
 
-TEST(SketchTest, AssignLoadsStoredRowsAndSaturation) {
+TEST(SketchTest, AssignLoadsStoredRows) {
     cuda::stream stream{cuda::devices[0]};
     using sketch_type = cuddl::sketch<k_default, b_default>;
     auto const host = make_inputs(65536);
@@ -253,21 +233,18 @@ TEST(SketchTest, AssignLoadsStoredRowsAndSaturation) {
     sketch_type original(stream);
     ASSERT_TRUE(original.add_async({input.data(), input.size()}, stream));
 
-    // Round-trip the registers and flag through host storage, exactly as a saved database would.
-    auto expected = original.winner_counts(stream);
-    ASSERT_TRUE(expected);
-    std::vector<uint32_t> words(b_default + 1U);
-    cuda::copy_bytes(stream, original.data(), words);
+    // Round-trip the registers through host storage, exactly as a saved database would.
+    std::vector<uint32_t> words(b_default);
+    cuda::copy_bytes(stream, std::as_const(original).data(), words);
     stream.sync();
-    words[b_default] = expected->second ? 1U : 0U;
     auto device_words = cuda::make_device_buffer<uint32_t>(stream, stream.device(), words);
 
     sketch_type assigned(stream);
     ASSERT_TRUE(assigned.assign_async({device_words.data(), words.size()}, stream));
-    auto counts = assigned.winner_counts(stream);
-    ASSERT_TRUE(counts);
-    EXPECT_EQ(counts->first, expected->first);
-    EXPECT_EQ(counts->second, expected->second);
+    std::vector<uint32_t> loaded(b_default);
+    cuda::copy_bytes(stream, std::as_const(assigned).data(), loaded);
+    stream.sync();
+    EXPECT_EQ(loaded, words);
     // The stored words carry no element count, so assign forgets it and stops capping estimates.
     // The raw reductions are what the round-tripped registers themselves say.
     auto assigned_raw = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
@@ -292,8 +269,8 @@ TEST(SketchTest, AssignLoadsStoredRowsAndSaturation) {
     ASSERT_TRUE(appended_cardinality.has_value());
     EXPECT_GT(*appended_cardinality, 1000.0);
 
-    // A span without the trailing saturation word is rejected without touching the sketch.
-    EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default}, stream));
+    // A span of the wrong length is rejected without touching the sketch.
+    EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default - 1U}, stream));
     stream.sync();
 }
 
@@ -323,8 +300,6 @@ TEST_F(ReferenceDatabaseTest, BufferMoveAssignmentRetainsRowsAndMetadata) {
 }
 
 TEST(SketchTest, EmptyRegisterEncoding) {
-    EXPECT_EQ(winner(0U), 0U);
-    EXPECT_EQ(cuddl::detail::count(0U), 0U);
     // No non-empty score may collide with the empty sentinel.
     EXPECT_GT(cuddl::detail::score(hash_kmer(0)), 0U);
 }
@@ -361,7 +336,6 @@ TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
 
     scalar_sketch<b_default, layout> oracle;
     oracle.add(inputs);
-    oracle.pack_registers();
 
     std::vector<uint32_t> gpu_regs(b_default);
     ASSERT_NO_THROW(([&] {
@@ -391,7 +365,6 @@ TEST(SketchTest, GpuRegistersMatchScalarOracleByteIdentically) {
 
     scalar_sketch<b_default> oracle;
     oracle.add(inputs);
-    oracle.pack_registers();
 
     std::vector<uint32_t> gpu_regs(b_default);
     ASSERT_NO_THROW(([&] {
@@ -431,10 +404,6 @@ TEST(SketchTest, RepeatedAddsFromReusableDeviceBufferMatchSingleAdd) {
         cuda::copy_bytes(stream, incremental.data(), actual);
         stream.sync();
         EXPECT_EQ(actual, expected);
-        EXPECT_EQ(
-            CUDDL_UNWRAP(incremental.winner_counts(stream)),
-            CUDDL_UNWRAP(full.winner_counts(stream))
-        );
     }
 }
 
@@ -523,9 +492,6 @@ void expect_sketches_equal(
     cuda::copy_bytes(stream, expected.data(), expected_regs);
     stream.sync();
     EXPECT_EQ(actual_regs, expected_regs);
-    EXPECT_EQ(
-        CUDDL_UNWRAP(actual.winner_counts(stream)), CUDDL_UNWRAP(expected.winner_counts(stream))
-    );
 }
 
 TEST(SketchTest, SequenceWholeGenomeMatchesPackedOracle) {
@@ -671,11 +637,6 @@ TEST(SketchTest, SequenceShortAndEmptyInputsAreNoOps) {
     cuda::copy_bytes(stream, empty.data(), regs);
     stream.sync();
     EXPECT_EQ(regs, std::vector<uint32_t>(b_default, 0U));
-    auto const empty_wc = CUDDL_UNWRAP(empty.winner_counts(stream));
-    EXPECT_FALSE(empty_wc.second);
-    EXPECT_TRUE(std::all_of(empty_wc.first.begin(), empty_wc.first.end(), [](auto c) {
-        return c == 0U;
-    }));
 
     auto const genome = make_genome(5000, 0x55aa'55aaULL);
     auto device_genome = make_device_sequence(stream, genome);
@@ -684,7 +645,6 @@ TEST(SketchTest, SequenceShortAndEmptyInputsAreNoOps) {
     std::vector<uint32_t> before(b_default);
     cuda::copy_bytes(stream, content.data(), before);
     stream.sync();
-    auto const before_wc = CUDDL_UNWRAP(content.winner_counts(stream));
     ASSERT_TRUE(content.add_sequence({}, stream).has_value());
     ASSERT_TRUE(
         content.add_sequence_async({device_short.data(), device_short.size()}, stream).has_value()
@@ -694,7 +654,6 @@ TEST(SketchTest, SequenceShortAndEmptyInputsAreNoOps) {
     cuda::copy_bytes(stream, content.data(), after);
     stream.sync();
     EXPECT_EQ(after, before);
-    EXPECT_EQ(CUDDL_UNWRAP(content.winner_counts(stream)), before_wc);
 
     std::string const one_window(k_default, 'C');
     auto const packed_one = encode_genome(one_window, k_default);
@@ -755,27 +714,19 @@ TEST(SketchTest, SequencePackedTilesMatchScalarOracle) {
         auto const packed = encode_genome(genome, k);
         scalar_sketch<B> oracle;
         auto input = make_device_sequence(stream, std::string(offset, 'N') + genome);
-        auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1, 0U);
-        std::vector<uint32_t> observed(B + 1);
+        auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B, 0U);
+        std::vector<uint32_t> observed(B);
         for (int append = 0; append < 2; ++append) {
             oracle.add(packed);
-            oracle.pack_registers();
             ASSERT_TRUE(
                 cuddl::detail::launch_sequence_add<B>(
-                    {input.data() + offset, genome.size()},
-                    k,
-                    {output.data(), B},
-                    output.data()[B],
-                    stream
+                    {input.data() + offset, genome.size()}, k, {output.data(), B}, stream
                 )
                     .has_value()
             );
             cuda::copy_bytes(stream, output, observed);
             stream.sync();
-            EXPECT_EQ(observed.back(), static_cast<uint32_t>(oracle.saturated));
-            EXPECT_TRUE(
-                std::equal(oracle.registers.begin(), oracle.registers.end(), observed.begin())
-            );
+            EXPECT_EQ(observed, oracle.registers);
         }
     };
     for (uint32_t k = 1; k <= 31; ++k) {
@@ -800,7 +751,7 @@ TEST(SketchTest, SequencePackedTilesMatchScalarOracle) {
     }
     verify.template operator()<b_default>(bytes, 25, 0);
     verify.template operator()<b_default>(bytes, 31, 3);
-    // Preserve every observation of low-complexity DNA, including saturated counts.
+    // Low-complexity DNA offers the same winner over and over.
     verify.template operator()<b_default>(std::string(140000, 'A'), 25, 1);
 }
 
@@ -814,7 +765,7 @@ __global__ void scalar_hybrid_cardinality(
     uint32_t bins[cuddl::detail::nlz_bins]{};
     float restored = 0.0f;
     for (size_t i = 0; i < size; ++i) {
-        auto const stored = winner(registers[i]);
+        auto const stored = static_cast<uint16_t>(registers[i]);
         ++bins[stored == 0U ? 0U : (stored >> Layout::mantissa_bits) + 1U];
         if (stored != 0U) {
             restored += static_cast<float>(restore<Layout>(stored));
@@ -840,8 +791,7 @@ TEST(SketchTest, HybridBlockPrimitivesMatchSequentialAggregation) {
                 auto const max_exponent =
                     std::min(63U - Layout::mantissa_bits, (1U << Layout::exponent_bits) - 1U);
                 auto const exponent = i % (max_exponent + 1U);
-                registers[i] =
-                    pack(static_cast<uint16_t>((exponent << Layout::mantissa_bits) | 1U), 1U);
+                registers[i] = (exponent << Layout::mantissa_bits) | 1U;
             }
             cuda::copy_bytes(stream, registers, sketch.data());
             scalar_hybrid_cardinality<Layout>
@@ -933,7 +883,6 @@ TEST(SketchTest, UnalignedInputSpanningMultipleGridStrideIterationsMatchesScalar
 
     scalar_sketch<b_default> oracle;
     oracle.add(inputs);
-    oracle.pack_registers();
 
     std::vector<uint32_t> gpu_regs(b_default);
     ASSERT_NO_THROW(([&] {
@@ -968,10 +917,8 @@ TEST(SketchTest, ComparisonCountsMatchScalarOracle) {
 
     scalar_sketch<b_default> oracle_a;
     oracle_a.add(a);
-    oracle_a.pack_registers();
     scalar_sketch<b_default> oracle_b;
     oracle_b.add(b_joined);
-    oracle_b.pack_registers();
     auto const oracle_counts = oracle_a.compare(oracle_b);
 
     EXPECT_EQ(gpu_summary->counts, oracle_counts);
@@ -999,8 +946,8 @@ TEST(SketchTest, BatchComparisonMatchesScalarOracle) {
                 (bucket + 2U * pair) % 13U == 0U
                     ? 0U
                     : static_cast<uint16_t>((bucket * 17U + pair * 3U) % 251U + 1U);
-            left_registers[index] = pack(left_scores[index], left_scores[index] == 0U ? 0U : 1U);
-            right_registers[index] = pack(right_scores[index], right_scores[index] == 0U ? 0U : 1U);
+            left_registers[index] = left_scores[index];
+            right_registers[index] = right_scores[index];
         }
     }
 
@@ -1064,20 +1011,11 @@ TEST(SketchTest, BatchComparisonMatchesScalarOracle) {
 TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
     cuda::stream stream{cuda::devices[0]};
     constexpr size_t row_count = 3;
-    constexpr size_t row_words = b_default + 1U;
     std::vector<scalar_sketch<b_default>> oracles(row_count);
-    std::vector<uint32_t> store(row_count * row_words, 0U);
-    std::vector<uint32_t> flags(row_count);
+    std::vector<uint32_t> store;
     for (size_t row = 0; row < row_count; ++row) {
         oracles[row].add(make_inputs(1U << 12, 0x5eed'0000ULL + row));
-        oracles[row].pack_registers();
-        std::copy(
-            oracles[row].registers.begin(),
-            oracles[row].registers.end(),
-            store.begin() + static_cast<ptrdiff_t>(row * row_words)
-        );
-        flags[row] = static_cast<uint32_t>(row + 7U);
-        store[row * row_words + b_default] = flags[row];
+        store.insert(store.end(), oracles[row].registers.begin(), oracles[row].registers.end());
     }
 
     auto device_store = cuda::make_device_buffer<uint32_t>(stream, stream.device(), store);
@@ -1085,15 +1023,7 @@ TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
         cuda::make_device_buffer<uint64_t>(stream, stream.device(), row_count, cuda::no_init);
     auto estimates =
         cuda::make_device_buffer<double>(stream, stream.device(), row_count, cuda::no_init);
-    auto counts = cuda::make_device_buffer<uint16_t>(
-        stream, stream.device(), row_count * b_default, cuda::no_init
-    );
-    auto saturation =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), row_count, cuda::no_init);
     auto scores = cuda::make_device_buffer<uint16_t>(
-        stream, stream.device(), row_count * b_default, cuda::no_init
-    );
-    auto packed = cuda::make_device_buffer<uint32_t>(
         stream, stream.device(), row_count * b_default, cuda::no_init
     );
 
@@ -1105,50 +1035,31 @@ TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
             .has_value()
     );
     ASSERT_TRUE(
-        cuddl::winner_counts_batch_async<b_default>(
-            rows, {counts.data(), counts.size()}, {saturation.data(), saturation.size()}, stream
-        )
-            .has_value()
-    );
-    ASSERT_TRUE(
         cuddl::extract_scores_batch_async<b_default>(rows, {scores.data(), scores.size()}, stream)
-            .has_value()
-    );
-    ASSERT_TRUE(
-        cuddl::extract_packed_rows_batch_async<b_default>(
-            rows, {packed.data(), packed.size()}, stream
-        )
             .has_value()
     );
     ASSERT_NO_THROW(stream.sync());
 
     std::vector<uint64_t> empty_values;
     std::vector<double> estimate_values;
-    std::vector<uint16_t> count_values, score_values;
-    std::vector<uint32_t> saturation_values, packed_values;
+    std::vector<uint16_t> score_values;
     ASSERT_TRUE(copy_device_buffer(empty_out, empty_values));
     ASSERT_TRUE(copy_device_buffer(estimates, estimate_values));
-    ASSERT_TRUE(copy_device_buffer(counts, count_values));
-    ASSERT_TRUE(copy_device_buffer(saturation, saturation_values));
     ASSERT_TRUE(copy_device_buffer(scores, score_values));
-    ASSERT_TRUE(copy_device_buffer(packed, packed_values));
 
     for (size_t row = 0; row < row_count; ++row) {
         uint64_t expected_empty = 0;
         float restored = 0.0F;
         for (size_t bucket = 0; bucket < b_default; ++bucket) {
-            auto const value = oracles[row].registers[bucket];
-            EXPECT_EQ(count_values[row * b_default + bucket], cuddl::detail::count(value));
-            EXPECT_EQ(score_values[row * b_default + bucket], winner(value));
-            EXPECT_EQ(packed_values[row * b_default + bucket], value);
-            if (winner(value) == 0U) {
+            auto const value = oracles[row].winners[bucket];
+            EXPECT_EQ(score_values[row * b_default + bucket], value);
+            if (value == 0U) {
                 ++expected_empty;
             } else {
-                restored += static_cast<float>(restore_midpoint(winner(value)));
+                restored += static_cast<float>(restore_midpoint(value));
             }
         }
         EXPECT_EQ(empty_values[row], expected_empty);
-        EXPECT_EQ(saturation_values[row], flags[row]);
         auto const expected = static_cast<double>(cuddl::detail::cardinality_f32(
             static_cast<float>(b_default), static_cast<float>(expected_empty), restored
         ));
@@ -1163,8 +1074,8 @@ TEST(SketchTest, BatchStoreStagesMatchScalarOracle) {
     );
     EXPECT_FALSE(partial_row.has_value());
     EXPECT_EQ(partial_row.error().category(), cuddl::ErrorCategory::invalid_argument);
-    auto const undersized = cuddl::winner_counts_batch_async<b_default>(
-        rows, {counts.data(), counts.size() - 1U}, {saturation.data(), saturation.size()}, stream
+    auto const undersized = cuddl::extract_scores_batch_async<b_default>(
+        rows, {scores.data(), scores.size() - 1U}, stream
     );
     EXPECT_FALSE(undersized.has_value());
     EXPECT_EQ(undersized.error().category(), cuddl::ErrorCategory::invalid_argument);
@@ -3226,7 +3137,6 @@ TEST(SketchTest, CardinalityMatchesScalarOracleAcrossMagnitudes) {
 
         scalar_sketch<b_default> oracle;
         oracle.add(inputs);
-        oracle.pack_registers();
         auto const oracle_cardinality = oracle.cardinality();
 
         EXPECT_TRUE(std::isfinite(gpu_cardinality));
@@ -3357,62 +3267,12 @@ TEST(SketchTest, ConstructionFloorMatchesScalarOracleAndAppend) {
         for (uint32_t pass = 0; pass < 2U; ++pass) {
             ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
             oracle.add(inputs);
-            oracle.pack_registers();
             std::vector<uint32_t> actual(b_default);
             cuda::copy_bytes(stream, gpu.data(), actual);
             stream.sync();
             EXPECT_EQ(actual, oracle.registers);
-            auto counts = gpu.winner_counts(stream);
-            ASSERT_TRUE(counts.has_value());
-            EXPECT_EQ(counts->second, oracle.saturated);
         }
     }
-}
-
-TEST(SketchTest, WinnerCountsAndSaturationMatchScalarOracle) {
-    cuda::stream stream{cuda::devices[0]};
-    // A repeated k-mer so a single bucket sees many equal observations.
-    auto const packed_kmer = 0x1234'5678'9abc'def0ULL & ((1ULL << (2 * k_default)) - 1);
-    std::vector<uint64_t> inputs;
-    auto const repeat = 65536U;
-    inputs.assign(repeat, packed_kmer);
-
-    auto device_inputs = cuda::make_device_buffer<uint64_t>(stream, stream.device(), inputs);
-    cuddl::sketch<k_default, b_default> gpu(stream);
-    ASSERT_TRUE(gpu.add(device_inputs, stream).has_value());
-    auto const gpu_wc = gpu.winner_counts(stream);
-    ASSERT_TRUE(gpu_wc.has_value());
-
-    scalar_sketch<b_default> oracle;
-    oracle.add(inputs);
-    oracle.pack_registers();
-
-    EXPECT_EQ(gpu_wc->second, oracle.saturated);
-    ASSERT_EQ(gpu_wc->first.size(), oracle.registers.size());
-    for (size_t b = 0; b < b_default; ++b) {
-        EXPECT_EQ(gpu_wc->first[b], cuddl::detail::count(oracle.registers[b])) << "bucket " << b;
-    }
-}
-
-TEST(SketchTest, SaturationFlagSetAtCounterOverflow) {
-    cuda::stream stream{cuda::devices[0]};
-    auto const packed_kmer = 0x0000'0000'0000'00ffULL & ((1ULL << (2 * k_default)) - 1);
-
-    cuddl::sketch<k_default, b_default> under(stream);
-    std::vector<uint64_t> few(1000, packed_kmer);
-    auto device_few = cuda::make_device_buffer<uint64_t>(stream, stream.device(), few);
-    ASSERT_TRUE(under.add(device_few, stream).has_value());
-    auto const under_wc = under.winner_counts(stream);
-    ASSERT_TRUE(under_wc.has_value());
-    EXPECT_FALSE(under_wc->second);
-
-    cuddl::sketch<k_default, b_default> over(stream);
-    std::vector<uint64_t> many(65536, packed_kmer);
-    auto device_many = cuda::make_device_buffer<uint64_t>(stream, stream.device(), many);
-    ASSERT_TRUE(over.add(device_many, stream).has_value());
-    auto const over_wc = over.winner_counts(stream);
-    ASSERT_TRUE(over_wc.has_value());
-    EXPECT_TRUE(over_wc->second);
 }
 
 TEST(SketchTest, HostMetricsOnRawPair) {
@@ -3652,7 +3512,6 @@ TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
     for (size_t i = 0; i < paths.size(); ++i) {
         auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[i].string(), 3));
         expected[i].add(parsed.kmers);
-        expected[i].pack_registers();
         EXPECT_TRUE(
             std::equal(
                 expected[i].winners.begin(), expected[i].winners.end(), rows.begin() + i * buckets
@@ -3766,7 +3625,6 @@ TEST(ReferenceDatabaseFileTest, GenomeLargerThanUploadBufferMatchesScalar) {
     auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths.front().string(), 25));
     scalar_sketch<2048> expected;
     expected.add(parsed.kmers);
-    expected.pack_registers();
     auto archive = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(paths, stream)));
     auto database = CUDDL_UNWRAP((archive.upload<25, 2048>(stream)));
     std::vector<uint16_t> rows(2048);
@@ -3811,7 +3669,6 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarAcrossPieceBoundaries
             auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[i].string(), 25));
             scalar_sketch<buckets> expected;
             expected.add(parsed.kmers);
-            expected.pack_registers();
             EXPECT_TRUE(
                 std::equal(
                     expected.winners.begin(),
@@ -3836,7 +3693,6 @@ TEST(ReferenceDatabaseFileTest, BatchedStagingMatchesScalarForWindowEdges) {
         auto expected = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, k, 1));
         scalar_sketch<2048> oracle;
         oracle.add(expected.kmers);
-        oracle.pack_registers();
         for (size_t const staging : {size_t{64}, size_t{128}}) {
             auto built = cuddl::reference_database_file::build<k, 2048>(
                 std::vector<std::filesystem::path>{path},
@@ -3897,7 +3753,6 @@ TEST(ReferenceDatabaseFileTest, SequenceSourceMatchesPathBuildAndScalar) {
         auto const parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(paths[genome].string(), 25));
         scalar_sketch<buckets> expected;
         expected.add(parsed.kmers);
-        expected.pack_registers();
         EXPECT_TRUE(
             std::equal(
                 expected.winners.begin(),
@@ -3935,9 +3790,7 @@ TEST(QuerySketchBatchTest, ScoresMatchTheScalarOracleAndDriveASearch) {
     scalar_sketch<buckets> query_oracle;
     auto const parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(queries.front().string(), 25));
     query_oracle.add(parsed.kmers);
-    query_oracle.pack_registers();
     EXPECT_EQ(scores, query_oracle.winners);
-    EXPECT_TRUE(same_elements(batch.saturation(), (std::vector<uint32_t>{0U})));
 
     // Searching with those scores finds the genome they came from, at no difference.
     auto output = cuda::make_device_buffer<cuddl::reference_search_result>(
@@ -3963,7 +3816,6 @@ TEST(QuerySketchBatchTest, ScoresMatchTheScalarOracleAndDriveASearch) {
     ASSERT_NE(self, hits.end()) << "the query's own genome is missing from the results";
     scalar_sketch<buckets> reference_oracle;
     reference_oracle.add(CUDDL_UNWRAP(cuddl::parse_fasta_file(references[1].string(), 25)).kmers);
-    reference_oracle.pack_registers();
     EXPECT_EQ(self->counts, query_oracle.compare(reference_oracle));
     for (auto const& path : references) std::filesystem::remove(path);
     std::filesystem::remove(queries.front());
@@ -3977,8 +3829,8 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
         write_tmp_fasta(">beta\n" + random_bases(12, 3000) + "\n"),
     };
     auto built = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, buckets>(paths, stream)));
-    // A store is what a build stages: each reference's registers followed by its saturation
-    // word. Adopting it keeps the same winner scores the build does.
+    // A store is what a build stages: each reference's registers. Adopting it keeps the same
+    // winner scores the build does.
     auto device_store = CUDDL_UNWRAP((cuddl::build_sketch_store<25, buckets>(paths, stream)));
     std::vector<std::string> const labels{"alpha", "beta"};
     auto adopted = CUDDL_UNWRAP((cuddl::reference_database_file::from_store<25, buckets>(

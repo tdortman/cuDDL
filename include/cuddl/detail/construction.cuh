@@ -13,14 +13,13 @@ namespace cuddl::detail {
 
 /// @brief Launches construction of a sketch.
 ///
-/// Sketches that fit in default static shared memory are built through a CTA-local shared winner
-/// array with an exact count fix-up and merge (`add_shared_kernel`); larger sketches fall back to
-/// the direct global packed-CAS kernel.
+/// Sketches that fit in default static shared memory are built through a CTA-local shared
+/// register array merged into @p registers (`add_shared_kernel`); larger sketches fall back to
+/// the direct global kernel.
 template <size_t BucketCount, typename Layout = default_register_layout>
 __host__ inline Result<void> launch_construction(
     device_span<uint64_t const> input,
     device_span<uint32_t> registers,
-    uint32_t& saturation,
     cuda::stream_ref stream
 ) {
     if (input.empty()) {
@@ -38,7 +37,7 @@ __host__ inline Result<void> launch_construction(
                 static_cast<uint32_t>(cuda::std::min<size_t>(multiprocessors * 2U, needed));
             add_shared_kernel<BucketCount, Layout, 1U>
                 <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
-                    input.data(), input.size(), registers.data(), saturation, vector_input
+                    input.data(), input.size(), registers.data(), vector_input
                 );
         } else {
             auto const capacity = static_cast<size_t>(block_size) * 2U;
@@ -46,7 +45,7 @@ __host__ inline Result<void> launch_construction(
             auto const blocks =
                 static_cast<uint32_t>(cuda::std::min<size_t>(multiprocessors * 16U, needed));
             add_kernel<BucketCount, Layout><<<blocks, block_size, 0, stream.get()>>>(
-                input.data(), input.size(), registers.data(), saturation
+                input.data(), input.size(), registers.data()
             );
         }
         return cudaGetLastError();

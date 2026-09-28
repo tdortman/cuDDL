@@ -330,13 +330,11 @@ class reference_database_file {
     /**
      * @brief Adopts a device store as the host rows this form saves.
      *
-     * A store holds `BucketCount` packed registers followed by one saturation word per reference,
-     * the layout a single sketch allocation has, so a reference's registers and its flag arrive in
-     * one copy. A staged build and the streamed tile builder both write that layout; a device
-     * database that keeps registers and flags in separate buffers has to hand over a store.
+     * A store holds `BucketCount` registers per reference, the layout a single sketch allocation
+     * has. A staged build and the streamed tile builder both write that layout.
      *
      * @p names labels one reference each in store order, or is empty for a database without
-     * labels. Registers and flags are validated as @ref load validates them.
+     * labels.
      */
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     [[nodiscard]] static Result<reference_database_file> from_store(
@@ -345,10 +343,10 @@ class reference_database_file {
         cuda::stream_ref stream
     ) try {
         return [&]() -> Result<reference_database_file> {
-            if (store.size() % (BucketCount + 1) != 0) {
-                return Err(Error::invalid_argument("a store must contain whole stored sketches"));
+            if (store.size() % BucketCount != 0) {
+                return Err(Error::invalid_argument("a store must contain whole sketches"));
             }
-            size_t const count = store.size() / (BucketCount + 1);
+            size_t const count = store.size() / BucketCount;
             if (!names.empty() && names.size() != count) {
                 return Err(Error::invalid_argument("labels must be empty or name every reference"));
             }
@@ -560,9 +558,8 @@ class reference_database_file {
 /**
  * @brief Sketches one genome per plain or gzip/BGZF FASTA/FASTQ file into a device store.
  *
- * Each genome gets `BucketCount` packed registers followed by its saturation word, the stored
- * sketch layout the batch operations in batch.cuh consume, in the order of @p paths. The rows
- * never leave the device. The build is synchronous.
+ * Each genome gets `BucketCount` registers, the row layout the batch operations in batch.cuh
+ * consume, in the order of @p paths. The rows never leave the device. The build is synchronous.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 [[nodiscard]] Result<cuda::device_buffer<uint32_t>> build_sketch_store(
@@ -571,9 +568,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     path_build_options options = {}
 ) try {
     return [&]() -> Result<cuda::device_buffer<uint32_t>> {
-        constexpr size_t row_words = BucketCount + 1;
         auto store = cuda::make_device_buffer<uint32_t>(
-            stream, stream.device(), paths.size() * row_words, cuda::no_init
+            stream, stream.device(), paths.size() * BucketCount, cuda::no_init
         );
         CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
             paths,
@@ -588,7 +584,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                     cuda::copy_bytes(
                         stream,
                         group,
-                        device_span<uint32_t>{store.data() + base * row_words, count * row_words}
+                        device_span<uint32_t>{
+                            store.data() + base * BucketCount, count * BucketCount
+                        }
                     )
                 );
                 return Ok();

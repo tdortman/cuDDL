@@ -33,8 +33,8 @@ def main(
         fixtures = {
             "genome": f">genome\n{sequence}\n",
             "partial": f">partial\n{sequence[:4096]}NNNN{sequence[5000:]}\n",
-            # Several records of one genome share each batch and saturate a common winner.
-            "saturated": "".join(
+            # Several records of one genome share each batch and repeat a common winner.
+            "repeats": "".join(
                 f">repeats{i}\n{'A' * 1024}\n" for i in range(70)
             ),
             "empty": ">short\nACGTNN\n>another\nACGT\n",
@@ -56,7 +56,6 @@ def main(
             "clear_and_incremental_construct",
             "extract_compact_rows",
             "extract_packed_rows",
-            "winner_counts",
             "cardinality",
             "pairwise_summary",
             "pairwise_summary_with_cardinality",
@@ -79,9 +78,9 @@ def main(
         ):
             report = root / f"k{key_bits}-{index}-{topology}.json"
             command = [str(binary.resolve())]
-            for name in ("genome", "partial", "saturated"):
+            for name in ("genome", "partial", "repeats"):
                 command.extend(("--reference", str(paths[name])))
-            for name in ("reverse", "empty", "saturated"):
+            for name in ("reverse", "empty", "repeats"):
                 command.extend(("--query", str(paths[name])))
             command.extend(
                 (
@@ -133,18 +132,9 @@ def main(
             for measurement in data["measurements"][1:]:
                 case, values = measurement["case"], measurement["metrics"]
                 if case["measurement"] == "genome":
-                    assert (
-                        sum(
-                            value
-                            for key, value in values.items()
-                            if key.startswith("q_")
-                        )
-                        == 2048
-                    )
-                    if case["genome_id"] == 2:
-                        assert values["saturated"] and values["q_65535"] > 0
+                    assert 0 <= values["empty_buckets"] <= 2048
                     if case["role"] == "query" and case["genome_id"] == 1:
-                        assert values["cardinality"] == 0 and values["q_0"] == 2048
+                        assert values["cardinality"] == 0 and values["empty_buckets"] == 2048
                 elif case["measurement"] == "match" and topology == "batch":
                     assert case["query_id"] != 1, (
                         "empty query passed the positive retrieval threshold"
@@ -155,9 +145,9 @@ def main(
         # Streamed ingestion replaces the host k-mer arrays with bounded per-genome GPU tiles.
         streamed = root / "streamed.json"
         command = [str(binary.resolve())]
-        for name in ("genome", "partial", "saturated"):
+        for name in ("genome", "partial", "repeats"):
             command.extend(("--reference", str(paths[name])))
-        for name in ("reverse", "empty", "saturated"):
+        for name in ("reverse", "empty", "repeats"):
             command.extend(("--query", str(paths[name])))
         command.extend(
             (
@@ -240,13 +230,13 @@ def main(
             "automatic GPU memory sizing changed sketches or pair results"
         )
         typer.echo("PASS automatic GPU memory sizing and same-genome batch merging")
-        # Single-batch corpus (empty + saturated fixtures included) must keep the cap
+        # Single-batch corpus (empty + repeats fixtures included) must keep the cap
         # in the case but report the smaller actual allocation: no cap-sized upload.
         single_path = root / "streamed-single.json"
         single_command = [str(binary.resolve())]
-        for name in ("genome", "partial", "saturated"):
+        for name in ("genome", "partial", "repeats"):
             single_command.extend(("--reference", str(paths[name])))
-        for name in ("reverse", "empty", "saturated"):
+        for name in ("reverse", "empty", "repeats"):
             single_command.extend(("--query", str(paths[name])))
         single_command.extend(
             (

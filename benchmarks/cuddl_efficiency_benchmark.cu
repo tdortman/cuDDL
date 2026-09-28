@@ -31,7 +31,7 @@ void add(uint64_t const* input, size_t n, uint32_t* output, uint32_t blocks, cud
     if (n == 0U) return;
     cuddl::detail::add_shared_kernel<B, cuddl::default_register_layout, Rounds>
         <<<blocks, cuddl::detail::shared_construction_block_size, 0, stream>>>(
-            input, n, output, output[B], (reinterpret_cast<uintptr_t>(input) & 31U) == 0U
+            input, n, output, (reinterpret_cast<uintptr_t>(input) & 31U) == 0U
         );
     check(cudaGetLastError());
 }
@@ -44,7 +44,8 @@ std::vector<uint64_t> const& genome_kmers(std::string const& path) {
         auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(path, 25U));
         entry->second = std::move(parsed.kmers);
     }
-    if (entry->second.empty()) throw std::runtime_error("genome contains no valid 25-mers: " + path);
+    if (entry->second.empty())
+        throw std::runtime_error("genome contains no valid 25-mers: " + path);
     return entry->second;
 }
 
@@ -66,9 +67,9 @@ void construction(nvbench::state& state) {
     if (distribution == "ecoli" || distribution == "worm" || distribution == "chr14" ||
         distribution.starts_with("fasta=")) {
         auto const path = distribution.starts_with("fasta=") ? distribution.substr(6)
-                        : distribution == "ecoli" ? "data/genomes/ecoli_k12_mg1655.fna"
-                        : distribution == "worm" ? "data/genomes/WBcel235.fna"
-                                                 : "data/genomes/chr14.fna";
+                          : distribution == "ecoli"          ? "data/genomes/ecoli_k12_mg1655.fna"
+                          : distribution == "worm"           ? "data/genomes/WBcel235.fna"
+                                                             : "data/genomes/chr14.fna";
         auto const& genome = genome_kmers(path);
         if (n == 0U) n = genome.size();  // Items=0 retains the full-genome benchmark.
         if (n > genome.size()) throw std::runtime_error("Items exceeds genome size");
@@ -86,9 +87,8 @@ void construction(nvbench::state& state) {
         }
     }
     auto input = cuda::make_device_buffer<uint64_t>(stream, stream.device(), host);
-    auto reference =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1U, uint32_t{0});
-    auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B + 1U, uint32_t{0});
+    auto reference = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B, uint32_t{0});
+    auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), B, uint32_t{0});
     auto const sms = stream.device().attribute(cuda::device_attributes::multiprocessor_count);
     auto const blocks = static_cast<uint32_t>(std::min<size_t>(2U * sms, (n + 3071U) / 3072U));
     auto launch = [&](cudaStream_t execution_stream) {
@@ -126,22 +126,19 @@ void construction(nvbench::state& state) {
     };
     add<B, 0>(input.data() + offset, n, reference.data(), blocks, stream.get());
     launch(stream.get());
-    auto const expected = download(reference.data(), B + 1U, stream.get());
-    if (download(output.data(), B + 1U, stream.get()) != expected)
-        throw std::runtime_error("construction register/count/saturation mismatch");
-    // Append the same stream: verify the merge and tie counts on populated sketches too.
+    auto const expected = download(reference.data(), B, stream.get());
+    if (download(output.data(), B, stream.get()) != expected)
+        throw std::runtime_error("construction register mismatch");
+    // Append the same stream: verify the merge on populated sketches too.
     add<B, 0>(input.data() + offset, n, reference.data(), blocks, stream.get());
     launch(stream.get());
-    if (download(output.data(), B + 1U, stream.get()) !=
-        download(reference.data(), B + 1U, stream.get()))
+    if (download(output.data(), B, stream.get()) != download(reference.data(), B, stream.get()))
         throw std::runtime_error("construction append mismatch");
     state.add_element_count(n, "Kmers");
     state.add_global_memory_reads<uint64_t>(n);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& execution, auto& timer) {
         // Resident add timing, matching cuddl-hll-comparison. Clear is explicitly excluded.
-        check(
-            cudaMemsetAsync(output.data(), 0, (B + 1U) * sizeof(uint32_t), execution.get_stream())
-        );
+        check(cudaMemsetAsync(output.data(), 0, B * sizeof(uint32_t), execution.get_stream()));
         timer.start();
         launch(execution.get_stream());
         timer.stop();
@@ -188,15 +185,14 @@ void sequence_construction(nvbench::state& state) {
     auto const sequence = cuddl::device_span<char const>{input.data() + offset, sequence_size};
     auto packed = cuda::make_device_buffer<uint64_t>(stream, stream.device(), parsed.kmers);
     auto reference =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets + 1, uint32_t{0});
-    auto output =
-        cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets + 1, uint32_t{0});
+        cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets, uint32_t{0});
+    auto output = cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets, uint32_t{0});
     auto const sms = stream.device().attribute(cuda::device_attributes::multiprocessor_count);
     auto launch = [&](cuda::stream_ref s) {
         if (blocks_per_sm == 0) {
             CUDDL_UNWRAP(
                 cuddl::detail::launch_sequence_add<buckets>(
-                    sequence, k, {output.data(), buckets}, output.data()[buckets], s
+                    sequence, k, {output.data(), buckets}, s
                 )
             );
         } else if (sequence.size() >= k) {
@@ -205,25 +201,19 @@ void sequence_construction(nvbench::state& state) {
             auto const blocks = std::min<size_t>(sms * blocks_per_sm, (windows + 2047) / 2048);
             cuddl::detail::add_sequence_single_kernel<buckets, cuddl::default_register_layout>
                 <<<blocks, 256, 0, s.get()>>>(
-                    sequence.data(),
-                    static_cast<uint32_t>(windows),
-                    k,
-                    output.data(),
-                    output.data()[buckets]
+                    sequence.data(), static_cast<uint32_t>(windows), k, output.data()
                 );
             check(cudaGetLastError());
         }
     };
     for (int append = 0; append < 2; ++append) {
         CUDDL_UNWRAP(
-            cuddl::detail::launch_construction<buckets>(
-                packed, {reference.data(), buckets}, reference.data()[buckets], stream
-            )
+            cuddl::detail::launch_construction<buckets>(packed, {reference.data(), buckets}, stream)
         );
         launch(stream);
-        if (download(output.data(), buckets + 1, stream.get()) !=
-            download(reference.data(), buckets + 1, stream.get())) {
-            throw std::runtime_error("sequence register/count/saturation mismatch");
+        if (download(output.data(), buckets, stream.get()) !=
+            download(reference.data(), buckets, stream.get())) {
+            throw std::runtime_error("sequence register mismatch");
         }
     }
     state.add_element_count(parsed.kmers.size(), "Kmers");

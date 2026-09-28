@@ -725,7 +725,7 @@ struct sparse_index_key {
     uint16_t mask;
     template <typename Row>
     __host__ __device__ uint16_t operator()(Row row) const noexcept {
-        auto const score = reference_score(row);
+        auto const score = static_cast<uint16_t>(row);
         return score == 0U || mask == 0xffffU ? score : static_cast<uint16_t>((score & mask) + 1U);
     }
 };

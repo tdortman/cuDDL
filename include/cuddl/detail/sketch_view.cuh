@@ -17,9 +17,9 @@ namespace cuddl::detail {
 /**
  * @brief Non-owning implementation view of a DDL sketch.
  *
- * Provides allocation-free, stream-ordered operations on an external contiguous allocation. The
- * allocation must contain `BucketCount` packed `uint32_t` registers followed by one aligned
- * `uint32_t` saturation flag. Pass by value into device or host code.
+ * Provides allocation-free, stream-ordered operations on an external allocation of
+ * `BucketCount` `uint32_t` registers, each holding its bucket's winning score. Pass by value into
+ * device or host code.
  */
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch_view {
@@ -31,21 +31,15 @@ class sketch_view {
     using register_type = uint32_t;
     using layout_type = Layout;
 
-    /// @brief Constructs a reference over @p registers and the sketch's saturation flag.
-    __host__ __device__ constexpr sketch_view(
-        device_span<register_type> registers,
-        uint32_t& saturation
+    /// @brief Constructs a reference over @p registers.
+    __host__ __device__ constexpr explicit sketch_view(
+        device_span<register_type> registers
     ) noexcept
-        : registers_(registers), saturation_(saturation) {}
+        : registers_(registers) {}
 
-    /// @brief Packed registers.
+    /// @brief Device registers.
     [[nodiscard]] __host__ __device__ constexpr device_span<register_type> data() const noexcept {
         return registers_;
-    }
-
-    /// @brief Sketch-level saturation flag.
-    [[nodiscard]] __host__ __device__ constexpr uint32_t& saturation_flag() const noexcept {
-        return saturation_;
     }
 
     /// @brief Number of registers in the sketch.
@@ -58,13 +52,10 @@ class sketch_view {
         return K;
     }
 
-    /// @brief Resets every register and the saturation flag to zero as one logical operation.
-    ///
-    /// The backing allocation is contractually `BucketCount` registers followed by the aligned
-    /// saturation flag, so one memset covers both.
+    /// @brief Resets every register to zero.
     [[nodiscard]] Result<void> clear_async(cuda::stream_ref stream) const noexcept {
         return cuda_try([&] {
-            cuda::fill_bytes(stream, cuda::std::span{registers_.data(), registers_.size() + 1U}, 0);
+            cuda::fill_bytes(stream, cuda::std::span{registers_.data(), registers_.size()}, 0);
         });
     }
 
@@ -73,9 +64,7 @@ class sketch_view {
     /// The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void>
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
-        return detail::launch_construction<BucketCount, Layout>(
-            input, registers_, saturation_, stream
-        );
+        return detail::launch_construction<BucketCount, Layout>(input, registers_, stream);
     }
 
     /// @brief Accumulates device-resident raw ASCII bases without clearing.
@@ -88,9 +77,7 @@ class sketch_view {
     /// records. No host copies. The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void>
     add_sequence_async(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
-        return detail::launch_sequence_add<BucketCount, Layout>(
-            sequence, K, registers_, saturation_, stream
-        );
+        return detail::launch_sequence_add<BucketCount, Layout>(sequence, K, registers_, stream);
     }
 
     /// @brief Computes the raw pairwise summary into caller-owned device storage.
@@ -133,24 +120,8 @@ class sketch_view {
         return cuda_try(cudaGetLastError());
     }
 
-    /// @brief Extracts per-register winner counts and the saturation flag to device outputs.
-    ///
-    /// @p counts_out must hold `BucketCount` `uint16_t` entries and @p saturation_out one
-    /// `uint32_t`, all valid until @p stream completes.
-    [[nodiscard]] Result<void> winner_counts_async(
-        uint16_t* counts_out,
-        uint32_t* saturation_out,
-        cuda::stream_ref stream
-    ) const noexcept {
-        detail::winner_counts_kernel<BucketCount><<<1, detail::block_size, 0, stream.get()>>>(
-            registers_.data(), &saturation_, counts_out, saturation_out
-        );
-        return cuda_try(cudaGetLastError());
-    }
-
    private:
     device_span<register_type> registers_;
-    uint32_t& saturation_;
 };
 
 }  // namespace cuddl::detail

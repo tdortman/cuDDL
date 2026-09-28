@@ -4,7 +4,6 @@
 #include <CLI/CLI.hpp>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>
-#include <cub/device/device_transform.cuh>
 #include <cuda/buffer>
 #include <cuda/iterator>
 #include <cuda/memory_pool>
@@ -58,12 +57,6 @@ struct options {
     int samples = 20, warmups = 3;
     size_t oracle_pairs = 1000000, match_rows = 20000, dataset_hashes = 8,
            all_to_all_pairs = 50000000;
-};
-
-struct winner_score {
-    __device__ uint16_t operator()(uint32_t reg) const {
-        return cuddl::detail::winner(reg);
-    }
 };
 
 json measure(
@@ -164,7 +157,7 @@ parsed_files parse(std::vector<std::string> const& paths) {
 // on the GPU, so neither a host nor a device k-mer array is materialized. Footprint is rows
 // (genomes * buckets) instead of bases, which is what makes a full RefSeq collection fit.
 struct genome_rows {
-    // One contiguous run per genome on the device: buckets registers, then the saturation word.
+    // One contiguous run of buckets registers per genome on the device.
     std::optional<cuda::device_buffer<uint32_t>> store;
     size_t genomes = 0;
     uint64_t input_bytes = 0;
@@ -205,8 +198,8 @@ struct collection {
     // Rows this collection owns inside a shared streamed store; empty for per-file sketches.
     cuddl::device_span<uint32_t> store;
     std::vector<sketch> sketches;
-    cuda::device_buffer<uint16_t> scores, counts;
-    cuda::device_buffer<uint32_t> packed, saturated;
+    cuda::device_buffer<uint16_t> scores;
+    cuda::device_buffer<uint32_t> packed;
     cuda::device_buffer<uint64_t> empty;
     cuda::device_buffer<double> cardinalities;
 
@@ -219,14 +212,6 @@ struct collection {
                   cuda::no_init
               )
           ),
-          counts(
-              cuda::make_device_buffer<uint16_t>(
-                  stream,
-                  stream.device(),
-                  genomes * buckets,
-                  cuda::no_init
-              )
-          ),
           packed(
               cuda::make_device_buffer<uint32_t>(
                   stream,
@@ -234,9 +219,6 @@ struct collection {
                   packed_rows ? genomes * buckets : 0,
                   cuda::no_init
               )
-          ),
-          saturated(
-              cuda::make_device_buffer<uint32_t>(stream, stream.device(), genomes, cuda::no_init)
           ),
           empty(
               cuda::make_device_buffer<uint64_t>(stream, stream.device(), genomes, cuda::no_init)
@@ -279,14 +261,12 @@ struct collection {
         }
         for (size_t i = 0; i < rows.genomes; ++i) {
             sketches.emplace_back(stream);
-            CUDDL_UNWRAP(
-                sketches[i].assign_async({store.data() + i * (buckets + 1), buckets + 1}, stream)
-            );
+            CUDDL_UNWRAP(sketches[i].assign_async({store.data() + i * buckets, buckets}, stream));
         }
     }
     /// @brief Stored sketches this collection contributes: shared store rows or per-file sketches.
     [[nodiscard]] size_t rows() const noexcept {
-        return store.size() ? store.size() / (buckets + 1) : sketches.size();
+        return store.size() ? store.size() / buckets : sketches.size();
     }
 
     /// @brief Binds the shared store rows written by the streamed construct kernel.
@@ -328,13 +308,9 @@ struct collection {
             return;
         }
         for (size_t i = 0; i < sketches.size(); ++i) {
-            CUDDL_CUDA_CALL(
-                cub::DeviceTransform::Transform(
-                    sketches[i].data().data(),
-                    scores.data() + i * buckets,
-                    buckets,
-                    winner_score{},
-                    stream
+            CUDDL_UNWRAP(
+                cuddl::extract_scores_batch_async<buckets>(
+                    sketches[i].data(), {scores.data() + i * buckets, buckets}, stream
                 )
             );
         }
@@ -343,42 +319,18 @@ struct collection {
         if (!packed.size()) {
             return;
         }
-        if (store.size()) {
-            CUDDL_UNWRAP(
-                cuddl::extract_packed_rows_batch_async<buckets>(stored_rows(store), packed, stream)
-            );
-            return;
-        }
-        for (size_t i = 0; i < sketches.size(); ++i) {
+        for (size_t i = 0; i < rows(); ++i) {
+            auto const* row = store.size() ? store.data() + i * buckets : sketches[i].data().data();
             cuda::copy_bytes(
                 stream,
-                cuda::std::span{sketches[i].data().data(), buckets},
+                cuda::std::span{row, buckets},
                 cuda::std::span{packed.data() + i * buckets, buckets}
-            );
-        }
-    }
-    void winner_counts(cuda::stream_ref stream) {
-        if (store.size()) {
-            CUDDL_UNWRAP(
-                cuddl::winner_counts_batch_async<buckets>(
-                    stored_rows(store), counts, saturated, stream
-                )
-            );
-            return;
-        }
-        for (size_t i = 0; i < sketches.size(); ++i) {
-            CUDDL_UNWRAP(
-                sketches[i].winner_counts_async(
-                    counts.data() + i * buckets, saturated.data() + i, stream
-                )
             );
         }
     }
     void extract(cuda::stream_ref stream) {
         if (scores.size()) extract_scores(stream);
         if (packed.size()) extract_packed(stream);
-
-        winner_counts(stream);
     }
     void cardinality(cuda::stream_ref stream) {
         if (store.size()) {
@@ -662,24 +614,15 @@ json collection_metrics(collection& group, cuda::stream_ref stream) {
     json output = json::array();
     // One async pass over the collection, then bulk downloads: no per-genome host synchronisation.
     group.cardinality(stream);
-    auto all_counts = download(group.counts, stream);
-    auto saturation = download(group.saturated, stream);
+    auto empty = download(group.empty, stream);
     auto cardinalities = download(group.cardinalities, stream);
     for (size_t i = 0; i < group.rows(); ++i) {
-        auto value = json{
-            {"cardinality", cardinalities[i]},
-            {"saturated", saturation[i] != 0},
-        };
-        std::map<uint16_t, uint32_t> histogram;
-        for (size_t j = 0; j < buckets; ++j) {
-            ++histogram[all_counts[i * buckets + j]];
-        }
-        for (auto [c, n] : histogram) {
-            value["q_" + std::to_string(c)] = n;
-        }
-        value["q_0"] = histogram[0];
-        value["q_65535"] = histogram[65535];
-        output.push_back(std::move(value));
+        output.push_back(
+            json{
+                {"cardinality", cardinalities[i]},
+                {"empty_buckets", empty[i]},
+            }
+        );
     }
     return output;
 }
@@ -911,14 +854,14 @@ json resident_timings(
     bool const all = opts.topology == "all-to-all";
     bool const sequence = opts.ingest == "sequence";
     cuda::stream setup{cuda::devices[0]};
-    // Streamed rows are hashed straight into one store of (buckets + 1)-word sketches, shared by
-    // the reference and query collections.
+    // Streamed rows are hashed straight into one store of buckets-word sketches, shared by the
+    // reference and query collections.
     auto paths = opts.references;
     if (!all) {
         paths.insert(paths.end(), opts.queries.begin(), opts.queries.end());
     }
     auto store = cuda::make_device_buffer<uint32_t>(
-        setup, setup.device(), sequence ? paths.size() * (buckets + 1) : 0, cuda::no_init
+        setup, setup.device(), sequence ? paths.size() * buckets : 0, cuda::no_init
     );
     collection refs = sequence ? collection(opts.references.size(), setup, true, false)
                                : collection(reference_files, setup, true, false);
@@ -926,7 +869,7 @@ json resident_timings(
                              ? collection(all ? 0 : opts.queries.size(), setup, true, false)
                              : collection(all ? parsed_files{} : query_files, setup, true, false);
     if (sequence) {
-        auto const reference_words = opts.references.size() * (buckets + 1);
+        auto const reference_words = opts.references.size() * buckets;
         refs.bind_store({store.data(), reference_words});
         queries.bind_store({store.data() + reference_words, store.size() - reference_words});
         refs.clear(setup);
@@ -967,8 +910,6 @@ json resident_timings(
     auto statistics = [&](cuda::stream_ref s) {
         refs.cardinality(s);
         queries.cardinality(s);
-        refs.winner_counts(s);
-        queries.winner_counts(s);
     };
     auto rows = [&](cuda::stream_ref s) {
         refs.extract_scores(s);
@@ -1162,7 +1103,7 @@ json resident_timings(
             segment("resident_rows", rows);
             segment("resident_index", index);
             segment("resident_search", query);
-            // Validate the timed resident construction, including multiplicities and saturation.
+            // Validate the timed resident construction.
             auto const observed_registers = download(store, setup);
             auto expected_registers = download(*expected_references->store, setup);
             // All-to-all stages only the references, matching paths above.
@@ -1541,12 +1482,10 @@ json run(options const& opts) {
                query_scores = download(queries.scores, stream);
     if (!streamed) {
         auto const original_packed = download(refs.packed, stream);
-        auto const original_saturation = download(refs.saturated, stream);
         refs.clear(stream);
         refs.add(stream, true);
         refs.extract(stream);
-        if (!(download(refs.packed, stream) == original_packed &&
-              download(refs.saturated, stream) == original_saturation)) {
+        if (!(download(refs.packed, stream) == original_packed)) {
             throw std::runtime_error("incremental construction differs from one-shot construction");
         }
     }
@@ -1676,10 +1615,6 @@ json run(options const& opts) {
     gpu("extract_packed_rows", [&](cuda::stream_ref s) {
         refs.extract_packed(s);
         queries.extract_packed(s);
-    });
-    gpu("winner_counts", [&](cuda::stream_ref s) {
-        refs.winner_counts(s);
-        queries.winner_counts(s);
     });
     gpu("cardinality", [&](cuda::stream_ref s) {
         refs.cardinality(s);

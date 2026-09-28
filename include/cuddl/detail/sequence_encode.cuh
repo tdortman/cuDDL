@@ -30,7 +30,6 @@ __device__ __forceinline__ void add_sequence_windows(
     size_t tile_stride,
     uint32_t k,
     uint32_t* registers,
-    uint32_t& saturation,
     bool packed_input = false
 ) {
     constexpr uint32_t tile_size = 256 * 8;
@@ -45,27 +44,6 @@ __device__ __forceinline__ void add_sequence_windows(
     auto* target = shared_sketch ? local : registers;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
     auto const valid_mask = (uint32_t{1} << k) - 1;
-    // Strict winner installs carry count 1; defer only ties, rechecking their winner
-    // under CAS so an increment cannot land on a replacement winner.
-    [[maybe_unused]] uint32_t prev_bucket = 0U;
-    [[maybe_unused]] uint32_t prev_score = 0xffffU;  // primes the first settle off
-    [[maybe_unused]] uint32_t prev_old = 0U;
-    [[maybe_unused]] auto const settle = [&] {
-        if ((prev_old >> 16U) == prev_score) {
-            auto expected = target[prev_bucket];
-            while ((expected >> 16U) == prev_score) {
-                if ((expected & 0xffffU) == max_winner_count) {
-                    atomicExch(&saturation, 1U);
-                    break;
-                }
-                auto const actual = atomicCAS(&target[prev_bucket], expected, expected + 1U);
-                if (actual == expected) {
-                    break;
-                }
-                expected = actual;
-            }
-        }
-    };
     for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
         auto const count = cuda::std::min(tile_size, windows - static_cast<uint32_t>(tile));
         // Four extra cells cover the k-1 halo, including the last partial cell.
@@ -143,19 +121,7 @@ __device__ __forceinline__ void add_sequence_windows(
                     auto const forward = high >> (64 - 2 * k);
                     auto const reverse = reverse_high & mask;
                     auto const hash = hash_kmer(forward > reverse ? forward : reverse);
-                    if constexpr (shared_sketch) {
-                        auto const incoming = static_cast<uint32_t>(score<Layout>(hash));
-                        auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
-                        auto const old = atomicMax(&target[bucket], (incoming << 16U) | 1U);
-                        settle();
-                        prev_bucket = bucket;
-                        prev_score = incoming;
-                        prev_old = old;
-                    } else {
-                        update(
-                            &target[bucket_of<BucketCount>(hash)], score<Layout>(hash), saturation
-                        );
-                    }
+                    atomicMax(&target[bucket_of<BucketCount>(hash)], score<Layout>(hash));
                 }
                 // Eight overlapping windows fit in one 32-base word when k <= 25.
                 if (k <= 25) {
@@ -173,11 +139,9 @@ __device__ __forceinline__ void add_sequence_windows(
         __syncthreads();
     }
     if constexpr (shared_sketch) {
-        // Drain the last deferred tie before the merge reads `local`.
-        settle();
         __syncthreads();
         for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
-            merge_register(&registers[i], local[i], saturation);
+            if (local[i] != 0U) atomicMax(&registers[i], local[i]);
         }
     }
 }
@@ -189,21 +153,14 @@ __global__ void add_sequence_tile_kernel(
     uint32_t const* window_count,
     char* carry,
     uint32_t k,
-    uint32_t* registers,
-    uint32_t& saturation
+    uint32_t* registers
 ) {
     auto const windows = *window_count;
     if (blockIdx.x == 0 && threadIdx.x < k - 1) {
         carry[threadIdx.x] = sequence[windows + threadIdx.x];
     }
     add_sequence_windows<BucketCount, Layout>(
-        sequence,
-        windows,
-        size_t{blockIdx.x} * 2048,
-        size_t{gridDim.x} * 2048,
-        k,
-        registers,
-        saturation
+        sequence, windows, size_t{blockIdx.x} * 2048, size_t{gridDim.x} * 2048, k, registers
     );
 }
 
@@ -245,7 +202,7 @@ __global__ void add_sequence_batch_kernel(
             first_block = low ? chunks[low - 1].block_end : 0;
         }
         __syncthreads();
-        auto* target = registers + size_t{chunk.genome} * (BucketCount + 1);
+        auto* target = registers + size_t{chunk.genome} * BucketCount;
         add_sequence_windows<BucketCount, Layout>(
             chunk.bases,
             chunk.windows,
@@ -253,7 +210,6 @@ __global__ void add_sequence_batch_kernel(
             (chunk.block_end - first_block) * 2048,
             k,
             target,
-            target[BucketCount],
             chunk.packed != 0
         );
         __syncthreads();
@@ -269,17 +225,10 @@ __global__ void add_sequence_single_kernel(
     char const* sequence,
     uint32_t windows,
     uint32_t k,
-    uint32_t* registers,
-    uint32_t& saturation
+    uint32_t* registers
 ) {
     add_sequence_windows<BucketCount, Layout>(
-        sequence,
-        windows,
-        size_t{blockIdx.x} * 2048,
-        size_t{gridDim.x} * 2048,
-        k,
-        registers,
-        saturation
+        sequence, windows, size_t{blockIdx.x} * 2048, size_t{gridDim.x} * 2048, k, registers
     );
 }
 
@@ -293,7 +242,6 @@ __host__ inline Result<void> launch_sequence_add(
     device_span<char const> sequence,
     uint32_t k,
     device_span<uint32_t> registers,
-    uint32_t& saturation,
     cuda::stream_ref stream
 ) {
     if (k < 1 || k > 31) {
@@ -321,9 +269,8 @@ __host__ inline Result<void> launch_sequence_add(
         size_t const capacity = static_cast<size_t>(multiprocessors) * blocks_per_sm;
         size_t const blocks_size = capacity == 0 ? size_t{1} : (capacity < need ? capacity : need);
         auto const blocks = static_cast<uint32_t>(blocks_size);
-        add_sequence_single_kernel<BucketCount, Layout><<<blocks, 256, 0, stream.get()>>>(
-            sequence.data(), windows, k, registers.data(), saturation
-        );
+        add_sequence_single_kernel<BucketCount, Layout>
+            <<<blocks, 256, 0, stream.get()>>>(sequence.data(), windows, k, registers.data());
         return cudaGetLastError();
     });
 }

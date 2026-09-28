@@ -142,8 +142,7 @@ template <uint32_t K, size_t BucketCount>
 ) {
     size_t const available = CUDDL_TRY(available_device_bytes(stream));
     size_t const usable = available - available / 10;
-    // (BucketCount + 1) words hold one genome's registers plus its saturation flag.
-    size_t const row_bytes = (BucketCount + 1) * sizeof(uint32_t);
+    size_t const row_bytes = BucketCount * sizeof(uint32_t);
     // Rows are small next to the input, so the whole collection stays resident whenever that
     // costs at most a quarter of what is affordable; otherwise rows stream back one group at a
     // time as each group completes.
@@ -238,10 +237,6 @@ class database_stager {
    public:
     static constexpr size_t hold_slots = stager_hold_slots;
 
-    static constexpr size_t row_words() noexcept {
-        return BucketCount + 1;
-    }
-
     /// @throws cuda::cuda_error or std::bad_alloc when the device buffers cannot be allocated.
     /// @param stream Stream owning the arena, descriptors, and row store.
     /// @param bounds Arena sizing the device row store, arena, and descriptors.
@@ -262,7 +257,7 @@ class database_stager {
               cuda::make_device_buffer<uint32_t>(
                   stream,
                   stream.device(),
-                  bounds.group * row_words(),
+                  bounds.group * BucketCount,
                   cuda::no_init
               )
           ),
@@ -506,7 +501,7 @@ class database_stager {
         auto const resident = CUDDL_TRY(begin_resident(stream_));
         CUDDL_CUDA_TRY(
             cuda::fill_bytes(
-                stream_, cuda::std::span{rows_.data(), genomes * row_words()}, uint32_t{0}
+                stream_, cuda::std::span{rows_.data(), genomes * BucketCount}, uint32_t{0}
             )
         );
         CUDDL_TRY(end_resident(resident, stream_));
@@ -515,13 +510,13 @@ class database_stager {
 
     /// @brief Launches everything staged and returns the group's rows on the device.
     ///
-    /// Each genome's row holds `row_words()` words: `BucketCount` packed registers followed by
-    /// its saturation word, the layout a single sketch allocation has. The rows are complete once
-    /// the stream reaches this point, and the next @ref begin_group reuses them, so a consumer
-    /// enqueues its reads on the stager's stream before then.
+    /// Each genome's row holds `BucketCount` registers, the layout a single sketch allocation
+    /// has. The rows are complete once the stream reaches this point, and the next
+    /// @ref begin_group reuses them, so a consumer enqueues its reads on the stager's stream
+    /// before then.
     [[nodiscard]] Result<device_span<uint32_t const>> end_group(size_t genomes) {
         CUDDL_TRY(flush());
-        return device_span<uint32_t const>{rows_.data(), genomes * row_words()};
+        return device_span<uint32_t const>{rows_.data(), genomes * BucketCount};
     }
 
     /// @brief Waits for the device and publishes the statistics.
@@ -1307,7 +1302,9 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             for (size_t id = base; id < base + count; ++id) {
                 (fits(probes[id]) ? device_ids : order).push_back(id);
             }
-            std::ranges::stable_sort(device_ids, {}, [&](size_t id) { return probes[id].compressed; });
+            std::ranges::stable_sort(device_ids, {}, [&](size_t id) {
+                return probes[id].compressed;
+            });
             order.insert(order.end(), device_ids.rbegin(), device_ids.rend());
             std::vector<std::filesystem::path> host_paths;
             host_paths.reserve(order.size());

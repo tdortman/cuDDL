@@ -60,17 +60,11 @@ int main(int argc, char** argv) {
     auto empty = cuda::make_device_buffer<uint64_t>(stream, stream.device(), 1, cuda::no_init);
     auto estimate = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
     CUDDL_UNWRAP(left.cardinality_async(empty.data(), estimate.data(), stream));
-    auto counts = cuda::make_device_buffer<uint16_t>(
-        stream, stream.device(), left.bucket_count(), cuda::no_init
-    );
-    auto saturated = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
-    CUDDL_UNWRAP(left.winner_counts_async(counts.data(), saturated.data(), stream));
     stream.sync();
 
     auto const summary = CUDDL_UNWRAP(left.summary(right, stream));
     auto const reverse = CUDDL_UNWRAP(right.compare(left, stream));
     auto const cardinality = CUDDL_UNWRAP(left.cardinality(stream));
-    auto const winner_counts = CUDDL_UNWRAP(left.winner_counts(stream));
 
     auto const wkid = left.wkid(summary);
     auto const ani = left.ani(summary);
@@ -83,6 +77,5 @@ int main(int argc, char** argv) {
               << "Left/right WKID: " << wkid.value_or(0.0) << '\n'
               << "Left/right ANI: " << ani.value_or(0.0) << '\n'
               << "Right containment in left: " << containment.value_or(0.0) << '\n'
-              << "Left content present in right: " << completeness.value_or(0.0) << '\n'
-              << "Left saturated: " << winner_counts.second << '\n';
+              << "Left content present in right: " << completeness.value_or(0.0) << '\n';
 }

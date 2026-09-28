@@ -50,9 +50,9 @@ struct sketch_scratch {
 /**
  * @brief Move-only owning DDL sketch backed by one contiguous device allocation.
  *
- * The device allocation holds `BucketCount` packed `uint32_t` registers and one aligned
- * `uint32_t` saturation flag. A separate mapped pinned-host scratch area receives small
- * synchronous results without a device-to-host copy.
+ * The device allocation holds `BucketCount` `uint32_t` registers, each holding its bucket's
+ * winning score. A separate mapped pinned-host scratch area receives small synchronous results
+ * without a device-to-host copy.
  *
  * The sketch also counts the k-mers offered through its own add paths, and @ref cardinality and
  * @ref hybrid_cardinality cap their estimates at that count: a sketch never reports more distinct
@@ -72,7 +72,7 @@ class sketch {
               cuda::make_device_buffer<register_type>(
                   stream,
                   stream.device(),
-                  allocation_words_,
+                  BucketCount,
                   register_type{0}
               )
           ),
@@ -86,7 +86,7 @@ class sketch {
     /// @brief Move-assigns the sketch, leaving the source empty.
     sketch& operator=(sketch&&) noexcept = default;
 
-    /// @brief Packed device registers.
+    /// @brief Device registers.
     ///
     /// Writing through this span bypasses the add paths, so the sketch can no longer relate its
     /// registers to an element count and forgets it.
@@ -95,7 +95,7 @@ class sketch {
         return {storage_.data(), BucketCount};
     }
 
-    /// @brief Packed device registers.
+    /// @brief Device registers.
     [[nodiscard]] device_span<register_type const> data() const noexcept {
         return {storage_.data(), BucketCount};
     }
@@ -121,7 +121,7 @@ class sketch {
         return added_;
     }
 
-    /// @brief Resets every register and the saturation flag to zero without synchronising.
+    /// @brief Resets every register to zero without synchronising.
     ///
     /// Resets the offered k-mer count, so the next estimate is capped at what the sketch is
     /// given after this call. The caller must keep the sketch alive until @p stream completes.
@@ -133,7 +133,7 @@ class sketch {
         return {};
     }
 
-    /// @brief Resets every register and the saturation flag to zero, then synchronises.
+    /// @brief Resets every register to zero, then synchronises.
     [[nodiscard]] Result<void> clear(cuda::stream_ref stream) const noexcept {
         if (auto const result = clear_async(stream); !result) {
             return result;
@@ -141,28 +141,25 @@ class sketch {
         return cuda_try([&] { stream.sync(); });
     }
 
-    /// @brief Overwrites packed registers and the saturation flag from stored words.
+    /// @brief Overwrites the registers from stored words.
     ///
     /// Loads a sketch from registers produced elsewhere, for example a saved reference database or
-    /// a streamed tile build. @p registers holds c BucketCount packed registers followed by the
-    /// saturation word, so one copy replaces both. Nothing is cleared or merged; the sketch's
-    /// contents become exactly @p registers. The stored words carry no element count, so the
-    /// sketch forgets its own and stops capping estimates.
+    /// a streamed tile build. Nothing is cleared or merged; the sketch's contents become exactly
+    /// @p registers. The stored words carry no element count, so the sketch forgets its own and
+    /// stops capping estimates.
     [[nodiscard]] Result<void> assign_async(
         device_span<register_type const> registers,
         cuda::stream_ref stream
     ) const noexcept {
-        if (registers.size() != BucketCount + 1U) {
-            return Err(
-                Error::invalid_argument("sketch assign needs one register per bucket plus a flag")
-            );
+        if (registers.size() != BucketCount) {
+            return Err(Error::invalid_argument("sketch assign needs one register per bucket"));
         }
         auto* const destination = storage_.data();
         if (auto const result = cuda_try([&] {
                 cuda::copy_bytes(
                     stream,
                     cuda::std::span{registers.data(), registers.size()},
-                    cuda::std::span{destination, BucketCount + 1U}
+                    cuda::std::span{destination, BucketCount}
                 );
             });
             !result) {
@@ -371,52 +368,17 @@ class sketch {
         return estimates;
     }
 
-    /// @brief Watches the winner-count extraction on the GPU (caller-owned outputs).
-    [[nodiscard]] Result<void> winner_counts_async(
-        uint16_t* counts_out,
-        uint32_t* saturation_out,
-        cuda::stream_ref stream
-    ) const noexcept {
-        return view().winner_counts_async(counts_out, saturation_out, stream);
-    }
-
-    /// @brief Extracts per-register winner counts and saturation flag (host result).
-    [[nodiscard]] Result<std::pair<std::vector<uint16_t>, bool>> winner_counts(
-        cuda::stream_ref stream
-    ) const {
-        struct count_scratch {
-            uint32_t saturated;
-            uint16_t counts[BucketCount];
-        };
-        auto scratch = CUDDL_CUDA_TRY(
-            cuda::make_buffer<count_scratch>(
-                stream, cuda::pinned_default_memory_pool(), 1, cuda::no_init
-            )
-        );
-        auto* output = scratch.data();
-        CUDDL_TRY(view().winner_counts_async(output->counts, &output->saturated, stream));
-        CUDDL_CUDA_TRY(stream.sync());
-        return std::pair{
-            std::vector<uint16_t>(output->counts, output->counts + BucketCount),
-            output->saturated != 0U
-        };
-    }
-
    private:
     using view_type = detail::sketch_view<K, BucketCount, Layout>;
 
     [[nodiscard]] view_type view() const noexcept {
-        return view_type({storage_.data(), BucketCount}, storage_.data()[BucketCount]);
+        return view_type({storage_.data(), BucketCount});
     }
 
     /// @brief Caps @p estimate at @ref added, which only describes registers the add paths built.
     [[nodiscard]] double capped(double estimate) const noexcept {
         return added_.has_value() ? std::min(estimate, static_cast<double>(*added_)) : estimate;
     }
-
-    /// @brief One pad register after the saturation flag keeps the next allocation aligned.
-    static constexpr size_t padded_prefix_words_ = BucketCount + 2U;
-    static constexpr size_t allocation_words_ = padded_prefix_words_;
 
     mutable cuda::device_buffer<register_type> storage_;
     mutable cuda::

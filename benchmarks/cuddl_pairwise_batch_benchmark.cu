@@ -111,9 +111,8 @@ class batch_fixture {
                                                ? uint16_t{0}
                                                : static_cast<uint16_t>((right_hash >> 48U) | 1U);
             auto const right_score = index % 4U == 0U ? left_score : independent_right;
-            host_left_.data()[index] = cuddl::detail::pack(left_score, left_score == 0U ? 0U : 1U);
-            host_right_.data()[index] =
-                cuddl::detail::pack(right_score, right_score == 0U ? 0U : 1U);
+            host_left_.data()[index] = left_score;
+            host_right_.data()[index] = right_score;
         }
         upload(setup_stream);
         setup_stream.sync();
@@ -149,8 +148,8 @@ class batch_fixture {
             cuddl::pairwise_counts expected{};
             auto const offset = pair * bucket_count;
             for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
-                auto const left = cuddl::detail::winner(host_left_.data()[offset + bucket]);
-                auto const right = cuddl::detail::winner(host_right_.data()[offset + bucket]);
+                auto const left = host_left_.data()[offset + bucket];
+                auto const right = host_right_.data()[offset + bucket];
                 if (left == 0U && right == 0U) {
                     ++expected.both_empty;
                 } else if (left < right) {

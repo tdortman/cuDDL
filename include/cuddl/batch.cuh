@@ -15,14 +15,9 @@
 /**
  * @brief Batch operations over contiguous device rows.
  *
- * Every function takes flat row-major spans and runs the whole batch in one kernel launch, so a
- * collection of N rows costs one launch instead of N. Two row layouts appear below:
- *
- * - compact rows hold `BucketCount` packed `uint32_t` registers, which is what
- *   `compare_batch_async` consumes;
- * - stored sketches hold `BucketCount` packed registers followed by the sketch's saturation
- *   word, the layout of a single sketch allocation and of the rows the streamed tile builder
- *   writes. `detail::stored_sketch_words` gives that row width.
+ * Every function takes flat row-major spans of `BucketCount` `uint32_t` registers per sketch, the
+ * layout of a single sketch allocation and of the stores the file builders write, and runs the
+ * whole batch in one kernel launch, so a collection of N rows costs one launch instead of N.
  *
  * Inputs and outputs must remain valid until @p stream completes.
  */
@@ -30,7 +25,7 @@
 namespace cuddl {
 
 /**
- * @brief Compares corresponding rows from two contiguous packed-register batches.
+ * @brief Compares corresponding rows from two contiguous register batches.
  *
  * The input spans are row-major and must contain the same whole number of BucketCount rows.
  * @p outputs must hold at least one summary per row pair. Inputs and outputs must remain valid
@@ -91,10 +86,10 @@ template <size_t BucketCount, typename Layout = default_register_layout>
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);
 
-    if (sketches.size() % detail::stored_sketch_words<BucketCount> != 0U) {
-        return Err(Error::invalid_argument("sketch store must contain whole stored sketches"));
+    if (sketches.size() % BucketCount != 0U) {
+        return Err(Error::invalid_argument("sketch store must contain whole sketches"));
     }
-    auto const row_count = sketches.size() / detail::stored_sketch_words<BucketCount>;
+    auto const row_count = sketches.size() / BucketCount;
     if (empty_out.size() < row_count || estimates_out.size() < row_count) {
         return Err(Error::invalid_argument("sketch store outputs are too small"));
     }
@@ -120,50 +115,6 @@ template <size_t BucketCount, typename Layout = default_register_layout>
 }
 
 /**
- * @brief Extracts the winner counts and saturation flag of every stored sketch.
- *
- * @p counts_out receives `BucketCount` `uint16_t` counts per row and @p saturation_out one
- * `uint32_t` per row.
- */
-template <size_t BucketCount>
-[[nodiscard]] inline Result<void> winner_counts_batch_async(
-    device_span<uint32_t const> sketches,
-    device_span<uint16_t> counts_out,
-    device_span<uint32_t> saturation_out,
-    cuda::stream_ref stream
-) {
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
-    static_assert((BucketCount & (BucketCount - 1U)) == 0U);
-
-    if (sketches.size() % detail::stored_sketch_words<BucketCount> != 0U) {
-        return Err(Error::invalid_argument("sketch store must contain whole stored sketches"));
-    }
-    auto const row_count = sketches.size() / detail::stored_sketch_words<BucketCount>;
-    if (counts_out.size() < row_count * BucketCount || saturation_out.size() < row_count) {
-        return Err(Error::invalid_argument("sketch store outputs are too small"));
-    }
-    if (row_count == 0U) {
-        return Ok();
-    }
-    if (sketches.data() == nullptr || counts_out.data() == nullptr ||
-        saturation_out.data() == nullptr) {
-        return Err(Error::invalid_argument("nonempty sketch store buffers must not be null"));
-    }
-    if (row_count > detail::maximum_batch_rows) {
-        return Err(Error::invalid_argument("sketch store has too many rows for one launch"));
-    }
-
-    detail::batch_winner_counts_kernel<BucketCount>
-        <<<static_cast<uint32_t>(row_count), detail::block_size, 0, stream.get()>>>(
-            sketches.data(),
-            static_cast<uint32_t>(row_count),
-            counts_out.data(),
-            saturation_out.data()
-        );
-    return cuda_try(cudaGetLastError());
-}
-
-/**
  * @brief Copies the winning score of every register into compact row-major scores.
  *
  * @p scores_out holds one `uint16_t`-per-register row per stored sketch.
@@ -177,10 +128,10 @@ template <size_t BucketCount>
     static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);
 
-    if (sketches.size() % detail::stored_sketch_words<BucketCount> != 0U) {
-        return Err(Error::invalid_argument("sketch store must contain whole stored sketches"));
+    if (sketches.size() % BucketCount != 0U) {
+        return Err(Error::invalid_argument("sketch store must contain whole sketches"));
     }
-    auto const row_count = sketches.size() / detail::stored_sketch_words<BucketCount>;
+    auto const row_count = sketches.size() / BucketCount;
     if (scores_out.size() < row_count * BucketCount) {
         return Err(Error::invalid_argument("sketch store outputs are too small"));
     }
@@ -197,45 +148,6 @@ template <size_t BucketCount>
     detail::batch_scores_kernel<BucketCount>
         <<<static_cast<uint32_t>(row_count), detail::block_size, 0, stream.get()>>>(
             sketches.data(), static_cast<uint32_t>(row_count), scores_out.data()
-        );
-    return cuda_try(cudaGetLastError());
-}
-
-/**
- * @brief Copies every stored sketch's registers into compact row-major rows.
- *
- * @p packed_out holds one `uint32_t`-per-register row per stored sketch; the saturation words
- * stay behind in the store.
- */
-template <size_t BucketCount>
-[[nodiscard]] inline Result<void> extract_packed_rows_batch_async(
-    device_span<uint32_t const> sketches,
-    device_span<uint32_t> packed_out,
-    cuda::stream_ref stream
-) {
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
-    static_assert((BucketCount & (BucketCount - 1U)) == 0U);
-
-    if (sketches.size() % detail::stored_sketch_words<BucketCount> != 0U) {
-        return Err(Error::invalid_argument("sketch store must contain whole stored sketches"));
-    }
-    auto const row_count = sketches.size() / detail::stored_sketch_words<BucketCount>;
-    if (packed_out.size() < row_count * BucketCount) {
-        return Err(Error::invalid_argument("sketch store outputs are too small"));
-    }
-    if (row_count == 0U) {
-        return Ok();
-    }
-    if (sketches.data() == nullptr || packed_out.data() == nullptr) {
-        return Err(Error::invalid_argument("nonempty sketch store buffers must not be null"));
-    }
-    if (row_count > detail::maximum_batch_rows) {
-        return Err(Error::invalid_argument("sketch store has too many rows for one launch"));
-    }
-
-    detail::batch_packed_rows_kernel<BucketCount>
-        <<<static_cast<uint32_t>(row_count), detail::block_size, 0, stream.get()>>>(
-            sketches.data(), static_cast<uint32_t>(row_count), packed_out.data()
         );
     return cuda_try(cudaGetLastError());
 }

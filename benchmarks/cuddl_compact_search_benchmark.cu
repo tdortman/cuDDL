@@ -258,14 +258,6 @@ std::vector<std::string> const parameter_launches{
     "cg_b256_w4", "cg_b512_w4", "cg_b1024_w4", "cg_b256_w8",  "cg_b512_w8",  "cg_b1024_w8",
 };
 
-std::vector<uint32_t> pack_rows(std::vector<uint16_t> const& rows) {
-    std::vector<uint32_t> packed(rows.size());
-    for (size_t index = 0; index < rows.size(); ++index) {
-        packed[index] = cuddl::detail::pack(rows[index], rows[index] == 0U ? 0U : 1U);
-    }
-    return packed;
-}
-
 template <uint32_t BlockSize, typename ReferenceRow>
 __global__ __launch_bounds__(BlockSize) void parameterised_cub_exhaustive_search_kernel(
     ReferenceRow const* rows,
@@ -289,9 +281,7 @@ __global__ __launch_bounds__(BlockSize) void parameterised_cub_exhaustive_search
     cuddl::pairwise_counts local{};
     auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
     for (auto bucket = static_cast<size_t>(lane); bucket < k_bucket_count; bucket += warp_width) {
-        cuddl::detail::classify(
-            local, query[bucket], cuddl::detail::reference_score(rows[row_offset + bucket])
-        );
+        cuddl::detail::classify(local, query[bucket], rows[row_offset + bucket]);
     }
     auto const total = warp_reduce(storage[warp]).Sum(local);
     if (lane == 0U) {
@@ -333,9 +323,7 @@ __global__ __launch_bounds__(BlockSize) void parameterised_cooperative_exhaustiv
         auto const row_offset = static_cast<size_t>(reference_id) * k_bucket_count;
         for (auto bucket = static_cast<size_t>(thread_in_reference); bucket < k_bucket_count;
              bucket += threads_per_reference) {
-            cuddl::detail::classify(
-                local, query[bucket], cuddl::detail::reference_score(rows[row_offset + bucket])
-            );
+            cuddl::detail::classify(local, query[bucket], rows[row_offset + bucket]);
         }
     }
     auto const warp_total = reduce_warp(warp, local);
@@ -622,7 +610,12 @@ void compact_exhaustive_parameter_sweep(nvbench::state& state) {
         );
     } else if (row_type == "packed") {
         run_parameterised_exhaustive(
-            state, pack_rows(fixture.rows), fixture.query, expected_host, reference_count, launch
+            state,
+            std::vector<uint32_t>(fixture.rows.begin(), fixture.rows.end()),
+            fixture.query,
+            expected_host,
+            reference_count,
+            launch
         );
     } else {
         throw std::runtime_error("unknown parameter sweep row type");

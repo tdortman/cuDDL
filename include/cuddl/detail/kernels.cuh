@@ -68,7 +68,7 @@ __device__ summary_payload combine_payloads(summary_payload a, summary_payload c
 /// @brief Buckets one contiguous chunk covers, for a query/reference score pair.
 ///
 /// One wide load covers 16 buckets whenever either row stores 16-bit scores, and 8 buckets
-/// when both store packed 32-bit registers. The scalar fallback covers half as many.
+/// when both store 32-bit registers. The scalar fallback covers half as many.
 template <typename QueryScore, typename ReferenceScore>
 constexpr uint32_t wide_chunk_buckets =
     (sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 16U : 8U;
@@ -80,34 +80,23 @@ constexpr size_t shared_construction_max_buckets = (size_t{1} << 13);
 constexpr uint32_t shared_construction_block_size = 768;
 
 /**
- * @brief Constructs a sketch through a CTA-local shared-memory winner array with a deferred
- * tie-count fix-up.
+ * @brief Constructs a sketch through a CTA-local shared-memory register array.
  *
- * Each shared word stores `(winner << 16) | count`, so the winner dominates the packed value and
- * a plain fire-and-forget 32-bit atomic max applies the DDL winner rule. Every item keeps its
- * atomic's return value for one slot; the deferred settle then compares the returned winner
- * against the item's score and, on the rare install (`old < score`) or tie (`old == score`),
- * increments the count through a CAS loop that re-validates the winner, so a stale increment can
- * never land on a replaced winner. A saturated per-block counter records the sketch-level
- * saturation flag, matching the sequential @ref update semantics. The per-item path is hash,
- * score, one atomic max, and one deferred compare: no dependent load, no branch on the common
- * path, no pair cache, and no separate count phase. The merge then applies the DDL winner/count
- * rule to the global registers, and the result is bit-identical to @ref add_kernel.
+ * Each item costs a hash, a score, and one fire-and-forget shared atomic max; the CTA then merges
+ * its registers into the global sketch with one global atomic max per nonempty bucket.
  *
  * The host launches two CTAs per SM and the kernel walks the input with a runtime grid-stride
  * loop over 256-bit chunks, so the grid is a single balanced wave for every input size and the
  * per-CTA merge traffic stays minimal.
  *
- * With FloorRounds > 0, drain pending ties after that many uniform input epochs and reduce
- * the minimum local winner. Subsequent scores strictly below that bound skip the atomic;
- * ties still count. The default instantiation retains the original ungated kernel.
+ * With FloorRounds > 0, the CTA reduces its minimum local register after that many uniform input
+ * epochs. Later scores at or below that bound cannot change any register and skip the atomic.
  */
 template <size_t BucketCount, typename Layout = default_register_layout, uint32_t FloorRounds = 0>
 __global__ __launch_bounds__(shared_construction_block_size) void add_shared_kernel(
     uint64_t const* input,
     size_t input_size,
     uint32_t* registers,
-    uint32_t& saturation,
     bool vector_input
 ) {
     static_assert(BucketCount <= shared_construction_max_buckets);
@@ -118,51 +107,21 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     __syncthreads();
 
     uint32_t floor = 0U;
-    uint32_t prev_bucket = 0U;
-    uint32_t prev_score = 0xffffU;  // primes the first settle off without a `have` flag
-    uint32_t prev_old = 0U;
-
-    auto const settle = [&] {
-        // A strict install already carries count 1 in the atomic max's replacement value,
-        // so only ties (old == score: count + 1) need the deferred increment. Re-validate
-        // the winner under CAS so an increment for a replaced winner is dropped, and
-        // saturate the per-block count exactly like the sequential update rule.
-        if ((prev_old >> 16U) == prev_score) {
-            auto expected = state[prev_bucket];
-            while ((expected >> 16U) == prev_score) {
-                if ((expected & 0xffffU) == max_winner_count) {
-                    atomicExch(&saturation, 1U);
-                    break;
-                }
-                auto const actual = atomicCAS(&state[prev_bucket], expected, expected + 1U);
-                if (actual == expected) {
-                    break;
-                }
-                expected = actual;
-            }
-        }
-    };
     auto const process = [&](uint64_t value) {
         auto const hash = hash_kmer(value);
         auto const incoming = static_cast<uint32_t>(score<Layout>(hash));
         if constexpr (FloorRounds != 0U) {
-            if (incoming < floor) {
+            if (incoming <= floor) {
                 return;
             }
         }
-        auto const bucket = static_cast<uint32_t>(bucket_of<BucketCount>(hash));
-        auto const old = atomicMax(&state[bucket], (incoming << 16U) | 1U);
-        settle();
-        prev_bucket = bucket;
-        prev_score = incoming;
-        prev_old = old;
+        atomicMax(&state[bucket_of<BucketCount>(hash)], incoming);
     };
 
     auto const stride = static_cast<size_t>(gridDim.x) * blockDim.x * 4U;
     auto const index = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4U;
     if constexpr (FloorRounds != 0U) {
-        // All lanes complete the same warm-up epochs before reducing the actual local
-        // winners. Strictly smaller scores cannot affect counts or saturation either.
+        // All lanes complete the same warm-up epochs before reducing the local registers.
         using reduce = cub::BlockReduce<uint32_t, shared_construction_block_size>;
         __shared__ typename reduce::TempStorage floor_storage;
         __shared__ uint32_t shared_floor;
@@ -180,13 +139,10 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
                 }
             }
         }
-        settle();
-        prev_score = 0xffffU;
-        prev_old = 0U;
         __syncthreads();
         uint32_t minimum = 0xffffU;
         for (auto bucket = threadIdx.x; bucket < BucketCount; bucket += blockDim.x) {
-            minimum = cuda::std::min(minimum, state[bucket] >> 16U);
+            minimum = cuda::std::min(minimum, state[bucket]);
         }
         auto const reduced =
             reduce(floor_storage).Reduce(minimum, [] __device__(uint32_t a, uint32_t b) {
@@ -223,24 +179,17 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
             }
         }
     }
-    settle();
     __syncthreads();
 
     // Each CTA starts its merge at a rotated bucket offset (odd multiplier, coprime with
     // the power-of-two bucket count), so the CTAs' atomic merges interleave across different
-    // addresses instead of all colliding on the same bucket at once. The per-address CAS
+    // addresses instead of all colliding on the same bucket at once. The per-address atomic
     // serialization then sees a smooth stream of arrivals rather than a synchronized burst.
     auto const bucket_offset = (static_cast<size_t>(blockIdx.x) * 139U) & (BucketCount - 1U);
     for (auto j = threadIdx.x; j < BucketCount; j += blockDim.x) {
         auto const i = (static_cast<size_t>(j) + bucket_offset) & (BucketCount - 1U);
         auto const stored = state[i];
-        if ((stored >> 16U) != 0U) {
-            merge_register(
-                &registers[i],
-                pack(static_cast<uint16_t>(stored >> 16U), static_cast<uint16_t>(stored & 0xffffU)),
-                saturation
-            );
-        }
+        if (stored != 0U) atomicMax(&registers[i], stored);
     }
 }
 
@@ -260,10 +209,10 @@ summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& ou
         auto const right_reg = right[bucket];
         classify(local.counts, left_reg, right_reg);
         if constexpr (IncludeCardinality) {
-            if (winner(left_reg) == 0U) {
+            if (left_reg == 0U) {
                 ++local.empty;
             } else {
-                local.restored_sum += restore_midpoint<Layout>(winner(left_reg));
+                local.restored_sum += restore_midpoint<Layout>(static_cast<uint16_t>(left_reg));
             }
         }
     }
@@ -281,7 +230,7 @@ summary_kernel(uint32_t const* left, uint32_t const* right, pairwise_summary& ou
 }
 
 /**
- * @brief Compares corresponding rows from two contiguous packed-register batches.
+ * @brief Compares corresponding rows from two contiguous register batches.
  *
  * One warp owns one pair. Grid-stride traversal keeps the launch bounded for very large batches.
  */
@@ -314,16 +263,6 @@ __global__ __launch_bounds__(block_size) void batch_summary_kernel(
         }
         __syncwarp();
     }
-}
-
-/// @brief Reads the search score from either supported exact row backing.
-__host__ __device__ constexpr uint16_t reference_score(uint16_t score) noexcept {
-    return score;
-}
-
-/// @brief Winning score of a packed register; the uint16_t overload passes scores through.
-__host__ __device__ constexpr uint16_t reference_score(uint32_t packed_register) noexcept {
-    return winner(packed_register);
 }
 
 /**
@@ -407,7 +346,7 @@ __global__ void count_index_cells_bucket_kernel(
             auto const key_base = quarter * quarter_keys;
             for (uint32_t reference = threadIdx.x; reference < reference_count;
                  reference += blockDim.x) {
-                auto const score = reference_score(__ldcs(&bucket_scores[reference]));
+                auto const score = static_cast<uint16_t>(__ldcs(&bucket_scores[reference]));
                 if (score == 0U) {
                     continue;
                 }
@@ -460,7 +399,7 @@ __global__ void scatter_index_postings_bucket_kernel(
             auto const key_base = quarter * quarter_keys;
             for (uint32_t reference = threadIdx.x; reference < reference_count;
                  reference += blockDim.x) {
-                auto const score = reference_score(__ldcs(&bucket_scores[reference]));
+                auto const score = static_cast<uint16_t>(__ldcs(&bucket_scores[reference]));
                 if (score == 0U) {
                     continue;
                 }
@@ -731,7 +670,9 @@ __global__ __launch_bounds__(block_size) void count_batch_index_matches_kernel(
         auto const bucket = static_cast<uint32_t>(cell) & bucket_mask;
         auto const score =
             cell < total_cells
-                ? reference_score(queries[(query_row_offset + query_index) * BucketCount + bucket])
+                ? static_cast<uint16_t>(
+                      queries[(query_row_offset + query_index) * BucketCount + bucket]
+                  )
                 : 0U;
         uint2 range{0U, 0U};
         if (score != 0U) {
@@ -1022,7 +963,8 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
     for (auto base = warp * warp_width; base < indexed_bucket_count;
          base += warps_per_block * warp_width) {
         auto const bucket = base + lane;
-        auto const score = bucket < indexed_bucket_count ? reference_score(query[bucket]) : 0U;
+        auto const score =
+            bucket < indexed_bucket_count ? static_cast<uint16_t>(query[bucket]) : 0U;
         uint32_t begin = 0U;
         uint32_t end = 0U;
         if (score != 0U) {
@@ -1169,7 +1111,7 @@ __global__ __launch_bounds__(block_size) void sparse_batch_posting_ranges_kernel
     for (auto query = static_cast<uint32_t>(threadIdx.x); query < query_count;
          query += block_size) {
         auto const score =
-            reference_score(queries[(query_row_offset + query) * BucketCount + bucket]);
+            static_cast<uint16_t>(queries[(query_row_offset + query) * BucketCount + bucket]);
         uint2 range{0U, 0U};
         if (score != 0U) {
             range = directory_posting_range(
@@ -1223,11 +1165,11 @@ __device__ __forceinline__ void classify_query_words(
         load_256_global_nc(reinterpret_cast<uint32_t const*>(reference) + 8U, r1);
         _Pragma("unroll")
         for (uint32_t i = 0; i < 8U; ++i) {
-            classify(target, qs[i], reference_score(r0[i]));
+            classify(target, qs[i], r0[i]);
         }
         _Pragma("unroll")
         for (uint32_t i = 0; i < 8U; ++i) {
-            classify(target, qs[8U + i], reference_score(r1[i]));
+            classify(target, qs[8U + i], r1[i]);
         }
     }
 }
@@ -1956,7 +1898,7 @@ cardinality_kernel(uint32_t const* registers, uint64_t* empty_out, double* estim
     cardinality_payload local{};
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(__ldcs(&registers[bucket]));
+        auto const stored = static_cast<uint16_t>(__ldcs(&registers[bucket]));
         if (stored == 0U) {
             ++local.empty;
         } else {
@@ -1990,7 +1932,7 @@ __global__ void hybrid_cardinality_kernel(
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(__ldcs(&registers[bucket]));
+        auto const stored = static_cast<uint16_t>(__ldcs(&registers[bucket]));
         uint32_t bin[1]{
             stored == 0U ? 0U : static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U
         };
@@ -2022,7 +1964,7 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
 
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(__ldcs(&registers[bucket]));
+        auto const stored = static_cast<uint16_t>(__ldcs(&registers[bucket]));
         uint32_t bin[1]{
             stored == 0U ? 0U : static_cast<uint32_t>(stored >> Layout::mantissa_bits) + 1U
         };
@@ -2044,31 +1986,9 @@ hybrid_cardinality_variant_kernel(uint32_t const* const registers, double* const
     }
 }
 
-/// @brief Extracts per-register winner counts and the sketch-level saturation flag.
-template <size_t BucketCount>
-__global__ void winner_counts_kernel(
-    uint32_t const* const registers,
-    uint32_t const* const saturation_in,
-    uint16_t* const counts_out,
-    uint32_t* const saturation_out
-) {
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
-         bucket += block_size) {
-        counts_out[bucket] = count(registers[bucket]);
-    }
-    if (threadIdx.x == 0) {
-        *saturation_out = *saturation_in;
-    }
-}
-
-/// @brief Words one stored sketch occupies: `BucketCount` registers then the saturation flag.
-template <size_t BucketCount>
-constexpr size_t stored_sketch_words = BucketCount + 1U;
-
 /// @brief Computes the cardinality of every stored sketch in one launch.
 ///
-/// One block reduces one row of the row-major store, so the store's rows must hold
-/// `BucketCount` packed registers followed by the sketch's saturation word.
+/// One block reduces one row of the row-major store of `BucketCount` registers per sketch.
 template <size_t BucketCount, typename Layout = default_register_layout>
 __global__ void batch_cardinality_kernel(
     uint32_t const* const registers,
@@ -2082,11 +2002,11 @@ __global__ void batch_cardinality_kernel(
     }
     using block_reduce = cub::BlockReduce<cardinality_payload, block_size>;
     __shared__ typename block_reduce::TempStorage storage;
-    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    auto const* const mine = registers + row * BucketCount;
     cardinality_payload local{};
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        auto const stored = winner(__ldcs(&mine[bucket]));
+        auto const stored = static_cast<uint16_t>(__ldcs(&mine[bucket]));
         if (stored == 0U) {
             ++local.empty;
         } else {
@@ -2102,29 +2022,6 @@ __global__ void batch_cardinality_kernel(
     }
 }
 
-/// @brief Extracts winner counts and saturation for every stored sketch in one launch.
-template <size_t BucketCount>
-__global__ void batch_winner_counts_kernel(
-    uint32_t const* const registers,
-    uint32_t const row_count,
-    uint16_t* const counts_out,
-    uint32_t* const saturation_out
-) {
-    auto const row = static_cast<size_t>(blockIdx.x);
-    if (row >= row_count) {
-        return;
-    }
-    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
-    auto* const counts = counts_out + row * BucketCount;
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
-         bucket += blockDim.x) {
-        counts[bucket] = count(mine[bucket]);
-    }
-    if (threadIdx.x == 0) {
-        saturation_out[row] = mine[BucketCount];
-    }
-}
-
 /// @brief Copies the winning score of every register into compact row-major scores.
 template <size_t BucketCount>
 __global__ void batch_scores_kernel(
@@ -2136,30 +2033,11 @@ __global__ void batch_scores_kernel(
     if (row >= row_count) {
         return;
     }
-    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
+    auto const* const mine = registers + row * BucketCount;
     auto* const scores = scores_out + row * BucketCount;
     for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
          bucket += blockDim.x) {
-        scores[bucket] = winner(__ldcs(&mine[bucket]));
-    }
-}
-
-/// @brief Copies every stored sketch's registers into compact row-major rows.
-template <size_t BucketCount>
-__global__ void batch_packed_rows_kernel(
-    uint32_t const* const registers,
-    uint32_t const row_count,
-    uint32_t* const packed_out
-) {
-    auto const row = static_cast<size_t>(blockIdx.x);
-    if (row >= row_count) {
-        return;
-    }
-    auto const* const mine = registers + row * stored_sketch_words<BucketCount>;
-    auto* const packed = packed_out + row * BucketCount;
-    for (auto bucket = static_cast<size_t>(threadIdx.x); bucket < BucketCount;
-         bucket += blockDim.x) {
-        packed[bucket] = __ldcs(&mine[bucket]);
+        scores[bucket] = static_cast<uint16_t>(__ldcs(&mine[bucket]));
     }
 }
 

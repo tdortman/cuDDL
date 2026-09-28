@@ -70,21 +70,13 @@ void fill_metrics(run_result& r, cuddl::pairwise_counts const& counts, uint32_t 
 /// @brief Scalar CPU DDL sketch used by the CPU backend (host-only, exact).
 template <size_t BucketCount>
 struct host_sketch {
-    std::vector<uint32_t> registers = std::vector<uint32_t>(BucketCount, 0U);
+    std::vector<uint16_t> registers = std::vector<uint16_t>(BucketCount, 0U);
 
     void add(std::vector<uint64_t> const& inputs) {
         for (auto const input : inputs) {
             auto const hash = cuddl::detail::hash_kmer(input);
-            auto const bucket = cuddl::detail::bucket_of<BucketCount>(hash);
-            auto const s = cuddl::detail::score(hash);
-            auto const observed = registers[bucket];
-            auto const w = cuddl::detail::winner(observed);
-            auto const c = cuddl::detail::count(observed);
-            if (s > w) {
-                registers[bucket] = cuddl::detail::pack(s, 1U);
-            } else if (s == w && c < cuddl::detail::max_winner_count) {
-                registers[bucket] = cuddl::detail::pack(s, static_cast<uint16_t>(c + 1U));
-            }
+            auto& stored = registers[cuddl::detail::bucket_of<BucketCount>(hash)];
+            stored = std::max(stored, cuddl::detail::score(hash));
         }
     }
 };
@@ -94,7 +86,7 @@ size_t construction_chunk_bytes() {
     size_t free_bytes = 0, total_bytes = 0;
     CUDDL_CUDA_CALL(cudaMemGetInfo(&free_bytes, &total_bytes));
     auto const cap = free_bytes * 4U / 5U;
-    // Leave room for the two sketches (registers + flags) plus a modest headroom.
+    // Leave room for the two sketches plus a modest headroom.
     auto const target = cap / 3;
     // Bound each chunk to a sane maximum so huge inputs stream without one giant allocation.
     auto const chunk_cap = (size_t{1} << 26);  // 64 Mi k-mers = 512 MiB
@@ -180,8 +172,8 @@ run_cpu(std::vector<uint64_t> const& query_kmers, std::vector<uint64_t> const& r
     t0 = steady_clock_t::now();
     cuddl::pairwise_counts counts{};
     for (size_t b = 0; b < BucketCount; ++b) {
-        auto const l = cuddl::detail::winner(query.registers[b]);
-        auto const rr = cuddl::detail::winner(ref_sketch.registers[b]);
+        auto const l = query.registers[b];
+        auto const rr = ref_sketch.registers[b];
         if (l == 0 && rr == 0) {
             ++counts.both_empty;
         } else if (l < rr) {

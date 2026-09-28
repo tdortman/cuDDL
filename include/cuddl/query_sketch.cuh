@@ -24,7 +24,7 @@ namespace cuddl {
  *
  * A query is the winner score of every register, one `uint16_t` row per query genome, which is
  * what `reference_database::search_async` and `search_batch_async` take. Sketching queries
- * through @ref reference_database_file would retain packed host rows and labels that queries
+ * through @ref reference_database_file would retain host score rows and labels that queries
  * do not need. This keeps the sketches on the device in the shape a
  * search wants, and nothing else.
  *
@@ -44,15 +44,12 @@ class query_sketch_batch {
     __host__ ~query_sketch_batch() {}  // NOLINT(modernize-use-equals-default)
 
     query_sketch_batch(query_sketch_batch&& other) noexcept
-        : scores_(std::move(other.scores_)),
-          saturation_(std::move(other.saturation_)),
-          query_count_(std::exchange(other.query_count_, 0U)) {}
+        : scores_(std::move(other.scores_)), query_count_(std::exchange(other.query_count_, 0U)) {}
 
     /// @brief Move-assigns the batch, leaving the source empty.
     query_sketch_batch& operator=(query_sketch_batch&& other) noexcept {
         if (this != &other) {
             scores_ = std::move(other.scores_);
-            saturation_ = std::move(other.saturation_);
             query_count_ = std::exchange(other.query_count_, 0U);
         }
         return *this;
@@ -126,14 +123,6 @@ class query_sketch_batch {
         return {scores_.data(), static_cast<size_t>(query_count_) * BucketCount};
     }
 
-    /// @brief Query saturation flags in query-ID order.
-    ///
-    /// The build computes these beside the registers, so they stay on the host: a search takes
-    /// scores alone, and a four-byte-per-query device copy would be a second transfer for them.
-    [[nodiscard]] std::span<uint32_t const> saturation() const noexcept {
-        return saturation_;
-    }
-
     /// @brief Query count, in the order the paths or genomes were supplied.
     [[nodiscard]] uint32_t query_count() const noexcept {
         return query_count_;
@@ -154,40 +143,23 @@ class query_sketch_batch {
                   cuda::no_init
               )
           ),
-          saturation_(queries),
           query_count_(queries) {}
 
-    /// @brief Staging sink that reduces each group's registers to query scores on the device
-    /// and copies only the saturation words back. The staging's final sync covers both.
+    /// @brief Staging sink that reduces each group's registers to query scores on the device.
+    /// The staging's final sync covers the reduction.
     [[nodiscard]] auto reduce_rows(cuda::stream_ref stream) {
-        return
-            [this,
-             stream](device_span<uint32_t const> group, size_t base, size_t count) -> Result<void> {
-                CUDDL_TRY(
-                    extract_scores_batch_async<BucketCount>(
-                        group,
-                        device_span<score_type>{
-                            scores_.data() + base * BucketCount, count * BucketCount
-                        },
-                        stream
-                    )
-                );
-                CUDDL_CUDA_TRY(cudaMemcpy2DAsync(
-                    saturation_.data() + base,
-                    sizeof(uint32_t),
-                    group.data() + BucketCount,
-                    (BucketCount + 1) * sizeof(uint32_t),
-                    sizeof(uint32_t),
-                    count,
-                    cudaMemcpyDeviceToHost,
-                    stream.get()
-                ));
-                return Ok();
-            };
+        return [this, stream](
+                   device_span<uint32_t const> group, size_t base, size_t count
+               ) -> Result<void> {
+            return extract_scores_batch_async<BucketCount>(
+                group,
+                device_span<score_type>{scores_.data() + base * BucketCount, count * BucketCount},
+                stream
+            );
+        };
     }
 
     cuda::device_buffer<score_type> scores_;
-    std::vector<uint32_t> saturation_;
     uint32_t query_count_ = 0;
 };
 
