@@ -33,3 +33,5 @@ build/test_artifacts/
 *.large.fasta
 *.large.fastq
 results
+
+!docs/reference-database.md

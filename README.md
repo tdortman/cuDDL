@@ -79,14 +79,13 @@ The following commands assume reference genomes are under `genomes/references/` 
 
 The builder searches the folder recursively and sorts file paths to assign reference IDs. Keep that ordered input list if you need to map result IDs back to filenames.
 
-Supported input extensions are `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, case-insensitively. Gzip and BGZF files may add `.gz`, `.bgz`, or `.bgzf`.
-Files containing additional gzip member signatures use the host parser, even when the first and last member trailers match.
-Fallback parsing runs between GPU batch submissions so it can overlap queued device work.
-On the discrete-GPU hybrid path, host workers compact and pack FASTA in cache-sized blocks. Adjacent blocks overlap by `k - 1` bases, preserving windows across line breaks without joining separate records or ambiguous-base runs.
-After GPU inflation, FASTA compaction reuses the compressed-input buffer as its output. CUB selects the retained bytes in one out-of-place pass, with both live device buffers included in the memory budget. CPU-inflated input keeps in-place compaction.
-Host line scanning, FASTA compaction, base packing, and gzip signature scanning have AVX-512, AVX2, and AArch64 NEON implementations, with portable fallbacks. The x86 paths select instructions supported by the host CPU; AVX-512 byte compaction requires VBMI2.
-The libdeflate patches combine a literal and its following short match into one decode-table entry when their Huffman prefixes fit. This targets the short matches common in DNA while retaining the general decoder for all other tokens.
-With the default `automatic` decompression, discrete GPUs inflate single-member gzip FASTA files and check each one's length and CRC32 against its trailer. Concurrent batches overlap file reads, inflation and sketch construction. Input sizes determine the split between compressed and decompressed GPU buffers within the available memory budget. Coherent-memory GPUs such as GH200 inflate gzip on CPU workers into pageable memory, then copy batches to the GPU for FASTA normalisation and sketching. File mapping and retirement overlap decoding, and completed inputs retain their original reference IDs. The host loader also takes other formats and any file the GPU cannot verify. It checks member structure, DEFLATE decoding and uncompressed lengths, but skips CRC32. Check input integrity separately when that matters. Saved databases and indexes are always checksummed.
+The builder reads FASTA and FASTQ files with the extensions `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, in any letter case. Gzip and BGZF files add `.gz`, `.bgz`, or `.bgzf`, as in `genome.fna.gz`.
+
+By default, a discrete GPU inflates gzip FASTA files with nvCOMP and checks each file's length and CRC32 against its gzip trailer. Coherent-memory GPUs such as GH200 inflate on CPU workers instead. Everything else goes to the host loader: FASTQ, BGZF, multi-member gzip, and any file the GPU cannot verify.
+
+The host loader checks the gzip structure and the uncompressed length, but not the CRC32. If you need that guarantee, verify the input files before you build. Saved databases and indexes carry their own checksum, which cuDDL checks on every load.
+
+[Build and save a reference database](docs/reference-database.md#choose-a-decompression-backend) covers the decompression backends and how each one loads files.
 
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
