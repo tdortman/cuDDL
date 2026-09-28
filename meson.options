@@ -22,7 +22,7 @@ option(
 option(
     'examples',
     type: 'feature',
-    value: 'disabled',
+    value: 'auto',
     description: 'Build examples for the library',
 )
 

@@ -47,8 +47,7 @@ cd cuDDL
 # Optional: enter the supplied development environment.
 nix develop
 
-# The command-line examples are off by default, enable them explicitly.
-meson setup build -Dexamples=enabled -Dtests=disabled -Dbenchmarks=disabled
+meson setup build
 meson compile -C build
 ```
 

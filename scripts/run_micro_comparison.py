@@ -807,7 +807,7 @@ def main(
     for binary in required:
         if not binary.exists():
             raise typer.BadParameter(
-                f"missing binary, build first (cuDDL CLIs need -Dexamples=enabled): {binary}"
+                f"missing binary, build first (cuDDL CLIs need the examples enabled): {binary}"
             )
 
     measurements: list[dict] = []
