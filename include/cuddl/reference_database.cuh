@@ -770,10 +770,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 [[nodiscard]] inline Result<void> validate_non_indexed_score_compatibility(
     score_compatibility const& compatibility
 ) {
-    if (auto const validation = validate_score_compatibility<K, BucketCount, Layout>(compatibility);
-        !validation) {
-        return validation;
-    }
+    CUDDL_TRY((validate_score_compatibility<K, BucketCount, Layout>(compatibility)));
     if (compatibility.indexed_bucket_count != BucketCount) {
         return Err(Error::invalid_argument("non-indexed builds require every bucket"));
     }
@@ -787,10 +784,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 [[nodiscard]] inline Result<void> validate_indexed_score_compatibility(
     score_compatibility const& compatibility
 ) {
-    if (auto const validation = validate_score_compatibility<K, BucketCount, Layout>(compatibility);
-        !validation) {
-        return validation;
-    }
+    CUDDL_TRY((validate_score_compatibility<K, BucketCount, Layout>(compatibility)));
     auto const full_bucket_count = static_cast<uint32_t>(BucketCount);
     if (compatibility.indexed_bucket_count != full_bucket_count &&
         compatibility.indexed_bucket_count != full_bucket_count / 2U) {
@@ -1090,11 +1084,9 @@ class reference_database_view {
         if (query.size() != BucketCount || query.data() == nullptr) {
             return Err(Error::invalid_argument("query must contain one complete score row"));
         }
-        if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility);
-            !validation) {
-            return validation;
-        }
+        CUDDL_TRY(
+            (detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility))
+        );
         if (query_compatibility != metadata_.compatibility) {
             return Err(Error::invalid_argument("query construction metadata is incompatible"));
         }
@@ -1148,11 +1140,9 @@ class reference_database_view {
         if (query.size() != BucketCount || query.data() == nullptr) {
             return Err(Error::invalid_argument("query must contain one complete score row"));
         }
-        if (auto const validation =
-                detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility);
-            !validation) {
-            return validation;
-        }
+        CUDDL_TRY(
+            (detail::validate_score_compatibility<K, BucketCount, Layout>(query_compatibility))
+        );
         if (query_compatibility != metadata_.compatibility) {
             return Err(Error::invalid_argument("query construction metadata is incompatible"));
         }

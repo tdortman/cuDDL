@@ -1128,10 +1128,11 @@ json resident_timings(
                             block_end +=
                                 std::min(per_chunk_blocks, (windows + size_t{2047}) / size_t{2048});
                             host.push_back({
-                                input->data() + chunk.offset,
-                                block_end,
-                                static_cast<uint32_t>(chunk.genome),
-                                static_cast<uint32_t>(windows),
+                                .bases = input->data() + chunk.offset,
+                                .block_end = block_end,
+                                .genome = static_cast<uint32_t>(chunk.genome),
+                                .windows = static_cast<uint32_t>(windows),
+                                .packed = 0U,
                             });
                         }
                         if (!staged || staged->size() < host.size()) {
