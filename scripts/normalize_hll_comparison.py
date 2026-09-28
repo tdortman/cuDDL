@@ -32,21 +32,19 @@ app = typer.Typer(
 def read_rows(path: Path, required: set[str], label: str) -> list[dict[str, str]]:
     try:
         with path.open(newline="") as source:
-            reader = csv.DictReader(source)
-            fields = set(reader.fieldnames or ())
-            missing = sorted(required - fields)
+            reader = csv.reader(source)
+            header = next(reader, [])
+            missing = sorted(required - set(header))
             if missing:
                 raise typer.BadParameter(
                     f"{label} is missing columns: {', '.join(missing)}"
                 )
+            # NVBench repeats names (e.g. the "Iters" axis and the "Iters" element
+            # count summary); the first occurrence is the axis value.
             return [
-                row
+                dict(reversed(list(zip(header, row))))
                 for row in reader
-                if any(
-                    value and value.strip()
-                    for value in row.values()
-                    if value is not None
-                )
+                if any(value.strip() for value in row)
             ]
     except OSError as error:
         raise typer.BadParameter(f"cannot read {label} {path}: {error}") from error
