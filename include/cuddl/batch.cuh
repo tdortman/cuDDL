@@ -38,7 +38,7 @@ template <size_t BucketCount>
     device_span<pairwise_summary> outputs,
     cuda::stream_ref stream
 ) {
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);
 
     if (left_rows.size() != right_rows.size()) {
@@ -83,7 +83,7 @@ template <size_t BucketCount, typename Layout = default_register_layout>
     device_span<double> estimates_out,
     cuda::stream_ref stream
 ) {
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);
 
     if (sketches.size() % BucketCount != 0U) {
@@ -125,7 +125,7 @@ template <size_t BucketCount>
     device_span<uint16_t> scores_out,
     cuda::stream_ref stream
 ) {
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1U)) == 0U);
 
     if (sketches.size() % BucketCount != 0U) {

@@ -38,7 +38,7 @@ struct pairwise_counts {
  * batch-search results.
  *
  * Lower occupies bits 0-20, equal bits 21-41 and higher bits 42-63; both-empty is the bucket
- * count minus the three, so every supported bucket count (at most 2^17) fits.
+ * count minus the three, so every supported bucket count (at most 2^13) fits.
  */
 struct packed_pairwise_counts {
     uint64_t bits{};

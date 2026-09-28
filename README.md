@@ -55,7 +55,7 @@ Without Nix, install the requirements above and omit `nix develop`. The flake pr
 
 For an existing build directory, use `meson configure build` with the same `-D` options instead of `meson setup`.
 
-The command-line tools support one sketch configuration per build: k = 25, 2,048 buckets and a 5-bit exponent with an 11-bit mantissa by default. For other settings, pass `-Dcli_kmer_length` (1 to 31), `-Dcli_buckets` (2048 to 131072, powers of two) and `-Dcli_exponent_bits` (5 or 6) and rebuild. A 6-bit exponent handles unbounded cardinality, such as metagenomes. A 5-bit exponent halves false register matches for genome-to-genome comparison. The search tool rejects databases built with a different configuration.
+The command-line tools support one sketch configuration per build: k = 25, 2,048 buckets and a 5-bit exponent with an 11-bit mantissa by default. For other settings, pass `-Dcli_kmer_length` (1 to 31), `-Dcli_buckets` (2048, 4096 or 8192) and `-Dcli_exponent_bits` (5 or 6) and rebuild. A 6-bit exponent handles unbounded cardinality, such as metagenomes. A 5-bit exponent halves false register matches for genome-to-genome comparison. The search tool rejects databases built with a different configuration.
 
 ### Run a GPU smoke check
 

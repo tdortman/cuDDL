@@ -33,15 +33,11 @@ __device__ __forceinline__ void add_sequence_windows(
     bool packed_input = false
 ) {
     constexpr uint32_t tile_size = 256 * 8;
-    constexpr bool shared_sketch = BucketCount <= 8192;
     __shared__ uint32_t cells[tile_size / 8 + 4];
-    __shared__ uint32_t local[shared_sketch ? BucketCount : 1];
-    if constexpr (shared_sketch) {
-        for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
-            local[i] = 0;
-        }
+    __shared__ uint32_t local[BucketCount];
+    for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
+        local[i] = 0;
     }
-    auto* target = shared_sketch ? local : registers;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
     auto const valid_mask = (uint32_t{1} << k) - 1;
     for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
@@ -121,7 +117,7 @@ __device__ __forceinline__ void add_sequence_windows(
                     auto const forward = high >> (64 - 2 * k);
                     auto const reverse = reverse_high & mask;
                     auto const hash = hash_kmer(forward > reverse ? forward : reverse);
-                    atomicMax(&target[bucket_of<BucketCount>(hash)], score<Layout>(hash));
+                    atomicMax(&local[bucket_of<BucketCount>(hash)], score<Layout>(hash));
                 }
                 // Eight overlapping windows fit in one 32-base word when k <= 25.
                 if (k <= 25) {
@@ -138,11 +134,9 @@ __device__ __forceinline__ void add_sequence_windows(
         }
         __syncthreads();
     }
-    if constexpr (shared_sketch) {
-        __syncthreads();
-        for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
-            if (local[i] != 0U) atomicMax(&registers[i], local[i]);
-        }
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
+        if (local[i] != 0U) atomicMax(&registers[i], local[i]);
     }
 }
 

@@ -490,7 +490,7 @@ class reference_database_file {
             CUDDL_TRY(detail::database_file_metadata(reader, result.metadata_));
             auto const& c = result.metadata_.compatibility;
             if (c.kmer_length < 1 || c.kmer_length > 31 || c.bucket_count < 2048 ||
-                c.bucket_count > 131072 || !std::has_single_bit(c.bucket_count) ||
+                c.bucket_count > 8192 || !std::has_single_bit(c.bucket_count) ||
                 c.indexed_bucket_count != c.bucket_count ||
                 (c.key_mask != 0xffffU && c.key_mask != 0x7fffU) || c.exponent_bits == 0 ||
                 c.mantissa_bits == 0 || c.exponent_bits + c.mantissa_bits != 16 ||

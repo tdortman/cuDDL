@@ -24,7 +24,7 @@ namespace cuddl::detail {
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class sketch_view {
     static_assert(K >= 1 && K <= 31);
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
 
    public:

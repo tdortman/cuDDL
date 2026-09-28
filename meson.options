@@ -38,7 +38,7 @@ option(
 option(
     'cli_buckets',
     type: 'combo',
-    choices: ['2048', '4096', '8192', '16384', '32768', '65536', '131072'],
+    choices: ['2048', '4096', '8192'],
     value: '2048',
     description: 'Sketch bucket count compiled into the example CLIs',
 )

@@ -873,7 +873,7 @@ namespace detail {
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class reference_database_view {
     static_assert(K >= 1 && K <= 31);
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
 
    public:
@@ -2336,7 +2336,7 @@ class reference_database {
     friend class reference_index;
     friend class reference_database_file;
     static_assert(K >= 1 && K <= 31);
-    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 17));
+    static_assert(BucketCount >= (size_t{1} << 11) && BucketCount <= (size_t{1} << 13));
     static_assert((BucketCount & (BucketCount - 1)) == 0);
 
    public:

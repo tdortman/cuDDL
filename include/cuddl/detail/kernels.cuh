@@ -73,9 +73,6 @@ template <typename QueryScore, typename ReferenceScore>
 constexpr uint32_t wide_chunk_buckets =
     (sizeof(QueryScore) == 2U || sizeof(ReferenceScore) == 2U) ? 16U : 8U;
 
-/// @brief Largest sketch (in registers) whose per-CTA staging fits in default static shared memory.
-constexpr size_t shared_construction_max_buckets = (size_t{1} << 13);
-
 /// @brief Threads per CTA for the CTA-local construction kernel.
 constexpr uint32_t shared_construction_block_size = 768;
 
@@ -99,7 +96,6 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
     uint32_t* registers,
     bool vector_input
 ) {
-    static_assert(BucketCount <= shared_construction_max_buckets);
     __shared__ uint32_t state[BucketCount];
     for (auto i = threadIdx.x; i < BucketCount; i += blockDim.x) {
         state[i] = 0U;

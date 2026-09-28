@@ -739,10 +739,10 @@ TEST(SketchTest, SequencePackedTilesMatchScalarOracle) {
             verify.template operator()<b_default>(genome, k, 3);
         }
     }
-    // Exercise multiple grid-stride tiles, the larger shared sketch, and global fallback.
+    // Exercise multiple grid-stride tiles and the largest supported sketch.
     auto const genome = make_genome(700003);
     verify.template operator()<8192>(genome, 31, 1);
-    verify.template operator()<16384>(genome, 25, 7);
+    verify.template operator()<4096>(genome, 25, 7);
     auto bytes = make_genome(256 * 8 * 32 + 31);
     for (uint32_t byte = 0; byte < 256; ++byte) {
         for (uint32_t position = 0; position < 8; ++position) {
