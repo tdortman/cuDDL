@@ -40,65 +40,64 @@ def main(
             )
             assert (result.returncode == 0) == succeeds, result.stdout + result.stderr
 
-        for k, buckets in ((3, 2048), (1, 131072), (31, 4096)):
-            run("--k", str(k), "--buckets", str(buckets), "--output", str(output))
-            data = output.read_bytes()
-            assert data[:8] == b"CUDDLDB\0"
-            assert struct.unpack_from("<III", data, 8) == (2, k, buckets)
-            assert struct.unpack_from("<I", data, 62)[0] == 2
-            assert struct.unpack_from("<I", data, len(data) - 4)[0] == zlib.crc32(data[:-4])
-            offset = 66
-            for expected in (first, second):
-                length = struct.unpack_from("<I", data, offset)[0]
-                offset += 4
-                assert data[offset : offset + length].decode() == str(expected)
-                offset += length
-            assert len(data) == offset + 2 * buckets * 2 + 4
-            if k == 3:
-                assert not any(data[offset : offset + buckets * 2])
+        # The builder is compiled for k=25 and 2048 buckets (cli_* Meson options).
+        k, buckets = 25, 2048
+        run("--output", str(output))
+        data = output.read_bytes()
+        assert data[:8] == b"CUDDLDB\0"
+        assert struct.unpack_from("<III", data, 8) == (2, k, buckets)
+        assert struct.unpack_from("<I", data, 62)[0] == 2
+        assert struct.unpack_from("<I", data, len(data) - 4)[0] == zlib.crc32(data[:-4])
+        offset = 66
+        for expected in (first, second):
+            length = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+            assert data[offset : offset + length].decode() == str(expected)
+            offset += length
+        assert len(data) == offset + 2 * buckets * 2 + 4
+        # The first genome is shorter than k, so its row stays empty.
+        assert not any(data[offset : offset + buckets * 2])
+        assert any(data[offset + buckets * 2 : offset + buckets * 4])
 
-        saved = output.read_bytes()
-        run("--k", "31", "--buckets", "4096", "--workers", "1", "-o", str(output))
+        saved = data
+        run("--workers", "1", "-o", str(output))
         assert output.read_bytes() == saved
         # Refill the bounded parser queue and preserve input order across worker counts.
         extra = [genomes / f"extra-{i:02}.fa" for i in range(10)]
         for i, path in enumerate(extra):
             path.write_text(">genome\n" + "ACGT" * (i + 10) + "\n")
         many_output = root / "many.cuddl"
-        run("--k", "3", "--buckets", "2048", "-o", str(many_output))
+        run("-o", str(many_output))
         many_saved = many_output.read_bytes()
-        run("--k", "3", "--buckets", "2048", "--workers", "1", "-o", str(many_output))
+        run("--workers", "1", "-o", str(many_output))
         assert many_output.read_bytes() == many_saved
         for path in extra:
             path.unlink()
         first.write_bytes(gzip.compress(b">first\nAA\n") + gzip.compress(b">second\nA\n"))
         second.write_bytes(gzip.compress(second.read_bytes()))
-        run("--k", "31", "--buckets", "4096", "-o", str(output))
+        run("-o", str(output))
         assert output.read_bytes() == saved
         compressed = first.read_bytes()
         for broken in (compressed[:-3], compressed[:-8] + b"\xff" * 8):
             first.write_bytes(broken)
-            run("--k", "31", "--buckets", "4096", "-o", str(output), succeeds=False)
+            run("-o", str(output), succeeds=False)
             assert output.read_bytes() == saved
         first.write_bytes(compressed)
-        run("--k", "0", "--buckets", "2048", succeeds=False)
-        run("--k", "32", "--buckets", "2048", succeeds=False)
-        run("--k", "25", "--buckets", "3000", succeeds=False)
-        run("--k", "25", "--buckets", "2048", "-o", str(first), succeeds=False)
+        run("-o", str(first), succeeds=False)
         assert first.read_bytes() == compressed
         second.write_text("@broken\nACGT\n+\nII\n")
-        run("--k", "25", "--buckets", "2048", "-o", str(output), succeeds=False)
+        run("-o", str(output), succeeds=False)
         assert output.read_bytes() == saved
         first.unlink()
         second.unlink()
-        run("--k", "25", "--buckets", "2048", succeeds=False)
+        run(succeeds=False)
         # More than 4 MiB of short records must stay separate across upload batches.
         short = genomes / "short.fa"
-        short.write_text((">read\n" + "A" * 30 + "\n") * 140000)
-        run("--k", "31", "--buckets", "2048", "-o", str(output))
+        short.write_text((">read\n" + "A" * (k - 1) + "\n") * 140000)
+        run("-o", str(output))
         data = output.read_bytes()
         offset = 70 + struct.unpack_from("<I", data, 66)[0]
-        assert not any(data[offset : offset + 2048 * 2])
+        assert not any(data[offset : offset + buckets * 2])
     print("Reference database CLI checks passed.")
 
 

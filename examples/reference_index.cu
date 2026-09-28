@@ -1,43 +1,146 @@
 #include <CLI/CLI.hpp>
 
+#include <cuddl/query_sketch.cuh>
+#include <cuddl/reference_index_file.cuh>
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <vector>
 
-#include "reference_index_command.hpp"
+#include "cli_config.hpp"
 
 namespace {
 
-template <size_t Buckets, uint32_t K>
-void dispatch_layout(reference_index_command const& command, uint32_t exponent_bits) {
-    if (exponent_bits == 5) return dispatch_reference_index<Buckets, K, 5>(command);
-    if (exponent_bits == 6) return dispatch_reference_index<Buckets, K, 6>(command);
-    throw std::invalid_argument("unsupported register exponent width");
-}
+// Binary output rows are raw little-endian batch_search_result records, documented in README.md.
+static_assert(sizeof(cuddl::batch_search_result) == 24);
+static_assert(std::is_trivially_copyable_v<cuddl::batch_search_result>);
 
-template <size_t Buckets, uint32_t K = 1>
-void dispatch_kmers(
-    reference_index_command const& command,
-    cuddl::score_compatibility const& compatibility
-) {
-    if (compatibility.kmer_length == K) {
-        return dispatch_layout<Buckets, K>(command, compatibility.exponent_bits);
-    }
-    if constexpr (K < 31) return dispatch_kmers<Buckets, K + 1>(command, compatibility);
-    throw std::invalid_argument("unsupported k-mer length");
-}
+/// Query genomes sketched per batch; each batch then runs as one batched search.
+constexpr size_t query_batch_size = 4096;
 
-/// Bucket counts are the powers of two from 2048 through 131072.
-template <size_t Buckets = 2048>
-void dispatch_buckets(
-    reference_index_command const& command,
-    cuddl::score_compatibility const& compatibility
+using database_type = cuddl::reference_database<cli::kmer_length, cli::buckets, cli::layout>;
+using index_type = cuddl::reference_index<cli::kmer_length, cli::buckets, cli::layout>;
+using query_type = cuddl::query_sketch_batch<cli::kmer_length, cli::buckets, cli::layout>;
+
+void search(
+    database_type const& database,
+    index_type const* index,
+    std::vector<std::filesystem::path> const& paths,
+    std::filesystem::path const& output,
+    bool all_to_all,
+    uint32_t minimum_matches,
+    unsigned workers,
+    cuddl::decompression_backend decompression,
+    cuda::stream_ref stream
 ) {
-    if (compatibility.bucket_count == Buckets) {
-        return dispatch_kmers<Buckets>(command, compatibility);
+    auto const batch_capacity = std::min(query_batch_size, paths.size());
+    auto const requirements = CUDDL_UNWRAP(
+        all_to_all ? database.all_to_all_search_requirements(index)
+                   : database.batch_search_requirements(
+                         static_cast<uint32_t>(batch_capacity), stream, index
+                     )
+    );
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    std::ofstream binary;
+    if (output.empty()) {
+        std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
+    } else {
+        binary.open(output, std::ios::binary | std::ios::trunc);
+        if (!binary) throw std::runtime_error("cannot open " + output.string());
     }
-    if constexpr (Buckets < 131072) return dispatch_buckets<Buckets * 2>(command, compatibility);
-    throw std::invalid_argument("unsupported sketch bucket count");
+    // Each tile's results are written before the next tile reuses the storage.
+    auto write_tile = [&](cuddl::batch_result_tile const& tile) {
+        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        auto const passing = tile_copy.passing();
+        if (binary.is_open()) {
+            binary.write(
+                reinterpret_cast<char const*>(passing.data()),
+                static_cast<std::streamsize>(passing.size() * sizeof(cuddl::batch_search_result))
+            );
+            return;
+        }
+        for (auto const& result : passing) {
+            auto const& counts = result.counts;
+            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
+                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
+                      << '\n';
+        }
+    };
+    // Without an index or a threshold every pair is reported, so the dedicated exhaustive
+    // kernels run instead of counting matches only to discard nothing.
+    bool const exhaustive = index == nullptr && minimum_matches == 0;
+    if (all_to_all) {
+        // Database rows are the queries; only pairs with query_id < reference_id are searched.
+        if (exhaustive) {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                {workspace.data(), workspace.size()},
+                {results.data(), results.size()},
+                write_tile,
+                {},
+                stream
+            ));
+        } else {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                {workspace.data(), workspace.size()},
+                {results.data(), results.size()},
+                write_tile,
+                {},
+                {.minimum_matches = minimum_matches},
+                stream,
+                index
+            ));
+        }
+    } else {
+        for (size_t first = 0; first < paths.size(); first += query_batch_size) {
+            auto batch_size = std::min(query_batch_size, paths.size() - first);
+            auto queries = CUDDL_UNWRAP(
+                query_type::sketch(
+                    std::span{paths.data() + first, batch_size},
+                    stream,
+                    {.parser_workers = workers, .decompression = decompression}
+                )
+            );
+            if (exhaustive) {
+                CUDDL_UNWRAP(database.search_batch_async(
+                    queries.scores(),
+                    query_type::compatibility(),
+                    static_cast<uint32_t>(first),
+                    {workspace.data(), workspace.size()},
+                    {results.data(), results.size()},
+                    write_tile,
+                    {},
+                    stream
+                ));
+            } else {
+                CUDDL_UNWRAP(database.search_batch_async(
+                    queries.scores(),
+                    query_type::compatibility(),
+                    static_cast<uint32_t>(first),
+                    {workspace.data(), workspace.size()},
+                    {results.data(), results.size()},
+                    write_tile,
+                    {},
+                    {.minimum_matches = minimum_matches},
+                    stream,
+                    index
+                ));
+            }
+        }
+    }
+    if (binary.is_open() ? !binary.flush() : !std::cout) {
+        throw std::runtime_error("cannot write search results");
+    }
 }
 
 }  // namespace
@@ -121,26 +224,40 @@ int main(int argc, char** argv) {
             std::filesystem::equivalent(database_path, index_path)) {
             throw std::invalid_argument("index output must not overwrite the reference database");
         }
-        auto database = CUDDL_UNWRAP(cuddl::reference_database_file::load(database_path));
-        auto const compatibility = database.metadata().compatibility;
+        auto const file = CUDDL_UNWRAP(cuddl::reference_database_file::load(database_path));
+        auto const compatibility = file.metadata().compatibility;
+        cli::require_compatible(compatibility);
         if (minimum_matches > compatibility.indexed_bucket_count) {
             throw std::invalid_argument("minimum matches exceeds indexed bucket count");
         }
-        reference_index_command command{
+        cuda::stream stream{cuda::devices[0]};
+        auto database =
+            CUDDL_UNWRAP((file.upload<cli::kmer_length, cli::buckets, cli::layout>(stream)));
+        if (*build) {
+            auto const storage =
+                format == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse;
+            auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, storage));
+            CUDDL_UNWRAP(cuddl::reference_index_file::save(index, database, index_path, stream));
+            std::cout << "Saved " << format << " index to " << index_path << '\n';
+            return 0;
+        }
+        std::optional<index_type> index;
+        if (!index_path.empty()) {
+            index.emplace(
+                CUDDL_UNWRAP(cuddl::reference_index_file::load(index_path, database, stream))
+            );
+        }
+        search(
             database,
-            index_path,
+            index ? &*index : nullptr,
             queries,
             output,
             all_to_all,
             minimum_matches,
             workers,
             decompression,
-            bool(*build),
-            format == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
-        };
-        dispatch_buckets(command, compatibility);
-        if (*build) std::cout << "Saved " << format << " index to " << index_path << '\n';
-
+            stream
+        );
     } catch (std::exception const& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;

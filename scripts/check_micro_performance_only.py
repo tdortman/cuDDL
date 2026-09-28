@@ -204,12 +204,6 @@ def main() -> None:
             [
                 str(examples / "cuddl-build-reference-db"),
                 str(genomes),
-                "--k",
-                "25",
-                "--buckets",
-                "2048",
-                "--exponent-bits",
-                "5",
                 "--output",
                 str(database),
             ],

@@ -56,6 +56,8 @@ Without Nix, install the requirements above and omit `nix develop`. The flake pr
 
 For an existing build directory, use `meson configure build` with the same `-D` options instead of `meson setup`.
 
+The command-line tools support one sketch configuration per build: k = 25, 2,048 buckets and a 5-bit exponent with an 11-bit mantissa by default. For other settings, pass `-Dcli_kmer_length` (1 to 31), `-Dcli_buckets` (2048 to 131072, powers of two) and `-Dcli_exponent_bits` (5 or 6) and rebuild. A 6-bit exponent handles unbounded cardinality, such as metagenomes. A 5-bit exponent halves false register matches for genome-to-genome comparison. The search tool rejects databases built with a different configuration.
+
 ### Run a GPU smoke check
 
 ```sh
@@ -72,8 +74,6 @@ The following commands assume reference genomes are under `genomes/references/` 
 
 ```sh
 ./build/examples/cuddl-build-reference-db \
-  --k 25 \
-  --buckets 2048 \
   --output references.cuddl \
   genomes/references/
 ```
@@ -91,9 +91,6 @@ With the default `automatic` decompression, discrete GPUs inflate single-member 
 
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--k`             | 1 through 31                                                                                                                                                  |
-| `--buckets`       | 2048, 4096, 8192, 16384, 32768, 65536, 131072                                                                                                                 |
-| `--exponent-bits` | 6 (default, 10-bit mantissa) for unbounded cardinality such as metagenomes; 5 (11-bit mantissa) halves false register matches for genome-to-genome comparison |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
 | `--decompression` | `automatic` (default), `cpu`, `gpu`, or `coherent`. `cpu` inflates every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP, and `coherent` uses CPU inflation followed by GPU FASTA normalisation on a coherent GPU. `gpu` and `coherent` need nvCOMP. |
 
@@ -106,7 +103,7 @@ With the default `automatic` decompression, discrete GPUs inflate single-member 
   > matches.tsv
 ```
 
-`--minimum-matches 0` compares each query against every reference. The database supplies the k-mer length and sketch configuration, so queries do not take separate `--k` or `--buckets` options. `--decompression automatic|cpu|gpu|coherent` selects how query genomes are inflated, with the same values as the builder.
+`--minimum-matches 0` compares each query against every reference. Queries are sketched with the configuration compiled into the tool, which must match the database. `--decompression automatic|cpu|gpu|coherent` selects how query genomes are inflated, with the same values as the builder.
 
 ### 3. Optionally build and use an index
 
@@ -152,7 +149,7 @@ Include `<cuddl/cuddl.cuh>` for the main API. File-based reference database I/O 
 | `cuddl::reference_index<K, BucketCount>`                         | Build optional dense or sparse search acceleration data.                       |
 | `cuddl::reference_database_file` / `cuddl::reference_index_file` | Save and load databases and indexes.                                           |
 
-Start with the runnable [sketch example](examples/main.cu), [database builder](examples/build_reference_database.cu), or [search implementation](examples/reference_index_dispatch.cu.in).
+Start with the runnable [sketch example](examples/main.cu), [database builder](examples/build_reference_database.cu), or [search implementation](examples/reference_index.cu).
 
 For GPU-only pipelines, `cuddl::build_sketch_store<K, BucketCount>` loads genome files into a device-resident store without downloading the registers. Each row contains `BucketCount` packed registers followed by a saturation word. The batch operations in `<cuddl/batch.cuh>` consume this layout directly. Use `query_sketch_batch` when you only need query scores.
 

@@ -25,3 +25,28 @@ option(
     value: 'disabled',
     description: 'Build examples for the library',
 )
+
+option(
+    'cli_kmer_length',
+    type: 'integer',
+    min: 1,
+    max: 31,
+    value: 25,
+    description: 'K-mer length compiled into the example CLIs',
+)
+
+option(
+    'cli_buckets',
+    type: 'combo',
+    choices: ['2048', '4096', '8192', '16384', '32768', '65536', '131072'],
+    value: '2048',
+    description: 'Sketch bucket count compiled into the example CLIs',
+)
+
+option(
+    'cli_exponent_bits',
+    type: 'combo',
+    choices: ['5', '6'],
+    value: '5',
+    description: 'Register exponent width compiled into the example CLIs; 6 leaves a 10-bit mantissa, 5 an 11-bit one',
+)

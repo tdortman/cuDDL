@@ -1,44 +1,23 @@
-# One unit per bucket count, range of eight k-mer lengths, and register exponent width bounds
-# per-unit compiler memory.
-index_dispatch_sources = []
-foreach buckets : [2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    foreach first_k : [1, 9, 17, 25]
-        foreach exponent : [5, 6]
-            instantiations = []
-            foreach k : range(first_k, first_k == 25 ? 32 : first_k + 8)
-                instantiations += 'template void dispatch_reference_index<@0@, @1@, @2@>(reference_index_command const&);'.format(
-                    buckets,
-                    k,
-                    exponent,
-                )
-            endforeach
-            index_dispatch_sources += configure_file(
-                input: 'reference_index_dispatch.cu.in',
-                output: 'reference_index_@0@_k@1@_e@2@.cu'.format(buckets, first_k, exponent),
-                configuration: {'INSTANTIATIONS': '\n'.join(instantiations)},
-            )
-        endforeach
-    endforeach
-endforeach
+# The CLIs support one sketch configuration each build; reconfigure with -Dcli_kmer_length,
+# -Dcli_buckets and -Dcli_exponent_bits to read databases built with other settings.
+cli_args = cuda_args + [
+    '-DCUDDL_CLI_KMER_LENGTH=@0@'.format(get_option('cli_kmer_length')),
+    '-DCUDDL_CLI_BUCKETS=@0@'.format(get_option('cli_buckets')),
+    '-DCUDDL_CLI_EXPONENT_BITS=@0@'.format(get_option('cli_exponent_bits')),
+]
 
 examples = {
-    'cuddl-reference-index': {
-        'src': ['reference_index.cu'] + index_dispatch_sources,
-    },
-    'cuddl-build-reference-db': {
-        'src': 'build_reference_database.cu',
-    },
-    'cuddl-main': {
-        'src': 'main.cu',
-    },
+    'cuddl-reference-index': {'src': 'reference_index.cu', 'args': cli_args},
+    'cuddl-build-reference-db': {'src': 'build_reference_database.cu', 'args': cli_args},
+    'cuddl-main': {'src': 'main.cu', 'args': cuda_args},
 }
 
 foreach name, config : examples
     executable(
         name,
         config['src'],
-        dependencies: [cuddl_dep, cli11_dep] + config.get('deps', []),
-        cuda_args: cuda_args,
+        dependencies: [cuddl_dep, cli11_dep],
+        cuda_args: config['args'],
         install: true,
     )
 endforeach

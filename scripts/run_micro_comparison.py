@@ -236,22 +236,10 @@ def cuddl_database(
     for i, path in enumerate(references):
         (farm / f"{i:0{width}d}-{path.name}").symlink_to(path.resolve())
     database = work / f"{name}.cuddl"
+    # The builder is compiled for k=25, 2048 buckets and 5 exponent bits.
     run_timed(
         f"cuddl database: {len(references)} references",
-        [
-            str(builder),
-            str(farm),
-            "--k",
-            "25",
-            "--buckets",
-            "2048",
-            "--exponent-bits",
-            "5",
-            "--output",
-            str(database),
-            "--workers",
-            str(workers),
-        ],
+        [str(builder), str(farm), "--output", str(database), "--workers", str(workers)],
     )
     return database
 
