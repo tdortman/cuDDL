@@ -150,10 +150,7 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
         for (auto bucket = threadIdx.x; bucket < BucketCount; bucket += blockDim.x) {
             minimum = cuda::std::min(minimum, state[bucket]);
         }
-        auto const reduced =
-            reduce(floor_storage).Reduce(minimum, [] __device__(uint32_t a, uint32_t b) {
-                return a < b ? a : b;
-            });
+        auto const reduced = reduce(floor_storage).Reduce(minimum, cuda::minimum<>{});
         if (threadIdx.x == 0U) shared_floor = reduced;
         __syncthreads();
         floor = shared_floor;

@@ -25,14 +25,45 @@ namespace cuddl {
 
 namespace detail {
 /// @brief Exact membership within the candidate's destination bucket.
+///
+/// A one-bit-per-slot presence map, indexed independently of the bucket, rejects most absent keys
+/// with a single load before the bucket's sorted keys are searched.
 struct blacklist_view {
+    static constexpr uint32_t presence_bits = 19;
+
     uint64_t const* keys = nullptr;
     uint32_t const* offsets = nullptr;
+    uint32_t const* presence = nullptr;
+    uint32_t const* minimum_hash = nullptr;
+
+    __host__ __device__ static uint32_t presence_slot(uint64_t key) noexcept {
+        return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ULL) >> (64 - presence_bits));
+    }
 
     __device__ bool contains(uint64_t key, size_t bucket) const noexcept {
-        auto const first = offsets[bucket];
-        auto const last = offsets[bucket + 1];
-        return first != last && cuda::std::binary_search(keys + first, keys + last, key);
+        if (static_cast<uint32_t>(hash_kmer(key) >> 32) < __ldg(minimum_hash + bucket)) {
+            return false;
+        }
+        auto const slot = presence_slot(key);
+        if ((__ldg(presence + slot / 32) >> (slot % 32) & 1U) == 0) return false;
+        return search(key, bucket);
+    }
+
+    // Present slots are rare; keeping the search out of line spares the caller's registers.
+    __device__ __noinline__ bool search(uint64_t key, size_t bucket) const noexcept {
+        auto first = offsets[bucket];
+        auto last = offsets[bucket + 1];
+        while (first < last) {
+            auto const middle = first + (last - first) / 2;
+            auto const value = __ldg(keys + middle);
+            if (value == key) return true;
+            if (value < key) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        return false;
     }
 };
 }  // namespace detail
@@ -173,9 +204,13 @@ class device_blacklist {
         if (source_.keys().empty()) return;
 
         std::vector<uint32_t> offsets(buckets + 1, 0);
+        std::vector<uint32_t> minimum_hash(buckets, UINT32_MAX);
 
         for (auto key : source_.keys()) {
-            ++offsets[(detail::hash_kmer(key) & (buckets - 1)) + 1];
+            auto const hash = detail::hash_kmer(key);
+            auto const bucket = hash & (buckets - 1);
+            ++offsets[bucket + 1];
+            minimum_hash[bucket] = std::min(minimum_hash[bucket], uint32_t(hash >> 32));
         }
 
         for (size_t b = 1; b <= buckets; ++b) {
@@ -187,9 +222,16 @@ class device_blacklist {
         for (auto key : source_.keys()) {
             keys[cursor[detail::hash_kmer(key) & (buckets - 1)]++] = key;
         }
+        std::vector<uint32_t> presence((size_t{1} << detail::blacklist_view::presence_bits) / 32);
+        for (auto key : keys) {
+            auto const slot = detail::blacklist_view::presence_slot(key);
+            presence[slot / 32] |= uint32_t{1} << (slot % 32);
+        }
 
         keys_.emplace(cuda::make_device_buffer<uint64_t>(stream, stream.device(), keys));
         offsets_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), offsets));
+        presence_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), presence));
+        minimum_hash_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), minimum_hash));
         stream.sync();
     }
     device_blacklist(device_blacklist const&) = delete;
@@ -202,7 +244,7 @@ class device_blacklist {
     }
     [[nodiscard]] cuda::std::optional<detail::blacklist_view> view() const noexcept {
         if (!keys_) return cuda::std::nullopt;
-        return detail::blacklist_view{keys_->data(), offsets_->data()};
+        return detail::blacklist_view{keys_->data(), offsets_->data(), presence_->data(), minimum_hash_->data()};
     }
     [[nodiscard]] Result<void> validate(uint32_t k, size_t buckets, cuda::stream_ref stream) const {
         if ((!source_.keys().empty() && source_.kmer_length() != k) || buckets != buckets_ ||
@@ -220,6 +262,8 @@ class device_blacklist {
     int device_;
     std::optional<cuda::device_buffer<uint64_t>> keys_;
     std::optional<cuda::device_buffer<uint32_t>> offsets_;
+    std::optional<cuda::device_buffer<uint32_t>> presence_;
+    std::optional<cuda::device_buffer<uint32_t>> minimum_hash_;
 };
 
 }  // namespace cuddl

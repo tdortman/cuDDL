@@ -112,39 +112,60 @@ number of NVBench samples. The plot rejects missing pairs, skipped states, misma
 configurations, and mixed GPUs. Parsing, blacklist upload, and serialization are outside
 these resident GPU timings. This measures filtering cost, not search accuracy.
 
-On an RTX 5070 Ti with the bundled 5,944-entry blacklist, 30 samples per order gave
-the following averages of the two GPU timing means:
+On an RTX 5070 Ti with the bundled 5,944-entry blacklist, k=25, 2,048 buckets,
+and the production launch policy, 200 samples per timing gave:
 
-| Input | No blacklist [ms] | BBTools blacklist [ms] | Time ratio |
-| --- | ---: | ---: | ---: |
-| E. coli K-12 | 0.0269 | 0.2874 | 10.70 |
-| WBcel235 | 0.4932 | 3.6177 | 7.34 |
-| Human chromosome 14 | 0.4769 | 5.5904 | 11.72 |
+| Input               | No blacklist [ms] | BBTools blacklist [ms] | Time ratio |
+| ------------------- | ----------------- | ---------------------- | ---------- |
+| WBcel235            |            0.3983 |                 0.4229 |       1.06 |
+| Human chromosome 14 |            0.3948 |                 0.4273 |       1.08 |
 
-Exact membership lookup costs more than unfiltered construction on these inputs, even
-with floor pruning. These ratios do not measure whole-pipeline overhead.
+Both paths encode four ASCII bases at a time with CUDA bytewise comparisons and
+integer dot products. They skip score calculations for hashes that cannot improve a
+register. These ratios do not measure whole-pipeline overhead.
 
 ### Measure lookup and pruning
 
+The encoder skips groups of eight windows when their shared span contains an ambiguous
+base.
+
+Single-sequence construction with or without a blacklist keeps each CTA's accepted
+winners in shared memory. After tiles 4, 16, 32, and subsequent multiples of 16, CTAs
+merge their winners through the output registers and take the smallest register as a
+floor. The floor becomes a conservative upper bound on the hash magnitude. Comparing
+the upper 32 bits rejects windows before score calculation or a
+shared-memory load. Ties proceed to scoring. With a blacklist, a k-mer is looked up only
+if its score also exceeds its bucket's current value. Only accepted keys reach the
+registers, so pruning cannot discard a winner.
+
+The lookup rejects most absent keys before it searches. A key whose hash is below the
+smallest blacklisted hash in its bucket cannot be listed. A 2^19-bit presence map, indexed
+by a second hash of the key, rejects most of the rest with one load. The remaining keys
+go through a binary search of their bucket's sorted keys.
+
 The efficiency benchmark checks register equality before timing sequence construction.
-Its `Floor` axis disables pruning for comparison, and `Blacklist` loads a list once,
-outside the timed region. `BlocksPerSM=0` uses the production launch policy.
+`Blacklist` loads a list once, outside the timed region. `BlocksPerSM=0` uses the
+production launch policy. The `Floor` axis only changes fixed-grid launches with
+`BlocksPerSM` above zero.
 
-`blacklist_lookup` compares bucket-partitioned and globally sorted exact lookup with
-1,651 and 23,020 keys and 0% or 50% hits. On an RTX 5070 Ti, 30-sample GPU means were
-22.5 versus 28.7–28.9 microseconds for 1,651 keys, and 45.0–45.5 versus 71.5–72.0
-microseconds for 23,020 keys, across 1,048,576 probes.
+`blacklist_lookup` compares the bucketed lookup with a binary search of the whole sorted
+list. It uses 1,651 and 23,020 keys, 0% or 50% hits, and 1,048,576 probes. On an RTX
+5070 Ti, 30-sample GPU means were:
 
-With the bundled BBTools k=25 list and production grid, floor pruning reduced the
-WBcel235 sequence kernel from 6.22 to 3.62 ms. E. coli stayed near 0.287 ms. Unfiltered
-construction was slower with pruning, so that specialization omits it. These measurements
-exclude parsing, upload, and database serialization.
+|   Keys | Hits | Bucketed [µs] | Whole-list search [µs] |
+| ------ | ---- | ------------- | ---------------------- |
+|  1,651 |   0% |          22.6 |                   28.7 |
+|  1,651 |  50% |          26.6 |                   28.7 |
+| 23,020 |   0% |          31.5 |                   73.1 |
+| 23,020 |  50% |          48.0 |                   72.8 |
+
+These measurements exclude parsing, upload, and database serialization.
 
 ```sh
 ./build/benchmarks/cuddl-efficiency-benchmark -b blacklist_lookup --no-batch \
   --stopping-criterion sample-count --min-samples 30 --target-samples 30
 ./build/benchmarks/cuddl-efficiency-benchmark -b sequence_construction \
-  -a Path=data/genomes/WBcel235.fna -a 'Floor=[0,1]' \
+  -a Path=data/genomes/WBcel235.fna -a Floor=1 \
   -a Blacklist=subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz \
   --no-batch --stopping-criterion sample-count --min-samples 30 --target-samples 30
 ```
