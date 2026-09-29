@@ -67,8 +67,12 @@ class sketch {
     /// @brief Allocates and clears the sketch. Throws on allocation failure.
     /// The allocation stream must outlive the sketch. Complete work on other streams before
     /// destroying or move-assigning the sketch, as required by cuda::buffer.
-    explicit sketch(cuda::stream_ref stream)
-        : storage_(
+    explicit sketch(
+        cuda::stream_ref stream,
+        std::optional<std::shared_ptr<device_blacklist const>> blacklist = std::nullopt
+    )
+        : blacklist_(std::move(blacklist)),
+          storage_(
               cuda::make_device_buffer<register_type>(
                   stream,
                   stream.device(),
@@ -77,6 +81,10 @@ class sketch {
               )
           ),
           mapped_scratch_(stream, cuda::pinned_default_memory_pool(), 1, cuda::no_init) {
+        if (blacklist_) {
+            if (!*blacklist_) throw std::invalid_argument("blacklist owner must not be null");
+            CUDDL_UNWRAP((*blacklist_)->validate(K, BucketCount, stream));
+        }
         stream.sync();
     }
 
@@ -146,11 +154,17 @@ class sketch {
     /// Loads a sketch from registers produced elsewhere, for example a saved reference database or
     /// a streamed tile build. Nothing is cleared or merged; the sketch's contents become exactly
     /// @p registers. The stored words carry no element count, so the sketch forgets its own and
-    /// stops capping estimates.
+    /// stops capping estimates. Supply the source construction blacklist, or {} for unfiltered
+    /// words. It must match this sketch's fixed policy.
     [[nodiscard]] Result<void> assign_async(
         device_span<register_type const> registers,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        kmer_blacklist const& source_blacklist
     ) const noexcept {
+        if (source_blacklist.identity() != blacklist_identity() ||
+            (!source_blacklist.keys().empty() && source_blacklist.kmer_length() != K)) {
+            return Err(Error::invalid_argument("assigned registers use a different blacklist"));
+        }
         if (registers.size() != BucketCount) {
             return Err(Error::invalid_argument("sketch assign needs one register per bucket"));
         }
@@ -174,8 +188,8 @@ class sketch {
     /// Call repeatedly to accumulate successive chunks. Empty input is a
     /// no-op. Keep input alive and unchanged until the stream completes. Use clear() to reset.
     /// When chunking raw sequence before packing, preserve the K-1 boundary bases and emit
-    /// each k-mer window exactly once; this API receives already-packed k-mers. Every accepted
-    /// k-mer raises @ref added, unless the registers arrived outside these paths.
+    /// each k-mer window exactly once; this API receives already-packed canonical k-mers. Every
+    /// offered k-mer raises @ref added, including blacklisted ones, so it remains an upper bound.
     [[nodiscard]] Result<void>
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
         if (auto const result = view().add_async(input, stream); !result) {
@@ -238,6 +252,9 @@ class sketch {
         pairwise_summary& output,
         cuda::stream_ref stream
     ) const noexcept {
+        if (blacklist_identity() != other.blacklist_identity()) {
+            return Err(Error::invalid_argument("sketch blacklist mismatch"));
+        }
         return view().template summary_async<IncludeCardinality>(other.view(), output, stream);
     }
 
@@ -255,8 +272,7 @@ class sketch {
     [[nodiscard]] Result<pairwise_summary>
     summary(sketch const& other, cuda::stream_ref stream) const {
         auto* const output = &mapped_scratch_.data()->summary;
-        if (auto const result =
-                view().template summary_async<IncludeCardinality>(other.view(), *output, stream);
+        if (auto const result = summary_async<IncludeCardinality>(other, *output, stream);
             !result) {
             return Err(result.error());
         }
@@ -372,7 +388,9 @@ class sketch {
     using view_type = detail::sketch_view<K, BucketCount, Layout>;
 
     [[nodiscard]] view_type view() const noexcept {
-        return view_type({storage_.data(), BucketCount});
+        return view_type(
+            {storage_.data(), BucketCount}, blacklist_ ? (*blacklist_)->view() : cuda::std::nullopt
+        );
     }
 
     /// @brief Caps @p estimate at @ref added, which only describes registers the add paths built.
@@ -380,6 +398,11 @@ class sketch {
         return added_.has_value() ? std::min(estimate, static_cast<double>(*added_)) : estimate;
     }
 
+    [[nodiscard]] uint64_t blacklist_identity() const noexcept {
+        return blacklist_ ? (*blacklist_)->source().identity() : 0;
+    }
+
+    std::optional<std::shared_ptr<device_blacklist const>> blacklist_;
     mutable cuda::device_buffer<register_type> storage_;
     mutable cuda::
         buffer<detail::sketch_scratch, cuda::mr::host_accessible, cuda::mr::device_accessible>

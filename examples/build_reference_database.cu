@@ -14,6 +14,7 @@
 int main(int argc, char** argv) {
     std::string folder;
     std::string output = "references.cuddl";
+    std::string blacklist_path;
     unsigned workers = cuddl::default_parser_workers();
     auto decompression = cuddl::decompression_backend::automatic;
     CLI::App app{
@@ -27,6 +28,12 @@ int main(int argc, char** argv) {
         " exponent bits, set by the cli_* Meson options at build time."
     };
     app.add_option("folder", folder, "Genome folder")->required()->check(CLI::ExistingDirectory);
+    app.add_option(
+           "--blacklist",
+           blacklist_path,
+           "BBTools DDL FASTA (plain/gzip, fused supported), or exact DNA k-mer lines"
+    )
+        ->check(CLI::ExistingFile);
     app.add_option("-o,--output", output, "Binary database destination (replaces existing file)")
         ->default_val(output);
     app.add_option(
@@ -56,6 +63,9 @@ int main(int argc, char** argv) {
                  folder, std::filesystem::directory_options::skip_permission_denied
              )) {
             if (!entry.is_regular_file()) continue;
+            if (!blacklist_path.empty() &&
+                std::filesystem::equivalent(entry.path(), blacklist_path))
+                continue;
             auto filename = entry.path().filename().string();
             std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char c) {
                 return static_cast<char>(std::tolower(c));
@@ -79,9 +89,25 @@ int main(int argc, char** argv) {
         }
         std::sort(paths.begin(), paths.end());
         cuda::stream stream{cuda::devices[0]};
+        std::optional<cuddl::device_blacklist> blacklist;
+        if (!blacklist_path.empty()) {
+            if (std::filesystem::exists(output) &&
+                std::filesystem::equivalent(blacklist_path, output)) {
+                throw std::invalid_argument("output must not overwrite the blacklist");
+            }
+            blacklist.emplace(
+                CUDDL_UNWRAP(cuddl::kmer_blacklist::load(blacklist_path, cli::kmer_length)),
+                cli::buckets,
+                stream
+            );
+        }
         auto file = CUDDL_UNWRAP(
             (cuddl::reference_database_file::build<cli::kmer_length, cli::buckets, cli::layout>(
-                paths, stream, {.parser_workers = workers, .decompression = decompression}
+                paths,
+                stream,
+                {.parser_workers = workers,
+                 .decompression = decompression,
+                 .blacklist = blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt}
             ))
         );
         CUDDL_UNWRAP(file.save(output));

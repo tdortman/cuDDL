@@ -240,7 +240,7 @@ TEST(SketchTest, AssignLoadsStoredRows) {
     auto device_words = cuda::make_device_buffer<uint32_t>(stream, stream.device(), words);
 
     sketch_type assigned(stream);
-    ASSERT_TRUE(assigned.assign_async({device_words.data(), words.size()}, stream));
+    ASSERT_TRUE(assigned.assign_async({device_words.data(), words.size()}, stream, {}));
     std::vector<uint32_t> loaded(b_default);
     cuda::copy_bytes(stream, std::as_const(assigned).data(), loaded);
     stream.sync();
@@ -262,7 +262,7 @@ TEST(SketchTest, AssignLoadsStoredRows) {
     // A sketch that took the same registers by assign and is then given one k-mer keeps no count:
     // capping at that single addition would crush an estimate built from the assigned registers.
     sketch_type appended(stream);
-    ASSERT_TRUE(appended.assign_async({device_words.data(), words.size()}, stream));
+    ASSERT_TRUE(appended.assign_async({device_words.data(), words.size()}, stream, {}));
     ASSERT_TRUE(appended.add(cuddl::device_span<uint64_t const>{input.data(), 1U}, stream));
     EXPECT_EQ(appended.added(), std::nullopt);
     auto const appended_cardinality = appended.cardinality(stream);
@@ -270,7 +270,7 @@ TEST(SketchTest, AssignLoadsStoredRows) {
     EXPECT_GT(*appended_cardinality, 1000.0);
 
     // A span of the wrong length is rejected without touching the sketch.
-    EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default - 1U}, stream));
+    EXPECT_FALSE(assigned.assign_async({device_words.data(), b_default - 1U}, stream, {}));
     stream.sync();
 }
 
@@ -3578,7 +3578,6 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     std::string bytes{std::istreambuf_iterator<char>(input), {}};
     ASSERT_GT(bytes.size(), 70U);
     EXPECT_EQ(bytes.substr(0, 8), std::string("CUDDLDB\0", 8));
-    EXPECT_EQ(static_cast<unsigned char>(bytes[8]), 2U);   // little-endian format version
     EXPECT_EQ(static_cast<unsigned char>(bytes[12]), 3U);  // k-mer length
     auto reject = [&](std::string const& corrupted) {
         {
@@ -3601,7 +3600,10 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     oversized.replace(62, 4, 4, '\xff');  // reference count, checked before allocation
     reject(oversized);
     oversized = bytes;
-    oversized.replace(66, 4, 4, '\xff');  // first label length, checked before allocation
+    oversized.replace(66, 4, 4, '\xff');  // blacklist extent, checked before allocation
+    reject(oversized);
+    oversized = bytes;
+    oversized.replace(70, 4, 4, '\xff');  // first label length, checked before allocation
     reject(oversized);
     {
         std::ofstream out(paths.front());
@@ -3802,7 +3804,7 @@ TEST(QuerySketchBatchTest, ScoresMatchTheScalarOracleAndDriveASearch) {
     ASSERT_TRUE(database
                     .search_async(
                         batch.scores(),
-                        cuddl::query_sketch_batch<25, buckets>::compatibility(),
+                        batch.compatibility(),
                         {workspace.data(), workspace.size()},
                         {output.data(), output.size()},
                         stream
@@ -3834,7 +3836,7 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
     auto device_store = CUDDL_UNWRAP((cuddl::build_sketch_store<25, buckets>(paths, stream)));
     std::vector<std::string> const labels{"alpha", "beta"};
     auto adopted = CUDDL_UNWRAP((cuddl::reference_database_file::from_store<25, buckets>(
-        {device_store.data(), device_store.size()}, labels, stream
+        {device_store.data(), device_store.size()}, labels, stream, {}
     )));
     EXPECT_EQ(adopted.metadata(), built.metadata());
     EXPECT_TRUE(same_elements(adopted.rows(), built.rows()));
@@ -3851,12 +3853,13 @@ TEST(ReferenceDatabaseFileTest, AdoptedDeviceRowsRoundTripThroughAFile) {
     // Counts that do not match the rows, and labels that match neither, are refused.
     cuddl::device_span<uint32_t const> const partial{device_store.data(), device_store.size() - 1};
     EXPECT_FALSE(
-        (cuddl::reference_database_file::from_store<25, buckets>(partial, labels, stream))
+        (cuddl::reference_database_file::from_store<25, buckets>(partial, labels, stream, {}))
     );
     EXPECT_FALSE((cuddl::reference_database_file::from_store<25, buckets>(
         {device_store.data(), device_store.size()},
         std::span<std::string const>{labels}.first(1),
-        stream
+        stream,
+        {}
     )));
     std::filesystem::remove(file);
     for (auto const& path : paths) std::filesystem::remove(path);

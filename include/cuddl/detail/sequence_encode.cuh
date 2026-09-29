@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <limits>
 
+#include <cub/block/block_reduce.cuh>
+#include <cuddl/blacklist.cuh>
 #include <cuddl/detail/dna.hpp>
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/register.cuh>
@@ -22,7 +24,11 @@ namespace cuddl::detail {
 ///
 /// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads reuse
 /// neighboring words to construct eight overlapping windows on both strands.
-template <size_t BucketCount, typename Layout>
+template <
+    size_t BucketCount,
+    typename Layout,
+    bool HasBlacklist = false,
+    bool UseFloor = HasBlacklist>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
     uint32_t windows,
@@ -30,7 +36,8 @@ __device__ __forceinline__ void add_sequence_windows(
     size_t tile_stride,
     uint32_t k,
     uint32_t* registers,
-    bool packed_input = false
+    bool packed_input = false,
+    blacklist_view blacklist = {}
 ) {
     constexpr uint32_t tile_size = 256 * 8;
     __shared__ uint32_t cells[tile_size / 8 + 4];
@@ -38,6 +45,8 @@ __device__ __forceinline__ void add_sequence_windows(
     for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
         local[i] = 0;
     }
+    uint32_t floor = 0;
+    size_t tiles = 0;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
     auto const valid_mask = (uint32_t{1} << k) - 1;
     for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
@@ -116,8 +125,15 @@ __device__ __forceinline__ void add_sequence_windows(
                 if ((bad & valid_mask) == 0) {
                     auto const forward = high >> (64 - 2 * k);
                     auto const reverse = reverse_high & mask;
-                    auto const hash = hash_kmer(forward > reverse ? forward : reverse);
-                    atomicMax(&local[bucket_of<BucketCount>(hash)], score<Layout>(hash));
+                    auto const word = forward > reverse ? forward : reverse;
+                    auto const hash = hash_kmer(word);
+                    auto const incoming = score<Layout>(hash);
+                    auto const bucket = bucket_of<BucketCount>(hash);
+                    if (!UseFloor || incoming > floor) {
+                        bool blocked = false;
+                        if constexpr (HasBlacklist) blocked = blacklist.contains(word, bucket);
+                        if (!blocked) atomicMax(&local[bucket], incoming);
+                    }
                 }
                 // Eight overlapping windows fit in one 32-base word when k <= 25.
                 if (k <= 25) {
@@ -133,6 +149,25 @@ __device__ __forceinline__ void add_sequence_windows(
             }
         }
         __syncthreads();
+        if constexpr (UseFloor) {
+            // Warm up with 16 windows per bucket; a single tile leaves the minimum at zero.
+            if (++tiles == (16 * BucketCount + tile_size - 1) / tile_size &&
+                tile + tile_stride < windows) {
+                using reduce = cub::BlockReduce<uint32_t, 256>;
+                __shared__ typename reduce::TempStorage scratch;
+                __shared__ uint32_t minimum;
+                uint32_t value = 0xffffU;
+                for (uint32_t b = threadIdx.x; b < BucketCount; b += blockDim.x) {
+                    value = cuda::std::min(value, local[b]);
+                }
+                auto const result = reduce(scratch).Reduce(
+                    value, [] __device__(uint32_t a, uint32_t b) { return a < b ? a : b; }
+                );
+                if (threadIdx.x == 0) minimum = result;
+                __syncthreads();
+                floor = minimum;
+            }
+        }
     }
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
@@ -141,20 +176,32 @@ __device__ __forceinline__ void add_sequence_windows(
 }
 
 /// @brief Tile kernel for one staged file-builder chunk, carrying K-1 bases across tiles.
-template <size_t BucketCount, typename Layout>
+template <
+    size_t BucketCount,
+    typename Layout,
+    bool HasBlacklist = false,
+    bool UseFloor = HasBlacklist>
 __global__ void add_sequence_tile_kernel(
     char const* sequence,
     uint32_t const* window_count,
     char* carry,
     uint32_t k,
-    uint32_t* registers
+    uint32_t* registers,
+    blacklist_view blacklist = {}
 ) {
     auto const windows = *window_count;
     if (blockIdx.x == 0 && threadIdx.x < k - 1) {
         carry[threadIdx.x] = sequence[windows + threadIdx.x];
     }
-    add_sequence_windows<BucketCount, Layout>(
-        sequence, windows, size_t{blockIdx.x} * 2048, size_t{gridDim.x} * 2048, k, registers
+    add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
+        sequence,
+        windows,
+        size_t{blockIdx.x} * 2048,
+        size_t{gridDim.x} * 2048,
+        k,
+        registers,
+        false,
+        blacklist
     );
 }
 
@@ -171,13 +218,18 @@ struct sequence_batch_chunk {
 };
 
 /// @brief Batch kernel covering every staged chunk in one launch, including short records.
-template <size_t BucketCount, typename Layout>
+template <
+    size_t BucketCount,
+    typename Layout,
+    bool HasBlacklist = false,
+    bool UseFloor = HasBlacklist>
 __global__ void add_sequence_batch_kernel(
     sequence_batch_chunk const* chunks,
     size_t chunk_count,
     size_t block_count,
     uint32_t k,
-    uint32_t* registers
+    uint32_t* registers,
+    blacklist_view blacklist = {}
 ) {
     __shared__ sequence_batch_chunk chunk;
     __shared__ size_t first_block;
@@ -197,14 +249,15 @@ __global__ void add_sequence_batch_kernel(
         }
         __syncthreads();
         auto* target = registers + size_t{chunk.genome} * BucketCount;
-        add_sequence_windows<BucketCount, Layout>(
+        add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
             chunk.bases,
             chunk.windows,
             (block - first_block) * 2048,
             (chunk.block_end - first_block) * 2048,
             k,
             target,
-            chunk.packed != 0
+            chunk.packed != 0,
+            blacklist
         );
         __syncthreads();
     }
@@ -214,15 +267,27 @@ __global__ void add_sequence_batch_kernel(
 ///
 /// Unlike the file-builder tile path, there is no cross-chunk carry: the caller supplies any
 /// K-1 overlap explicitly.
-template <size_t BucketCount, typename Layout>
+template <
+    size_t BucketCount,
+    typename Layout,
+    bool HasBlacklist = false,
+    bool UseFloor = HasBlacklist>
 __global__ void add_sequence_single_kernel(
     char const* sequence,
     uint32_t windows,
     uint32_t k,
-    uint32_t* registers
+    uint32_t* registers,
+    blacklist_view blacklist = {}
 ) {
-    add_sequence_windows<BucketCount, Layout>(
-        sequence, windows, size_t{blockIdx.x} * 2048, size_t{gridDim.x} * 2048, k, registers
+    add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
+        sequence,
+        windows,
+        size_t{blockIdx.x} * 2048,
+        size_t{gridDim.x} * 2048,
+        k,
+        registers,
+        false,
+        blacklist
     );
 }
 
@@ -231,12 +296,13 @@ __global__ void add_sequence_single_kernel(
 /// Windows derive as size >= k ? size - k + 1 : 0; short input is a no-op. Window counts above
 /// UINT32_MAX are rejected instead of narrowing, so size must not exceed UINT32_MAX + k - 1.
 /// No hidden carry: the caller supplies any K-1 overlap explicitly.
-template <size_t BucketCount, typename Layout = default_register_layout>
+template <size_t BucketCount, typename Layout = default_register_layout, bool UseFloor = true>
 __host__ inline Result<void> launch_sequence_add(
     device_span<char const> sequence,
     uint32_t k,
     device_span<uint32_t> registers,
-    cuda::stream_ref stream
+    cuda::stream_ref stream,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     if (k < 1 || k > 31) {
         return Err(Error::invalid_argument("invalid k-mer length for sequence add"));
@@ -250,23 +316,38 @@ __host__ inline Result<void> launch_sequence_add(
         return Err(Error::invalid_argument("sequence chunk exceeds 32-bit window capacity"));
     }
     auto const windows = static_cast<uint32_t>(windows_size);
-    return cuda_try([&] {
-        auto const multiprocessors =
-            stream.device().attribute(cuda::device_attributes::multiprocessor_count);
-        // Fill one resident wave, accounting for the GPU and this sketch's shared memory.
-        int blocks_per_sm = 0;
-        auto const occupancy = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_per_sm, add_sequence_single_kernel<BucketCount, Layout>, 256, 0
-        );
-        if (occupancy != cudaSuccess) return occupancy;
-        size_t const need = (static_cast<size_t>(windows) + 2047) / 2048;
-        size_t const capacity = static_cast<size_t>(multiprocessors) * blocks_per_sm;
-        size_t const blocks_size = capacity == 0 ? size_t{1} : (capacity < need ? capacity : need);
-        auto const blocks = static_cast<uint32_t>(blocks_size);
-        add_sequence_single_kernel<BucketCount, Layout>
-            <<<blocks, 256, 0, stream.get()>>>(sequence.data(), windows, k, registers.data());
-        return cudaGetLastError();
-    });
+    auto launch = [&]<bool Filter>() -> Result<void> {
+        return cuda_try([&] {
+            auto const multiprocessors =
+                stream.device().attribute(cuda::device_attributes::multiprocessor_count);
+            // Fill one resident wave, accounting for the GPU and this sketch's shared memory.
+            int blocks_per_sm = 0;
+            auto const occupancy = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm,
+                add_sequence_single_kernel < BucketCount,
+                Layout,
+                Filter,
+                UseFloor && Filter >
+                , 256, 0
+            );
+            if (occupancy != cudaSuccess) return occupancy;
+            size_t const need = (static_cast<size_t>(windows) + 2047) / 2048;
+            size_t const capacity = static_cast<size_t>(multiprocessors) * blocks_per_sm;
+            size_t const blocks_size =
+                capacity == 0 ? size_t{1} : (capacity < need ? capacity : need);
+            auto const blocks = static_cast<uint32_t>(blocks_size);
+            add_sequence_single_kernel<BucketCount, Layout, Filter, UseFloor && Filter>
+                <<<blocks, 256, 0, stream.get()>>>(
+                    sequence.data(),
+                    windows,
+                    k,
+                    registers.data(),
+                    blacklist.value_or(blacklist_view{})
+                );
+            return cudaGetLastError();
+        });
+    };
+    return blacklist ? launch.template operator()<true>() : launch.template operator()<false>();
 }
 
 }  // namespace cuddl::detail

@@ -21,6 +21,15 @@ index_file_test_exe = executable(
 )
 test('reference-index-file-tests', index_file_test_exe)
 
+blacklist_test_exe = executable(
+    'test-blacklist',
+    files('blacklist_test.cu'),
+    dependencies: [cuddl_dep, gtest_dep, gtest_main_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
+test('blacklist-tests', blacklist_test_exe)
+
 result_json_test_exe = executable(
     'test-result-json',
     files('result_json_test.cu'),

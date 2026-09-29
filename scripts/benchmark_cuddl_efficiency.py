@@ -21,6 +21,7 @@ class Suite(str, Enum):
     genome_sizes = "genome-sizes"
     size_controls = "size-controls"
     floor_sweep = "floor-sweep"
+    blacklist = "blacklist"
 
 
 def parse_sizes(value: str) -> list[int]:
@@ -85,15 +86,48 @@ def main(
             help="Comma-separated positive sizes for random input; enables --random and overrides --items."
         ),
     ] = None,
+    blacklist: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="BBTools DDL blacklist for the blacklist suite",
+        ),
+    ] = None,
     device: Annotated[int, typer.Option(min=0, help="NVBench CUDA device index")] = 0,
     binary: Annotated[Path, typer.Option()] = Path(
         "build/benchmarks/cuddl-efficiency-benchmark"
     ),
 ) -> None:
-    if (
-        genome or items or label or random or fastx_items or random_items
-    ) and suite != Suite.floor_sweep:
-        raise typer.BadParameter("Input and size options require floor-sweep")
+    if (genome or label) and suite not in (Suite.floor_sweep, Suite.blacklist):
+        raise typer.BadParameter(
+            "Input and label options require floor-sweep or blacklist"
+        )
+    if (items or random or fastx_items or random_items) and suite != Suite.floor_sweep:
+        raise typer.BadParameter("Size and random-input options require floor-sweep")
+    if blacklist is not None and suite != Suite.blacklist:
+        raise typer.BadParameter("--blacklist requires the blacklist suite")
+    if suite == Suite.blacklist:
+        genome = genome or [
+            Path("data/genomes") / name
+            for name in ("ecoli_k12_mg1655.fna", "WBcel235.fna", "chr14.fna")
+        ]
+        blacklist = blacklist or Path(
+            "subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz"
+        )
+        if not blacklist.is_file() or any(not p.is_file() for p in genome):
+            raise typer.BadParameter(
+                "Missing input: supply --fastx and --blacklist or fetch the bundled data"
+            )
+        if any(c in str(blacklist) for c in ",[]:\n\r"):
+            raise typer.BadParameter(
+                "Blacklist path cannot contain commas, brackets, colons, or newlines"
+            )
+        if any(output.glob("blacklist-*")):
+            raise typer.BadParameter(
+                "Output already contains a blacklist comparison; choose a fresh --output"
+            )
     if label is not None and (
         len(label) != len(genome or []) or any(not x.strip() for x in label)
     ):
@@ -163,6 +197,8 @@ def main(
             "--timeout",
             str(timeout),
         ]
+        if suite == Suite.blacklist:
+            command += ["--no-batch"]
         for key, value in axes.items():
             command += ["--axis", f"{key}={value}"]
         report = output / f"{name}.json"
@@ -180,6 +216,50 @@ def main(
         print(
             f"  {len(states)} states passed correctness checks and completed",
             flush=True,
+        )
+
+    if suite == Suite.blacklist:
+        variants = [("unfiltered", None), ("bbtools", str(blacklist.resolve()))]
+        reports = []
+        for order in ("forward", "reverse"):
+            for i, (path, name) in enumerate(
+                zip(paths, label or [p.name for p in paths])
+            ):
+                for variant, source in variants:
+                    report_name = f"blacklist-{order}-{i}-{variant}"
+                    run(
+                        report_name,
+                        "sequence_construction",
+                        {
+                            "Path": str(path),
+                            "K": "25",
+                            "Offset": "0",
+                            "Floor": "1",
+                            "BlocksPerSM": "0",
+                            **({"Blacklist": source} if source is not None else {}),
+                        },
+                    )
+                    reports.append(
+                        {
+                            "label": name,
+                            "path": str(path),
+                            "variant": variant,
+                            "order": order,
+                            "report": report_name + ".csv",
+                        }
+                    )
+            variants.reverse()
+        (output / "blacklist-comparison.json").write_text(
+            json.dumps(
+                {
+                    "blacklist": str(blacklist.resolve()),
+                    "samples": samples,
+                    "scope": "resident GPU sequence construction; excludes parsing and upload",
+                    "reports": reports,
+                },
+                indent=2,
+            )
+            + "\n"
         )
 
     if suite == Suite.floor_sweep:

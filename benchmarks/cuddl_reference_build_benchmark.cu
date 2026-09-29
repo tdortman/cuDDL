@@ -14,6 +14,7 @@
 int main(int argc, char** argv) try {
     std::vector<std::string> references;
     std::string output;
+    std::string blacklist_path;
     unsigned threads = std::thread::hardware_concurrency();
     // One loader by default: run_micro_comparison.py measures ingest this way.
     unsigned workers = 1;
@@ -32,6 +33,8 @@ int main(int argc, char** argv) try {
         "--threads", threads, "CPU oracle parser threads (--parse-only); defaults to all cores"
     );
     app.add_option("--workers", workers, "Concurrent genome loaders (default: 1)");
+    app.add_option("--blacklist", blacklist_path, "DDL FASTA or exact k-mer lines")
+        ->check(CLI::ExistingFile);
     app.add_option(
         "--staging-bytes",
         staging_bytes,
@@ -83,6 +86,12 @@ int main(int argc, char** argv) try {
         }
     }
     cuda::stream stream{cuda::devices[0]};
+    std::optional<cuddl::device_blacklist> blacklist;
+    if (!blacklist_path.empty()) {
+        blacklist.emplace(
+            CUDDL_UNWRAP(cuddl::kmer_blacklist::load(blacklist_path, 25)), 2048, stream
+        );
+    }
     cuddl::reference_build_statistics statistics;
     std::vector<double> resident_ms;
     int invocation = -1;
@@ -107,7 +116,9 @@ int main(int argc, char** argv) try {
                          .parser_workers = workers,
                          .staging_bytes = staging_bytes,
                          .transfer = requested_transfer,
-                         .decompression = decompression}
+                         .decompression = decompression,
+                         .blacklist =
+                             blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt}
                     ))
                 );
                 CUDDL_UNWRAP(file.save(output));
@@ -163,6 +174,8 @@ int main(int argc, char** argv) try {
         {"source", "nvbench_cpu_wall"},
         {"references", paths.size()},
         {"input_paths", references},
+        {"blacklist_path", blacklist_path},
+        {"blacklist_entries", blacklist ? blacklist->source().keys().size() : 0},
         {"copies", copies},
         {"input_bytes", bytes},
         {"parser_threads", threads},

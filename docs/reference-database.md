@@ -38,6 +38,117 @@ The position of a path in the list is its zero-based reference ID. `names()` kee
 
 The optional third argument to `build` is a `path_build_options`. `parser_workers` sets how many genomes load at once. It defaults to the machine's thread count, capped by the number of inputs. Zero is an error. To load one genome at a time and keep host memory low, set `parser_workers = 1`, or pass `--workers 1` to the CLI. The saved bytes are the same for every worker count and every decompression backend.
 
+## Blacklist construction
+
+BBTools DDL blacklists are FASTA sequence files, often gzip-compressed. Headers such as
+`>kmer_HEX raw=N g=N ...` describe how a list was generated; construction ignores those
+annotations. Each record contributes all valid k-mer windows. This also accepts BBTools'
+`*_fused.fa.gz` lists, whose longer records compact multiple k-mers. Windows never cross
+record boundaries or ambiguous bases. cuDDL uses the same A=0, C=1, T=2, G=3 encoding and
+canonical maximum of the two strands. The older BBTools MinHash `.sketch` blacklists are
+not DDL FASTA and are not accepted.
+
+The loader also accepts one exact DNA k-mer per text line, case-insensitively, with blank
+lines and CRLF allowed. Wrong lengths and non-ACGT bases in this form are errors. FASTA
+lengths need not equal k, so choose a list generated for the intended k; a FASTA header
+is not a reliable declaration of k. Reordering, duplicate entries, and reverse-complement
+spelling do not change blacklist identity.
+
+Upload once and reuse the lookup across builds or query batches:
+
+```cpp
+auto source = CUDDL_UNWRAP(cuddl::kmer_blacklist::load("blacklist.fa.gz", 25));
+cuddl::device_blacklist filter(std::move(source), 2048, stream);
+auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(
+    genomes, stream, {.blacklist = std::cref(filter)}
+)));
+CUDDL_UNWRAP(file.save("references.cuddl"));
+```
+
+The device owner keeps the normalized host list and a bucket-partitioned sorted device
+lookup. Upload synchronizes its stream. Keep the owner and allocation stream alive until
+all consuming kernels finish. `build`, `build_from_sequences`, `build_sketch_store`, and
+the corresponding query builders accept an optional reference through their options.
+Use `std::nullopt` for no blacklist. Owning `sketch` instances take an optional
+`std::shared_ptr<device_blacklist const>` at construction and
+retain that policy across additions and clears.
+
+A loaded database exposes its embedded list through `file.blacklist()`. Construct a device
+lookup from that list before sketching raw queries. The search CLI does this automatically,
+without reopening the input blacklist. Search-only database uploads and all-to-all searches
+do not allocate blacklist lookups. Query compatibility is instance metadata: pass
+`queries.compatibility()` with `queries.scores()`. Incompatible query blacklists are rejected.
+When adopting raw registers through `from_store`, explicitly supply the construction
+blacklist after the stream argument, or `{}` for unfiltered registers. Raw register spans
+cannot establish their own provenance. `sketch::assign_async` likewise requires the source
+blacklist after its stream argument and rejects a different policy.
+
+Filtering precedes register updates, so excluding a winner lets the next eligible k-mer
+win. Both packed and raw-sequence construction skip membership checks when a score cannot
+beat the CTA-local floor. Filtered raw-sequence construction computes that floor after 16
+windows per bucket per CTA, and only when another tile remains. Short sequences avoid the
+reduction. Unfiltered raw-sequence construction omits both the lookup and the floor.
+
+### Compare cuDDL with and without the BBTools blacklist
+
+The `blacklist` suite runs the same GPU sequence-construction benchmark with filtering
+enabled and disabled. It uses the production launch policy and checks each result against
+packed-k-mer construction with the same policy before timing. The default inputs are
+E. coli K-12, WBcel235, and human chromosome 14. Repeat `--fastx` and `--label` to choose
+other inputs. Both variants run in forward and reverse order.
+
+```sh
+uv run scripts/benchmark_cuddl_efficiency.py blacklist --samples 300 \
+  --blacklist subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz \
+  --output results/blacklist-comparison
+uv run scripts/plot_blacklist_comparison.py results/blacklist-comparison
+```
+
+The runner preserves NVBench JSON, CSV, and logs plus a comparison manifest. The plotting
+script writes PNG and PDF figures showing GPU construction time and the paired
+blacklist/no-blacklist time ratio. Bars average the two run-order means; circle and square
+markers show the forward and reverse means separately. Each mean contains the requested
+number of NVBench samples. The plot rejects missing pairs, skipped states, mismatched
+configurations, and mixed GPUs. Parsing, blacklist upload, and serialization are outside
+these resident GPU timings. This measures filtering cost, not search accuracy.
+
+On an RTX 5070 Ti with the bundled 5,944-entry blacklist, 30 samples per order gave
+the following averages of the two GPU timing means:
+
+| Input | No blacklist [ms] | BBTools blacklist [ms] | Time ratio |
+| --- | ---: | ---: | ---: |
+| E. coli K-12 | 0.0269 | 0.2874 | 10.70 |
+| WBcel235 | 0.4932 | 3.6177 | 7.34 |
+| Human chromosome 14 | 0.4769 | 5.5904 | 11.72 |
+
+Exact membership lookup costs more than unfiltered construction on these inputs, even
+with floor pruning. These ratios do not measure whole-pipeline overhead.
+
+### Measure lookup and pruning
+
+The efficiency benchmark checks register equality before timing sequence construction.
+Its `Floor` axis disables pruning for comparison, and `Blacklist` loads a list once,
+outside the timed region. `BlocksPerSM=0` uses the production launch policy.
+
+`blacklist_lookup` compares bucket-partitioned and globally sorted exact lookup with
+1,651 and 23,020 keys and 0% or 50% hits. On an RTX 5070 Ti, 30-sample GPU means were
+22.5 versus 28.7–28.9 microseconds for 1,651 keys, and 45.0–45.5 versus 71.5–72.0
+microseconds for 23,020 keys, across 1,048,576 probes.
+
+With the bundled BBTools k=25 list and production grid, floor pruning reduced the
+WBcel235 sequence kernel from 6.22 to 3.62 ms. E. coli stayed near 0.287 ms. Unfiltered
+construction was slower with pruning, so that specialization omits it. These measurements
+exclude parsing, upload, and database serialization.
+
+```sh
+./build/benchmarks/cuddl-efficiency-benchmark -b blacklist_lookup --no-batch \
+  --stopping-criterion sample-count --min-samples 30 --target-samples 30
+./build/benchmarks/cuddl-efficiency-benchmark -b sequence_construction \
+  -a Path=data/genomes/WBcel235.fna -a 'Floor=[0,1]' \
+  -a Blacklist=subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz \
+  --no-batch --stopping-criterion sample-count --min-samples 30 --target-samples 30
+```
+
 ## Choose a decompression backend
 
 `path_build_options::decompression` picks one of four backends:
@@ -205,30 +316,33 @@ Each result takes 8 bytes as a `cuddl::packed_pairwise_counts`. Its position imp
 
 On the device, every pair has a fixed slot. A tile holds one row of `reference_count` slots per query, or the upper triangle for all-to-all. A threshold search writes only the passing slots and marks them in a pass bitmap. `download` gathers the passing results on the device first, so only they cross the bus.
 
-## Version-2 database file layout
+## Version-3 database file layout
 
 All integers are unsigned and little-endian. Fields follow each other with no padding:
 
 | Field                                                                    | Encoding                                                  |
 | ------------------------------------------------------------------------ | --------------------------------------------------------- |
 | Magic                                                                    | 8 bytes: `CUDDLDB` followed by a zero byte                |
-| Version                                                                  | `uint32_t`, value 2                                       |
+| Version                                                                  | `uint32_t`, value 3                                       |
 | K-mer length, bucket count, indexed bucket count, score encoder identity | Four `uint32_t` values                                    |
 | Exponent bits, mantissa bits                                             | Two `uint16_t` values                                     |
 | Hash identity, hash seed                                                 | `uint32_t`, `uint64_t`                                    |
 | Canonicalization policy, blacklist identity, blacklist version           | `uint32_t`, `uint64_t`, `uint32_t`                        |
 | Key mask, reference count                                                | `uint16_t`, `uint32_t`                                    |
+| Blacklist entry count and canonical packed k-mers | `uint32_t` count followed by that many `uint64_t` values |
 | Labels in reference-ID order                                             | Each: `uint32_t` byte length followed by the path's bytes |
 | Winner scores in reference-ID order                                      | `reference_count * bucket_count` `uint16_t` values        |
 | Checksum                                                                 | `uint32_t` CRC-32 of every preceding byte                 |
 
-Version 2 records the current hash, canonicalization, and score-encoder identities, with every bucket indexed and no blacklist. The key mask is `0x7fff` or `0xffff`, and the exponent and mantissa widths add up to 16.
+Version 3 records the current hash, canonicalization, and score-encoder identities, with every bucket indexed. The blacklist payload is sorted, unique, canonical, and checked against its recorded identity. An empty list has identity and policy version zero; nonempty lists use policy version one. Older database file versions are rejected and must be rebuilt. The index file format remains version 2. The key mask is `0x7fff` or `0xffff`, and the exponent and mantissa widths add up to 16.
 
 To run the round-trip and malformed-input tests:
 
 ```sh
 nix develop -c meson compile -C build test-cuddl
 nix develop -c build/tests/test-cuddl --gtest_filter='ReferenceDatabaseFileTest.*'
+nix develop -c meson compile -C build test-blacklist
+nix develop -c build/tests/test-blacklist
 ```
 
 ## Measure build throughput

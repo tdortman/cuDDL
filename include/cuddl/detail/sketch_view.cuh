@@ -33,9 +33,10 @@ class sketch_view {
 
     /// @brief Constructs a reference over @p registers.
     __host__ __device__ constexpr explicit sketch_view(
-        device_span<register_type> registers
+        device_span<register_type> registers,
+        cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
     ) noexcept
-        : registers_(registers) {}
+        : registers_(registers), blacklist_(blacklist) {}
 
     /// @brief Device registers.
     [[nodiscard]] __host__ __device__ constexpr device_span<register_type> data() const noexcept {
@@ -64,7 +65,9 @@ class sketch_view {
     /// The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void>
     add_async(device_span<uint64_t const> input, cuda::stream_ref stream) const noexcept {
-        return detail::launch_construction<BucketCount, Layout>(input, registers_, stream);
+        return detail::launch_construction<BucketCount, Layout>(
+            input, registers_, stream, blacklist_
+        );
     }
 
     /// @brief Accumulates device-resident raw ASCII bases without clearing.
@@ -77,7 +80,9 @@ class sketch_view {
     /// records. No host copies. The input must remain valid until @p stream completes.
     [[nodiscard]] Result<void>
     add_sequence_async(device_span<char const> sequence, cuda::stream_ref stream) const noexcept {
-        return detail::launch_sequence_add<BucketCount, Layout>(sequence, K, registers_, stream);
+        return detail::launch_sequence_add<BucketCount, Layout>(
+            sequence, K, registers_, stream, blacklist_
+        );
     }
 
     /// @brief Computes the raw pairwise summary into caller-owned device storage.
@@ -122,6 +127,7 @@ class sketch_view {
 
    private:
     device_span<register_type> registers_;
+    cuda::std::optional<blacklist_view> blacklist_;
 };
 
 }  // namespace cuddl::detail

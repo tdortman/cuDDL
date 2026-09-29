@@ -44,13 +44,16 @@ class query_sketch_batch {
     __host__ ~query_sketch_batch() {}  // NOLINT(modernize-use-equals-default)
 
     query_sketch_batch(query_sketch_batch&& other) noexcept
-        : scores_(std::move(other.scores_)), query_count_(std::exchange(other.query_count_, 0U)) {}
+        : scores_(std::move(other.scores_)),
+          query_count_(std::exchange(other.query_count_, 0U)),
+          compatibility_(other.compatibility_) {}
 
     /// @brief Move-assigns the batch, leaving the source empty.
     query_sketch_batch& operator=(query_sketch_batch&& other) noexcept {
         if (this != &other) {
             scores_ = std::move(other.scores_);
             query_count_ = std::exchange(other.query_count_, 0U);
+            compatibility_ = other.compatibility_;
         }
         return *this;
     }
@@ -69,6 +72,7 @@ class query_sketch_batch {
     ) try {
         return [&]() -> Result<query_sketch_batch> {
             query_sketch_batch batch(stream, static_cast<uint32_t>(paths.size()));
+            CUDDL_TRY(batch.set_blacklist(options.blacklist, stream));
             CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
                 paths,
                 stream,
@@ -77,7 +81,8 @@ class query_sketch_batch {
                 options.transfer,
                 options.decompression,
                 options.statistics,
-                batch.reduce_rows(stream)
+                batch.reduce_rows(stream),
+                options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
             )));
             return batch;
         }();
@@ -101,12 +106,14 @@ class query_sketch_batch {
     ) try {
         return [&]() -> Result<query_sketch_batch> {
             query_sketch_batch batch(stream, static_cast<uint32_t>(genomes.size()));
+            CUDDL_TRY(batch.set_blacklist(options.blacklist, stream));
             CUDDL_TRY((detail::stage_sequences<K, BucketCount, Layout>(
                 genomes,
                 stream,
                 options.staging_bytes,
                 options.statistics,
-                batch.reduce_rows(stream)
+                batch.reduce_rows(stream),
+                options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
             )));
             return batch;
         }();
@@ -129,8 +136,8 @@ class query_sketch_batch {
     }
 
     /// @brief Compatibility a search must be given alongside @ref scores.
-    [[nodiscard]] static constexpr score_compatibility compatibility() noexcept {
-        return score_compatibility::current<K, BucketCount, Layout>();
+    [[nodiscard]] score_compatibility compatibility() const noexcept {
+        return compatibility_;
     }
 
    private:
@@ -161,6 +168,18 @@ class query_sketch_batch {
 
     cuda::device_buffer<score_type> scores_;
     uint32_t query_count_ = 0;
+    score_compatibility compatibility_ = score_compatibility::current<K, BucketCount, Layout>();
+
+    Result<void> set_blacklist(
+        std::optional<std::reference_wrapper<device_blacklist const>> filter,
+        cuda::stream_ref stream
+    ) {
+        if (!filter) return Ok();
+        CUDDL_TRY(filter->get().validate(K, BucketCount, stream));
+        compatibility_.blacklist_identity = filter->get().source().identity();
+        compatibility_.blacklist_version = filter->get().source().version();
+        return Ok();
+    }
 };
 
 }  // namespace cuddl

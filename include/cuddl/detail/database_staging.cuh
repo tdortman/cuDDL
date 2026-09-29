@@ -247,12 +247,14 @@ class database_stager {
         cuda::stream_ref stream,
         staging_plan bounds,
         reference_build_statistics* statistics = nullptr,
-        bool direct = false
+        bool direct = false,
+        cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
     )
         : stream_(stream),
           bounds_(bounds),
           statistics_(statistics),
           direct_(direct),
+          blacklist_(blacklist),
           rows_(
               cuda::make_device_buffer<uint32_t>(
                   stream,
@@ -684,10 +686,22 @@ class database_stager {
         auto const grid = std::min(block_end_, max_grid_);
         if (grid != 0) {
             auto const resident = CUDDL_TRY(begin_resident(kernel_stream_));
-            add_sequence_batch_kernel<BucketCount, Layout>
-                <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
-                    descriptors_.data(), copied_chunks_.size(), block_end_, K, rows_.data()
-                );
+            auto launch = [&]<bool Filter>() {
+                add_sequence_batch_kernel<BucketCount, Layout, Filter>
+                    <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
+                        descriptors_.data(),
+                        copied_chunks_.size(),
+                        block_end_,
+                        K,
+                        rows_.data(),
+                        blacklist_.value_or(blacklist_view{})
+                    );
+            };
+            if (blacklist_) {
+                launch.template operator()<true>();
+            } else {
+                launch.template operator()<false>();
+            }
             CUDDL_CUDA_TRY(cudaGetLastError());
             CUDDL_TRY(end_resident(resident, kernel_stream_));
         }
@@ -756,6 +770,7 @@ class database_stager {
     staging_plan bounds_;
     reference_build_statistics* statistics_;
     bool direct_ = false;
+    cuda::std::optional<blacklist_view> blacklist_;
     cuda::device_buffer<uint32_t> rows_;
     cuda::stream copy_stream_;
     cuda::stream kernel_stream_;
@@ -1029,11 +1044,12 @@ template <
     reference_build_statistics* statistics,
     Fill&& fill,
     Sink&& sink,
-    bool in_place = false
+    bool in_place = false,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     auto const plan =
         CUDDL_TRY((plan_staging<K, BucketCount>(genomes, staged_ceiling, staging_bytes, stream)));
-    database_stager<K, BucketCount, Layout> stager(stream, plan, statistics, in_place);
+    database_stager<K, BucketCount, Layout> stager(stream, plan, statistics, in_place, blacklist);
     size_t base = 0;
     while (base < genomes) {
         auto const count = std::min(plan.group, genomes - base);
@@ -1086,7 +1102,8 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     unsigned parser_workers,
     transfer_mode transfer,
     reference_build_statistics* statistics,
-    Sink&& sink
+    Sink&& sink,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
     auto const in_place = stages_in_place(transfer, stream.device());
@@ -1208,7 +1225,8 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                 statistics,
                 fill,
                 sink,
-                in_place
+                in_place,
+                blacklist
             );
         } catch (...) {
             failure = std::current_exception();
@@ -1239,7 +1257,8 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     unsigned parser_workers,
     transfer_mode transfer,
     reference_build_statistics* statistics,
-    Sink&& sink
+    Sink&& sink,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
     bool const in_place = stages_in_place(transfer, stream.device());
@@ -1391,7 +1410,8 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             );
         },
         sink,
-        in_place
+        in_place,
+        blacklist
     )));
     if (statistics != nullptr) {
         statistics->workers = static_cast<unsigned>(workers);
@@ -1420,7 +1440,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     transfer_mode transfer,
     decompression_backend decompression,
     reference_build_statistics* statistics,
-    Sink&& sink
+    Sink&& sink,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
@@ -1463,7 +1484,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             parser_workers,
             transfer,
             statistics,
-            std::forward<Sink>(sink)
+            std::forward<Sink>(sink),
+            blacklist
         );
     }
     if (decompression != decompression_backend::cpu) {
@@ -1474,7 +1496,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             parser_workers,
             transfer,
             statistics,
-            std::forward<Sink>(sink)
+            std::forward<Sink>(sink),
+            blacklist
         );
     }
 #endif
@@ -1518,7 +1541,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             return Ok();
         },
         sink,
-        in_place
+        in_place,
+        blacklist
     )));
     if (statistics != nullptr) {
         statistics->pinned_buffers = loaders.page_locked_buffers();
@@ -1536,7 +1560,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     cuda::stream_ref stream,
     std::optional<size_t> staging_bytes,
     reference_build_statistics* statistics,
-    Sink&& sink
+    Sink&& sink,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     if (genomes.empty()) return Ok();
     // The caller knows exactly what the corpus holds, so the ceiling is the sum of its bases
@@ -1569,7 +1594,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             }
             return Ok();
         },
-        sink
+        sink,
+        false,
+        blacklist
     );
 }
 

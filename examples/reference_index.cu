@@ -37,6 +37,7 @@ void search(
     uint32_t minimum_matches,
     unsigned workers,
     cuddl::decompression_backend decompression,
+    std::optional<std::reference_wrapper<cuddl::device_blacklist const>> blacklist,
     cuda::stream_ref stream
 ) {
     auto const batch_capacity = std::min(query_batch_size, paths.size());
@@ -108,13 +109,15 @@ void search(
                 query_type::sketch(
                     std::span{paths.data() + first, batch_size},
                     stream,
-                    {.parser_workers = workers, .decompression = decompression}
+                    {.parser_workers = workers,
+                     .decompression = decompression,
+                     .blacklist = blacklist}
                 )
             );
             if (exhaustive) {
                 CUDDL_UNWRAP(database.search_batch_async(
                     queries.scores(),
-                    query_type::compatibility(),
+                    queries.compatibility(),
                     static_cast<uint32_t>(first),
                     {workspace.data(), workspace.size()},
                     {results.data(), results.size()},
@@ -125,7 +128,7 @@ void search(
             } else {
                 CUDDL_UNWRAP(database.search_batch_async(
                     queries.scores(),
-                    query_type::compatibility(),
+                    queries.compatibility(),
                     static_cast<uint32_t>(first),
                     {workspace.data(), workspace.size()},
                     {results.data(), results.size()},
@@ -247,6 +250,10 @@ int main(int argc, char** argv) {
                 CUDDL_UNWRAP(cuddl::reference_index_file::load(index_path, database, stream))
             );
         }
+        std::optional<cuddl::device_blacklist> blacklist;
+        if (!all_to_all && !file.blacklist().keys().empty()) {
+            blacklist.emplace(file.blacklist(), cli::buckets, stream);
+        }
         search(
             database,
             index ? &*index : nullptr,
@@ -256,6 +263,7 @@ int main(int argc, char** argv) {
             minimum_matches,
             workers,
             decompression,
+            blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt,
             stream
         );
     } catch (std::exception const& error) {

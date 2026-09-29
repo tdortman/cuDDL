@@ -17,7 +17,8 @@ template <size_t BucketCount, typename Layout = default_register_layout>
 __host__ inline Result<void> launch_construction(
     device_span<uint64_t const> input,
     device_span<uint32_t> registers,
-    cuda::stream_ref stream
+    cuda::stream_ref stream,
+    cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     if (input.empty()) {
         return {};
@@ -31,10 +32,21 @@ __host__ inline Result<void> launch_construction(
         auto const needed = input.size() / capacity + (input.size() % capacity != 0U);
         auto const blocks =
             static_cast<uint32_t>(cuda::std::min<size_t>(multiprocessors * 2U, needed));
-        add_shared_kernel<BucketCount, Layout, 1U>
-            <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
-                input.data(), input.size(), registers.data(), vector_input
-            );
+        auto launch = [&]<bool Filter>() {
+            add_shared_kernel<BucketCount, Layout, 1U, Filter>
+                <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
+                    input.data(),
+                    input.size(),
+                    registers.data(),
+                    vector_input,
+                    blacklist.value_or(blacklist_view{})
+                );
+        };
+        if (blacklist) {
+            launch.template operator()<true>();
+        } else {
+            launch.template operator()<false>();
+        }
         return cudaGetLastError();
     });
 }

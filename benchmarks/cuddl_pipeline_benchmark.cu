@@ -261,7 +261,9 @@ struct collection {
         }
         for (size_t i = 0; i < rows.genomes; ++i) {
             sketches.emplace_back(stream);
-            CUDDL_UNWRAP(sketches[i].assign_async({store.data() + i * buckets, buckets}, stream));
+            CUDDL_UNWRAP(
+                sketches[i].assign_async({store.data() + i * buckets, buckets}, stream, {})
+            );
         }
     }
     /// @brief Stored sketches this collection contributes: shared store rows or per-file sketches.

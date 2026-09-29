@@ -79,6 +79,8 @@ The following commands assume reference genomes are under `genomes/references/` 
 
 The builder searches the folder recursively and sorts file paths to assign reference IDs. Keep that ordered input list if you need to map result IDs back to filenames.
 
+Pass `--blacklist blacklist.fa.gz` to exclude literal k-mers during construction. BBTools DDL FASTA blacklists work directly, including fused records; one exact DNA k-mer per text line is also accepted. The database embeds the normalized list, and raw queries automatically use it. Keep k consistent with the blacklist. Changing the list requires rebuilding the database and its index. See [blacklist construction](docs/reference-database.md#blacklist-construction).
+
 The builder reads FASTA and FASTQ files with the extensions `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, in any letter case. Gzip and BGZF files add `.gz`, `.bgz`, or `.bgzf`, as in `genome.fna.gz`.
 
 By default, a discrete GPU inflates gzip FASTA files with nvCOMP and checks each file's length and CRC32 against its gzip trailer. Coherent-memory GPUs such as GH200 inflate on CPU workers instead. Everything else goes to the host loader: FASTQ, BGZF, multi-member gzip, and any file the GPU cannot verify.

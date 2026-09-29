@@ -89,7 +89,7 @@ std::vector<cuddl::reference_search_result> search(
     auto count = cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1, cuda::no_init);
     CUDDL_UNWRAP(db.search_async(
         query.scores(),
-        query_batch::compatibility(),
+        query.compatibility(),
         {workspace.data(), workspace.size()},
         {results.data(), results.size()},
         {count.data(), count.size()},
@@ -145,7 +145,7 @@ std::vector<cuddl::batch_search_result> search_batch(
     } else {
         CUDDL_UNWRAP(db.search_batch_async(
             query.scores(),
-            query_batch::compatibility(),
+            query.compatibility(),
             0U,
             workspace,
             results,

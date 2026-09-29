@@ -187,6 +187,8 @@ struct path_build_options {
     /// actually took.
     transfer_mode transfer = transfer_mode::automatic;
     decompression_backend decompression = decompression_backend::automatic;
+    /// Reusable lookup; keep alive through this synchronous build.
+    std::optional<std::reference_wrapper<device_blacklist const>> blacklist = std::nullopt;
 };
 
 /// @brief Knobs for a build the caller feeds with bases it already holds.
@@ -195,6 +197,7 @@ struct sequence_build_options {
     /// Arena bytes. Unset sizes the arena from free device memory and what the bases can fill,
     /// capped at 128 MiB so sketching overlaps staging.
     std::optional<size_t> staging_bytes{};
+    std::optional<std::reference_wrapper<device_blacklist const>> blacklist = std::nullopt;
 };
 
 /**
@@ -206,10 +209,14 @@ struct sequence_build_options {
  * Build and upload are synchronous. The supplied stream must outlive the uploaded database.
  */
 class reference_database_file {
-    /// @brief On-disk format revision; 2 stores winner-score rows.
-    static constexpr uint32_t database_file_version = 2U;
+    /// @brief On-disk format revision for score rows and embedded construction blacklists.
+    static constexpr uint32_t database_file_version = 3U;
 
    public:
+    [[nodiscard]] kmer_blacklist const& blacklist() const noexcept {
+        return blacklist_;
+    }
+
     /// @brief Compatibility metadata and reference count.
     [[nodiscard]] reference_database_metadata metadata() const noexcept {
         return metadata_;
@@ -252,6 +259,7 @@ class reference_database_file {
                 score_compatibility::current<K, BucketCount, Layout>(),
                 static_cast<uint32_t>(paths.size())
             };
+            CUDDL_TRY((result.set_blacklist<K, BucketCount>(options.blacklist, stream)));
             result.rows_.resize(paths.size() * BucketCount);
             result.names_.reserve(paths.size());
             // No inputs means no staging budget to resolve and nothing to encode.
@@ -264,7 +272,8 @@ class reference_database_file {
                 options.transfer,
                 options.decompression,
                 options.statistics,
-                result.download_rows<BucketCount>(stream)
+                result.download_rows<BucketCount>(stream),
+                options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
             )));
             for (auto const& path : paths) result.names_.push_back(path.string());
             // Instantiate the same constraints as the destination GPU database.
@@ -305,6 +314,7 @@ class reference_database_file {
                 score_compatibility::current<K, BucketCount, Layout>(),
                 static_cast<uint32_t>(genomes.size())
             };
+            CUDDL_TRY((result.set_blacklist<K, BucketCount>(options.blacklist, stream)));
             result.rows_.resize(genomes.size() * BucketCount);
             result.names_.reserve(genomes.size());
             if (genomes.empty()) return result;
@@ -313,7 +323,8 @@ class reference_database_file {
                 stream,
                 options.staging_bytes,
                 options.statistics,
-                result.download_rows<BucketCount>(stream)
+                result.download_rows<BucketCount>(stream),
+                options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
             )));
             for (auto const& genome : genomes) result.names_.emplace_back(genome.name);
             static_assert(sizeof(database_type) > 0);
@@ -334,13 +345,15 @@ class reference_database_file {
      * has. A staged build and the streamed tile builder both write that layout.
      *
      * @p names labels one reference each in store order, or is empty for a database without
-     * labels.
+     * labels. The caller must supply the blacklist used to construct these registers,
+     * or an empty blacklist for unfiltered registers.
      */
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     [[nodiscard]] static Result<reference_database_file> from_store(
         device_span<uint32_t const> store,
         std::span<std::string const> names,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        kmer_blacklist const& blacklist
     ) try {
         return [&]() -> Result<reference_database_file> {
             if (store.size() % BucketCount != 0) {
@@ -357,6 +370,12 @@ class reference_database_file {
             result.metadata_ = {
                 score_compatibility::current<K, BucketCount, Layout>(), static_cast<uint32_t>(count)
             };
+            if (!blacklist.keys().empty() && blacklist.kmer_length() != K) {
+                return Err(Error::invalid_argument("store blacklist k mismatch"));
+            }
+            result.blacklist_ = blacklist;
+            result.metadata_.compatibility.blacklist_identity = blacklist.identity();
+            result.metadata_.compatibility.blacklist_version = blacklist.version();
             result.rows_.resize(count * BucketCount);
             if (count == 0) return result;
             CUDDL_TRY(detail::download_store<BucketCount>(store, result.rows_, stream));
@@ -412,7 +431,15 @@ class reference_database_file {
             CUDDL_TRY(writer.bytes("CUDDLDB\0", 8));
             CUDDL_TRY(writer.value(database_file_version));
             auto metadata = metadata_;
+            if (blacklist_.identity() != metadata.compatibility.blacklist_identity ||
+                blacklist_.version() != metadata.compatibility.blacklist_version) {
+                return Err(
+                    Error::invalid_argument("database is missing its construction blacklist")
+                );
+            }
             CUDDL_TRY(detail::database_file_metadata(writer, metadata));
+            CUDDL_TRY(writer.value(static_cast<uint32_t>(blacklist_.keys().size())));
+            CUDDL_TRY(writer.words(blacklist_.keys()));
             auto const prefix = ::ftello(writer.output);
             auto const limit = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
             if (prefix < 0 || static_cast<uint64_t>(prefix) > limit - sizeof(uint32_t)) {
@@ -496,8 +523,25 @@ class reference_database_file {
                 c.mantissa_bits == 0 || c.exponent_bits + c.mantissa_bits != 16 ||
                 c.score_encoder_identity != 1 || c.hash_identity != 1 ||
                 c.hash_seed != detail::seed || c.canonicalisation_policy != 1 ||
-                c.blacklist_identity != 0 || c.blacklist_version != 0) {
+                c.blacklist_version > 1 ||
+                ((c.blacklist_identity == 0) != (c.blacklist_version == 0))) {
                 return Err(Error::invalid_argument("unsupported database construction metadata"));
+            }
+            uint32_t blacklist_count = 0;
+            CUDDL_TRY(reader.value(blacklist_count));
+            if (blacklist_count > reader.remaining / sizeof(uint64_t)) {
+                return Err(Error::invalid_argument("invalid blacklist extent"));
+            }
+            std::vector<uint64_t> keys(blacklist_count);
+            CUDDL_TRY(reader.words(keys));
+            if (!std::is_sorted(keys.begin(), keys.end()) ||
+                std::adjacent_find(keys.begin(), keys.end()) != keys.end()) {
+                return Err(Error::invalid_argument("blacklist payload is not sorted and unique"));
+            }
+            result.blacklist_ = kmer_blacklist(c.kmer_length, std::move(keys));
+            if (result.blacklist_.identity() != c.blacklist_identity ||
+                result.blacklist_.version() != c.blacklist_version) {
+                return Err(Error::invalid_argument("blacklist identity mismatch"));
             }
             uint64_t const count = result.metadata_.reference_count;
             uint64_t const words = count * c.bucket_count;
@@ -532,6 +576,8 @@ class reference_database_file {
             }
             return result;
         }();
+    } catch (std::invalid_argument const& error) {
+        return Err(Error::invalid_argument(error.what()));
     } catch (std::bad_alloc const& error) {
         return Err(Error::resource(error.what()));
     }
@@ -550,6 +596,21 @@ class reference_database_file {
             );
         };
     }
+
+    template <uint32_t K, size_t BucketCount>
+    Result<void> set_blacklist(
+        std::optional<std::reference_wrapper<device_blacklist const>> filter,
+        cuda::stream_ref stream
+    ) {
+        if (!filter) return Ok();
+        CUDDL_TRY(filter->get().validate(K, BucketCount, stream));
+        blacklist_ = filter->get().source();
+        metadata_.compatibility.blacklist_identity = blacklist_.identity();
+        metadata_.compatibility.blacklist_version = blacklist_.version();
+        return Ok();
+    }
+
+    kmer_blacklist blacklist_;
     reference_database_metadata metadata_{};
     std::vector<std::string> names_;
     std::vector<uint16_t> rows_;
@@ -568,9 +629,12 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     path_build_options options = {}
 ) try {
     return [&]() -> Result<cuda::device_buffer<uint32_t>> {
+        if (options.blacklist) CUDDL_TRY(options.blacklist->get().validate(K, BucketCount, stream));
+
         auto store = cuda::make_device_buffer<uint32_t>(
             stream, stream.device(), paths.size() * BucketCount, cuda::no_init
         );
+
         CUDDL_TRY((detail::stage_paths<K, BucketCount, Layout>(
             paths,
             stream,
@@ -590,7 +654,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                     )
                 );
                 return Ok();
-            }
+            },
+            options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
         )));
         return store;
     }();

@@ -11,6 +11,7 @@
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 
+#include <cuddl/blacklist.cuh>
 #include <cuddl/detail/cardinality.cuh>
 #include <cuddl/detail/comparison.cuh>
 #include <cuddl/detail/hash.cuh>
@@ -89,12 +90,17 @@ constexpr uint32_t shared_construction_block_size = 768;
  * With FloorRounds > 0, the CTA reduces its minimum local register after that many uniform input
  * epochs. Later scores at or below that bound cannot change any register and skip the atomic.
  */
-template <size_t BucketCount, typename Layout = default_register_layout, uint32_t FloorRounds = 0>
+template <
+    size_t BucketCount,
+    typename Layout = default_register_layout,
+    uint32_t FloorRounds = 0,
+    bool HasBlacklist = false>
 __global__ __launch_bounds__(shared_construction_block_size) void add_shared_kernel(
     uint64_t const* input,
     size_t input_size,
     uint32_t* registers,
-    bool vector_input
+    bool vector_input,
+    blacklist_view blacklist = {}
 ) {
     __shared__ uint32_t state[BucketCount];
     for (auto i = threadIdx.x; i < BucketCount; i += blockDim.x) {
@@ -111,7 +117,11 @@ __global__ __launch_bounds__(shared_construction_block_size) void add_shared_ker
                 return;
             }
         }
-        atomicMax(&state[bucket_of<BucketCount>(hash)], incoming);
+        auto const bucket = bucket_of<BucketCount>(hash);
+        if constexpr (HasBlacklist) {
+            if (blacklist.contains(value, bucket)) return;
+        }
+        atomicMax(&state[bucket], incoming);
     };
 
     auto const stride = static_cast<size_t>(gridDim.x) * blockDim.x * 4U;
