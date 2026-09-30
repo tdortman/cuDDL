@@ -1529,6 +1529,77 @@ TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries)
     }
 }
 
+TEST_F(ReferenceDatabaseTest, IndexedAllToAllPlaneFallbackMatchesOracleAcrossQueryGroups) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    constexpr uint32_t references = 65U;
+    auto compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    compatibility.indexed_bucket_count = b_default / 2U;
+    compatibility.key_mask = 0x7fffU;
+    std::vector<uint16_t> rows(static_cast<size_t>(references) * b_default);
+    for (uint32_t reference = 0U; reference < references; ++reference) {
+        for (size_t bucket = 0U; bucket < b_default; ++bucket) {
+            if (reference % 11U == 0U || (reference % 2U == 0U && bucket % 7U == 0U)) {
+                continue;
+            }
+            auto const score = bucket < 4U ? 7U : 16U + reference % 3U + bucket % 5U;
+            rows[static_cast<size_t>(reference) * b_default + bucket] =
+                static_cast<uint16_t>(score | (reference % 5U == 0U ? 0x8000U : 0U));
+        }
+    }
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto index =
+        CUDDL_UNWRAP(index_type::build_async(database, stream, cuddl::index_storage::dense));
+    ASSERT_GT(index.pair_fraction(), cuddl::detail::index_pair_fraction_limit);
+    auto requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(&index));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    auto matches = cuda::make_device_buffer<uint32_t>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    for (uint32_t minimum : {0U, 5U}) {
+        SCOPED_TRACE(minimum);
+        std::vector<cuddl::batch_search_result> expected;
+        std::vector<uint32_t> expected_matches;
+        for (uint32_t query_id = 0U; query_id < references; ++query_id) {
+            auto const query = std::span<uint16_t const>{rows}.subspan(
+                static_cast<size_t>(query_id) * b_default, b_default
+            );
+            for (uint32_t reference = query_id + 1U; reference < references; ++reference) {
+                uint32_t count = 0U;
+                for (size_t bucket = 0U; bucket < compatibility.indexed_bucket_count; ++bucket) {
+                    auto const score = rows[static_cast<size_t>(reference) * b_default + bucket];
+                    count += query[bucket] != 0U && score != 0U &&
+                             (query[bucket] & compatibility.key_mask) ==
+                                 (score & compatibility.key_mask);
+                }
+                if (count >= minimum) {
+                    expected.push_back(
+                        {query_id, reference, score_row_oracle(query, rows, reference)}
+                    );
+                    expected_matches.push_back(count);
+                }
+            }
+        }
+        ASSERT_FALSE(expected.empty());
+        if (minimum != 0U) {
+            ASSERT_LT(expected.size(), references * (references - 1U) / 2U);
+        }
+        tile_collector actual{stream};
+        CUDDL_UNWRAP(database.search_all_to_all_async(
+            workspace, results, actual, matches, {.minimum_matches = minimum}, stream, &index
+        ));
+        EXPECT_EQ(actual.results, expected);
+        EXPECT_EQ(actual.match_counts, expected_matches);
+    }
+}
+
 TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueries) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
@@ -2233,7 +2304,7 @@ TEST_F(ReferenceDatabaseTest, AllToAllSearchHasOneExactDirectionalOrientation) {
 TEST_F(ReferenceDatabaseTest, ExhaustiveAllToAllOwnsBoundedTraversal) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;
-    // Tiles hold about 2^24 pairs and storage two tiles, so this many references need several
+    // Tiles hold about 2^25 pairs and storage two tiles, so this many references need several
     // tiles and more pairs than the storage holds.
     constexpr uint32_t reference_count = 12000U;
     auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();

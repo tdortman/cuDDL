@@ -832,11 +832,11 @@ constexpr uint32_t batch_query_tile_count = 128U;
     return std::min(query_count, std::min(tile_limit, std::max(1U, count_capacity)));
 }
 
-/// @brief Query rows one all-to-all tile compares: about 2^24 pairs, and at least
+/// @brief Query rows one all-to-all tile compares: about 2^25 pairs, and at least
 /// @ref batch_query_tile_count. Enough query groups to fill the GPU for each launch, while result
 /// storage holds two tiles so one is searched as the other is consumed.
 [[nodiscard]] constexpr uint32_t all_to_all_tile_queries(uint32_t reference_count) noexcept {
-    constexpr uint32_t pair_budget = 1U << 24U;
+    constexpr uint32_t pair_budget = 1U << 25U;
     auto const limit = reference_count == 0U
                            ? batch_query_tile_count
                            : std::max(batch_query_tile_count, pair_budget / reference_count);

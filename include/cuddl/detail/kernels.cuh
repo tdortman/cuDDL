@@ -1696,7 +1696,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     constexpr uint32_t lane_groups = groups_per_row / warp_width;
     // Reference groups one lane keeps in registers across the selecting queries.
     constexpr uint32_t cached_groups = lane_groups < 2U ? lane_groups : 2U;
-    constexpr uint32_t block_words = static_cast<uint32_t>(cuda::std::max<size_t>(
+    constexpr uint32_t max_block_words = static_cast<uint32_t>(cuda::std::max<size_t>(
         1U, refine_block_row_bytes / (BucketCount * sizeof(uint16_t)) / warp_width
     ));
     extern __shared__ uint4 query_plane_storage[];
@@ -1705,6 +1705,12 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
     auto const groups = (query_count + group - 1U) / group;
+    // Fill the grid for small batches without spilling whole query groups into a second wave.
+    auto const reference_blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
+    auto const block_words = cuda::std::min(
+        max_block_words,
+        (words_per_query + reference_blocks_per_wave - 1U) / reference_blocks_per_wave
+    );
     auto const reference_blocks = (words_per_query + block_words - 1U) / block_words;
     auto const cell_count = groups * reference_blocks;
     auto const indexed_groups = indexed_bucket_count / warp_width;
@@ -1796,8 +1802,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                 uint32_t mine_empty = 0U;
                 uint32_t mine_matches = 0U;
                 auto const compare_members = [&](auto full) {
-                    for (auto members = selected; members != 0U; members &= members - 1U) {
-                        auto const m = static_cast<uint32_t>(__ffs(members) - 1);
+                    auto const compare_member = [&](uint32_t m) {
                         auto const* member =
                             member_planes + static_cast<size_t>(m) * (row_words / 4U);
                         plane_counts counts{};
@@ -1841,6 +1846,17 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                             mine_equal = total.equal;
                             mine_empty = total.both_empty;
                             mine_matches = counts_matches_total;
+                        }
+                    };
+                    if constexpr (Candidates == refine_candidates::all) {
+                        // All-pairs and upper-triangle selections are prefixes of the query group.
+                        auto const member_count = static_cast<uint32_t>(__popc(selected));
+                        for (uint32_t m = 0U; m < member_count; ++m) {
+                            compare_member(m);
+                        }
+                    } else {
+                        for (auto members = selected; members != 0U; members &= members - 1U) {
+                            compare_member(static_cast<uint32_t>(__ffs(members) - 1));
                         }
                     }
                 };

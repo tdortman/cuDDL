@@ -1076,28 +1076,40 @@ void compact_indexed_batch_search(nvbench::state& state) {
 // Real reference collections share winner scores between related genomes, so index posting
 // lists are long and most pairs pass the threshold; the synthetic fixtures above do neither.
 // `CUDDL_REFSEQ_DATABASE` names a k=25, 2048-bucket database file; the state is skipped
-// without it. Queries are 4096 evenly spaced database rows.
-void refseq_batch_search(nvbench::state& state) {
-    using database_type = cuddl::reference_database<k_kmer_length, k_bucket_count>;
-    using index_type = cuddl::reference_index<k_kmer_length, k_bucket_count>;
-    auto const* path = std::getenv("CUDDL_REFSEQ_DATABASE");
-    if (path == nullptr) {
-        state.skip("CUDDL_REFSEQ_DATABASE is not set");
-        return;
-    }
+// without it. Batch queries are evenly spaced database rows; indexed all-to-all modes can be
+// requested explicitly with Mode=dense_all_to_all or Mode=sparse_all_to_all.
+template <typename Layout>
+void refseq_batch_search_impl(nvbench::state& state, cuddl::reference_database_file const& file) {
+    using index_type = cuddl::reference_index<k_kmer_length, k_bucket_count, Layout>;
     auto const stream = cuda::stream_ref{state.get_cuda_stream()};
     auto const mode = state.get_string("Mode");
     // "host" times what a caller waits for: every tile downloaded and each passing result read
     // on the host, not just the search itself.
     auto const deliver = state.get_string("Delivery") == "host";
-    auto const file = CUDDL_UNWRAP(cuddl::reference_database_file::load(path));
     auto const host_rows = file.rows();
-    auto database = CUDDL_UNWRAP((file.upload<k_kmer_length, k_bucket_count>(stream)));
+    auto database = CUDDL_UNWRAP((file.upload<k_kmer_length, k_bucket_count, Layout>(stream)));
     auto const references = database.reference_count();
     auto const compatibility = database.metadata().compatibility;
-    constexpr uint32_t query_count = 4096U;
-    auto const all_to_all = mode == "all_to_all";
-    auto const queries = all_to_all ? references : std::min(query_count, references);
+    auto const requested_queries = state.get_int64("Queries");
+    auto const requested_matches = state.get_int64("MinimumMatches");
+    if (requested_queries <= 0 || requested_queries > std::numeric_limits<uint32_t>::max() ||
+        requested_matches < 0 || requested_matches > compatibility.indexed_bucket_count) {
+        throw std::invalid_argument("RefSeq query count or minimum matches is out of range");
+    }
+    if (references == 0U) {
+        state.skip("RefSeq database is empty");
+        return;
+    }
+    auto const minimum_matches = static_cast<uint32_t>(requested_matches);
+    auto const dense = mode == "dense" || mode == "dense_all_to_all";
+    auto const sparse = mode == "sparse" || mode == "sparse_all_to_all";
+    auto const all_to_all =
+        mode == "all_to_all" || mode == "dense_all_to_all" || mode == "sparse_all_to_all";
+    if (!dense && !sparse && mode != "exhaustive" && !all_to_all) {
+        throw std::invalid_argument("unknown RefSeq search mode");
+    }
+    auto const queries =
+        all_to_all ? references : std::min(static_cast<uint32_t>(requested_queries), references);
     auto source_row = [&](uint32_t query) {
         return all_to_all
                    ? query
@@ -1116,16 +1128,14 @@ void refseq_batch_search(nvbench::state& state) {
     }
     auto query_input = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
     std::optional<index_type> acceleration;
-    if (mode == "dense" || mode == "sparse") {
+    if (dense || sparse) {
         acceleration = CUDDL_UNWRAP((index_type::build_async(
-            database,
-            stream,
-            mode == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse
+            database, stream, dense ? cuddl::index_storage::dense : cuddl::index_storage::sparse
         )));
     }
     auto const* index = acceleration ? &*acceleration : nullptr;
     auto const requirements =
-        all_to_all ? CUDDL_UNWRAP(database.all_to_all_search_requirements())
+        all_to_all ? CUDDL_UNWRAP(database.all_to_all_search_requirements(index))
                    : CUDDL_UNWRAP(database.batch_search_requirements(queries, stream, index));
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
@@ -1135,7 +1145,17 @@ void refseq_batch_search(nvbench::state& state) {
     );
 
     auto const search = [&](cuda::stream_ref execution_stream, auto&& on_tile) {
-        if (all_to_all) {
+        if (all_to_all && index != nullptr) {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                workspace,
+                results,
+                on_tile,
+                {},
+                {.minimum_matches = minimum_matches},
+                execution_stream,
+                index
+            ));
+        } else if (all_to_all) {
             CUDDL_UNWRAP(
                 database.search_all_to_all_async(workspace, results, on_tile, {}, execution_stream)
             );
@@ -1148,7 +1168,7 @@ void refseq_batch_search(nvbench::state& state) {
                 results,
                 on_tile,
                 {},
-                {.minimum_matches = 5U},
+                {.minimum_matches = minimum_matches},
                 execution_stream,
                 index
             ));
@@ -1159,30 +1179,46 @@ void refseq_batch_search(nvbench::state& state) {
         }
     };
 
-    // The first query's results are checked against a scalar oracle: every pair for the
-    // exhaustive modes, exactly the pairs with at least five equal buckets for the indexed ones.
+    // Check both ends of the query traversal, using the index's bucket range and masked keys
+    // for candidate selection and full scores for the exact summaries. The final all-to-all
+    // query has no pairs, so also check the preceding query.
+    auto const last_query = queries - (all_to_all && queries > 1U ? 2U : 1U);
     std::vector<cuddl::batch_search_result> observed;
     uint64_t result_total = 0U;
-    bool first_tile = true;
     search(stream, [&](cuddl::batch_result_tile const& tile) {
         auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
         auto const host = tile_copy.passing();
         result_total += host.size();
-        if (first_tile) {
-            for (auto const& result : host) {
-                if (result.query_id == 0U) observed.push_back(result);
+        for (auto const& result : host) {
+            if (result.query_id == 0U || result.query_id >= last_query) {
+                observed.push_back(result);
             }
-            first_tile = false;
         }
     });
     std::vector<cuddl::batch_search_result> expected;
-    for (uint32_t reference = all_to_all ? 1U : 0U; reference < references; ++reference) {
-        auto const summary = score_row_oracle_rows(
-            host_rows.data() + static_cast<size_t>(source_row(0U)) * k_bucket_count,
-            host_rows.data() + static_cast<size_t>(reference) * k_bucket_count
-        );
-        if (index == nullptr || summary.equal >= 5U) {
-            expected.push_back({.query_id = 0U, .reference_id = reference, .counts = summary});
+    for (uint32_t edge = 0U; edge < (last_query == 0U ? 1U : 2U); ++edge) {
+        auto const query = edge == 0U ? 0U : last_query;
+        auto const* query_row =
+            host_rows.data() + static_cast<size_t>(source_row(query)) * k_bucket_count;
+        for (uint32_t reference = all_to_all ? query + 1U : 0U; reference < references;
+             ++reference) {
+            auto const* reference_row =
+                host_rows.data() + static_cast<size_t>(reference) * k_bucket_count;
+            uint32_t matches = 0U;
+            if (index != nullptr) {
+                for (uint32_t bucket = 0U; bucket < compatibility.indexed_bucket_count; ++bucket) {
+                    matches += query_row[bucket] != 0U && reference_row[bucket] != 0U &&
+                               (query_row[bucket] & compatibility.key_mask) ==
+                                   (reference_row[bucket] & compatibility.key_mask);
+                }
+            }
+            if (index == nullptr || matches >= minimum_matches) {
+                expected.push_back({
+                    .query_id = query,
+                    .reference_id = reference,
+                    .counts = score_row_oracle_rows(query_row, reference_row),
+                });
+            }
         }
     }
     if (observed != expected) {
@@ -1218,6 +1254,30 @@ void refseq_batch_search(nvbench::state& state) {
         state, "Median GPU Time", state.get_summary("nv/cold/time/gpu/median").get_float64("value")
     );
     add_value(state, "Results", static_cast<double>(result_total));
+    add_value(state, "References", references);
+    add_value(state, "Actual Queries", queries);
+    if (index != nullptr) {
+        add_value(state, "Pair Fraction", index->pair_fraction());
+    }
+}
+
+void refseq_batch_search(nvbench::state& state) {
+    auto const* path = std::getenv("CUDDL_REFSEQ_DATABASE");
+    if (path == nullptr) {
+        state.skip("CUDDL_REFSEQ_DATABASE is not set");
+        return;
+    }
+    auto const file = CUDDL_UNWRAP(cuddl::reference_database_file::load(path));
+    switch (file.metadata().compatibility.exponent_bits) {
+        case 5U:
+            refseq_batch_search_impl<cuddl::register_layout<5, 11>>(state, file);
+            break;
+        case 6U:
+            refseq_batch_search_impl<cuddl::register_layout<6, 10>>(state, file);
+            break;
+        default:
+            throw std::invalid_argument("RefSeq database requires 5 or 6 exponent bits");
+    }
 }
 
 void compact_batch_and_all_to_all_search(nvbench::state& state) {
@@ -1410,6 +1470,8 @@ NVBENCH_BENCH(compact_indexed_zero_threshold_search)
     .add_string_axis("Index", {"dense", "sparse"});
 NVBENCH_BENCH(compact_batch_and_all_to_all_search);
 NVBENCH_BENCH(refseq_batch_search)
+    .add_int64_axis("Queries", {4096})
+    .add_int64_axis("MinimumMatches", {5})
     .add_string_axis("Mode", {"exhaustive", "dense", "sparse", "all_to_all"})
     .add_string_axis("Delivery", {"device", "host"});
 
