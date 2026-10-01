@@ -397,8 +397,7 @@ class reference_index {
     build_posting_bitmaps(database_type const& database, cuda::stream_ref stream) {
         auto const references = database.reference_count();
         auto const buckets = database.metadata().compatibility.indexed_bucket_count;
-        if (references < 8192U || buckets == 0U || buckets > 65535U || index_offsets_.empty() ||
-            pair_fraction_ > detail::index_pair_fraction_limit) {
+        if (references < 8192U || buckets == 0U || buckets > 65535U) {
             return Ok();
         }
         auto const words = detail::candidate_bit_words(references);
@@ -411,13 +410,15 @@ class reference_index {
             cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init)
         );
         auto const* offsets = index_offsets_.data();
+        auto const* keys = index_keys_.empty() ? nullptr : index_keys_.data();
+        auto const cells = keys == nullptr ? index_offsets_.size() - 1U : index_keys_.size();
         CUDDL_CUDA_TRY(
             cub::DeviceSelect::If(
                 cuda::make_counting_iterator(uint32_t{0}),
                 bitmap_cells_.data(),
                 selected.data(),
-                static_cast<int64_t>(index_offsets_.size() - 1U),
-                detail::posting_bitmap_cell{offsets, words},
+                static_cast<int64_t>(cells),
+                detail::posting_bitmap_cell{offsets, keys, references, words},
                 stream
             )
         );
@@ -436,6 +437,9 @@ class reference_index {
             build_posting_bitmaps_kernel<<<bitmap_count_, detail::block_size, 0, stream.get()>>>(
                 bitmap_cells_.data(),
                 offsets,
+                keys,
+                references,
+                static_cast<uint32_t>(database.metadata().compatibility.key_mask) + 1U,
                 index_postings_.data(),
                 words,
                 posting_bitmaps_.data()

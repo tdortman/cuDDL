@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>
 #include <cub/device/device_select.cuh>
@@ -1657,9 +1658,10 @@ class reference_database_view {
     }
 
     /// @brief Whether threshold search compares bit-planes for every pair: always without an
-    /// index, and when the index's lookups would visit many cells, counting slower than that.
+    /// index, or for a dense posting workload without bitmaps to count the long lists.
     [[nodiscard]] constexpr bool compares_planes() const noexcept {
-        return !indexed_ || index_pair_fraction_ > detail::index_pair_fraction_limit;
+        return !indexed_ ||
+               (bitmap_cells_.empty() && index_pair_fraction_ > detail::index_pair_fraction_limit);
     }
 
     /// @brief Requirements for one tile.
@@ -1681,8 +1683,11 @@ class reference_database_view {
         };
         auto const staging_bytes = query_plane_bytes(staged_queries);
         if (!indexed || dense_pair_count == 0U) {
-            if (staging_bytes != 0U) {
-                requirements.workspace_bytes = staging_bytes + plane_alignment - 1U;
+            // The refinement's cell counter follows the staged query planes.
+            if (maximum_pair_count != 0U) {
+                requirements.counter_bytes = sizeof(uint32_t);
+                requirements.workspace_bytes =
+                    staging_bytes + plane_alignment - 1U + sizeof(uint32_t);
             }
             return requirements;
         }
@@ -1705,6 +1710,28 @@ class reference_database_view {
                                                     (sizeof(uint2) + sizeof(uint32_t)) +
                                                 sizeof(uint32_t));
             }
+        } else {
+            // The match filter and refinement reuse one cell counter.
+            requirements.counter_bytes = sizeof(uint32_t);
+        }
+        if constexpr (detail::match_filter_supported<BucketCount>) {
+            // Candidate counting and query ordering reuse the temporary workspace.
+            size_t sort_bytes = 0U;
+            CUDDL_CUDA_TRY(
+                cub::DeviceRadixSort::SortKeys(
+                    nullptr,
+                    sort_bytes,
+                    static_cast<uint64_t const*>(nullptr),
+                    static_cast<uint64_t*>(nullptr),
+                    tile_query_count,
+                    32,
+                    64
+                )
+            );
+            requirements.temporary_bytes = std::max(
+                requirements.temporary_bytes,
+                2U * static_cast<size_t>(tile_query_count) * sizeof(uint64_t) + sort_bytes
+            );
         }
         constexpr size_t alignment_slack = alignof(uint32_t) - 1U + plane_alignment - 1U + 255U;
         requirements.workspace_bytes = requirements.counter_bytes + requirements.candidate_bytes +
@@ -1863,6 +1890,16 @@ class reference_database_view {
             query_planes =
                 CUDDL_TRY(stage_query_planes(queries, first_query, query_count, workspace, stream));
         }
+        // The cell counter follows the staged query planes; see make_batch_requirements.
+        auto const counter_address =
+            detail::align_up(reinterpret_cast<uintptr_t>(workspace.data()), plane_alignment) +
+            query_plane_bytes(AllToAll ? 0U : query_count);
+        if (counter_address + sizeof(uint32_t) >
+            reinterpret_cast<uintptr_t>(workspace.data()) + workspace.size_bytes()) {
+            return Err(Error::resource("exhaustive batch workspace is too small"));
+        }
+        auto* cell_counter = reinterpret_cast<uint32_t*>(counter_address);
+        CUDDL_CUDA_TRY(cudaMemsetAsync(cell_counter, 0, sizeof(uint32_t), stream.get()));
         // Over every bucket with the full key, index match counts are the equal buckets.
         CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
             query_planes,
@@ -1873,7 +1910,10 @@ class reference_database_view {
             nullptr,
             results,
             result_match_counts,
-            stream
+            stream,
+            0U,
+            nullptr,
+            cell_counter
         )));
         return make_tile(
             results, result_match_counts, nullptr, query_id_offset, query_count, AllToAll
@@ -1901,7 +1941,9 @@ class reference_database_view {
     }
 
     /// @brief Exactly compares query bit-planes with the selected references' planes, a group of
-    /// queries per reference row read; see detail::refine_batch_bitmap_kernel.
+    /// queries per reference row read; see detail::refine_batch_bitmap_kernel. With
+    /// @p cell_counter, a zeroed word, blocks claim cells dynamically; with @p query_order,
+    /// groups follow that order.
     template <detail::refine_candidates Candidates, bool UpperTriangle>
     [[nodiscard]] Result<void> launch_refine(
         uint32_t const* query_planes,
@@ -1914,9 +1956,21 @@ class reference_database_view {
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream,
         uint32_t minimum_matches = 0U,
-        uint32_t* pass_bits = nullptr
+        uint32_t* pass_bits = nullptr,
+        uint32_t* cell_counter = nullptr,
+        uint64_t const* query_order = nullptr
     ) const {
         auto const counting = !result_match_counts.empty() || pass_bits != nullptr;
+        if constexpr (
+            Candidates == detail::refine_candidates::all &&
+            detail::match_filter_supported<BucketCount>
+        ) {
+            if (!counting) {
+                return launch_all_pairs<UpperTriangle>(
+                    query_planes, query_id_offset, query_count, results, stream, cell_counter
+                );
+            }
+        }
         auto const select_kernel = [&]<uint32_t Group>() {
             return counting ? detail::refine_batch_bitmap_kernel<
                                   BucketCount,
@@ -1976,7 +2030,92 @@ class reference_database_view {
             results.data(),
             result_match_counts.empty() ? nullptr : result_match_counts.data(),
             minimum_matches,
-            pass_bits
+            pass_bits,
+            cell_counter,
+            query_order
+        );
+        return cuda_try(cudaGetLastError());
+    }
+
+    /// @brief Exactly compares every pair of the tile's layout; see
+    /// detail::refine_all_pairs_kernel. With @p cell_counter, a zeroed word, blocks claim cells
+    /// dynamically.
+    template <bool UpperTriangle>
+    [[nodiscard]] Result<void> launch_all_pairs(
+        uint32_t const* query_planes,
+        uint32_t query_id_offset,
+        uint32_t query_count,
+        device_span<batch_result_type> results,
+        cuda::stream_ref stream,
+        uint32_t* cell_counter
+    ) const {
+        constexpr auto group = detail::bitmap_refine_group<BucketCount>;
+        constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
+        auto const kernel =
+            detail::refine_all_pairs_kernel<BucketCount, batch_result_type, UpperTriangle, group>;
+        CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+            reinterpret_cast<void const*>(kernel),
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes)
+        ));
+        auto const multiprocessors = static_cast<uint32_t>(
+            stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+        );
+        kernel<<<multiprocessors, detail::all_pairs_block_size, shared_bytes, stream.get()>>>(
+            query_planes,
+            query_id_offset,
+            query_count,
+            planes_.data(),
+            metadata_.reference_count,
+            results.data(),
+            cell_counter
+        );
+        return cuda_try(cudaGetLastError());
+    }
+
+    /// @brief Writes to @p candidate_bits a superset of the tile's pairs with at least
+    /// @p minimum_matches index matches; see detail::match_filter_kernel. Blocks claim cells
+    /// from @p cell_counter, a zeroed word.
+    template <bool UpperTriangle>
+    [[nodiscard]] Result<void> launch_match_filter(
+        uint32_t const* query_planes,
+        uint32_t query_id_offset,
+        uint32_t query_count,
+        uint32_t indexed_bucket_count,
+        uint32_t minimum_matches,
+        uint32_t* candidate_bits,
+        uint32_t* cell_counter,
+        cuda::stream_ref stream
+    ) const {
+        constexpr auto group = detail::bitmap_refine_group<BucketCount>;
+        constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
+        auto const kernel = detail::match_filter_kernel<BucketCount, UpperTriangle, group>;
+        CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+            reinterpret_cast<void const*>(kernel),
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes)
+        ));
+        int resident_blocks = 0;
+        CUDDL_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident_blocks, kernel, detail::match_filter_block_size, shared_bytes
+        ));
+        auto const multiprocessors = static_cast<uint32_t>(
+            stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+        );
+        kernel<<<
+            multiprocessors* static_cast<uint32_t>(resident_blocks > 0 ? resident_blocks : 1),
+            detail::match_filter_block_size,
+            shared_bytes,
+            stream.get()>>>(
+            query_planes,
+            query_id_offset,
+            query_count,
+            planes_.data(),
+            metadata_.reference_count,
+            indexed_bucket_count,
+            minimum_matches,
+            candidate_bits,
+            cell_counter
         );
         return cuda_try(cudaGetLastError());
     }
@@ -2070,21 +2209,84 @@ class reference_database_view {
             query_planes = converted;
         }
 
-        if (compares_planes()) {
-            // Every passing pair's summary lands at its slot as the pass bitmap is written.
-            CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
+        auto const refine_selected = [&](bool thresholded) -> Result<void> {
+            uint64_t* query_order = nullptr;
+            if constexpr (detail::match_filter_supported<BucketCount>) {
+                // Groups of queries selecting similar references share row loads.
+                auto* signatures = static_cast<uint64_t*>(temporary_workspace);
+                query_order = signatures + query_count;
+                auto* sort_scratch = static_cast<void*>(query_order + query_count);
+                auto sort_bytes = requirements.temporary_bytes -
+                                  2U * static_cast<size_t>(query_count) * sizeof(uint64_t);
+                detail::selection_signature_kernel<<<
+                    detail::warp_grid_blocks(query_count),
+                    detail::block_size,
+                    0,
+                    stream.get()>>>(candidate_bits, query_count, reference_count, signatures);
+                CUDDL_CUDA_TRY(cudaGetLastError());
+                CUDDL_CUDA_TRY(
+                    cub::DeviceRadixSort::SortKeys(
+                        sort_scratch,
+                        sort_bytes,
+                        signatures,
+                        query_order,
+                        query_count,
+                        32,
+                        64,
+                        stream.get()
+                    )
+                );
+            }
+            CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, sizeof(uint32_t), stream.get()));
+            return launch_refine<detail::refine_candidates::bitmap, AllToAll>(
                 query_planes,
                 query_id_offset,
                 query_count,
                 indexed_bucket_count,
                 key_mask,
-                nullptr,
+                candidate_bits,
                 results,
                 result_match_counts,
                 stream,
-                options.minimum_matches,
-                candidate_bits
-            )));
+                thresholded ? options.minimum_matches : 0U,
+                thresholded ? candidate_bits : nullptr,
+                match_counts,
+                query_order
+            );
+        };
+
+        if (compares_planes()) {
+            // A low-plane bound selects candidates; the refinement counts their matches exactly
+            // and keeps, in the same bitmap, those meeting the threshold.
+            if constexpr (detail::match_filter_supported<BucketCount>) {
+                CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, sizeof(uint32_t), stream.get()));
+                CUDDL_TRY((launch_match_filter<AllToAll>(
+                    query_planes,
+                    query_id_offset,
+                    query_count,
+                    indexed_bucket_count,
+                    options.minimum_matches,
+                    candidate_bits,
+                    match_counts,
+                    stream
+                )));
+                CUDDL_TRY(refine_selected(true));
+            } else {
+                // Every passing pair's summary lands at its slot as the pass bitmap is written.
+                CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
+                    query_planes,
+                    query_id_offset,
+                    query_count,
+                    indexed_bucket_count,
+                    key_mask,
+                    nullptr,
+                    results,
+                    result_match_counts,
+                    stream,
+                    options.minimum_matches,
+                    candidate_bits
+                )));
+            }
             return result_tile;
         }
 
@@ -2105,13 +2307,35 @@ class reference_database_view {
             return cuda_try(cudaGetLastError());
         };
         if (detail::uses_tiled_index_counts(reference_count, query_count, indexed_bucket_count)) {
-            auto const tile =
-                detail::index_tile_references(reference_count, query_count, multiprocessors);
+            auto const tile = detail::index_tile_references(
+                reference_count,
+                query_count,
+                multiprocessors,
+                static_cast<uint32_t>(stream.device().attribute(
+                    cuda::device_attributes::max_shared_memory_per_block_optin
+                ))
+            );
             auto const tiles = (reference_count + tile - 1U) / tile;
             // Sparse ranges are resolved bucket-major first: a block's lookups all search one
             // bucket's keys, so their shared upper search levels stay in L1.
             uint2* ranges = nullptr;
             uint32_t counter_bits = 0U;
+            if (!index_keys_.empty()) {
+                ranges = static_cast<uint2*>(temporary_workspace);
+                detail::sparse_batch_posting_ranges_kernel<BucketCount>
+                    <<<indexed_bucket_count, detail::block_size, 0, stream.get()>>>(
+                        query_scores,
+                        0U,
+                        query_count,
+                        index_keys_.data(),
+                        key_directory_.data(),
+                        reference_count,
+                        indexed_bucket_count,
+                        key_mask,
+                        ranges
+                    );
+                CUDDL_CUDA_TRY(cudaGetLastError());
+            }
             auto const hybrid = !bitmap_cells_.empty();
             if (hybrid) {
                 ranges = static_cast<uint2*>(temporary_workspace);
@@ -2121,7 +2345,7 @@ class reference_database_view {
                 detail::hybrid_posting_ranges_kernel<BucketCount>
                     <<<query_count, detail::block_size, 0, stream.get()>>>(
                         query_scores,
-                        index_offsets_.data(),
+                        index_offsets_.empty() ? nullptr : index_offsets_.data(),
                         bitmap_cells_.data(),
                         static_cast<uint32_t>(bitmap_cells_.size()),
                         detail::candidate_bit_words(reference_count),
@@ -2135,9 +2359,13 @@ class reference_database_view {
                 counter_bits = std::max<uint32_t>(1U, std::bit_width(options.minimum_matches));
                 auto const count_bitmaps = [&]<uint32_t Bits>() -> Result<void> {
                     auto const words = detail::candidate_bit_words(reference_count);
+                    constexpr auto words_per_query = detail::bitmap_count_words_per_query;
+                    constexpr auto queries_per_block = detail::block_size / words_per_query;
+                    auto const query_tiles =
+                        (query_count + queries_per_block - 1U) / queries_per_block;
                     auto const blocks = static_cast<uint32_t>(std::min<size_t>(
-                        static_cast<size_t>(query_count) *
-                            ((words + detail::block_size - 1U) / detail::block_size),
+                        static_cast<size_t>(query_tiles) *
+                            ((words + words_per_query - 1U) / words_per_query),
                         65535U
                     ));
                     detail::count_posting_bitmaps_kernel<Bits>
@@ -2149,6 +2377,8 @@ class reference_database_view {
                             reference_count,
                             indexed_bucket_count,
                             options.minimum_matches,
+                            query_id_offset,
+                            AllToAll,
                             match_counts,
                             candidate_bits
                         );
@@ -2205,29 +2435,13 @@ class reference_database_view {
                         break;
                 }
             }
-            if (!index_keys_.empty()) {
-                ranges = static_cast<uint2*>(temporary_workspace);
-                detail::sparse_batch_posting_ranges_kernel<BucketCount>
-                    <<<indexed_bucket_count, detail::block_size, 0, stream.get()>>>(
-                        query_scores,
-                        0U,
-                        query_count,
-                        index_keys_.data(),
-                        key_directory_.data(),
-                        reference_count,
-                        indexed_bucket_count,
-                        key_mask,
-                        ranges
-                    );
-                CUDDL_CUDA_TRY(cudaGetLastError());
-            }
             auto const count_postings = [&]<bool Seeded>() -> Result<void> {
                 CUDDL_CUDA_TRY(cudaFuncSetAttribute(
                     reinterpret_cast<void const*>(
                         detail::count_batch_index_tile_kernel<BucketCount, Seeded, uint16_t>
                     ),
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    static_cast<int>(detail::index_tile_max_references / 2U * sizeof(uint32_t))
+                    static_cast<int>(tile / 2U * sizeof(uint32_t))
                 ));
                 detail::count_batch_index_tile_kernel<BucketCount, Seeded>
                     <<<query_count * tiles,
@@ -2286,17 +2500,7 @@ class reference_database_view {
             CUDDL_CUDA_TRY(cudaGetLastError());
             CUDDL_TRY(bits_from_counts());
         }
-        CUDDL_TRY((launch_refine<detail::refine_candidates::bitmap, AllToAll>(
-            query_planes,
-            query_id_offset,
-            query_count,
-            indexed_bucket_count,
-            key_mask,
-            candidate_bits,
-            results,
-            result_match_counts,
-            stream
-        )));
+        CUDDL_TRY(refine_selected(false));
         return result_tile;
     }
 
