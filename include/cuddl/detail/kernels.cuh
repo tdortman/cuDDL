@@ -1184,8 +1184,20 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
                     count(ids[j]);
                 }
             }
-            for (; posting < range_end; posting += warp_width) {
-                count(postings[posting]);
+            // The four-ID bulk loop leaves at most three independent loads per lane.
+            auto const remaining = posting < range_end ? range_end - posting : 0U;
+            uint32_t ids[3];
+            _Pragma("unroll")
+            for (uint32_t j = 0U; j < 3U; ++j) {
+                if (j * warp_width < remaining) {
+                    ids[j] = postings[posting + j * warp_width];
+                }
+            }
+            _Pragma("unroll")
+            for (uint32_t j = 0U; j < 3U; ++j) {
+                if (j * warp_width < remaining) {
+                    count(ids[j]);
+                }
             }
         }
     }
@@ -2347,8 +2359,8 @@ __global__ __launch_bounds__(match_filter_block_size, 1) void match_filter_kerne
 /// registers, so a block holds fewer threads than a refine block.
 constexpr uint32_t all_pairs_block_size = 512U;
 
-/// @brief Exactly compares every pair of the layout, as @ref refine_batch_bitmap_kernel does for
-/// @ref refine_candidates::all without match counts.
+/// @brief Exactly compares the layout pairs selected by @p reference_mask, without match counts.
+/// A null mask selects every reference.
 ///
 /// Cells, query staging, and word claiming follow @ref refine_batch_bitmap_kernel. A warp takes
 /// a claimed word's references two at a time and keeps both references' planes in registers, so
@@ -2362,7 +2374,8 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     uint32_t const* reference_planes,
     uint32_t reference_count,
     SearchResult* results,
-    uint32_t* cell_counter
+    uint32_t* cell_counter,
+    uint32_t const* reference_mask
 ) {
     static_assert(match_filter_supported<BucketCount>);
     constexpr uint32_t warp_width = 32;
@@ -2430,6 +2443,9 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
                         auto const skipped = query_id - first_reference + 1U;
                         bits &= skipped >= warp_width ? 0U : ~0U << skipped;
                     }
+                }
+                if (reference_mask != nullptr) {
+                    bits &= reference_mask[word];
                 }
             }
             auto remaining = __reduce_or_sync(0xffffffffU, bits);

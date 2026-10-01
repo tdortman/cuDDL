@@ -475,9 +475,10 @@ __global__ __launch_bounds__(delta_correction_warps * 32U, 1) void apply_referen
         }
     };
     for (auto cell = blockIdx.x; cell < query_groups * child_tiles; cell += gridDim.x) {
-        auto const first_member = (cell % query_groups) * group;
+        // Adjacent child tiles reuse a query group's base-result region.
+        auto const first_member = (cell / child_tiles) * group;
         auto const members = cuda::std::min(group, query_count - first_member);
-        auto const begin_child = (cell / query_groups) * delta_child_tile;
+        auto const begin_child = (cell % child_tiles) * delta_child_tile;
         auto const end_child = cuda::std::min(deltas.child_count, begin_child + delta_child_tile);
         if constexpr (UpperTriangle) {
             // Children ascend, so a tile whose last child precedes the group has no pairs.

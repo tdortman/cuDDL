@@ -1526,9 +1526,75 @@ void expect_near_duplicate_exhaustive_searches(cuda::stream_ref stream, uint32_t
 }
 
 TEST_F(ReferenceDatabaseTest, ExhaustiveSearchesOfNearDuplicateRowsMatchScalarOracle) {
-    // More than one child tile of children, and the widest bucket count's query grouping.
-    expect_near_duplicate_exhaustive_searches<b_default>(stream_, 2400U);
+    // Cover incomplete reference words and query groups at both bucket widths.
+    expect_near_duplicate_exhaustive_searches<b_default>(stream_, 2403U);
     expect_near_duplicate_exhaustive_searches<8192>(stream_, 300U);
+}
+
+TEST_F(ReferenceDatabaseTest, UnfilteredHostVisitPreservesChunkBoundaries) {
+    auto const stream = cuda::stream_ref{stream_};
+    constexpr uint32_t references = 4097U;
+    constexpr uint32_t queries = 769U;
+    constexpr uint32_t first_query = 7U;
+    constexpr uint32_t buckets = 2048U;
+    for (bool upper_triangle : {false, true}) {
+        SCOPED_TRACE(upper_triangle);
+        auto expected_count = size_t{queries} * references;
+        if (upper_triangle) {
+            expected_count -= size_t{queries} * (2U * first_query + queries + 1U) / 2U;
+        }
+        std::vector<cuddl::packed_pairwise_counts> packed;
+        packed.reserve(expected_count);
+        for (uint32_t query = first_query; query < first_query + queries; ++query) {
+            for (uint32_t reference = upper_triangle ? query + 1U : 0U; reference < references;
+                 ++reference) {
+                packed.push_back(
+                    cuddl::packed_pairwise_counts::pack(
+                        query % 19U, reference % 23U, (query + reference) % 31U
+                    )
+                );
+            }
+        }
+        auto device_packed = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+            stream, stream.device(), packed
+        );
+        cuddl::batch_result_tile const tile{
+            .results = device_packed.data(),
+            .first_query_id = first_query,
+            .query_count = queries,
+            .reference_count = references,
+            .bucket_count = buckets,
+            .upper_triangle = upper_triangle,
+        };
+        size_t delivered = 0U;
+        uint64_t previous_pair = 0U;
+        CUDDL_UNWRAP(
+            cuddl::for_each_passing(tile, stream, [&](cuddl::batch_search_result const& result) {
+                EXPECT_GE(result.query_id, first_query);
+                EXPECT_LT(result.query_id, first_query + queries);
+                EXPECT_LT(result.reference_id, references);
+                if (upper_triangle) {
+                    EXPECT_LT(result.query_id, result.reference_id);
+                }
+                auto const pair =
+                    (static_cast<uint64_t>(result.query_id) << 32U) | result.reference_id;
+                EXPECT_GT(pair, previous_pair);
+                previous_pair = pair;
+                auto const lower = result.query_id % 19U;
+                auto const equal = result.reference_id % 23U;
+                auto const higher = (result.query_id + result.reference_id) % 31U;
+                cuddl::pairwise_counts const expected{
+                    .lower = lower,
+                    .equal = equal,
+                    .higher = higher,
+                    .both_empty = buckets - lower - equal - higher,
+                };
+                EXPECT_EQ(result.counts, expected);
+                ++delivered;
+            })
+        );
+        EXPECT_EQ(delivered, expected_count);
+    }
 }
 
 TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries) {
@@ -1632,6 +1698,7 @@ TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries)
             stream, stream.device(), all_requirements.maximum_pair_count, cuda::no_init
         );
         std::vector<uint32_t> per_query(references);
+        uint64_t previous_pair = 0U;
         auto consume = [&](cuddl::batch_result_tile const& tile) {
             CUDDL_UNWRAP(
                 cuddl::for_each_passing(
@@ -1641,6 +1708,10 @@ TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries)
                         EXPECT_LT(result.query_id, result.reference_id);
                         EXPECT_EQ(result.query_id % 5U, result.reference_id % 5U);
                         EXPECT_EQ(result.counts.equal, 16U);
+                        auto const pair =
+                            (static_cast<uint64_t>(result.query_id) << 32U) | result.reference_id;
+                        EXPECT_GT(pair, previous_pair);
+                        previous_pair = pair;
                         ++per_query[result.query_id];
                     }
                 )

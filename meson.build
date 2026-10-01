@@ -77,6 +77,8 @@ if build_benchmarks
     cmake = import('cmake')
 
     nvbench_opts = cmake.subproject_options()
+    # NVCC cannot use the GNU dialect inferred from imported C++ target options.
+    nvbench_opts.set_override_option('cuda_std', 'c++17')
     nvbench_opts.add_cmake_defines({
         'CMAKE_CXX_STANDARD': '20',
         'CCCL_DIR': meson.project_source_root() / 'subprojects/cccl/lib/cmake/cccl',

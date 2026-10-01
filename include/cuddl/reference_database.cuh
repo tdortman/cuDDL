@@ -546,7 +546,9 @@ for_each_passing(batch_result_tile const& tile, cuda::stream_ref stream, F&& f) 
                 chunk.last = query;
                 chunk.end_record = record;
                 chunks.push_back(chunk);
-                chunk = {.first = query, .first_record = record};
+                // NVCC 13.4 mislowers assignments that skip aggregate members.
+                chunk.first = query;
+                chunk.first_record = record;
             }
             record += row;
         }
@@ -691,12 +693,20 @@ for_each_passing(batch_result_tile const& tile, cuda::stream_ref stream, F&& f) 
             continue;
         }
         auto const words_per_query = tile.words_per_query();
-        for (auto w = chunk.first; w < chunk.last; ++w) {
-            auto const query_id = tile.first_query_id + static_cast<uint32_t>(w / words_per_query);
-            auto const base = static_cast<uint32_t>(w % words_per_query) * 32U;
-            for (auto bits = pass_bits[w]; bits != 0U; bits &= bits - 1U) {
-                emit(query_id, base + static_cast<uint32_t>(cuda::std::countr_zero(bits)));
+        auto query = static_cast<uint32_t>(chunk.first / words_per_query);
+        auto column = static_cast<uint32_t>(chunk.first % words_per_query);
+        auto w = chunk.first;
+        while (w < chunk.last) {
+            // A transfer chunk may start or end inside a query row.
+            auto const row_end = std::min(chunk.last, w + words_per_query - column);
+            auto const query_id = tile.first_query_id + query;
+            for (auto base = column * 32U; w < row_end; ++w, base += 32U) {
+                for (auto bits = pass_bits[w]; bits != 0U; bits &= bits - 1U) {
+                    emit(query_id, base + static_cast<uint32_t>(cuda::std::countr_zero(bits)));
+                }
             }
+            ++query;
+            column = 0U;
         }
     }
     return Ok();
@@ -2012,12 +2022,20 @@ class reference_database_view {
     ) const {
         auto const counting = !result_match_counts.empty() || pass_bits != nullptr;
         if constexpr (
-            Candidates == detail::refine_candidates::all &&
+            (Candidates == detail::refine_candidates::all ||
+             Candidates == detail::refine_candidates::reference_mask) &&
             detail::match_filter_supported<BucketCount>
         ) {
             if (!counting) {
                 return launch_all_pairs<UpperTriangle>(
-                    query_planes, query_id_offset, query_count, results, stream, cell_counter
+                    query_planes,
+                    query_id_offset,
+                    query_count,
+                    results,
+                    stream,
+                    cell_counter,
+                    Candidates == detail::refine_candidates::reference_mask ? candidate_bits
+                                                                            : nullptr
                 );
             }
         }
@@ -2087,9 +2105,9 @@ class reference_database_view {
         return cuda_try(cudaGetLastError());
     }
 
-    /// @brief Exactly compares every pair of the tile's layout; see
-    /// detail::refine_all_pairs_kernel. With @p cell_counter, a zeroed word, blocks claim cells
-    /// dynamically.
+    /// @brief Exactly compares the tile's pairs selected by @p reference_mask; a null mask selects
+    /// every reference. See detail::refine_all_pairs_kernel. With @p cell_counter, a zeroed word,
+    /// blocks claim cells dynamically.
     template <bool UpperTriangle>
     [[nodiscard]] Result<void> launch_all_pairs(
         uint32_t const* query_planes,
@@ -2097,7 +2115,8 @@ class reference_database_view {
         uint32_t query_count,
         device_span<batch_result_type> results,
         cuda::stream_ref stream,
-        uint32_t* cell_counter
+        uint32_t* cell_counter,
+        uint32_t const* reference_mask
     ) const {
         constexpr auto group = detail::bitmap_refine_group<BucketCount>;
         constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
@@ -2118,7 +2137,8 @@ class reference_database_view {
             planes_.data(),
             metadata_.reference_count,
             results.data(),
-            cell_counter
+            cell_counter,
+            reference_mask
         );
         return cuda_try(cudaGetLastError());
     }
