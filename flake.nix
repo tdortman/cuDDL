@@ -27,28 +27,8 @@
 
           rustToolchain = pkgs.rust-bin.stable.latest.default;
           lib = pkgs.lib;
-          cudaPkgs = pkgs.cudaPackages_13_3;
+          cudaPkgs = pkgs.cudaPackages_13_4;
           llvmPkgs = pkgs.llvmPackages_22;
-
-          # Compute Sanitizer 2026.3 adds initcheck support for CCCL's batched copies.
-          cudaSanitizer = cudaPkgs.cuda_sanitizer_api.overrideAttrs (
-            final: _: {
-              version = "13.4.46";
-              src =
-                let
-                  platform = if system == "x86_64-linux" then "linux-x86_64" else "linux-sbsa";
-                in
-                pkgs.fetchurl {
-                  url = "https://packages.nvidia.com/bin-archive/pool/${platform}/5B515474-7E78-11F1-8656-C51E4F4B317F/cuda_sanitizer_api-${platform}-${final.version}-archive.tar.xz";
-                  sha256 =
-                    {
-                      x86_64-linux = "cbffa4277abe42dd451519b1e367176415d71925e061356780291ccb58116869";
-                      aarch64-linux = "880b5165f88318599c037730b62ceca7db2a0a7b24dc34ebed00acd784459209";
-                    }
-                    .${system};
-                };
-            }
-          );
 
           cudaToolkit = pkgs.symlinkJoin {
             name = "cuda-toolkit";
@@ -58,13 +38,13 @@
               cuda_crt
               cuda_cudart
               cuda_profiler_api.include
+              cuda_sanitizer_api
               cuda_cuobjdump
               cuda_nvdisasm
 
               cuda_gdb.bin
               nsight_systems
               nsight_compute
-              cudaSanitizer
 
               # nvCOMP ships its headers, library and CMake config in separate
               # outputs, so the merge takes each of them: the default output is
