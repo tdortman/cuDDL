@@ -1741,6 +1741,8 @@ enum class refine_candidates {
     bitmap,
     /// Every pair of the layout, or with pass bits requested, those meeting the threshold.
     all,
+    /// Every pair of the layout whose reference is set in one reference-wide bitmap.
+    reference_mask,
 };
 
 /// @brief Position of the pair (@p query_index of the tile, @p reference_id) in a tile's
@@ -1906,7 +1908,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
         1U, refine_block_row_bytes / (BucketCount * sizeof(uint16_t)) / warp_width
     ));
     // Bitmap selections cluster in a few words, so their warps claim quarter words.
-    constexpr uint32_t word_slices = Candidates == refine_candidates::bitmap ? 4U : 1U;
+    constexpr uint32_t word_slices = Candidates == refine_candidates::all ? 1U : 4U;
     extern __shared__ uint4 query_plane_storage[];
     __shared__ uint32_t next_word;
     __shared__ uint32_t claimed_cell;
@@ -1972,10 +1974,10 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
             // Lane m holds query m's selected references in this slice of the word.
             uint32_t bits = 0U;
             if (lane < group_size) {
+                constexpr uint32_t slice_width = warp_width / word_slices;
+                constexpr uint32_t slice_mask =
+                    slice_width == warp_width ? ~0U : (1U << slice_width) - 1U;
                 if constexpr (Candidates == refine_candidates::bitmap) {
-                    constexpr uint32_t slice_width = warp_width / word_slices;
-                    constexpr uint32_t slice_mask =
-                        slice_width == warp_width ? ~0U : (1U << slice_width) - 1U;
                     bits = candidate_bits[static_cast<size_t>(my_query) * words_per_query + word] &
                            (slice_mask << (claim % word_slices * slice_width));
                 } else {
@@ -1988,6 +1990,10 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                             auto const skipped = query_id - first_reference + 1U;
                             bits &= skipped >= warp_width ? 0U : ~0U << skipped;
                         }
+                    }
+                    if constexpr (Candidates == refine_candidates::reference_mask) {
+                        bits &= candidate_bits[word] &
+                                (slice_mask << (claim % word_slices * slice_width));
                     }
                 }
             }
@@ -2071,8 +2077,8 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                             mine_matches = counts_matches_total;
                         }
                     };
-                    if constexpr (Candidates == refine_candidates::all) {
-                        // All-pairs and upper-triangle selections are prefixes of the query group.
+                    if constexpr (Candidates != refine_candidates::bitmap) {
+                        // Layout and reference-mask selections are prefixes of the query group.
                         auto const member_count = static_cast<uint32_t>(__popc(selected));
                         for (uint32_t m = 0U; m < member_count; ++m) {
                             compare_member(m);
@@ -2115,8 +2121,10 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                         ~(bits & ~passed)
                     );
                 }
-            } else if (thresholded && lane < group_size) {
-                pass_bits[static_cast<size_t>(my_query) * words_per_query + word] = passed;
+            } else if constexpr (Candidates == refine_candidates::all) {
+                if (thresholded && lane < group_size) {
+                    pass_bits[static_cast<size_t>(my_query) * words_per_query + word] = passed;
+                }
             }
         }
     }

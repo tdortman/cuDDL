@@ -270,7 +270,7 @@ The rename makes a new file appear all at once. It does not protect against powe
 
 The database owns the reference rows. A `reference_index<K, BucketCount, Layout>` owns only acceleration data and neither copies nor owns the database. To use an index, pass a pointer to it to a search call. To search without one, pass `nullptr` or leave the argument out. Both paths apply the same threshold and return exact counts in reference order.
 
-A database row stores one 16-bit winner score per bucket, so rows take `reference_count * bucket_count * 2` bytes.
+A database row stores one 16-bit winner score per bucket, so rows take `reference_count * bucket_count * 2` bytes. `build_async` also groups near-duplicate rows so exhaustive searches can skip about half of the full comparisons. On RefSeq bacteria this takes about 7% more device memory than the rows. See [near-duplicate references in exhaustive search](near-duplicate-references.md).
 
 On the GPU, each group of 32 buckets is stored as 16 bit-planes, one per score bit. One comparison then covers 32 buckets in a handful of logic operations. `copy_scores_async` decodes the planes back to row-major scores. Index construction decodes them too, into a temporary buffer, so it needs extra device memory. Posting offsets are 32-bit, and index construction rejects databases with more postings than that.
 

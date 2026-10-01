@@ -1410,6 +1410,127 @@ TEST_F(ReferenceDatabaseTest, TiledIndexedBatchCountsMatchExhaustive) {
     }
 }
 
+/// Near-duplicate rows with up to and beyond the delta change limit, empty buckets entering and
+/// leaving rows, and empty or partially empty queries: exhaustive batch and all-to-all results
+/// must match the scalar oracle for every pair.
+template <size_t Buckets>
+void expect_near_duplicate_exhaustive_searches(cuda::stream_ref stream, uint32_t reference_count) {
+    using database_type = cuddl::reference_database<k_default, Buckets>;
+    constexpr uint32_t clusters = 24U;
+    constexpr uint32_t query_count = 37U;
+    std::mt19937 random(0x5eedU + static_cast<uint32_t>(Buckets));
+    auto random_score = [&] {
+        return random() % 10U == 0U ? uint16_t{0} : static_cast<uint16_t>(1U + random() % 0xffffU);
+    };
+    std::vector<uint16_t> bases(clusters * Buckets);
+    std::ranges::generate(bases, random_score);
+    std::vector<uint16_t> rows(static_cast<size_t>(reference_count) * Buckets);
+    for (uint32_t row = 0U; row < reference_count; ++row) {
+        auto* const out = rows.data() + static_cast<size_t>(row) * Buckets;
+        std::copy_n(bases.data() + (row % clusters) * Buckets, Buckets, out);
+        // Exact duplicates, changes up to the limit, and rows just beyond it.
+        auto const changes = row % 7U == 0U   ? 0U
+                             : row % 5U == 0U ? cuddl::detail::delta_change_limit + 1U + row % 60U
+                                              : 1U + row % cuddl::detail::delta_change_limit;
+        for (uint32_t change = 0U; change < changes; ++change) {
+            auto& score = out[random() % Buckets];
+            auto const old = score;
+            switch (random() % 4U) {
+                case 0:
+                    score = old == 0U ? uint16_t{1} : uint16_t{0};
+                    break;
+                case 1:
+                    score = static_cast<uint16_t>(old == 0xffffU ? 1U : old + 1U + random() % 64U);
+                    break;
+                case 2:
+                    score = static_cast<uint16_t>(old <= 1U ? 0xfff0U : old - 1U - random() % old);
+                    break;
+                default:
+                    score = random_score();
+                    break;
+            }
+        }
+    }
+    std::vector<uint16_t> queries(query_count * Buckets);
+    for (uint32_t query = 0U; query + 1U < query_count; ++query) {
+        auto* const out = queries.data() + static_cast<size_t>(query) * Buckets;
+        if (query % 3U == 2U) {
+            std::generate_n(out, Buckets, random_score);
+            continue;
+        }
+        std::copy_n(
+            rows.data() + static_cast<size_t>(query * 61U % reference_count) * Buckets, Buckets, out
+        );
+        if (query % 3U == 1U) {
+            for (uint32_t i = 0U; i < 200U; ++i) out[random() % Buckets] = 0U;
+        }
+    }
+    // The last query is empty.
+
+    auto const compatibility = cuddl::score_compatibility::current<k_default, Buckets>();
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), queries);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto expect_oracle = [&](std::vector<cuddl::batch_search_result> const& actual,
+                             std::vector<uint16_t> const& query_rows,
+                             bool upper_triangle) {
+        auto const queries_searched = static_cast<uint32_t>(query_rows.size() / Buckets);
+        size_t position = 0U;
+        size_t mismatches = 0U;
+        for (uint32_t query = 0U; query < queries_searched; ++query) {
+            auto const row = std::span<uint16_t const>{query_rows}.subspan(
+                static_cast<size_t>(query) * Buckets, Buckets
+            );
+            for (auto reference = upper_triangle ? query + 1U : 0U; reference < reference_count;
+                 ++reference, ++position) {
+                ASSERT_LT(position, actual.size());
+                auto const& result = actual[position];
+                auto const expected = score_row_oracle(row, rows, reference);
+                if (result.query_id != query || result.reference_id != reference ||
+                    result.counts != expected) {
+                    if (mismatches++ == 0U) {
+                        ADD_FAILURE()
+                            << "first mismatch at query " << query << ", reference " << reference;
+                    }
+                }
+            }
+        }
+        EXPECT_EQ(actual.size(), position);
+        EXPECT_EQ(mismatches, 0U);
+    };
+
+    auto batch = CUDDL_UNWRAP(database.batch_search_requirements(query_count, stream));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), batch.workspace_bytes, uint8_t{}
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), batch.maximum_pair_count, cuddl::packed_pairwise_counts{}
+    );
+    tile_collector batch_tiles{stream};
+    CUDDL_UNWRAP(database.search_batch_async(
+        device_queries, compatibility, 0U, workspace, results, batch_tiles, {}, stream
+    ));
+    expect_oracle(batch_tiles.results, queries, false);
+
+    auto all = CUDDL_UNWRAP(database.all_to_all_search_requirements());
+    auto all_workspace =
+        cuda::make_device_buffer<uint8_t>(stream, stream.device(), all.workspace_bytes, uint8_t{});
+    auto all_results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), all.maximum_pair_count, cuddl::packed_pairwise_counts{}
+    );
+    tile_collector all_tiles{stream};
+    CUDDL_UNWRAP(
+        database.search_all_to_all_async(all_workspace, all_results, all_tiles, {}, stream)
+    );
+    expect_oracle(all_tiles.results, rows, true);
+}
+
+TEST_F(ReferenceDatabaseTest, ExhaustiveSearchesOfNearDuplicateRowsMatchScalarOracle) {
+    // More than one child tile of children, and the widest bucket count's query grouping.
+    expect_near_duplicate_exhaustive_searches<b_default>(stream_, 2400U);
+    expect_near_duplicate_exhaustive_searches<8192>(stream_, 300U);
+}
+
 TEST_F(ReferenceDatabaseTest, FrequentPostingBitmapsPreserveThresholdBoundaries) {
     auto const stream = cuda::stream_ref{stream_};
     using database_type = cuddl::reference_database<k_default, b_default>;

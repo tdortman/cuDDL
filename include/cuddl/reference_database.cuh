@@ -29,6 +29,7 @@
 
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/kernels.cuh>
+#include <cuddl/detail/reference_deltas.cuh>
 #include <cuddl/detail/register.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
@@ -893,7 +894,8 @@ class reference_database_view {
         device_span<uint32_t const> key_directory = {},
         double index_pair_fraction = 0.0,
         device_span<uint32_t const> bitmap_cells = {},
-        device_span<uint32_t const> posting_bitmaps = {}
+        device_span<uint32_t const> posting_bitmaps = {},
+        reference_delta_view deltas = {}
     ) noexcept
         : planes_(planes),
           metadata_(metadata),
@@ -903,6 +905,7 @@ class reference_database_view {
           key_directory_(key_directory),
           bitmap_cells_(bitmap_cells),
           posting_bitmaps_(posting_bitmaps),
+          deltas_(deltas),
           index_pair_fraction_(index_pair_fraction),
           indexed_(indexed) {}
 
@@ -1900,24 +1903,71 @@ class reference_database_view {
         }
         auto* cell_counter = reinterpret_cast<uint32_t*>(counter_address);
         CUDDL_CUDA_TRY(cudaMemsetAsync(cell_counter, 0, sizeof(uint32_t), stream.get()));
-        // Over every bucket with the full key, index match counts are the equal buckets.
-        CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
-            query_planes,
-            query_id_offset,
-            query_count,
-            static_cast<uint32_t>(BucketCount),
-            uint16_t{0xffffU},
-            nullptr,
-            results,
-            result_match_counts,
-            stream,
-            0U,
-            nullptr,
-            cell_counter
-        )));
+        if (deltas_.child_count != 0U && result_match_counts.empty() && corrects_deltas(stream)) {
+            // Bases are refined exactly; every child pair then follows from its base pair.
+            CUDDL_TRY((launch_refine<detail::refine_candidates::reference_mask, AllToAll>(
+                query_planes,
+                query_id_offset,
+                query_count,
+                static_cast<uint32_t>(BucketCount),
+                uint16_t{0xffffU},
+                deltas_.base_bits,
+                results,
+                result_match_counts,
+                stream,
+                0U,
+                nullptr,
+                cell_counter
+            )));
+            auto const kernel =
+                detail::apply_reference_deltas_kernel<BucketCount, batch_result_type, AllToAll>;
+            CUDDL_CUDA_TRY(cudaFuncSetAttribute(
+                reinterpret_cast<void const*>(kernel),
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(detail::delta_correction_shared_bytes<BucketCount>)
+            ));
+            kernel<<<
+                static_cast<uint32_t>(
+                    stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+                ),
+                detail::delta_correction_warps * 32U,
+                detail::delta_correction_shared_bytes<BucketCount>,
+                stream.get()>>>(
+                query_planes,
+                query_id_offset,
+                query_count,
+                metadata_.reference_count,
+                deltas_,
+                results.data()
+            );
+            CUDDL_CUDA_TRY(cudaGetLastError());
+        } else {
+            // Over every bucket with the full key, index match counts are the equal buckets.
+            CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
+                query_planes,
+                query_id_offset,
+                query_count,
+                static_cast<uint32_t>(BucketCount),
+                uint16_t{0xffffU},
+                nullptr,
+                results,
+                result_match_counts,
+                stream,
+                0U,
+                nullptr,
+                cell_counter
+            )));
+        }
         return make_tile(
             results, result_match_counts, nullptr, query_id_offset, query_count, AllToAll
         );
+    }
+
+    /// @brief True when the device can stage a delta-correction cell.
+    [[nodiscard]] static bool corrects_deltas(cuda::stream_ref stream) {
+        return static_cast<size_t>(stream.device().attribute(
+                   cuda::device_attributes::max_shared_memory_per_block_optin
+               )) >= detail::delta_correction_shared_bytes<BucketCount>;
     }
 
     [[nodiscard]] batch_result_tile make_tile(
@@ -2520,6 +2570,7 @@ class reference_database_view {
     device_span<uint32_t const> key_directory_;
     device_span<uint32_t const> bitmap_cells_;
     device_span<uint32_t const> posting_bitmaps_;
+    reference_delta_view deltas_;
     double index_pair_fraction_{};
     bool indexed_{};
 };
@@ -2559,7 +2610,8 @@ class reference_database {
         : planes_(std::move(other.planes_)),
           metadata_(std::exchange(other.metadata_, {})),
           names_(std::move(other.names_)),
-          identity_(std::move(other.identity_)) {}
+          identity_(std::move(other.identity_)),
+          deltas_(std::move(other.deltas_)) {}
 
     reference_database& operator=(reference_database&& other) noexcept {
         if (this != &other) {
@@ -2567,6 +2619,7 @@ class reference_database {
             metadata_ = std::exchange(other.metadata_, {});
             names_ = std::move(other.names_);
             identity_ = std::move(other.identity_);
+            deltas_ = std::move(other.deltas_);
         }
         return *this;
     }
@@ -2574,7 +2627,8 @@ class reference_database {
     /// @brief Builds a database from flat row-major scores on @p stream.
     ///
     /// The database keeps each row only as bit-planes (detail::score_plane_index), the layout
-    /// every search compares 32 buckets at a time; @p rows is not retained.
+    /// every search compares 32 buckets at a time; @p rows is not retained. Grouping near-duplicate
+    /// rows (detail::reference_delta_view) waits for @p stream once.
     [[nodiscard]] static Result<reference_database> build_async(
         device_span<score_type const> rows,
         score_compatibility compatibility,
@@ -2596,6 +2650,11 @@ class reference_database {
                    0,
                    stream.get()>>>(rows.data(), reference_count, database.planes_.data());
             CUDDL_CUDA_TRY(cudaGetLastError());
+            // Rows are compared as base references plus changed buckets; see
+            // detail::reference_delta_view. Building it waits for the stream.
+            database.deltas_ = CUDDL_TRY(
+                detail::build_reference_deltas<BucketCount>(rows.data(), reference_count, stream)
+            );
         }
         return Result<reference_database>::ok(std::move(database));
     }
@@ -2809,7 +2868,19 @@ class reference_database {
     using view_type = detail::reference_database_view<K, BucketCount, Layout>;
 
     [[nodiscard]] view_type view() const noexcept {
-        return view_type({planes_.data(), planes_.size()}, metadata_);
+        return view_type(
+            {planes_.data(), planes_.size()},
+            metadata_,
+            {},
+            {},
+            false,
+            {},
+            {},
+            0.0,
+            {},
+            {},
+            delta_view()
+        );
     }
 
     [[nodiscard]] Result<view_type> view(
@@ -2835,8 +2906,13 @@ class reference_database {
             index->key_directory_,
             index->pair_fraction_,
             {index->bitmap_cells_.data(), index->bitmap_count_},
-            index->posting_bitmaps_
+            index->posting_bitmaps_,
+            delta_view()
         );
+    }
+
+    [[nodiscard]] detail::reference_delta_view delta_view() const noexcept {
+        return deltas_ ? deltas_->view() : detail::reference_delta_view{};
     }
 
     explicit reference_database(cuda::stream_ref stream)
@@ -2865,6 +2941,7 @@ class reference_database {
     std::vector<std::string> names_;
     // A shared identity prevents accepting an index for a different or recycled row allocation.
     std::shared_ptr<char const> identity_ = std::make_shared<char>(0);
+    std::optional<detail::reference_deltas> deltas_;
 };
 
 }  // namespace cuddl
