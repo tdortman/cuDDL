@@ -18,14 +18,15 @@ Grouping runs on the GPU at the end of `build_async`, in `build_reference_deltas
 3. From each signature, keep the 4 highest-ID candidates whose ID is above the row's own (`delta_signature_candidates`). That gives each row up to 32 candidates.
 4. One warp per row compares the row with its candidates from the highest ID down. The first candidate that differs in at most `delta_change_limit` buckets becomes the row's target.
 5. Every row that some row targets becomes a base. A row targeted by nobody becomes a child of its own target. A row without a target is a base.
+6. Revisit each child's candidates and choose the existing base with the fewest changed buckets. Keep the current target on a tie. This pass leaves the base set unchanged.
 
-Two properties fall out of step 5, and both matter at search time.
+Steps 5 and 6 preserve two properties that matter at search time.
 
 The grouping is flat. A base is never a child, so correcting a child reads a base result that the base refinement has already written. Corrections never wait on other corrections.
 
 A child's base always has a higher ID than the child. All-to-all searches fill only pairs with `query_id < reference_id`. If a pair `(query, child)` is in a tile, the pair `(query, base)` is in the same tile, because `base > child > query`.
 
-Hashing exact scores misses rows that differ inside every signature, so some near duplicates stay bases. Grouping takes about 1.5 ms for 43,029 rows on an RTX 5070 Ti, so a better grouping could afford far more work.
+Hashing exact scores misses rows that differ inside every signature, so some near duplicates stay bases. The closest-base pass takes about 0.16 ms of GPU time for 43,897 rows on an RTX 5070 Ti.
 
 ## How a search uses the groups
 
@@ -59,21 +60,21 @@ Indexed searches compare only the pairs that pass the match filter. A correction
 
 `build_async` waits for its stream once, to read how many children and changed buckets it must allocate. The groups are not part of the database file. `reference_database_file::upload` calls `build_async`, so every upload groups the rows again.
 
-On the 43,029-genome RefSeq corpus at 2,048 buckets:
+On the frozen 43,897-genome RefSeq corpus at 2,048 buckets, the grouping model gives:
 
 | Item                  | Value                      |
 | --------------------- | -------------------------- |
-| Bases                 | 22,270 rows (51.76%)       |
-| Children              | 20,759 rows                |
-| Changed buckets       | 1,602,294 (77.2 per child) |
-| Delta storage         | 12.55 MiB                  |
-| Row bit-plane storage | 168.1 MiB                  |
+| Bases                 | 22,647 rows (51.59%)       |
+| Children              | 21,250 rows                |
+| Changed buckets       | 1,268,461 (59.7 per child) |
+| Delta storage         | 10.01 MiB                  |
+| Row bit-plane storage | 171.5 MiB                  |
 
 Each child takes 16 bytes and each changed bucket takes 8 bytes. The base mask takes one bit per row.
 
 ## Why the limit is 160 buckets
 
-A higher `delta_change_limit` turns more rows into children, but each child then costs more to correct. Base refinement dominates the run time, so the higher limits measured faster. These timings come from the same corpus with 4,096 queries on an RTX 5070 Ti:
+A higher `delta_change_limit` turns more rows into children, but each child then costs more to correct. Base refinement dominates the run time, so the higher limits measured faster. These timings used a 43,029-reference corpus with 4,096 queries on an RTX 5070 Ti, without the closest-base pass. They are not comparable to timings on the 43,897-reference corpus above.
 
 | `delta_change_limit` | Exhaustive batch | All-to-all |
 | -------------------- | ---------------- | ---------- |

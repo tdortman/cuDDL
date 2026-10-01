@@ -163,7 +163,7 @@ Pairwise helpers include `wkid`, `ani`, `containment`, and `completeness`. ANI h
 
 Indexed counting walks short posting lists per lane and medium lists per warp. Only lists with enough postings to occupy every block thread enter the block-wide queue.
 
-Large dense indexes that use posting lookup also cache lists whose reference bitmaps are no larger than their posting arrays. Batch search first counts bitmap matches with saturating bit-sliced counters, then adds the remaining posting-list matches. The cache is rebuilt on load; the index file format is unchanged.
+Large dense and sparse indexes also cache lists whose reference bitmaps are no larger than their posting arrays. Batch search first counts bitmap matches with saturating bit-sliced counters, then adds the remaining posting-list matches. The cache is rebuilt on load; the index file format is unchanged.
 
 Posting lists and cached bitmaps request CUDA transparent memory compression on supported Hopper and newer GPUs; other devices use ordinary device allocations. Compression affects device storage, not the on-disk representation.
 

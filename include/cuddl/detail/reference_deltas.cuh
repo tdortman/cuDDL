@@ -127,13 +127,13 @@ __global__ __launch_bounds__(block_size) void delta_candidates_kernel(
     }
 }
 
-/// @brief One warp per row: the highest candidate within @ref delta_change_limit changed
-/// buckets becomes the row's target, or the row targets itself.
-template <size_t BucketCount>
+/// @brief Select the highest viable target, or retarget children to closer marked bases.
+template <size_t BucketCount, bool Closest>
 __global__ __launch_bounds__(block_size) void delta_targets_kernel(
     uint16_t const* rows,
     uint32_t count,
     uint32_t const* candidates,
+    uint8_t const* is_base,
     uint32_t* targets,
     uint32_t* changes
 ) {
@@ -141,11 +141,21 @@ __global__ __launch_bounds__(block_size) void delta_targets_kernel(
     auto const lane = threadIdx.x % 32U;
     for (auto row = (blockIdx.x * blockDim.x + threadIdx.x) / 32U; row < count;
          row += gridDim.x * blockDim.x / 32U) {
+        if constexpr (Closest) {
+            if (is_base[row] != 0U || changes[row] == 0U) {
+                continue;
+            }
+        }
+        auto target = Closest ? targets[row] : row;
+        uint32_t changed = Closest ? changes[row] : 0U;
         auto candidate = candidates[static_cast<size_t>(row) * delta_candidates + lane];
+        if constexpr (Closest) {
+            if (candidate != ~0U && (candidate == target || is_base[candidate] == 0U)) {
+                candidate = ~0U;
+            }
+        }
         auto const* own =
             reinterpret_cast<uint4 const*>(rows + static_cast<size_t>(row) * BucketCount);
-        auto target = row;
-        uint32_t changed = 0U;
         for (;;) {
             auto const best =
                 __reduce_max_sync(0xffffffffU, candidate == ~0U ? 0U : candidate + 1U);
@@ -165,10 +175,12 @@ __global__ __launch_bounds__(block_size) void delta_targets_kernel(
                 }
             }
             differ = __reduce_add_sync(0xffffffffU, differ);
-            if (differ <= delta_change_limit) {
+            if (Closest ? differ < changed : differ <= delta_change_limit) {
                 target = best - 1U;
                 changed = differ;
-                break;
+                if (!Closest || differ == 0U) {
+                    break;
+                }
             }
             if (candidate == best - 1U) {
                 candidate = ~0U;
@@ -349,8 +361,8 @@ build_reference_deltas(uint16_t const* rows, uint32_t count, cuda::stream_ref st
     // One extra zero entry makes the exclusive scan's last element the record total.
     auto offsets =
         CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, device, count + 1U, 0U));
-    delta_targets_kernel<BucketCount><<<warp_grid, block_size, 0, stream.get()>>>(
-        rows, count, candidates.data(), targets.data(), offsets.data()
+    delta_targets_kernel<BucketCount, false><<<warp_grid, block_size, 0, stream.get()>>>(
+        rows, count, candidates.data(), nullptr, targets.data(), offsets.data()
     );
     CUDDL_CUDA_TRY(cudaGetLastError());
     auto is_base = CUDDL_CUDA_TRY(cuda::make_device_buffer<uint8_t>(stream, device, count, 0U));
@@ -363,6 +375,10 @@ build_reference_deltas(uint16_t const* rows, uint32_t count, cuda::stream_ref st
     );
     delta_mark_bases_kernel<<<grid, block_size, 0, stream.get()>>>(
         targets.data(), count, is_base.data()
+    );
+    CUDDL_CUDA_TRY(cudaGetLastError());
+    delta_targets_kernel<BucketCount, true><<<warp_grid, block_size, 0, stream.get()>>>(
+        rows, count, candidates.data(), is_base.data(), targets.data(), offsets.data()
     );
     CUDDL_CUDA_TRY(cudaGetLastError());
     delta_classify_kernel<<<

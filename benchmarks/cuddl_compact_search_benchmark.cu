@@ -1185,11 +1185,23 @@ void refseq_batch_search_impl(nvbench::state& state, cuddl::reference_database_f
     auto const last_query = queries - (all_to_all && queries > 1U ? 2U : 1U);
     std::vector<cuddl::batch_search_result> observed;
     uint64_t result_total = 0U;
+    // Order-independent fingerprint of every passing result, kept below 2^52 so the reported
+    // double is exact.
+    uint64_t result_checksum = 0U;
     search(stream, [&](cuddl::batch_result_tile const& tile) {
         auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
         auto const host = tile_copy.passing();
         result_total += host.size();
         for (auto const& result : host) {
+            auto const& c = result.counts;
+            result_checksum += cuddl::detail::splitmix64(
+                (static_cast<uint64_t>(result.query_id) << 32U | result.reference_id) ^
+                cuddl::detail::splitmix64(
+                    static_cast<uint64_t>(c.lower) | static_cast<uint64_t>(c.equal) << 16U |
+                    static_cast<uint64_t>(c.higher) << 32U |
+                    static_cast<uint64_t>(c.both_empty) << 48U
+                )
+            );
             if (result.query_id == 0U || result.query_id >= last_query) {
                 observed.push_back(result);
             }
@@ -1254,6 +1266,9 @@ void refseq_batch_search_impl(nvbench::state& state, cuddl::reference_database_f
         state, "Median GPU Time", state.get_summary("nv/cold/time/gpu/median").get_float64("value")
     );
     add_value(state, "Results", static_cast<double>(result_total));
+    add_value(
+        state, "Result Checksum", static_cast<double>(result_checksum & ((1ULL << 52U) - 1U))
+    );
     add_value(state, "References", references);
     add_value(state, "Actual Queries", queries);
     if (index != nullptr) {
