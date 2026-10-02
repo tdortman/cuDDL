@@ -300,7 +300,7 @@ An index belongs to the database it was built or loaded for. Moving that databas
 
 Index files cover databases saved by `reference_database_file`, with every bucket indexed and a 15-bit or 16-bit key mask. Indexes over fewer buckets stay in memory only. `save` publishes index files the same way as database files, through a temporary file and a rename.
 
-The version-2 index file starts with `CUDDLIX\0`. A 32-bit version, a 32-bit storage kind (0 for dense, 1 for sparse), the 64-bit database fingerprint, and a 64-bit posting count follow. Then come dense offsets, posting IDs, and sparse keys, and a CRC32 at the end. Integers are little-endian.
+The version-3 index file starts with `CUDDLIX\0`. A 32-bit version, a 32-bit storage kind (0 for dense, 1 for sparse), the 64-bit database fingerprint, a 64-bit posting count, and the 64-bit pair-work sum behind the index's pair fraction follow. Then come dense offsets, posting IDs, and sparse keys, and a CRC32 at the end. Integers are little-endian.
 
 ```sh
 cuddl-reference-index build references.cuddl -o references.index --format sparse

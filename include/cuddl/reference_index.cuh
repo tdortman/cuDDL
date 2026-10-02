@@ -33,6 +33,7 @@ class reference_index {
           posting_bitmaps_(std::move(other.posting_bitmaps_)),
           bitmap_count_(std::exchange(other.bitmap_count_, 0U)),
           index_posting_capacity_(std::exchange(other.index_posting_capacity_, 0)),
+          pair_work_(std::exchange(other.pair_work_, 0ULL)),
           pair_fraction_(std::exchange(other.pair_fraction_, 0.0)),
           indexed_(std::exchange(other.indexed_, false)) {}
 
@@ -48,6 +49,7 @@ class reference_index {
             posting_bitmaps_ = std::move(other.posting_bitmaps_);
             bitmap_count_ = std::exchange(other.bitmap_count_, 0U);
             index_posting_capacity_ = std::exchange(other.index_posting_capacity_, 0);
+            pair_work_ = std::exchange(other.pair_work_, 0ULL);
             pair_fraction_ = std::exchange(other.pair_fraction_, 0.0);
             indexed_ = std::exchange(other.indexed_, false);
         }
@@ -91,6 +93,7 @@ class reference_index {
         auto const reference_count = database.reference_count();
         auto const compatibility = database.metadata().compatibility;
         pair_fraction_ = 0.0;
+        pair_work_ = 0U;
         if (reference_count == 0U || compatibility.indexed_bucket_count == 0U) {
             return Ok();
         }
@@ -114,9 +117,10 @@ class reference_index {
         unsigned long long host = 0U;
         CUDDL_CUDA_TRY(cuda::copy_bytes(stream, work, cuda::std::span{&host, size_t{1}}));
         CUDDL_CUDA_TRY(stream.sync());
-        pair_fraction_ =
-            static_cast<double>(host) / (static_cast<double>(reference_count) * reference_count *
-                                         compatibility.indexed_bucket_count);
+        pair_work_ = host;
+        pair_fraction_ = static_cast<double>(pair_work_) /
+                         (static_cast<double>(reference_count) * reference_count *
+                          compatibility.indexed_bucket_count);
         return Ok();
     }
 
@@ -457,6 +461,8 @@ class reference_index {
     cuda::device_buffer<uint32_t> posting_bitmaps_;
     uint32_t bitmap_count_{};
     size_t index_posting_capacity_{};
+    // Raw pair-work sum behind pair_fraction_; persisted in index files so loads skip its scan.
+    unsigned long long pair_work_{};
     double pair_fraction_{};
     bool indexed_{};
 };

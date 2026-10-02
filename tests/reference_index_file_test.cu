@@ -261,7 +261,7 @@ TEST(ReferenceIndexFileTest, EmptyIndexesRoundTripAndMalformedFilesFailAtLoad) {
         EXPECT_TRUE(search(disk_database, query, stream, &*loaded).empty());
         if (storage == cuddl::index_storage::dense) {
             std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
-            corrupt.seekp(32 + sizeof(uint32_t));
+            corrupt.seekp(40 + sizeof(uint32_t));
             corrupt.write("\1\0\0\0", 4);
             corrupt.flush();
             corrupt.seekg(0);
@@ -334,9 +334,9 @@ TEST(ReferenceIndexFileTest, ValidChecksumDoesNotPermitMalformedSparsePostings) 
     };
     reject(12, 2);            // Unknown storage kind.
     reject(24, 0xffffffffU);  // Posting extent exceeds the bound database.
-    reject(32, 2);            // Reference ID is outside the database.
-    uint32_t first_id = static_cast<unsigned char>(original[32]);
-    reject(36, first_id);                      // Duplicate valid ID, with matching zero keys.
+    reject(40, 2);            // Reference ID is outside the database.
+    uint32_t first_id = static_cast<unsigned char>(original[40]);
+    reject(44, first_id);                      // Duplicate valid ID, with matching zero keys.
     reject(original.size() - 8, 0x00010000U);  // Sorted nonzero key for an empty reference.
 }
 

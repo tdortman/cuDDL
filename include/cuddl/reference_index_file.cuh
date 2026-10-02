@@ -94,10 +94,11 @@ class reference_index_file {
                 return Err(Error::resource("cannot open temporary index file"));
             }
             CUDDL_TRY(writer.bytes("CUDDLIX\0", 8));
-            CUDDL_TRY(writer.value(uint32_t{2}));
+            CUDDL_TRY(writer.value(uint32_t{3}));
             CUDDL_TRY(writer.value(storage == index_storage::dense ? uint32_t{0} : uint32_t{1}));
             CUDDL_TRY(writer.value(digest));
             CUDDL_TRY(writer.value(static_cast<uint64_t>(postings.size())));
+            CUDDL_TRY(writer.value(index.pair_work_));
             CUDDL_TRY(writer.words(offsets));
             CUDDL_TRY(writer.words(postings));
             if constexpr (std::endian::native == std::endian::little) {
@@ -161,7 +162,16 @@ class reference_index_file {
             stream
         ));
         index.indexed_ = true;
-        CUDDL_TRY(index.measure_pair_fraction(database, stream));
+        index.pair_work_ = decoded.pair_work_;
+        {
+            auto const reference_count = database.reference_count();
+            auto const indexed_buckets = database.metadata().compatibility.indexed_bucket_count;
+            index.pair_fraction_ = reference_count == 0U || indexed_buckets == 0U
+                                       ? 0.0
+                                       : static_cast<double>(index.pair_work_) /
+                                             (static_cast<double>(reference_count) *
+                                              reference_count * indexed_buckets);
+        }
         CUDDL_TRY(index.build_posting_bitmaps(database, stream));
         return index;
     }
@@ -197,6 +207,7 @@ class reference_index_file {
     struct decoded_index {
         reference_database_file database_;
         index_storage storage_;
+        unsigned long long pair_work_{};
         std::vector<uint32_t> offsets_{};
         std::vector<uint32_t> postings_{};
         std::vector<uint16_t> keys_{};
@@ -222,7 +233,7 @@ class reference_index_file {
             uint32_t version{}, kind{};
             CUDDL_TRY(reader.value(version));
             CUDDL_TRY(reader.value(kind));
-            if (version != 2 || kind > 1) {
+            if (version != 3 || kind > 1) {
                 return Err(Error::invalid_argument("unsupported reference index format"));
             }
             uint64_t digest{};
@@ -241,6 +252,8 @@ class reference_index_file {
             }
             uint64_t count{};
             CUDDL_TRY(reader.value(count));
+            unsigned long long pair_work{};
+            CUDDL_TRY(reader.value(pair_work));
             auto const metadata = database.metadata();
             auto const capacity =
                 detail::indexed_posting_count(metadata.reference_count, metadata.compatibility);
@@ -258,6 +271,7 @@ class reference_index_file {
             decoded_index result{
                 std::move(database), kind == 0 ? index_storage::dense : index_storage::sparse
             };
+            result.pair_work_ = pair_work;
             result.offsets_.resize(static_cast<size_t>(offset_count));
             result.postings_.resize(static_cast<size_t>(count));
             result.keys_.resize(static_cast<size_t>(key_count));
