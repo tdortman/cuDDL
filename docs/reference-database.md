@@ -38,6 +38,54 @@ The position of a path in the list is its zero-based reference ID. `names()` kee
 
 The optional third argument to `build` is a `path_build_options`. `parser_workers` sets how many genomes load at once. It defaults to the machine's thread count, capped by the number of inputs. Zero is an error. To load one genome at a time and keep host memory low, set `parser_workers = 1`, or pass `--workers 1` to the CLI. The saved bytes are the same for every worker count and every decompression backend.
 
+### Reconstruct a RabbitTClust-style bacterial dataset
+
+`scripts/reconstruct_refseq211.py` takes a directory, downloads missing NCBI current
+and historical bacterial assembly tables, and writes `genomes.urls` alongside them.
+It reuses existing tables without downloading them again. It approximates membership
+at a cutoff, then applies the [RabbitTClust v2.0.0 row filter](https://raw.githubusercontent.com/RabbitBio/RabbitTClust/v2.0.0/benchmark/download/download_refseq.py)
+to the old metadata columns. This can include Scaffold and Chromosome assemblies
+with `genome_rep=Full`; it excludes rows containing `contig` anywhere in those columns.
+
+Run from the repository root:
+
+```bash
+uv run scripts/reconstruct_refseq211.py data/refseq211-candidate
+```
+
+The script creates the directory if needed. Its three files are
+`assembly_summary.txt`, `assembly_summary_historical.txt`, and `genomes.urls`.
+Failed downloads do not leave partially written metadata files at those paths;
+failed reconstruction preserves any existing URL list.
+
+The default cutoff is `2022-03-07`, as specified in the
+[release 211 notes](https://ftp.ncbi.nlm.nih.gov/refseq/release/release-notes/archive/RefSeq-release211.txt).
+Use `--cutoff YYYY-MM-DD` for another date. Release dates are inclusive; assemblies
+removed on or before the cutoff are excluded. Missing dates or FTP paths are
+reported on stderr and excluded. Keep the two input tables with the URL list so
+the selection can be reproduced after NCBI updates its tables.
+
+This is not an exact reconstruction of the paper's 113,674 genomes. NCBI defines
+[`seq_rel_date`](https://ftp.ncbi.nlm.nih.gov/genomes/README_assembly_summary.txt)
+as the INSDC sequence-release date, not the date an assembly entered RefSeq.
+Taxonomy, metadata and RefSeq inclusion may have changed since the cutoff. A
+matching count does not prove identical membership. The script reports the count
+difference but does not tune the cutoff or add genomes to force a match.
+
+Download the candidate files separately; the script does not check every URL
+or fetch genomes:
+
+```bash
+aria2c -c -j 8 -x 1 -s 1 \
+  -d data/refseq211-candidate/genomes \
+  -i data/refseq211-candidate/genomes.urls
+uv run scripts/check_refseq211_reconstruction.py
+```
+
+The check exercises the CLI with isolated assembly tables, covering date boundaries,
+historical records, the row filter, both header styles, reuse of existing metadata
+and preservation of the URL list on malformed input.
+
 ## Blacklist construction
 
 BBTools DDL blacklists are FASTA sequence files, often gzip-compressed. Headers such as
