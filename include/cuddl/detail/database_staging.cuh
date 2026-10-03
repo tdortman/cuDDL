@@ -41,19 +41,23 @@
 namespace cuddl::detail {
 
 /// @brief Where inputs are decompressed; sketch construction always runs on the GPU.
-enum class decompression_backend {
+enum class decompression_backend : uint8_t {
     automatic,
+    /// CPU inflation, followed by GPU FASTA normalisation through coherent host memory.
+    coherent,
+    /// CPU inflation and normalisation
     cpu,
     /// nvCOMP for eligible gzip inputs; unsupported formats use host loaders.
     gpu,
-    /// CPU inflation, followed by GPU FASTA normalisation through coherent host memory.
-    coherent,
 };
 
 /// @brief How a build gets CPU-parsed sequence bytes to the device.
-enum class transfer_mode {
+enum class transfer_mode : uint8_t {
     /// In-place host reads on coherent devices, page-locked transfers elsewhere.
     automatic,
+    /// Decompress into a heap buffer and let the kernels read it there. Only a device that reads
+    /// pageable host memory can do this, and it pays neither the copy nor the page-locking.
+    in_place,
     /// Decompress into page-locked buffers, which the transfer engine reads directly. Measured
     /// 2.1x faster than staging on an x86 host with a discrete GPU, and slower on a coherent
     /// system, where the same mapping costs host writes more than the copy it removes.
@@ -62,9 +66,6 @@ enum class transfer_mode {
     /// is a single-threaded bounce through the driver, which is what leaves 72 loaders parked
     /// while one core copies and the device waits for data.
     staged,
-    /// Decompress into a heap buffer and let the kernels read it there. Only a device that reads
-    /// pageable host memory can do this, and it pays neither the copy nor the page-locking.
-    in_place,
 };
 
 /// @brief Whether @p device reads pageable host memory itself.

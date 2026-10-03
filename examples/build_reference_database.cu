@@ -48,9 +48,9 @@ int main(int argc, char** argv) {
             CLI::CheckedTransformer(
                 std::map<std::string, cuddl::decompression_backend>{
                     {"automatic", cuddl::decompression_backend::automatic},
+                    {"coherent", cuddl::decompression_backend::coherent},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
-                    {"coherent", cuddl::decompression_backend::coherent}
                 }
             )
         )
