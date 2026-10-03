@@ -92,7 +92,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
-| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `coherent`. `cpu` inflates every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP, and `coherent` uses CPU inflation followed by GPU FASTA normalisation on a coherent GPU. `gpu` and `coherent` need nvCOMP. |
+| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `coherent`. `cpu` inflates every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `coherent` uses CPU inflation followed by GPU FASTA normalisation on a coherent GPU. `gpu` and `coherent` need nvCOMP. |
 
 ### 2. Search without an index
 

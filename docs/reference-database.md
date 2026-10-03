@@ -223,8 +223,8 @@ These measurements exclude parsing, upload, and database serialization.
 `path_build_options::decompression` picks one of four backends:
 
 - `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP it uses `coherent` on a coherent-memory GPU with more than one loader, `cpu` on a coherent-memory GPU with one loader, and `gpu` everywhere else.
-- `gpu` inflates eligible gzip files with nvCOMP. The CPU still reads the files and hands anything nvCOMP can't take to the host loader.
 - `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU. Host workers read plain files into the reusable buffers that also hold inflated files, so the transfer mode applies to both kinds alike.
+- `gpu` inflates eligible gzip files with nvCOMP and copies plain FASTA files to the GPU unchanged. The CPU still reads the files and hands anything the GPU can't take to the host loader.
 - `coherent` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It needs a GPU that reads pageable host memory, such as GH200, GB300, or GB10. cuDDL checks for that capability, not for a device name.
 
 `reference_database_file::build`, `build_sketch_store`, and `query_sketch_batch::sketch` all take the same options:
@@ -250,15 +250,16 @@ Consumers of `cuddl_dep` get the right macro and link flags. If you include the 
 
 ## How the GPU path loads files
 
-The `gpu` backend sends a file to the host loader when:
+The `gpu` backend takes gzip files and plain FASTA files. A plain FASTA file is uncompressed and starts with `>`. The backend sends a file to the host loader when:
 
 - the file is FASTQ, BGZF, or has more than one gzip member
+- an uncompressed file starts with anything but `>`, such as a blank line
 - a gzip member signature appears inside the compressed data, since the file may then hold extra members even if its first and last trailers match
 - the inflated length or CRC32 disagrees with the gzip trailer
 
 Host workers load the rejected files together, one row group at a time, and each file keeps its original reference ID. Host parsing runs between GPU batch submissions, so it overlaps GPU work that is already queued.
 
-Six GPU lanes overlap file reads, inflation, and sketching. The builder splits free device memory between compressed and inflated buffers based on the input file sizes. After nvCOMP inflates a batch, CUB counts the sequence bytes each file keeps and compacts them into the buffer that held the compressed input. The memory budget covers both buffers.
+Six GPU lanes overlap file reads, inflation, and sketching. The builder splits free device memory between compressed and inflated buffers based on the input file sizes. Plain files skip nvCOMP. Each batch puts them first, so one copy moves all of them into the inflated buffer. After nvCOMP inflates a batch, CUB counts the sequence bytes each file keeps and compacts them into the buffer that held the compressed input. The memory budget covers both buffers.
 
 Host workers compact and pack FASTA in cache-sized blocks. Neighbouring blocks overlap by `k - 1` bases, so k-mers that cross a line break survive. Separate records and runs of ambiguous bases never join.
 

@@ -1245,9 +1245,10 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     return Ok();
 }
 
-/// @brief @ref stage_paths with gzip FASTA inflated and compacted on the device.
+/// @brief @ref stage_paths with gzip FASTA inflated, and plain FASTA copied as read, then both
+/// compacted on the device.
 ///
-/// The host only reads compressed bytes for the files the device takes. Everything else, and any
+/// The host only reads file bytes for the files the device takes. Everything else, and any
 /// file the device hands back, loads through host loaders exactly as the host path would load it,
 /// so results and errors match it.
 template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
@@ -1273,7 +1274,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
     auto const fits = [&](gzip_file_probe const& probe) {
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
-               probe.compressed <= inflater->compressed_capacity();
+               probe.host_bytes() <= inflater->compressed_capacity();
     };
     // Sized once the stager holds its rows and arena, from what is left and what the inputs need.
     auto const make_inflater = [&]() -> Result<void> {
@@ -1281,7 +1282,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         for (auto const& probe : probes) {
             if (!probe.device) continue;
             slots += probe.isize + size_t{1};
-            compressed += probe.compressed;
+            compressed += probe.host_bytes();
         }
         auto const available = CUDDL_TRY(available_device_bytes(stream));
         auto const budget = (available - available / 5) / device_fasta_pipeline::lane_count;

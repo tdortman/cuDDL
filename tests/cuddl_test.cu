@@ -4553,7 +4553,8 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     }
     paths.push_back(write_tmp_fasta(">plain\r\n" + bases(1000, 77) + ">next\n" + bases(900, 78)));
     // Wrapped records cross several compact-and-pack blocks. Ambiguities and headers must
-    // still break windows, while line endings must not. Plain input forces the host path.
+    // still break windows, while line endings must not. Plain inputs go to the device on the gpu
+    // backend and into the loaders' reused buffers on the host path.
     paths.push_back(write_tmp_fasta(
         ">wrapped\r\n" + bases(17000, 81) + "NN\t" + bases(34000, 82) + ">short\nACGT\n>last\n" +
         bases(33000, 83)
@@ -4565,6 +4566,7 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     ASSERT_TRUE(host) << host.error().message();
     auto const headerless = write_tmp_gzip("ACGTACGTACGTACGTACGTACGTACGTACGT\n");
     auto const empty_header = write_tmp_gzip(">only\n");
+    auto const empty_plain_header = write_tmp_fasta(">only\n");
     auto invalid_tail = paths;
     invalid_tail.push_back(empty_header);
     auto const missing = write_tmp_gzip(">missing\nACGT\n");
@@ -4617,6 +4619,10 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
                 std::vector<std::filesystem::path>{empty_header}, stream, options
             );
             EXPECT_FALSE(rejected_header);
+            auto const rejected_plain_header = cuddl::reference_database_file::build<25, buckets>(
+                std::vector<std::filesystem::path>{empty_plain_header}, stream, options
+            );
+            EXPECT_FALSE(rejected_plain_header);
             auto const rejected_tail =
                 cuddl::reference_database_file::build<25, buckets>(invalid_tail, stream, options);
             ASSERT_FALSE(rejected_tail);
@@ -4647,6 +4653,7 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
 
     std::filesystem::remove(headerless);
     std::filesystem::remove(empty_header);
+    std::filesystem::remove(empty_plain_header);
     for (auto const& path : paths) {
         std::filesystem::remove(path);
     }

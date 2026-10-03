@@ -44,19 +44,28 @@
 
 namespace cuddl::detail {
 
-/// @brief What a gzip file's header and trailer say, read without inflating it.
+/// @brief What a gzip file's header and trailer say, or that a file is plain FASTA, read
+/// without inflating it.
 struct gzip_file_probe {
-    uint64_t compressed = 0;
-    uint32_t isize = 0;   // trailer ISIZE: the last member's length modulo 2^32
-    uint32_t crc = 0;     // trailer CRC32 of the last member
-    bool device = false;  // a single-member candidate the device may inflate
+    uint64_t compressed = 0;  // file size
+    uint32_t isize = 0;  // trailer ISIZE: the last member's length modulo 2^32; a plain file's size
+    uint32_t crc = 0;    // trailer CRC32 of the last member
+    bool device = false;  // a single-member candidate the device may inflate, or plain FASTA
+    bool plain = false;   // uncompressed FASTA, which the device normalises as read
+
+    /// @brief Bytes the file takes in a lane's page-locked buffer. A plain file lies there as it
+    /// will in its slot, guard byte included.
+    [[nodiscard]] uint64_t host_bytes() const noexcept {
+        return plain ? uint64_t{isize} + 1 : compressed;
+    }
 };
 
 /// @brief Reads the header and trailer of @p path.
 ///
-/// A candidate is a gzip file without FEXTRA (so never BGZF) whose name does not mark it FASTQ,
-/// and whose trailer names a non-empty member. Additional member signatures are checked
-/// after reading the compressed bytes, before accepting the device output.
+/// A candidate is a gzip file without FEXTRA (so never BGZF) whose trailer names a non-empty
+/// member, or an uncompressed file that opens with a FASTA header, either one with a name that
+/// does not mark it FASTQ. Additional member signatures are checked after reading the compressed
+/// bytes, before accepting the device output.
 [[nodiscard]] inline gzip_file_probe probe_gzip_file(std::filesystem::path const& path) {
     gzip_file_probe probe;
     int const fd = ::open(path.c_str(), O_RDONLY);
@@ -64,20 +73,30 @@ struct gzip_file_probe {
     struct stat status{};
     unsigned char header[4] = {};
     unsigned char trailer[8] = {};
-    if (::fstat(fd, &status) == 0 && status.st_size >= 18 &&
-        ::pread(fd, header, sizeof(header), 0) == sizeof(header) &&
-        ::pread(fd, trailer, sizeof(trailer), status.st_size - 8) == sizeof(trailer)) {
-        probe.compressed = static_cast<uint64_t>(status.st_size);
-        std::memcpy(&probe.crc, trailer, 4);
-        std::memcpy(&probe.isize, trailer + 4, 4);
+    if (::fstat(fd, &status) == 0 && status.st_size >= 4 &&
+        ::pread(fd, header, sizeof(header), 0) == sizeof(header)) {
+        auto const size = static_cast<uint64_t>(status.st_size);
+        probe.compressed = size;
         auto name = path.filename().string();
         std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
         auto const fastq =
             name.find(".fq") != std::string::npos || name.find(".fastq") != std::string::npos;
-        probe.device = header[0] == 0x1f && header[1] == 0x8b && header[2] == 8 &&
-                       (header[3] & 0xe4U) == 0 && probe.isize != 0 && !fastq;
+        if (header[0] == '>') {
+            // Slot offsets count a plain file's bytes and its guard byte in 32 bits.
+            probe.plain = size < std::numeric_limits<uint32_t>::max();
+            probe.isize = static_cast<uint32_t>(probe.plain ? size : 0);
+            probe.device = probe.plain && !fastq;
+        } else if (
+            status.st_size >= 18 &&
+            ::pread(fd, trailer, sizeof(trailer), status.st_size - 8) == sizeof(trailer)
+        ) {
+            std::memcpy(&probe.crc, trailer, 4);
+            std::memcpy(&probe.isize, trailer + 4, 4);
+            probe.device = header[0] == 0x1f && header[1] == 0x8b && header[2] == 8 &&
+                           (header[3] & 0xe4U) == 0 && probe.isize != 0 && !fastq;
+        }
     }
     ::close(fd);
     return probe;
@@ -498,9 +517,10 @@ struct decoded_fasta {
     std::string_view bytes;
 };
 
-/// @brief Normalises FASTA batches supplied compressed or already inflated.
+/// @brief Normalises FASTA batches supplied compressed, uncompressed, or already inflated.
 ///
-/// Each lane receives raw bytes through a batched copy or inflates gzip through nvCOMP.
+/// Each lane receives raw bytes through a batched copy, or reads files itself and inflates the
+/// gzip ones through nvCOMP.
 /// Kernels blank header text and leading bytes, then compaction drops whitespace.
 /// GPU-inflated data reuses compressed-input storage. CPU-inflated data compacts in place.
 /// One genome comes out as one run of bases with its records
@@ -683,11 +703,11 @@ class device_fasta_pipeline {
         size_t files = 0, compressed = 0, slots = 0;
         while (files < ids.size() && files < max_files) {
             auto const& probe = probes[ids[files]];
-            if (compressed + probe.compressed > compressed_capacity_ ||
+            if (compressed + probe.host_bytes() > compressed_capacity_ ||
                 slots + probe.isize + 1 > slot_capacity_) {
                 break;
             }
-            compressed += probe.compressed;
+            compressed += probe.host_bytes();
             slots += probe.isize + 1;
             ++files;
         }
@@ -696,7 +716,8 @@ class device_fasta_pipeline {
 
     /// @brief Starts inflating files from the front of @p ids on @p lane.
     ///
-    /// Every id must be a device candidate that fits one lane on its own.
+    /// Every id must be a device candidate that fits one lane on its own. Plain files skip
+    /// nvCOMP: they lead the lane's slots and reach them as read.
     /// Files with extra member signatures reach @ref finish without device inflation.
     /// @return How many ids the batch took: @ref batch_files of them.
     [[nodiscard]] Result<size_t> submit(
@@ -712,12 +733,24 @@ class device_fasta_pipeline {
         // The pinned bytes are rewritten below, so the previous batch's upload must be done.
         CUDDL_CUDA_TRY(lane.uploaded->sync());
         auto table = host_table(lane);
-        uint64_t compressed_at = 0, slot_at = 0;
+        // Plain files lie in the page-locked buffer exactly as they will in the slots, which
+        // they lead, so one copy places them all. Compressed bytes follow them.
+        uint64_t plain_at = 0;
         for (size_t file = 0; file < files; ++file) {
             auto const& probe = probes[ids[file]];
-            table.compressed_offsets[file] = compressed_at;
+            if (probe.plain) plain_at += probe.host_bytes();
+        }
+        uint64_t compressed_at = plain_at, slot_at = 0;
+        for (size_t file = 0; file < files; ++file) {
+            auto const& probe = probes[ids[file]];
             table.compressed_bytes[file] = probe.compressed;
-            compressed_at += probe.compressed;
+            if (probe.plain) {
+                table.compressed_offsets[file] = slot_at + 1;
+                slot_at += probe.host_bytes();
+            } else {
+                table.compressed_offsets[file] = compressed_at;
+                compressed_at += probe.compressed;
+            }
         }
         std::atomic<bool> failed{false};
         readers_.for_each(files, [&](size_t file) {
@@ -739,16 +772,13 @@ class device_fasta_pipeline {
             // A matching trailer cannot distinguish repeated first and last members.
             // A signature inside compressed data is ambiguous too, so use the host parser.
             lane.possible_members[file] =
-                done > 10 && has_gzip_signature(out + 10, done - 10);
+                !probes[ids[file]].plain && done > 10 && has_gzip_signature(out + 10, done - 10);
         });
-        if (failed) return Err(Error::invalid_argument("cannot read gzip reference inputs"));
+        if (failed) return Err(Error::invalid_argument("cannot read reference inputs"));
         lane.files.clear();
         lane.fallback.clear();
-        for (size_t file = 0; file < files; ++file) {
-            if (lane.possible_members[file]) {
-                lane.fallback.push_back(ids[file]);
-                continue;
-            }
+        slot_at = 0;
+        auto const accept = [&](size_t file) {
             auto const target = lane.files.size();
             auto const& probe = probes[ids[file]];
             table.compressed_ptrs[target] = lane.payload->data() + table.compressed_offsets[file];
@@ -758,6 +788,18 @@ class device_fasta_pipeline {
             table.output_bytes[target] = probe.isize;
             slot_at += probe.isize + 1;
             lane.files.push_back(ids[file]);
+        };
+        for (size_t file = 0; file < files; ++file) {
+            if (probes[ids[file]].plain) accept(file);
+        }
+        auto const plain = lane.files.size();
+        for (size_t file = 0; file < files; ++file) {
+            if (probes[ids[file]].plain) continue;
+            if (lane.possible_members[file]) {
+                lane.fallback.push_back(ids[file]);
+            } else {
+                accept(file);
+            }
         }
         table.slots[lane.files.size()] = slot_at;
         lane.slot_bytes = slot_at;
@@ -768,13 +810,25 @@ class device_fasta_pipeline {
         auto const device_table = device_tables(lane);
         // The slots are rewritten below, so the sketch kernel reading them must be done.
         CUDDL_CUDA_TRY(s.wait(*lane.released));
-        CUDDL_CUDA_TRY(
-            cuda::copy_bytes(
-                s,
-                cuda::std::span{lane.pinned->data(), compressed_at},
-                device_span<char>{lane.payload->data(), compressed_at}
-            )
-        );
+        // Plain bytes land in their slots; slot_init_kernel then writes the guard bytes between.
+        if (plain_at != 0) {
+            CUDDL_CUDA_TRY(
+                cuda::copy_bytes(
+                    s,
+                    cuda::std::span{lane.pinned->data(), plain_at},
+                    device_span<char>{lane.slots->data(), plain_at}
+                )
+            );
+        }
+        if (compressed_at != plain_at) {
+            CUDDL_CUDA_TRY(
+                cuda::copy_bytes(
+                    s,
+                    cuda::std::span{lane.pinned->data() + plain_at, compressed_at - plain_at},
+                    device_span<char>{lane.payload->data() + plain_at, compressed_at - plain_at}
+                )
+            );
+        }
         CUDDL_CUDA_TRY(
             cuda::copy_bytes(
                 s,
@@ -792,26 +846,32 @@ class device_fasta_pipeline {
             device_table.header_count
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
-        auto const inflated = nvcompBatchedGzipDecompressAsync(
-            reinterpret_cast<void const* const*>(device_table.compressed_ptrs),
-            device_table.compressed_bytes,
-            device_table.output_bytes,
-            device_table.inflated_bytes,
-            count,
-            lane.temp->data(),
-            nvcomp_temp_bytes_,
-            reinterpret_cast<void* const*>(device_table.output_ptrs),
-            nvcompBatchedGzipDecompressDefaultOpts,
-            device_table.statuses,
-            stream
-        );
-        if (inflated != nvcompSuccess) {
-            return Err(Error::resource("nvCOMP gzip launch failed: " + std::to_string(inflated)));
+        // Table entries past the plain files belong to gzip files.
+        auto const gzip = count - static_cast<uint32_t>(plain);
+        if (gzip != 0) {
+            auto const inflated = nvcompBatchedGzipDecompressAsync(
+                reinterpret_cast<void const* const*>(device_table.compressed_ptrs + plain),
+                device_table.compressed_bytes + plain,
+                device_table.output_bytes + plain,
+                device_table.inflated_bytes + plain,
+                gzip,
+                lane.temp->data(),
+                nvcomp_temp_bytes_,
+                reinterpret_cast<void* const*>(device_table.output_ptrs + plain),
+                nvcompBatchedGzipDecompressDefaultOpts,
+                device_table.statuses + plain,
+                stream
+            );
+            if (inflated != nvcompSuccess) {
+                return Err(
+                    Error::resource("nvCOMP gzip launch failed: " + std::to_string(inflated))
+                );
+            }
+            device_gzip::slot_crc_kernel<<<gzip, device_gzip::block_size, 0, stream>>>(
+                lane.slots->data(), device_table.slots + plain, device_table.crcs + plain
+            );
+            CUDDL_CUDA_TRY(cudaGetLastError());
         }
-        device_gzip::slot_crc_kernel<<<count, device_gzip::block_size, 0, stream>>>(
-            lane.slots->data(), device_table.slots, device_table.crcs
-        );
-        CUDDL_CUDA_TRY(cudaGetLastError());
         CUDDL_TRY(normalise(lane, slot_at));
         return files;
     }
@@ -1014,9 +1074,10 @@ class device_fasta_pipeline {
         for (size_t file = 0; file < lane.files.size(); ++file) {
             auto const id = lane.files[file];
             auto const size = table.kept[file];
-            bool const intact = lane.decoded || (table.statuses[file] == nvcompSuccess &&
-                                                 table.inflated_bytes[file] == probes[id].isize &&
-                                                 table.crcs[file] == probes[id].crc);
+            bool const intact = lane.decoded || probes[id].plain ||
+                                (table.statuses[file] == nvcompSuccess &&
+                                 table.inflated_bytes[file] == probes[id].isize &&
+                                 table.crcs[file] == probes[id].crc);
             auto const fasta =
                 table.first_char[file] != '@' && table.first_header[file] < table.slots[file + 1];
             // Each header contributes one separator, including the first header.
