@@ -62,10 +62,11 @@ class reference_index {
     }
 
     /// @brief Build acceleration data without taking ownership of or copying reference rows.
+    /// @ref index_storage::automatic builds whichever storage needs less device memory.
     [[nodiscard]] static Result<reference_index> build_async(
         database_type const& database,
         cuda::stream_ref stream,
-        index_storage storage = index_storage::dense
+        index_storage storage = index_storage::automatic
     ) {
         auto index = CUDDL_TRY(build_index<score_type>(database, stream, storage));
         CUDDL_TRY(index.measure_pair_fraction(database, stream));
@@ -149,6 +150,9 @@ class reference_index {
         );
         CUDDL_TRY(source.copy_scores_async({decoded.data(), decoded.size()}, stream));
         auto rows = device_span<Row const>{decoded.data(), decoded.size()};
+        if (storage == index_storage::automatic) {
+            storage = detail::smaller_index_storage(source.reference_count(), compatibility);
+        }
         if (storage != index_storage::dense && storage != index_storage::sparse) {
             return Err(Error::invalid_argument("unsupported index storage"));
         }

@@ -279,16 +279,14 @@ On the GPU, each group of 32 buckets is stored as 16 bit-planes, one per score b
 Include `<cuddl/reference_index_file.cuh>`. With `database` from the first example:
 
 ```cpp
-auto index = CUDDL_UNWRAP((cuddl::reference_index<25, 2048>::build_async(
-    database, stream, cuddl::index_storage::sparse
-)));
+auto index = CUDDL_UNWRAP((cuddl::reference_index<25, 2048>::build_async(database, stream)));
 CUDDL_UNWRAP(cuddl::reference_index_file::save(index, database, "references.index", stream));
 auto loaded = CUDDL_UNWRAP(cuddl::reference_index_file::load(
     "references.index", database, stream
 ));
 ```
 
-`build_async` and `load` return the same move-only index type. `load` reads dense or sparse storage from the file header, so the file name doesn't matter. Before the index is usable, `load` checks:
+`build_async` defaults to `index_storage::automatic`, which compares the bytes of dense offsets against sparse keys and their lookup directory and builds the smaller one. Pass `index_storage::dense` or `index_storage::sparse` to choose. `build_async` and `load` return the same move-only index type. `load` reads dense or sparse storage from the file header, so the file name doesn't matter. Before the index is usable, `load` checks:
 
 - the version, extents, and CRC32
 - that posting lists are sorted and agree with the database scores
@@ -303,7 +301,7 @@ Index files cover databases saved by `reference_database_file`, with every bucke
 The version-3 index file starts with `CUDDLIX\0`. A 32-bit version, a 32-bit storage kind (0 for dense, 1 for sparse), the 64-bit database fingerprint, a 64-bit posting count, and the 64-bit pair-work sum behind the index's pair fraction follow. Then come dense offsets, posting IDs, and sparse keys, and a CRC32 at the end. Integers are little-endian.
 
 ```sh
-cuddl-reference-index build references.cuddl -o references.index --format sparse
+cuddl-reference-index build references.cuddl -o references.index
 cuddl-reference-index search references.cuddl --index references.index --query query.fna
 # The same search without the index:
 cuddl-reference-index search references.cuddl --query query.fna

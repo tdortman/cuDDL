@@ -109,7 +109,6 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 
 ```sh
 ./build/examples/cuddl-reference-index build references.cuddl \
-  --format sparse \
   --output references.cuddl.index
 
 ./build/examples/cuddl-reference-index search references.cuddl \
@@ -119,7 +118,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
   > candidates.tsv
 ```
 
-Both `dense` and `sparse` index formats are supported; `dense` is the CLI default. Search detects the saved format and validates the index against the database. Rebuild the index when you rebuild the database.
+`--format automatic|dense|sparse` selects the index storage. The default, `automatic`, builds whichever needs less device memory: sparse up to about 1.75 references per index key (57,342 references with 15-bit keys, 114,686 with 16-bit keys), dense above that. Dense offsets favor query latency, so pass `--format dense` to keep them for smaller databases. Search detects the saved format and validates the index against the database. Rebuild the index when you rebuild the database.
 
 `--minimum-matches` counts matching indexed buckets, not matching k-mers or a percentage identity. A positive threshold filters candidates and is not an exhaustive comparison. Omit `--index` to search directly against the database.
 

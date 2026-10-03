@@ -151,7 +151,8 @@ void search(
 int main(int argc, char** argv) {
     CLI::App app{"Build persistent retrieval indexes or search a validated index file"};
     app.require_subcommand(1);
-    std::string database_path, index_path, format = "dense";
+    std::string database_path, index_path;
+    auto format = cuddl::index_storage::automatic;
     std::vector<std::filesystem::path> queries;
     std::filesystem::path output;
     uint32_t minimum_matches = 1;
@@ -163,9 +164,20 @@ int main(int argc, char** argv) {
     build->add_option("database", database_path)->required()->check(CLI::ExistingFile);
     build->add_option("-o,--output", index_path, "Index file destination (replaces existing file)")
         ->required();
-    build->add_option("--format", format)
-        ->check(CLI::IsMember({"dense", "sparse"}))
-        ->default_val(format);
+    build
+        ->add_option(
+            "--format", format, "Index storage; automatic picks the one using less device memory"
+        )
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::index_storage>{
+                    {"automatic", cuddl::index_storage::automatic},
+                    {"dense", cuddl::index_storage::dense},
+                    {"sparse", cuddl::index_storage::sparse}
+                }
+            )
+        )
+        ->default_str("automatic");
     auto* query = app.add_subcommand(
         "search", "Load once and search all query genomes; format is detected from the index"
     );
@@ -237,11 +249,11 @@ int main(int argc, char** argv) {
         auto database =
             CUDDL_UNWRAP((file.upload<cli::kmer_length, cli::buckets, cli::layout>(stream)));
         if (*build) {
-            auto const storage =
-                format == "dense" ? cuddl::index_storage::dense : cuddl::index_storage::sparse;
-            auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, storage));
+            auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, format));
             CUDDL_UNWRAP(cuddl::reference_index_file::save(index, database, index_path, stream));
-            std::cout << "Saved " << format << " index to " << index_path << '\n';
+            std::cout << "Saved "
+                      << (index.storage() == cuddl::index_storage::dense ? "dense" : "sparse")
+                      << " index to " << index_path << '\n';
             return 0;
         }
         std::optional<index_type> index;

@@ -1127,6 +1127,20 @@ TEST_F(ReferenceDatabaseTest, SparseAndDenseIndexesAgreeAcrossKeyWidths) {
             ASSERT_TRUE(sparse_built) << sparse_built.error().message();
             auto dense = std::move(*dense_built);
             auto sparse = std::move(*sparse_built);
+            EXPECT_EQ(
+                CUDDL_UNWRAP(build(cuddl::index_storage::automatic)).storage(),
+                cuddl::index_storage::sparse
+            );
+            // Largest reference count whose sparse keys and directory undercut dense offsets.
+            auto const crossover = mask == 0x7fffU ? 57342U : 114686U;
+            EXPECT_EQ(
+                cuddl::detail::smaller_index_storage(crossover, compatibility),
+                cuddl::index_storage::sparse
+            );
+            EXPECT_EQ(
+                cuddl::detail::smaller_index_storage(crossover + 1U, compatibility),
+                cuddl::index_storage::dense
+            );
             // Exercise move assignment with a live index allocation on both sides.
             auto replacement = build(cuddl::index_storage::sparse);
             ASSERT_TRUE(replacement);

@@ -41,7 +41,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 class reference_index;
 
 /// @brief Dense offsets favor query latency; sparse sorted keys reduce index memory and build time.
-enum class index_storage { dense, sparse };
+/// Automatic picks whichever needs fewer device bytes for the database's reference count.
+enum class index_storage { automatic, dense, sparse };
 
 /// @brief Construction parameters of compatible score rows.
 struct score_compatibility {
@@ -817,6 +818,18 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 [[nodiscard]] inline constexpr uint64_t
 indexed_posting_count(uint32_t reference_count, score_compatibility const& compatibility) noexcept {
     return static_cast<uint64_t>(reference_count) * compatibility.indexed_bucket_count;
+}
+
+/// @brief Storage needing fewer device bytes for @p reference_count references; dense on ties.
+/// Both store one 32-bit posting per indexed row, so only the per-storage extras are compared:
+/// dense offsets per key cell against sparse 16-bit keys and their derived key directory.
+[[nodiscard]] inline constexpr index_storage
+smaller_index_storage(uint32_t reference_count, score_compatibility const& compatibility) noexcept {
+    auto const dense = (indexed_cell_count(compatibility) + 1U) * sizeof(uint32_t);
+    auto const sparse = indexed_posting_count(reference_count, compatibility) * sizeof(uint16_t) +
+                        static_cast<uint64_t>(sparse_directory_entries(reference_count)) *
+                            compatibility.indexed_bucket_count * sizeof(uint32_t);
+    return sparse < dense ? index_storage::sparse : index_storage::dense;
 }
 
 [[nodiscard]] inline uintptr_t align_up(uintptr_t address, size_t alignment) noexcept {
