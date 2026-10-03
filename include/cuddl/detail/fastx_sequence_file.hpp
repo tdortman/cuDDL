@@ -192,6 +192,20 @@ static const fastx_line_end_fn line_end = resolve_fastx_line_end();
     return line_end(data, position);
 }
 
+#if defined(__linux__)
+/// @brief Reads @p size bytes of @p fd into @p out, then closes it. False on a short read.
+[[nodiscard]] inline bool read_whole_file(int fd, char* out, size_t size) noexcept {
+    size_t done = 0;
+    while (done < size) {
+        auto const got = ::pread(fd, out + done, size - done, static_cast<off_t>(done));
+        if (got <= 0) break;
+        done += static_cast<size_t>(got);
+    }
+    ::close(fd);
+    return done == size;
+}
+#endif
+
 /// @brief Read-only contiguous file payload for in-memory FASTX parsing.
 ///
 /// On Linux a plain file is memory-mapped by default, so FASTA extents reference the mapping
@@ -245,6 +259,17 @@ class fastx_mapped_file {
         return buffer;
     }
 
+#if defined(__linux__)
+    /// @brief @ref load for a descriptor already open on a file of @p size bytes. Closes it.
+    [[nodiscard]] static Result<std::unique_ptr<fastx_mapped_file>>
+    adopt(int fd, size_t size, std::string const& path, bool read) {
+        auto buffer = std::make_unique<fastx_mapped_file>();
+        auto loaded = buffer->load_from_descriptor(fd, size, path, read);
+        if (!loaded) return Err(loaded.error());
+        return buffer;
+    }
+#endif
+
     /// @brief Contiguous read-only file bytes.
     [[nodiscard]] std::string_view data() const noexcept {
         return std::string_view{data_, size_};
@@ -290,41 +315,7 @@ class fastx_mapped_file {
             ::close(fd);
             return Err(Error::invalid_argument("Failed to stat FASTA/FASTQ file: " + path));
         }
-
-        if (file_status.st_size == 0) {
-            ::close(fd);
-            return Ok();
-        }
-
-        auto const size = static_cast<size_t>(file_status.st_size);
-        if (!read) {
-            mapped_ = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd);
-            if (mapped_ == MAP_FAILED) {
-                mapped_ = nullptr;
-                return Err(Error::invalid_argument("Failed to mmap FASTA/FASTQ file: " + path));
-            }
-            mapped_size_ = size;
-            data_ = static_cast<char const*>(mapped_);
-            size_ = size;
-            return Ok();
-        }
-        owned_storage_.reset(new char[size]);
-        size_t done = 0;
-        while (done < size) {
-            auto const got =
-                ::pread(fd, owned_storage_.get() + done, size - done, static_cast<off_t>(done));
-            if (got <= 0) break;
-            done += static_cast<size_t>(got);
-        }
-        ::close(fd);
-        if (done != size) {
-            owned_storage_.reset();
-            return Err(Error::invalid_argument("Failed to read FASTA/FASTQ file: " + path));
-        }
-        data_ = owned_storage_.get();
-        size_ = size;
-        return Ok();
+        return load_from_descriptor(fd, static_cast<size_t>(file_status.st_size), path, read);
 #else
         std::ifstream input(path, std::ios::binary);
         if (!input.is_open()) {
@@ -348,6 +339,36 @@ class fastx_mapped_file {
         return Ok();
 #endif
     }
+
+#if defined(__linux__)
+    [[nodiscard]] Result<void>
+    load_from_descriptor(int fd, size_t size, std::string const& path, bool read) {
+        if (size == 0) {
+            ::close(fd);
+            return Ok();
+        }
+        if (!read) {
+            mapped_ = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd);
+            if (mapped_ == MAP_FAILED) {
+                mapped_ = nullptr;
+                return Err(Error::invalid_argument("Failed to mmap FASTA/FASTQ file: " + path));
+            }
+            mapped_size_ = size;
+            data_ = static_cast<char const*>(mapped_);
+            size_ = size;
+            return Ok();
+        }
+        owned_storage_.reset(new char[size]);
+        if (!read_whole_file(fd, owned_storage_.get(), size)) {
+            owned_storage_.reset();
+            return Err(Error::invalid_argument("Failed to read FASTA/FASTQ file: " + path));
+        }
+        data_ = owned_storage_.get();
+        size_ = size;
+        return Ok();
+    }
+#endif
 };
 
 /// @brief Detected record format for a FASTX buffer.
@@ -1481,6 +1502,40 @@ inline Result<void> pack_fasta_chunks(
     return Ok();
 }
 
+/// @brief Parses, packs or defers the bytes @p data of a loaded file, which @p result holds.
+inline Result<std::unique_ptr<fastx_sequence_file>> finish_fastx_sequence_file(
+    std::unique_ptr<fastx_sequence_file> result,
+    std::string_view data,
+    std::string const& path,
+    bool defer_fasta,
+    uint32_t pack_k
+) {
+    result->input = data;
+    if (defer_fasta) {
+        auto const first = data.find_first_not_of("\r\n");
+        if (first != std::string_view::npos && data[first] == '>') {
+            auto const end = fastx_line_end(data, first);
+            // Empty first records and malformed inputs stay with the CPU parser.
+            if (end + 1 < data.size() && data[end + 1] != '>') return result;
+        }
+    }
+    if (pack_k >= 16) {
+        auto const first = data.find_first_not_of("\r\n");
+        if (first == std::string_view::npos || data[first] != '@') {
+            char* out = result->decompressed_target;
+            if (out == nullptr) {
+                if (data.data() != result->decompressed.data())
+                    result->decompressed.resize(data.size());
+                out = result->decompressed.data();
+            }
+            CUDDL_TRY(pack_fasta_chunks(*result, data, out, pack_k, path));
+            return result;
+        }
+    }
+    CUDDL_TRY(parse_fastx_sequence_file(*result, path));
+    return result;
+}
+
 inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
     std::unique_ptr<fastx_mapped_file> file,
     std::string const& path,
@@ -1526,31 +1581,7 @@ inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
             data = decompressed;
         }
     }
-
-    result->input = data;
-    if (defer_fasta) {
-        auto const first = data.find_first_not_of("\r\n");
-        if (first != std::string_view::npos && data[first] == '>') {
-            auto const end = fastx_line_end(data, first);
-            // Empty first records and malformed inputs stay with the CPU parser.
-            if (end + 1 < data.size() && data[end + 1] != '>') return result;
-        }
-    }
-    if (pack_k >= 16) {
-        auto const first = data.find_first_not_of("\r\n");
-        if (first == std::string_view::npos || data[first] != '@') {
-            char* out = result->decompressed_target;
-            if (out == nullptr) {
-                if (data.data() != result->decompressed.data())
-                    result->decompressed.resize(data.size());
-                out = result->decompressed.data();
-            }
-            CUDDL_TRY(pack_fasta_chunks(*result, data, out, pack_k, path));
-            return result;
-        }
-    }
-    CUDDL_TRY(parse_fastx_sequence_file(*result, path));
-    return result;
+    return finish_fastx_sequence_file(std::move(result), data, path, defer_fasta, pack_k);
 }
 
 inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
@@ -1560,6 +1591,38 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     bool read = false,
     uint32_t pack_k = 0
 ) {
+#if defined(__linux__)
+    if (source.acquire != nullptr) {
+        int const fd = ::open(path.c_str(), O_RDONLY);
+        struct stat status{};
+        if (fd == -1 || ::fstat(fd, &status) != 0 || status.st_size < 0) {
+            if (fd != -1) ::close(fd);
+            return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+        }
+        auto const size = static_cast<size_t>(status.st_size);
+        unsigned char magic[2] = {};
+        bool const gzip = ::pread(fd, magic, sizeof(magic), 0) == sizeof(magic) &&
+                          magic[0] == 0x1f && magic[1] == 0x8b;
+        // Plain bytes go straight into the caller's buffer, as inflated bytes do: the parser
+        // compacts them in place and the stager reads them without another copy.
+        auto target = gzip ? decompression_target{} : source.request(size);
+        if (target.data == nullptr) {
+            auto file = fastx_mapped_file::adopt(fd, size, path, read);
+            if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+            return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
+        }
+        if (!read_whole_file(fd, target.data, size)) {
+            return Err(Error::invalid_argument("cannot open FASTX file: " + path));
+        }
+        auto result = std::make_unique<fastx_sequence_file>();
+        result->decompressed_target = target.data;
+        result->decompressed_size = size;
+        result->storage_owner = std::move(target.owner);
+        return finish_fastx_sequence_file(
+            std::move(result), {target.data, size}, path, defer_fasta, pack_k
+        );
+    }
+#endif
     auto file = fastx_mapped_file::load(path, read);
     if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
     return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);

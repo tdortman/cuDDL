@@ -4652,6 +4652,50 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     }
 }
 
+TEST(ReferenceDatabaseFileTest, PlainFastaSkipsPageableStaging) {
+    // Plain FASTA reaches the device as gzip does. Host loaders, which on the gpu backend share
+    // the device candidates with nvCOMP, hand it over from page-locked buffers.
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    std::vector<std::filesystem::path> plain, gzip;
+    for (uint64_t id = 0; id < 12; ++id) {
+        std::string genome = ">genome " + std::to_string(id) + "\n";
+        for (uint64_t i = 0; i < 20000 + id * 97; ++i) {
+            genome.push_back("ACGT"[cuddl::detail::splitmix64(id << 32 | i) & 3U]);
+            if (i % 80 == 79) genome.push_back('\n');
+        }
+        genome.push_back('\n');
+        plain.push_back(write_tmp_fasta(genome));
+        gzip.push_back(write_tmp_gzip(genome));
+    }
+    auto const reference = cuddl::reference_database_file::build<25, buckets>(
+        gzip, stream, {.decompression = cuddl::decompression_backend::cpu}
+    );
+    ASSERT_TRUE(reference) << reference.error().message();
+    std::vector<cuddl::decompression_backend> backends{cuddl::decompression_backend::cpu};
+    if (CUDDL_HAS_NVCOMP) backends.push_back(cuddl::decompression_backend::gpu);
+    for (auto backend : backends) {
+        SCOPED_TRACE(static_cast<int>(backend));
+        cuddl::reference_build_statistics statistics;
+        auto const built = cuddl::reference_database_file::build<25, buckets>(
+            plain,
+            stream,
+            {.statistics = &statistics,
+             .parser_workers = 4,
+             .transfer = cuddl::transfer_mode::pinned,
+             .decompression = backend}
+        );
+        ASSERT_TRUE(built) << built.error().message();
+        EXPECT_TRUE(std::ranges::equal(reference->rows(), built->rows()));
+        EXPECT_EQ(statistics.staged_bytes, 0u);
+        if (backend == cuddl::decompression_backend::cpu) EXPECT_GT(statistics.direct_bytes, 0u);
+    }
+    for (size_t index = 0; index < plain.size(); ++index) {
+        std::filesystem::remove(plain[index]);
+        std::filesystem::remove(gzip[index]);
+    }
+}
+
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {
     auto const path = write_tmp_fasta("");
     auto const res = cuddl::parse_fasta_file(path, 3);

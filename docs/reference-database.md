@@ -223,8 +223,8 @@ These measurements exclude parsing, upload, and database serialization.
 `path_build_options::decompression` picks one of four backends:
 
 - `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP it uses `coherent` on a coherent-memory GPU with more than one loader, `cpu` on a coherent-memory GPU with one loader, and `gpu` everywhere else.
-- `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU.
 - `gpu` inflates eligible gzip files with nvCOMP. The CPU still reads the files and hands anything nvCOMP can't take to the host loader.
+- `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU. Host workers read plain files into the reusable buffers that also hold inflated files, so the transfer mode applies to both kinds alike.
 - `coherent` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It needs a GPU that reads pageable host memory, such as GH200, GB300, or GB10. cuDDL checks for that capability, not for a device name.
 
 `reference_database_file::build`, `build_sketch_store`, and `query_sketch_batch::sketch` all take the same options:
