@@ -50,6 +50,7 @@ struct options {
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
     unsigned workers = cuddl::default_parser_workers();
+    cuddl::decompression_backend decompression = cuddl::decompression_backend::automatic;
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
     bool resident_plan = false;
     bool performance_only = false;
@@ -173,7 +174,11 @@ genome_rows stream_genomes(
     cuddl::reference_build_statistics statistics;
     genome_rows result;
     result.store = CUDDL_UNWRAP((cuddl::build_sketch_store<k, buckets, layout>(
-        files, stream, {.statistics = &statistics, .parser_workers = opts.workers}
+        files,
+        stream,
+        {.statistics = &statistics,
+         .parser_workers = opts.workers,
+         .decompression = opts.decompression}
     )));
     result.genomes = paths.size();
     result.parser_workers = statistics.workers;
@@ -2024,6 +2029,22 @@ int main(int argc, char** argv) try {
            "File loading workers for --ingest sequence (defaults to machine threads)"
     )
         ->check(CLI::PositiveNumber);
+    app.add_option(
+           "--decompression",
+           opts.decompression,
+           "Decompression backend for --ingest sequence; GPU allows format fallbacks"
+    )
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::decompression_backend>{
+                    {"automatic", cuddl::decompression_backend::automatic},
+                    {"coherent", cuddl::decompression_backend::coherent},
+                    {"cpu", cuddl::decompression_backend::cpu},
+                    {"gpu", cuddl::decompression_backend::gpu},
+                }
+            )
+        )
+        ->default_str("automatic");
     app.add_option(
            "--resident-bytes",
            opts.resident_bytes,

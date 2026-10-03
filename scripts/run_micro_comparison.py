@@ -105,6 +105,15 @@ class CuddlTransfer(StrEnum):
     IN_PLACE = "in-place"
 
 
+class CuddlDecompression(StrEnum):
+    """Where cuDDL decompresses gzip input."""
+
+    AUTOMATIC = "automatic"
+    COHERENT = "coherent"
+    CPU = "cpu"
+    GPU = "gpu"
+
+
 class CuddlIndex(StrEnum):
     """Reference index used by cuDDL search."""
 
@@ -224,7 +233,12 @@ def cub_inputs(
 
 
 def cuddl_database(
-    builder: Path, work: Path, name: str, references: list[Path], workers: int
+    builder: Path,
+    work: Path,
+    name: str,
+    references: list[Path],
+    workers: int,
+    decompression: CuddlDecompression,
 ) -> Path:
     """Builds a cuDDL reference database whose IDs follow the order of @p references.
 
@@ -239,7 +253,16 @@ def cuddl_database(
     # The builder is compiled for k=25, 2048 buckets and 5 exponent bits.
     run_timed(
         f"cuddl database: {len(references)} references",
-        [str(builder), str(farm), "--output", str(database), "--workers", str(workers)],
+        [
+            str(builder),
+            str(farm),
+            "--output",
+            str(database),
+            "--workers",
+            str(workers),
+            "--decompression",
+            decompression,
+        ],
     )
     return database
 
@@ -252,6 +275,7 @@ def cuddl_search_command(
     queries: list[Path] | None,
     minimum_matches: int,
     workers: int,
+    decompression: CuddlDecompression,
     index: Path | None = None,
 ) -> list[str]:
     """Returns a CLI search that loads @p database (and @p index).
@@ -282,6 +306,8 @@ def cuddl_search_command(
         str(minimum_matches),
         "--workers",
         str(workers),
+        "--decompression",
+        decompression,
     ]
 
 
@@ -720,6 +746,15 @@ def main(
             "device that reads pageable host memory can do."
         ),
     ] = CuddlTransfer.AUTOMATIC,
+    cuddl_decompression: Annotated[
+        CuddlDecompression,
+        typer.Option(
+            help="Where every cuDDL stage decompresses gzip input: 'automatic' picks for the "
+            "device and loader count, 'cpu' uses the loaders, 'gpu' uses nvCOMP and falls back "
+            "to the CPU for formats it cannot read, 'coherent' inflates on the loaders and "
+            "normalises FASTA on a device that reads pageable host memory."
+        ),
+    ] = CuddlDecompression.AUTOMATIC,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if performance_only:
@@ -1504,6 +1539,8 @@ def main(
                     str(cuddl_workers),
                     "--transfer",
                     cuddl_transfer,
+                    "--decompression",
+                    cuddl_decompression,
                 ],
                 capture=True,
             )
@@ -1528,7 +1565,12 @@ def main(
                 key = tuple(str(p) for p in refs)
                 if key not in cuddl_databases:
                     cuddl_databases[key] = cuddl_database(
-                        cuddl_dbbuild, work, name, refs, cuddl_workers
+                        cuddl_dbbuild,
+                        work,
+                        name,
+                        refs,
+                        cuddl_workers,
+                        cuddl_decompression,
                     )
                 return cuddl_databases[key]
 
@@ -1985,6 +2027,8 @@ def main(
                     "0",
                     "--workers",
                     str(cuddl_workers),
+                    "--decompression",
+                    cuddl_decompression,
                     "--config",
                     str(cfg),
                     "--output",
@@ -2033,6 +2077,7 @@ def main(
                     query_list if topology == "batch" else None,
                     0,
                     cuddl_workers,
+                    cuddl_decompression,
                 ),
                 samples,
                 warmups,
@@ -2183,6 +2228,8 @@ def main(
                     str(min_matches),
                     "--workers",
                     str(cuddl_workers),
+                    "--decompression",
+                    cuddl_decompression,
                     "--config",
                     str(cfg),
                     "--output",
@@ -2234,6 +2281,7 @@ def main(
                     query_set if search_topology == "batch" else None,
                     min_matches,
                     cuddl_workers,
+                    cuddl_decompression,
                     search_index_file,
                 ),
                 samples,
