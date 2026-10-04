@@ -45,10 +45,9 @@ def main(
         run("--output", str(output))
         data = output.read_bytes()
         assert data[:8] == b"CUDDLDB\0"
-        assert struct.unpack_from("<III", data, 8) == (2, k, buckets)
-        assert struct.unpack_from("<I", data, 62)[0] == 2
+        assert struct.unpack_from("<HBBHHIIQ", data, 8) == (1, k, 5, buckets, 0x7FFF, 2, 0, 0)
         assert struct.unpack_from("<I", data, len(data) - 4)[0] == zlib.crc32(data[:-4])
-        offset = 66
+        offset = 32
         for expected in (first, second):
             length = struct.unpack_from("<I", data, offset)[0]
             offset += 4
@@ -96,7 +95,7 @@ def main(
         short.write_text((">read\n" + "A" * (k - 1) + "\n") * 140000)
         run("-o", str(output))
         data = output.read_bytes()
-        offset = 70 + struct.unpack_from("<I", data, 66)[0]
+        offset = 36 + struct.unpack_from("<I", data, 32)[0]
         assert not any(data[offset : offset + buckets * 2])
     print("Reference database CLI checks passed.")
 

@@ -49,9 +49,9 @@ struct asset_prerequisite {
         "refseqSketchDDL_k25e5b4096.tsv.gz";
     uint64_t size_bytes = 1270805218;
     std::string sha256 = "4f7181c94c32e2e778ea1f4ec4edb8ba485a62549cc9460d842a5a7acaa8acc5";
-    uint32_t k = 25;
-    uint32_t buckets = 4096;
-    uint32_t exponent = refseq_register_layout::exponent_bits;
+    uint8_t k = 25;
+    uint16_t buckets = 4096;
+    uint8_t exponent = refseq_register_layout::exponent_bits;
     uint32_t records = 148108;
     bool merged = false;
 };
@@ -266,7 +266,7 @@ void report_prerequisite(asset_prerequisite const& prereq, bool asset_present) {
         "  URL:           %s\n"
         "  Byte size:     %s\n"
         "  SHA-256:       %s\n"
-        "  Header:        k=%u, buckets=%u, exponent=%u\n"
+        "  Header:        k=%hhu, buckets=%hu, exponent=%hhu\n"
         "  Merged/unmerged: %s\n",
         prereq.resource.c_str(),
         prereq.release.empty() ? "(unspecified)" : prereq.release.c_str(),

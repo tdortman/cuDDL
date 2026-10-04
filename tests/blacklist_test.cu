@@ -143,12 +143,11 @@ TEST(Blacklist, ExactMembershipSurvivesPersistenceAndIndexing) {
         auto reader = cuddl::detail::database_file_reader{
             std::ifstream(database_path, std::ios::binary), bytes.size()
         };
-        std::array<char, 12> prefix{};
+        std::array<char, 10> prefix{};
         CUDDL_UNWRAP(reader.bytes(prefix.data(), prefix.size()));
         cuddl::reference_database_metadata metadata;
-        CUDDL_UNWRAP(cuddl::detail::database_file_metadata(reader, metadata));
         uint32_t count = 0;
-        CUDDL_UNWRAP(reader.value(count));
+        CUDDL_UNWRAP(cuddl::detail::database_file_metadata(reader, metadata, count));
         auto key_offset = static_cast<size_t>(reader.input.tellg());
         bytes[key_offset + 7] = static_cast<char>(0xff);
         auto checksum = libdeflate_crc32(0, bytes.data(), bytes.size() - 4);

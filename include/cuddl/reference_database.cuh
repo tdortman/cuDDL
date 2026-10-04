@@ -46,30 +46,31 @@ enum class index_storage { automatic, dense, sparse };
 
 /// @brief Construction parameters of compatible score rows.
 struct score_compatibility {
-    uint32_t kmer_length{};
-    uint32_t bucket_count{};
-    uint32_t indexed_bucket_count{};
+    uint8_t kmer_length{};
+    uint16_t bucket_count{};
+    uint16_t indexed_bucket_count{};
     uint32_t score_encoder_identity{};
-    uint16_t exponent_bits{};
-    uint16_t mantissa_bits{};
+    uint8_t exponent_bits{};
+    uint8_t mantissa_bits{};
     uint32_t hash_identity{};
     uint64_t hash_seed{};
-    uint32_t canonicalisation_policy{};
+    uint8_t canonicalisation_policy{};
     uint64_t blacklist_identity{};
-    uint32_t blacklist_version{};
+    uint8_t blacklist_version{};
     uint16_t key_mask{};
 
     /// @brief Metadata for score rows produced by the current cuDDL construction path.
     template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
     [[nodiscard]] static constexpr score_compatibility current() noexcept {
-        static_assert(BucketCount <= std::numeric_limits<uint32_t>::max());
+        static_assert(K <= std::numeric_limits<uint8_t>::max());
+        static_assert(BucketCount <= std::numeric_limits<uint16_t>::max());
         return {
             .kmer_length = K,
-            .bucket_count = static_cast<uint32_t>(BucketCount),
-            .indexed_bucket_count = static_cast<uint32_t>(BucketCount),
+            .bucket_count = BucketCount,
+            .indexed_bucket_count = BucketCount,
             .score_encoder_identity = 1U,
-            .exponent_bits = static_cast<uint16_t>(Layout::exponent_bits),
-            .mantissa_bits = static_cast<uint16_t>(Layout::mantissa_bits),
+            .exponent_bits = Layout::exponent_bits,
+            .mantissa_bits = Layout::mantissa_bits,
             .hash_identity = 1U,
             .hash_seed = detail::seed,
             .canonicalisation_policy = 1U,

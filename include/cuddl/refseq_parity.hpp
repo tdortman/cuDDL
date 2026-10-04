@@ -12,14 +12,14 @@ namespace cuddl {
 /// construction constants, while the mantissa/exponent split and bucket/key masks are taken from
 /// the asset's header so decoded rows pass cuDDL's normal validation paths.
 [[nodiscard]] inline score_compatibility
-decoded_compatibility(uint32_t k, uint32_t buckets, uint32_t exponent_bits, uint64_t seed) {
+decoded_compatibility(uint8_t k, uint16_t buckets, uint8_t exponent_bits, uint64_t seed) {
     score_compatibility compat;
     compat.kmer_length = k;
     compat.bucket_count = buckets;
     compat.indexed_bucket_count = buckets;
     compat.score_encoder_identity = 2U;
-    compat.exponent_bits = static_cast<uint16_t>(exponent_bits);
-    compat.mantissa_bits = static_cast<uint16_t>(16U - exponent_bits);
+    compat.exponent_bits = exponent_bits;
+    compat.mantissa_bits = 16U - exponent_bits;
     compat.hash_identity = 2U;
     compat.hash_seed = seed;
     compat.canonicalisation_policy = 1U;

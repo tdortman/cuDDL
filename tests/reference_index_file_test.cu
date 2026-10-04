@@ -259,6 +259,17 @@ TEST(ReferenceIndexFileTest, EmptyIndexesRoundTripAndMalformedFilesFailAtLoad) {
         auto loaded = (index_file::load<25, 2048>(path, disk_database, stream));
         ASSERT_TRUE(loaded) << loaded.error().message();
         EXPECT_TRUE(search(disk_database, query, stream, &*loaded).empty());
+        auto reject_changed_metadata = [&](auto field) {
+            auto compatibility = empty.metadata().compatibility;
+            ++(compatibility.*field);
+            auto other = CUDDL_UNWRAP(database::build_async({}, compatibility, stream));
+            EXPECT_FALSE((index_file::load<25, 2048>(path, other, stream)));
+        };
+        reject_changed_metadata(&cuddl::score_compatibility::canonicalisation_policy);
+        reject_changed_metadata(&cuddl::score_compatibility::blacklist_version);
+        reject_changed_metadata(&cuddl::score_compatibility::score_encoder_identity);
+        reject_changed_metadata(&cuddl::score_compatibility::hash_identity);
+        reject_changed_metadata(&cuddl::score_compatibility::hash_seed);
         if (storage == cuddl::index_storage::dense) {
             std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
             corrupt.seekp(40 + sizeof(uint32_t));

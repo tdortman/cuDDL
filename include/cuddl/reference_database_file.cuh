@@ -129,21 +129,16 @@ struct database_file_writer {
 };
 
 template <typename IO>
-Result<void> database_file_metadata(IO& io, reference_database_metadata& metadata) {
+Result<void>
+database_file_metadata(IO& io, reference_database_metadata& metadata, uint32_t& blacklist_count) {
     auto& c = metadata.compatibility;
     CUDDL_TRY(io.value(c.kmer_length));
-    CUDDL_TRY(io.value(c.bucket_count));
-    CUDDL_TRY(io.value(c.indexed_bucket_count));
-    CUDDL_TRY(io.value(c.score_encoder_identity));
     CUDDL_TRY(io.value(c.exponent_bits));
-    CUDDL_TRY(io.value(c.mantissa_bits));
-    CUDDL_TRY(io.value(c.hash_identity));
-    CUDDL_TRY(io.value(c.hash_seed));
-    CUDDL_TRY(io.value(c.canonicalisation_policy));
-    CUDDL_TRY(io.value(c.blacklist_identity));
-    CUDDL_TRY(io.value(c.blacklist_version));
+    CUDDL_TRY(io.value(c.bucket_count));
     CUDDL_TRY(io.value(c.key_mask));
     CUDDL_TRY(io.value(metadata.reference_count));
+    CUDDL_TRY(io.value(blacklist_count));
+    CUDDL_TRY(io.value(c.blacklist_identity));
     return Ok();
 }
 
@@ -210,7 +205,7 @@ struct sequence_build_options {
  */
 class reference_database_file {
     /// @brief On-disk format revision for score rows and embedded construction blacklists.
-    static constexpr uint32_t database_file_version = 3U;
+    static constexpr uint16_t database_file_version = 1U;
 
    public:
     [[nodiscard]] kmer_blacklist const& blacklist() const noexcept {
@@ -437,8 +432,8 @@ class reference_database_file {
                     Error::invalid_argument("database is missing its construction blacklist")
                 );
             }
-            CUDDL_TRY(detail::database_file_metadata(writer, metadata));
-            CUDDL_TRY(writer.value(static_cast<uint32_t>(blacklist_.keys().size())));
+            auto blacklist_count = static_cast<uint32_t>(blacklist_.keys().size());
+            CUDDL_TRY(detail::database_file_metadata(writer, metadata, blacklist_count));
             CUDDL_TRY(writer.words(blacklist_.keys()));
             auto const prefix = ::ftello(writer.output);
             auto const limit = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
@@ -508,27 +503,28 @@ class reference_database_file {
             if (std::string_view(magic, sizeof(magic)) != std::string_view("CUDDLDB\0", 8)) {
                 return Err(Error::invalid_argument("not a cuDDL reference database file"));
             }
-            uint32_t version{};
+            uint16_t version{};
             CUDDL_TRY(reader.value(version));
             if (version != database_file_version) {
                 return Err(Error::invalid_argument("unsupported database file version"));
             }
             reference_database_file result;
-            CUDDL_TRY(detail::database_file_metadata(reader, result.metadata_));
-            auto const& c = result.metadata_.compatibility;
+            uint32_t blacklist_count = 0;
+            CUDDL_TRY(detail::database_file_metadata(reader, result.metadata_, blacklist_count));
+            auto& c = result.metadata_.compatibility;
             if (c.kmer_length < 1 || c.kmer_length > 31 || c.bucket_count < 2048 ||
                 c.bucket_count > 8192 || !std::has_single_bit(c.bucket_count) ||
-                c.indexed_bucket_count != c.bucket_count ||
                 (c.key_mask != 0xffffU && c.key_mask != 0x7fffU) || c.exponent_bits == 0 ||
-                c.mantissa_bits == 0 || c.exponent_bits + c.mantissa_bits != 16 ||
-                c.score_encoder_identity != 1 || c.hash_identity != 1 ||
-                c.hash_seed != detail::seed || c.canonicalisation_policy != 1 ||
-                c.blacklist_version > 1 ||
-                ((c.blacklist_identity == 0) != (c.blacklist_version == 0))) {
+                c.exponent_bits >= 16) {
                 return Err(Error::invalid_argument("unsupported database construction metadata"));
             }
-            uint32_t blacklist_count = 0;
-            CUDDL_TRY(reader.value(blacklist_count));
+            c.indexed_bucket_count = c.bucket_count;
+            c.mantissa_bits = 16U - c.exponent_bits;
+            c.score_encoder_identity = 1U;
+            c.hash_identity = 1U;
+            c.hash_seed = detail::seed;
+            c.canonicalisation_policy = 1U;
+            c.blacklist_version = blacklist_count == 0 ? 0U : 1U;
             if (blacklist_count > reader.remaining / sizeof(uint64_t)) {
                 return Err(Error::invalid_argument("invalid blacklist extent"));
             }

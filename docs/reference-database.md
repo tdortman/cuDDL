@@ -1,6 +1,8 @@
-# Build and save a reference database
+Build and save a reference database
 
 `<cuddl/reference_database_file.cuh>` builds one GPU sketch per genome file and saves the sketches as a binary database. You can load that database later on any host, without the original genomes. The file API needs a POSIX host, because it publishes finished files with an atomic rename.
+
+All integers in the binary formats below are unsigned and little-endian. Fields have no padding.
 
 ```cpp
 #include <cuddl/reference_database_file.cuh>
@@ -347,7 +349,56 @@ An index belongs to the database it was built or loaded for. Moving that databas
 
 Index files cover databases saved by `reference_database_file`, with every bucket indexed and a 15-bit or 16-bit key mask. Indexes over fewer buckets stay in memory only. `save` publishes index files the same way as database files, through a temporary file and a rename.
 
-The version-3 index file starts with `CUDDLIX\0`. A 32-bit version, a 32-bit storage kind (0 for dense, 1 for sparse), the 64-bit database fingerprint, a 64-bit posting count, and the 64-bit pair-work sum behind the index's pair fraction follow. Then come dense offsets, posting IDs, and sparse keys, and a CRC32 at the end. Integers are little-endian.
+The index fingerprint covers database metadata, labels, and scores.
+
+```text
+byte           0               1               2               3
+       ┌───────────────┬───────────────┬───────────────┬───────────────┐
+    0  │      'C'      │      'U'      │      'D'      │      'D'      │
+       ├───────────────┼───────────────┼───────────────┼───────────────┤
+    4  │      'L'      │      'I'      │      'X'      │      00       │
+       ├───────────────┴───────────────┴───────────────┴───────────────┤
+    8  │                          version = 1                          │
+       ├───────────────────────────────────────────────────────────────┤
+   12  │              storage kind: 0 = dense, 1 = sparse              │
+       ├───────────────────────────────────────────────────────────────┤
+   16  │                  database fingerprint [31:0]                  │
+       ├───────────────────────────────────────────────────────────────┤
+   20  │                 database fingerprint [63:32]                  │
+       ├───────────────────────────────────────────────────────────────┤
+   24  │                    posting count P [31:0]                     │
+       ├───────────────────────────────────────────────────────────────┤
+   28  │                    posting count P [63:32]                    │
+       ├───────────────────────────────────────────────────────────────┤
+   32  │                     pair-work sum [31:0]                      │
+       ├───────────────────────────────────────────────────────────────┤
+   36  │                     pair-work sum [63:32]                     │
+       └───────────────────────────────────────────────────────────────┘
+```
+
+`B` is the database's indexed bucket count, `R` is its reference count, and `C = B * (key_mask + 1)`.
+
+```text
+Dense (kind = 0)
+             ┌───────────────────────────────────────────────────┐
+          40 │          offsets: C + 1 uint32_t values           │
+             ├───────────────────────────────────────────────────┤
+  40+4*(C+1) │          posting IDs: P uint32_t values           │
+             ├───────────────────────────────────────────────────┤
+40+4*(C+1+P) │      CRC32 of every preceding byte: uint32_t      │
+             └───────────────────────────────────────────────────┘
+
+Sparse (kind = 1, P = B * R)
+             ┌───────────────────────────────────────────────────┐
+          40 │          posting IDs: P uint32_t values           │
+             ├───────────────────────────────────────────────────┤
+      40+4*P │              keys: P uint16_t values              │
+             ├───────────────────────────────────────────────────┤
+      40+6*P │      CRC32 of every preceding byte: uint32_t      │
+             └───────────────────────────────────────────────────┘
+```
+
+In dense storage, cell `bucket * (key_mask + 1) + key` uses the half-open posting range `[offsets[cell], offsets[cell + 1])`. Empty scores have no postings. In sparse storage, each bucket has `R` entries sorted by key, then reference ID, including empty scores. The loader builds the lookup directory and posting bitmaps.
 
 ```sh
 cuddl-reference-index build references.cuddl -o references.index
@@ -384,25 +435,52 @@ Each result takes 8 bytes as a `cuddl::packed_pairwise_counts`. Its position imp
 
 On the device, every pair has a fixed slot. A tile holds one row of `reference_count` slots per query, or the upper triangle for all-to-all. A threshold search writes only the passing slots and marks them in a pass bitmap. `download` gathers the passing results on the device first, so only they cross the bus.
 
-## Version-3 database file layout
+## Database file layout
 
-All integers are unsigned and little-endian. Fields follow each other with no padding:
+```text
+byte           0               1               2               3
+       ┌───────────────┬───────────────┬───────────────┬───────────────┐
+    0  │      'C'      │      'U'      │      'D'      │      'D'      │
+       ├───────────────┼───────────────┼───────────────┼───────────────┤
+    4  │      'L'      │      'D'      │      'B'      │      00       │
+       ├───────────────┴───────────────┼───────────────┼───────────────┤
+    8  │          version = 1          │ k-mer length  │ exponent bits │
+       ├───────────────────────────────┼───────────────┴───────────────┤
+   12  │        bucket count B         │           key mask            │
+       ├───────────────────────────────┴───────────────────────────────┤
+   16  │                       reference count R                       │
+       ├───────────────────────────────────────────────────────────────┤
+   20  │                       blacklist count N                       │
+       ├───────────────────────────────────────────────────────────────┤
+   24  │                   blacklist identity [31:0]                   │
+       ├───────────────────────────────────────────────────────────────┤
+   28  │                  blacklist identity [63:32]                   │
+       └───────────────────────────────────────────────────────────────┘
+```
 
-| Field                                                                    | Encoding                                                  |
-| ------------------------------------------------------------------------ | --------------------------------------------------------- |
-| Magic                                                                    | 8 bytes: `CUDDLDB` followed by a zero byte                |
-| Version                                                                  | `uint32_t`, value 3                                       |
-| K-mer length, bucket count, indexed bucket count, score encoder identity | Four `uint32_t` values                                    |
-| Exponent bits, mantissa bits                                             | Two `uint16_t` values                                     |
-| Hash identity, hash seed                                                 | `uint32_t`, `uint64_t`                                    |
-| Canonicalization policy, blacklist identity, blacklist version           | `uint32_t`, `uint64_t`, `uint32_t`                        |
-| Key mask, reference count                                                | `uint16_t`, `uint32_t`                                    |
-| Blacklist entry count and canonical packed k-mers | `uint32_t` count followed by that many `uint64_t` values |
-| Labels in reference-ID order                                             | Each: `uint32_t` byte length followed by the path's bytes |
-| Winner scores in reference-ID order                                      | `reference_count * bucket_count` `uint16_t` values        |
-| Checksum                                                                 | `uint32_t` CRC-32 of every preceding byte                 |
+```text
+             ┌───────────────────────────────────────────────────┐
+          32 │        blacklist: N uint64_t packed k-mers        │
+             ├───────────────────────────────────────────────────┤
+      32+8*N │      label 0: uint32_t L[0], then L[0] bytes      │
+             ├───────────────────────────────────────────────────┤
+             │                         ⋮                         │
+             ├───────────────────────────────────────────────────┤
+             │   label R-1: uint32_t L[R-1], then L[R-1] bytes   │
+             ├───────────────────────────────────────────────────┤
+           S │           scores: R * B uint16_t values           │
+             ├───────────────────────────────────────────────────┤
+     S+2*R*B │      CRC32 of every preceding byte: uint32_t      │
+             └───────────────────────────────────────────────────┘
 
-Version 3 records the current hash, canonicalization, and score-encoder identities, with every bucket indexed. The blacklist payload is sorted, unique, canonical, and checked against its recorded identity. An empty list has identity and policy version zero; nonempty lists use policy version one. Older database file versions are rejected and must be rebuilt. The index file format remains version 2. The key mask is `0x7fff` or `0xffff`, and the exponent and mantissa widths add up to 16.
+S = 32 + 8*N + sum(4 + L[i], i = 0 .. R-1)
+```
+
+Labels have no terminating zero byte. Scores use row-major order, with `[reference_id][bucket]` at byte `S + 2 * (reference_id * B + bucket)`.
+
+`kmer_length` ranges from 1 through 31. `exponent_bits` ranges from 1 through 15. `bucket_count` is 2,048, 4,096, or 8,192. `key_mask` is `0x7fff` or `0xffff`.
+
+The loader requires sorted, unique, canonical blacklist keys and verifies `blacklist_identity`. Empty blacklists have identity zero.
 
 To run the round-trip and malformed-input tests:
 

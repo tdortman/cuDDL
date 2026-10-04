@@ -9,14 +9,14 @@
 namespace cuddl {
 
 /// @brief Compile-time split of a 16-bit DDL score into exponent and mantissa fields.
-template <uint32_t ExponentBits, uint32_t MantissaBits>
+template <uint8_t ExponentBits, uint8_t MantissaBits>
 struct register_layout {
     static_assert(ExponentBits > 0U);
     static_assert(MantissaBits > 0U);
     static_assert(ExponentBits + MantissaBits == 16U);
 
-    static constexpr uint32_t exponent_bits = ExponentBits;
-    static constexpr uint32_t mantissa_bits = MantissaBits;
+    static constexpr uint8_t exponent_bits = ExponentBits;
+    static constexpr uint8_t mantissa_bits = MantissaBits;
 };
 
 using default_register_layout = register_layout<6, 10>;
@@ -24,7 +24,7 @@ using default_register_layout = register_layout<6, 10>;
 namespace detail {
 
 /// @brief Default score layout retained for source compatibility.
-constexpr uint32_t mantissa_bits = default_register_layout::mantissa_bits;
+constexpr uint8_t mantissa_bits = default_register_layout::mantissa_bits;
 constexpr uint32_t mantissa_mask = (1U << mantissa_bits) - 1U;
 
 /// @brief Default restoration constants retained for source compatibility.

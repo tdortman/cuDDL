@@ -42,8 +42,21 @@ struct reference_index_digest {
 inline Result<uint64_t> reference_database_digest(reference_database_file const& db) {
     reference_index_digest hash;
     CUDDL_TRY(hash.bytes("CUDDLDB-XXH64-v1", sizeof("CUDDLDB-XXH64-v1") - 1));
-    auto metadata = db.metadata();
-    CUDDL_TRY(database_file_metadata(hash, metadata));
+    auto const metadata = db.metadata();
+    auto const& c = metadata.compatibility;
+    CUDDL_TRY(hash.value(c.kmer_length));
+    CUDDL_TRY(hash.value(c.bucket_count));
+    CUDDL_TRY(hash.value(c.indexed_bucket_count));
+    CUDDL_TRY(hash.value(c.score_encoder_identity));
+    CUDDL_TRY(hash.value(c.exponent_bits));
+    CUDDL_TRY(hash.value(c.mantissa_bits));
+    CUDDL_TRY(hash.value(c.hash_identity));
+    CUDDL_TRY(hash.value(c.hash_seed));
+    CUDDL_TRY(hash.value(c.canonicalisation_policy));
+    CUDDL_TRY(hash.value(c.blacklist_identity));
+    CUDDL_TRY(hash.value(c.blacklist_version));
+    CUDDL_TRY(hash.value(c.key_mask));
+    CUDDL_TRY(hash.value(metadata.reference_count));
     CUDDL_TRY(hash.value(static_cast<uint64_t>(db.names().size())));
     for (auto const& name : db.names()) {
         CUDDL_TRY(hash.value(static_cast<uint64_t>(name.size())));
@@ -94,7 +107,7 @@ class reference_index_file {
                 return Err(Error::resource("cannot open temporary index file"));
             }
             CUDDL_TRY(writer.bytes("CUDDLIX\0", 8));
-            CUDDL_TRY(writer.value(uint32_t{3}));
+            CUDDL_TRY(writer.value(uint32_t{1}));
             CUDDL_TRY(writer.value(storage == index_storage::dense ? uint32_t{0} : uint32_t{1}));
             CUDDL_TRY(writer.value(digest));
             CUDDL_TRY(writer.value(static_cast<uint64_t>(postings.size())));
@@ -233,7 +246,7 @@ class reference_index_file {
             uint32_t version{}, kind{};
             CUDDL_TRY(reader.value(version));
             CUDDL_TRY(reader.value(kind));
-            if (version != 3 || kind > 1) {
+            if (version != 1 || kind > 1) {
                 return Err(Error::invalid_argument("unsupported reference index format"));
             }
             uint64_t digest{};
@@ -371,8 +384,9 @@ class reference_index_file {
             }
             return nullptr;
         };
-        auto const workers =
-            std::max(1U, std::min(std::thread::hardware_concurrency(), c.indexed_bucket_count));
+        auto const workers = std::max(
+            1U, std::min<unsigned>(std::thread::hardware_concurrency(), c.indexed_bucket_count)
+        );
         std::atomic<uint32_t> next{0};
         std::atomic<size_t> indexed{0};
         std::atomic<char const*> failure{nullptr};

@@ -174,7 +174,7 @@ class kmer_blacklist {
     [[nodiscard]] uint64_t identity() const noexcept {
         return identity_;
     }
-    [[nodiscard]] uint32_t version() const noexcept {
+    [[nodiscard]] uint8_t version() const noexcept {
         return keys_.empty() ? 0U : 1U;
     }
     [[nodiscard]] std::vector<uint64_t> const& keys() const noexcept {
@@ -231,7 +231,9 @@ class device_blacklist {
         keys_.emplace(cuda::make_device_buffer<uint64_t>(stream, stream.device(), keys));
         offsets_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), offsets));
         presence_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), presence));
-        minimum_hash_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), minimum_hash));
+        minimum_hash_.emplace(
+            cuda::make_device_buffer<uint32_t>(stream, stream.device(), minimum_hash)
+        );
         stream.sync();
     }
     device_blacklist(device_blacklist const&) = delete;
@@ -244,7 +246,9 @@ class device_blacklist {
     }
     [[nodiscard]] cuda::std::optional<detail::blacklist_view> view() const noexcept {
         if (!keys_) return cuda::std::nullopt;
-        return detail::blacklist_view{keys_->data(), offsets_->data(), presence_->data(), minimum_hash_->data()};
+        return detail::blacklist_view{
+            keys_->data(), offsets_->data(), presence_->data(), minimum_hash_->data()
+        };
     }
     [[nodiscard]] Result<void> validate(uint32_t k, size_t buckets, cuda::stream_ref stream) const {
         if ((!source_.keys().empty() && source_.kmer_length() != k) || buckets != buckets_ ||

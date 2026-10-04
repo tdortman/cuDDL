@@ -3850,6 +3850,58 @@ TEST(ReferenceDatabaseFileTest, GenomeFilesRoundTripAndSearch) {
     std::filesystem::remove(file);
 }
 
+TEST(ReferenceDatabaseFileTest, CompactMetadataLoadsAndSavesWithoutGpu) {
+    auto const file = write_tmp_fasta("");
+    for (uint8_t exponent : {1, 5, 6, 15}) {
+        for (auto const& keys : {std::vector<uint64_t>{}, std::vector<uint64_t>{42}}) {
+            cuddl::kmer_blacklist blacklist(3, keys);
+            std::string bytes("CUDDLDB\0", 8);
+            auto append = [&](uint64_t value, size_t width) {
+                for (size_t i = 0; i < width; ++i) {
+                    bytes.push_back(static_cast<char>(value >> (8 * i)));
+                }
+            };
+            append(1, 2);
+            append(3, 1);
+            append(exponent, 1);
+            append(2048, 2);
+            append(0x7fff, 2);
+            append(1, 4);
+            append(keys.size(), 4);
+            append(blacklist.identity(), 8);
+            for (auto key : keys) {
+                append(key, 8);
+            }
+            append(3, 4);
+            bytes += "ref";
+            append(123, 2);
+            bytes.append(2047 * 2, '\0');
+            append(libdeflate_crc32(0, bytes.data(), bytes.size()), 4);
+            {
+                std::ofstream out(file, std::ios::binary | std::ios::trunc);
+                out.write(bytes.data(), bytes.size());
+            }
+            auto loaded = cuddl::reference_database_file::load(file);
+            ASSERT_TRUE(loaded) << loaded.error().message();
+            auto expected = cuddl::score_compatibility::current<3, 2048>();
+            expected.exponent_bits = exponent;
+            expected.mantissa_bits = 16U - exponent;
+            expected.blacklist_identity = blacklist.identity();
+            expected.blacklist_version = blacklist.version();
+            EXPECT_EQ(loaded->metadata().compatibility, expected);
+            EXPECT_EQ(loaded->blacklist().keys(), keys);
+            ASSERT_EQ(loaded->names().size(), 1U);
+            EXPECT_EQ(loaded->names()[0], "ref");
+            ASSERT_EQ(loaded->rows().size(), 2048U);
+            EXPECT_EQ(loaded->rows()[0], 123U);
+            ASSERT_TRUE(loaded->save(file));
+            std::ifstream input(file, std::ios::binary);
+            EXPECT_EQ(std::string(std::istreambuf_iterator<char>{input}, {}), bytes);
+        }
+    }
+    std::filesystem::remove(file);
+}
+
 TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     cuda::stream stream{cuda::devices[0]};
     std::vector<std::filesystem::path> paths{write_tmp_fasta(">genome\nACGTACGT\n")};
@@ -3858,9 +3910,9 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
     ASSERT_TRUE(archive.save(file));
     std::ifstream input(file, std::ios::binary);
     std::string bytes{std::istreambuf_iterator<char>(input), {}};
-    ASSERT_GT(bytes.size(), 70U);
+    ASSERT_GT(bytes.size(), 32U);
     EXPECT_EQ(bytes.substr(0, 8), std::string("CUDDLDB\0", 8));
-    EXPECT_EQ(static_cast<unsigned char>(bytes[12]), 3U);  // k-mer length
+    EXPECT_EQ(static_cast<unsigned char>(bytes[10]), 3U);  // k-mer length
     auto reject = [&](std::string const& corrupted) {
         {
             std::ofstream out(file, std::ios::binary | std::ios::trunc);
@@ -3869,24 +3921,36 @@ TEST(ReferenceDatabaseFileTest, RejectsMalformedBinaryAndFastx) {
         EXPECT_FALSE(cuddl::reference_database_file::load(file));
     };
     reject("");
-    reject(bytes.substr(0, 65));
+    reject(bytes.substr(0, 31));
     reject(bytes.substr(0, bytes.size() - 1));
     reject(bytes + "trailing data");
     for (size_t offset :
-         {size_t{0}, size_t{8}, size_t{12}, size_t{16}, size_t{68}, bytes.size() - 10}) {
+         {size_t{0}, size_t{8}, size_t{10}, size_t{12}, size_t{30}, bytes.size() - 10}) {
         auto corrupted = bytes;
         corrupted[offset] ^= 0x40;
         reject(corrupted);
     }
     auto oversized = bytes;
-    oversized.replace(62, 4, 4, '\xff');  // reference count, checked before allocation
+    oversized.replace(16, 4, 4, '\xff');  // reference count, checked before allocation
     reject(oversized);
     oversized = bytes;
-    oversized.replace(66, 4, 4, '\xff');  // blacklist extent, checked before allocation
+    oversized.replace(20, 4, 4, '\xff');  // blacklist extent, checked before allocation
     reject(oversized);
     oversized = bytes;
-    oversized.replace(70, 4, 4, '\xff');  // first label length, checked before allocation
+    oversized.replace(32, 4, 4, '\xff');  // first label length, checked before allocation
     reject(oversized);
+    // Keep the CRC valid so invalid metadata cannot hide behind checksum rejection.
+    for (auto [offset, value] : std::array<std::pair<size_t, uint8_t>, 8>{
+             {{8, 0}, {8, 2}, {10, 0}, {10, 32}, {11, 0}, {11, 16}, {11, 255}, {13, 64}}
+         }) {
+        auto corrupted = bytes;
+        corrupted[offset] = static_cast<char>(value);
+        auto const checksum = libdeflate_crc32(0, corrupted.data(), corrupted.size() - 4);
+        for (size_t i = 0; i < 4; ++i) {
+            corrupted[corrupted.size() - 4 + i] = static_cast<char>(checksum >> (8 * i));
+        }
+        reject(corrupted);
+    }
     {
         std::ofstream out(paths.front());
         out << "@broken\nACGT\n+\nII\n";
@@ -4931,7 +4995,7 @@ TEST_F(ReferenceDatabaseTest, A48DecodedRowsMatchDdlIndexOracle) {
     using layout = cuddl::register_layout<5, 11>;
     using database_type = cuddl::reference_database<k_default, b_default, layout>;
     using index_type = cuddl::reference_index<k_default, b_default, layout>;
-    constexpr uint32_t exponent = layout::exponent_bits;
+    constexpr uint8_t exponent = layout::exponent_bits;
     constexpr uint64_t seed = 42ULL;
     constexpr uint32_t minimum_matches = 3U;
     constexpr uint32_t reference_count = 4U;

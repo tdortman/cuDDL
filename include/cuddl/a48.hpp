@@ -27,7 +27,7 @@ struct database_metadata {
     bool has_seed{};
     /// Exponent bit width (`#exponent`) of each 16-bit bucket value. The mantissa gets
     /// `16 - exponent_bits` bits. Defaults to 6 (the BBTools DDL default) when absent.
-    uint32_t exponent_bits{6U};
+    uint8_t exponent_bits{6U};
     bool has_exponent{};
     /// Blacklist filenames recorded in the header (`#blacklist`), if any.
     std::string blacklist;
@@ -116,7 +116,7 @@ struct database {
 /// @p offset is -1 the stored value is already an absolute score. @p exponent_bits selects the
 /// split between the exponent (NLZ tier) and mantissa fields.
 [[nodiscard]] inline uint16_t
-promote_score(uint16_t loaded, int32_t offset, uint32_t exponent_bits) {
+promote_score(uint16_t loaded, int32_t offset, uint8_t exponent_bits) {
     if (loaded == 0U || offset < 0) {
         return loaded;
     }
@@ -261,7 +261,7 @@ template <typename T, typename Parser>
 
 /// @brief Decodes one A48 data row into absolute 16-bit bucket scores.
 [[nodiscard]] inline Result<std::vector<uint16_t>>
-decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t exponent_bits) {
+decode_a48_row(std::string_view row, record_metadata const& metadata, uint8_t exponent_bits) {
     auto const fields = split_fields(row, '\t', true);
     std::vector<uint16_t> scores;
     scores.reserve(fields.size());
@@ -291,7 +291,7 @@ decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t e
 /// code paths in unit tests.
 [[nodiscard]] inline Result<database> decode_a48_tsv(std::string_view input) {
     database result;
-    uint32_t exponent_bits = 6U;
+    uint8_t exponent_bits = 6U;
     bool has_exponent = false;
     size_t expected_bucket_count = 0;
     bool bucket_count_set = false;
@@ -445,7 +445,7 @@ decode_a48_row(std::string_view row, record_metadata const& metadata, uint32_t e
 
     database result;
     std::vector<record_job> jobs;
-    uint32_t exponent_bits = 6U;
+    uint8_t exponent_bits = 6U;
     bool has_exponent = false;
     size_t expected_bucket_count = 0;
     bool bucket_count_set = false;

@@ -8,9 +8,9 @@
 /// Sketch configuration fixed at build time by the cli_* Meson options.
 namespace cli {
 
-constexpr uint32_t kmer_length = CUDDL_CLI_KMER_LENGTH;
-constexpr size_t buckets = CUDDL_CLI_BUCKETS;
-constexpr uint32_t exponent_bits = CUDDL_CLI_EXPONENT_BITS;
+constexpr uint8_t kmer_length = CUDDL_CLI_KMER_LENGTH;
+constexpr uint16_t buckets = CUDDL_CLI_BUCKETS;
+constexpr uint8_t exponent_bits = CUDDL_CLI_EXPONENT_BITS;
 using layout = cuddl::register_layout<exponent_bits, 16U - exponent_bits>;
 
 /// @brief Rejects a database whose sketch configuration differs from this build's.
