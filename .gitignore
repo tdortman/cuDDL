@@ -35,3 +35,4 @@ build/test_artifacts/
 results
 
 !docs/reference-database.md
+target
