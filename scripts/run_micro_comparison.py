@@ -31,8 +31,10 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
 - SEARCH: the query wall includes FASTX query sketching and getting the index
   ready: cuDDL loads a saved index file; tools without an index file format
   (RabbitSketch, Dashing2) construct it inside the timed interval, RabbitSketch
-  from its loaded sketch file. SimdSketch and HyperGen have no search mode, so their
-  SEARCH is the exhaustive COMPARE.
+  from its loaded sketch file. sketchlib.rust times building its inverted index from FASTA
+  apart from querying it; BBTools rebuilds its in-memory CSR index from its sketch file and
+  times the build apart from the ranked search. SimdSketch and HyperGen have no search mode,
+  so their SEARCH is the exhaustive COMPARE.
 
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
@@ -47,7 +49,8 @@ passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
 work and the slowest lane on a full corpus: it can run on a host that is not
 measuring a GPU. Fixed-size sketches use 2048 entries (cuDDL buckets with DDL's
 5-bit exponent and 11-bit mantissa, Dashing2 registers, RabbitSketch slots,
-SimdSketch buckets keeping the 8 low hash bits its author recommends,
+SimdSketch buckets keeping the 8 low hash bits its author recommends, sketchlib.rust
+one-permutation bins, BBTools DynamicDemiLog buckets with the same exponent as cuDDL,
 hypergen dimensions); skani keeps its own sampling and k. Entries differ in width
 and information per tool, so tools are compared in error-versus-time space.
 
@@ -84,7 +87,9 @@ from hypergen_pipeline import dataset_entries, summarize
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = typer.Typer()
-DEFAULT_TOOLS = "cuddl,rabbitsketch,simdsketch,hypergen,skani,dashing2,cub-exact"
+DEFAULT_TOOLS = (
+    "cuddl,rabbitsketch,simdsketch,sketchlib,bbtools,hypergen,skani,dashing2,cub-exact"
+)
 TOOLS = tuple(DEFAULT_TOOLS.split(","))
 
 
@@ -409,14 +414,19 @@ def read_dashing2_panel(
     return rows, evaluated
 
 
-def read_simdsketch_pairs(
-    path: Path, references: list[Path], queries: list[Path], k: int, stride: int
-) -> list[dict]:
-    """Samples every @p stride-th pair, plus the last, from a SimdSketch similarity file.
+def mash_ani(jaccard: float, k: int) -> float | None:
+    """ANI as one minus the Mash distance at k-mer size @p k; undefined without shared k-mers."""
+    return 1 + math.log(2 * jaccard / (1 + jaccard)) / k if jaccard > 0 else None
 
-    The file holds one little-endian `f32` Jaccard per pair: row-major query by reference for
-    batch @p queries, or the strict upper triangle of @p references, row by row, when
-    @p queries is empty. ANI comes from the Mash distance at k-mer size @p k.
+
+def read_f32_pairs(
+    path: Path, references: list[Path], queries: list[Path], stride: int
+) -> list[tuple[Path, Path, float]]:
+    """Samples every @p stride-th pair, plus the last, from a binary similarity file.
+
+    The file holds one little-endian `f32` per pair: row-major query by reference for batch
+    @p queries, or the strict upper triangle of @p references, row by row, when @p queries is
+    empty. Returns (query, reference, value) for the sampled pairs.
     """
     values = array.array("f")
     values.frombytes(path.read_bytes())
@@ -429,26 +439,51 @@ def read_simdsketch_pairs(
     positions = list(range(0, len(values), stride))
     if values and positions[-1] != len(values) - 1:
         positions.append(len(values) - 1)
-
-    def row(query: Path, reference: Path, jaccard: float) -> dict:
-        ani = 1 + math.log(2 * jaccard / (1 + jaccard)) / k if jaccard > 0 else None
-        return {
-            "query": str(query),
-            "reference": str(reference),
-            "jaccard": jaccard,
-            "ani": ani,
-        }
-
     if queries:
-        return [row(queries[p // n], references[p % n], values[p]) for p in positions]
-    rows = []
+        return [(queries[p // n], references[p % n], values[p]) for p in positions]
+    pairs = []
     i, start = 0, 0
     for p in positions:
         while p >= start + n - 1 - i:
             start += n - 1 - i
             i += 1
-        rows.append(row(references[i], references[i + 1 + p - start], values[p]))
-    return rows
+        pairs.append((references[i], references[i + 1 + p - start], values[p]))
+    return pairs
+
+
+def write_sketchlib_list(path: Path, prefix: str, files: list) -> None:
+    """Writes a sketchlib input list. Short index names keep its text output small; callers
+    map them back to paths."""
+    path.write_text("".join(f"{prefix}{i}\t{f}\n" for i, f in enumerate(files)))
+
+
+def read_sketchlib_dists(
+    path: Path, names: dict[str, Path], k: int, stride: int
+) -> tuple[list[dict], int]:
+    """Samples every @p stride-th row of sketchlib's long-form Jaccard distances.
+
+    Each line is `reference<TAB>query<TAB>distance` with the distance one minus Jaccard. The
+    file has one line per pair, which at a full corpus is millions, so it is streamed and the
+    returned count is every pair the tool evaluated.
+    """
+    rows: list[dict] = []
+    count = 0
+    with path.open() as handle:
+        for line in handle:
+            if count % stride == 0:
+                reference, query, distance = line.rstrip("\n").split("\t")[:3]
+                jaccard = 1 - float(distance)
+                rows.append(
+                    {
+                        "query": str(names[query]),
+                        "reference": str(names[reference]),
+                        "jaccard": jaccard,
+                        "ani": mash_ani(jaccard, k),
+                    }
+                )
+            count += 1
+    return rows, count
+
 
 
 def discover(directory: Path) -> list[Path]:
@@ -647,7 +682,7 @@ def main(
         str,
         typer.Option(
             help="Comma-separated tools to measure: cuddl, rabbitsketch, simdsketch, "
-            "hypergen, skani, dashing2, cub-exact."
+            "sketchlib, bbtools, hypergen, skani, dashing2, cub-exact."
         ),
     ] = DEFAULT_TOOLS,
     performance_only: Annotated[
@@ -871,6 +906,8 @@ def main(
     cuddl_dbbuild = build / "examples/cuddl-build-reference-db"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
     simdsketch = build / "benchmarks/simdsketch-benchmark"
+    sketchlib = build / "subprojects/sketchlib/sketchlib"
+    bbtools_jar = ROOT / "subprojects/bbmap/bbtools.jar"
     # Forwarded to every cub lane that evaluates pairs, so a large corpus can be told to keep
     # less resident than the default share of host memory.
     cub_stash: list[str] = []
@@ -890,6 +927,13 @@ def main(
         required.append(rabbit)
     if "simdsketch" in selected:
         required.append(simdsketch)
+    if "sketchlib" in selected:
+        required.append(sketchlib)
+    if "bbtools" in selected:
+        required.append(bbtools_jar)
+        for program in ("java", "javac"):
+            if shutil.which(program) is None:
+                raise typer.BadParameter(f"the BBTools lane needs {program} on PATH")
     for binary in required:
         if not binary.exists():
             raise typer.BadParameter(
@@ -926,6 +970,8 @@ def main(
         "cuddl": 25,
         "rabbitsketch": 25,
         "simdsketch": 25,
+        "sketchlib": 25,
+        "bbtools": 25,
         "hypergen": 25,
         "dashing2": 25,
         "cub-exact": 25,
@@ -1763,6 +1809,127 @@ def main(
                     quiet=True,
                 )
 
+        if "sketchlib" in selected:
+            # Same file set and reference-only reuse rule as SimdSketch. Index names stand in
+            # for paths: `r` references, `q` batch queries, `s` anything else.
+            skl_flags = ["-k", "25", "-s", "2048", "--threads", str(threads), "--quiet"]
+            skl_reference_list = work / "skl-references.tsv"
+            write_sketchlib_list(skl_reference_list, "r", references)
+            skl_reuses = sketch_file_args == [str(p) for p in references]
+            skl_sketch_list = work / "skl-sketch.tsv"
+            write_sketchlib_list(
+                skl_sketch_list, "r" if skl_reuses else "s", sketch_file_args
+            )
+            skl_sketch = work / "skl-sketch"
+            skl_resident: list[dict] = []
+            marks = wall_of(
+                [
+                    str(sketchlib),
+                    "sketch",
+                    "-f",
+                    str(skl_sketch_list),
+                    "-o",
+                    str(skl_sketch),
+                    *skl_flags,
+                ],
+                samples,
+                warmups,
+                resident=skl_resident,
+            )
+            record_native_resident("sketchlib", "sketch", skl_resident)
+            sketch_times["sketchlib"] = marks
+            sketch_bytes["sketchlib"] = sum(
+                skl_sketch.with_suffix(suffix).stat().st_size
+                for suffix in (".skm", ".skd")
+            )
+            record_sketch(
+                "sketchlib",
+                "one-perm-minhash",
+                marks,
+                {"sketch_bytes": sketch_bytes["sketchlib"]},
+            )
+            skl_references = skl_sketch
+            if not skl_reuses:
+                skl_references = work / "skl-references"
+                run(
+                    [
+                        str(sketchlib),
+                        "sketch",
+                        "-f",
+                        str(skl_reference_list),
+                        "-o",
+                        str(skl_references),
+                        *skl_flags,
+                    ],
+                    quiet=True,
+                )
+
+        if "bbtools" in selected:
+            # BBTools' own DDLWriter, comparison, and index classes, driven by a small harness
+            # so file lists and the all-to-all triangle need no shell argument or mode BBTools
+            # lacks. Same reference-only reuse rule as SimdSketch.
+            bb_classes = work / "bbtools-classes"
+            run(
+                [
+                    "javac",
+                    "-cp",
+                    str(bbtools_jar),
+                    "-d",
+                    str(bb_classes),
+                    str(ROOT / "benchmarks/BBToolsMicro.java"),
+                ],
+                quiet=True,
+            )
+            bb_java = [
+                "java",
+                f"-Xmx{max(4, _host_ram_bytes() // 4 >> 30)}g",
+                "-cp",
+                f"{bb_classes}:{bbtools_jar}",
+                "BBToolsMicro",
+            ]
+            bb_threads = str(threads)
+            bb_sketch_list = work / "bb-sketch.txt"
+            bb_sketch_list.write_text("".join(f"{p}\n" for p in sketch_file_args))
+            bb_sketch = work / "bb-sketch.tsv"
+            bb_resident: list[dict] = []
+            marks = wall_of(
+                [*bb_java, "sketch", str(bb_sketch_list), str(bb_sketch), bb_threads],
+                samples,
+                warmups,
+                resident=bb_resident,
+            )
+            record_native_resident("bbtools", "sketch", bb_resident)
+            sketch_times["bbtools"] = marks
+            sketch_bytes["bbtools"] = bb_sketch.stat().st_size
+            record_sketch(
+                "bbtools", "ddl", marks, {"sketch_bytes": sketch_bytes["bbtools"]}
+            )
+            bb_references = bb_sketch
+            if sketch_file_args != [str(p) for p in references]:
+                bb_reference_list = work / "bb-references.txt"
+                bb_reference_list.write_text("".join(f"{p}\n" for p in references))
+                bb_references = work / "bb-references.tsv"
+                run(
+                    [
+                        *bb_java,
+                        "sketch",
+                        str(bb_reference_list),
+                        str(bb_references),
+                        bb_threads,
+                    ],
+                    quiet=True,
+                )
+            # Batch queries are sketched inside each COMPARE and SEARCH wall, then compared.
+            bb_query_sketch: list[list[str]] = []
+            bb_queries = "-"
+            if topology == "batch":
+                bb_query_list = work / "bb-queries.txt"
+                bb_query_list.write_text("".join(f"{p}\n" for p in query_list))
+                bb_queries = str(work / "bb-queries.tsv")
+                bb_query_sketch = [
+                    [*bb_java, "sketch", str(bb_query_list), bb_queries, bb_threads]
+                ]
+
         if "cub-exact" in selected:
             import json as jsonlib4
 
@@ -2266,14 +2433,124 @@ def main(
             stride = (
                 max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
             )
-            rows = read_simdsketch_pairs(
-                ss_pairs,
-                references,
-                query_list if topology == "batch" else [],
-                sketch_k["simdsketch"],
-                stride,
-            )
+            rows = [
+                {
+                    "query": str(query),
+                    "reference": str(reference),
+                    "jaccard": jaccard,
+                    "ani": mash_ani(jaccard, sketch_k["simdsketch"]),
+                }
+                for query, reference, jaccard in read_f32_pairs(
+                    ss_pairs,
+                    references,
+                    query_list if topology == "batch" else [],
+                    stride,
+                )
+            ]
             record_compare("simdsketch", "bucket-b8", marks, rows, evaluated=evaluated)
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
+
+        if "sketchlib" in selected:
+            # Batch queries are sketched into their own database inside the wall, then compared;
+            # all-to-all compares the reference database with itself.
+            skl_dists = work / "skl-dists.tsv"
+            skl_dist = [
+                str(sketchlib),
+                "dist",
+                str(skl_references),
+                "-k",
+                "25",
+                "--threads",
+                str(threads),
+                "-o",
+                str(skl_dists),
+                "--quiet",
+            ]
+            skl_names = {f"r{i}": p for i, p in enumerate(references)}
+            if topology == "batch":
+                skl_query_list = work / "skl-queries.tsv"
+                write_sketchlib_list(skl_query_list, "q", query_list)
+                skl_names |= {f"q{i}": p for i, p in enumerate(query_list)}
+                skl_queries = work / "skl-queries"
+                skl_dist.insert(3, str(skl_queries))
+                skl_compare = [
+                    [
+                        str(sketchlib),
+                        "sketch",
+                        "-f",
+                        str(skl_query_list),
+                        "-o",
+                        str(skl_queries),
+                        *skl_flags,
+                    ],
+                    skl_dist,
+                ]
+            else:
+                skl_compare = [skl_dist]
+            skl_compare_resident: list[dict] = []
+            marks = wall_of(
+                skl_compare,
+                samples,
+                warmups,
+                resident=skl_compare_resident,
+                resident_skip=len(skl_compare) - 1,
+            )
+            record_native_resident("sketchlib", "compare", skl_compare_resident)
+            evaluated = count_pairs(references, query_list, topology)
+            stride = (
+                max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
+            )
+            rows, counted = read_sketchlib_dists(
+                skl_dists, skl_names, sketch_k["sketchlib"], stride
+            )
+            if counted != evaluated:
+                raise ValueError(f"sketchlib wrote {counted} pairs, expected {evaluated}")
+            record_compare(
+                "sketchlib", "one-perm-minhash", marks, rows, evaluated=evaluated
+            )
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
+
+        if "bbtools" in selected:
+            # DDL reports ANI and WKID, not Jaccard, like cuDDL.
+            bb_pairs = work / "bb-pairs.f32"
+            bb_compare_resident: list[dict] = []
+            marks = wall_of(
+                [
+                    *bb_query_sketch,
+                    [
+                        *bb_java,
+                        "compare",
+                        str(bb_references),
+                        bb_queries,
+                        str(bb_pairs),
+                        bb_threads,
+                    ],
+                ],
+                samples,
+                warmups,
+                resident=bb_compare_resident,
+                resident_skip=len(bb_query_sketch),
+            )
+            record_native_resident("bbtools", "compare", bb_compare_resident)
+            evaluated = count_pairs(references, query_list, topology)
+            stride = (
+                max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
+            )
+            rows = [
+                {
+                    "query": str(query),
+                    "reference": str(reference),
+                    "jaccard": None,
+                    "ani": ani,
+                }
+                for query, reference, ani in read_f32_pairs(
+                    bb_pairs,
+                    references,
+                    query_list if topology == "batch" else [],
+                    stride,
+                )
+            ]
+            record_compare("bbtools", "ddl", marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
         if "cub-exact" in selected:
@@ -2465,6 +2742,131 @@ def main(
                             str(search_references[m["case"]["reference_id"]]),
                         )
                     ] = metrics["wkid"]
+
+        if "sketchlib" in selected:
+            # The inverted index is built from FASTA, not from the sketch database. Batch
+            # queries count matching bins per reference; all-to-all preclusters through the
+            # index and keeps each genome's k nearest Jaccard neighbours.
+            skl_index = work / "skl-index"
+            search_index_ms["sketchlib"] = wall_of(
+                [
+                    str(sketchlib),
+                    "inverted",
+                    "build",
+                    "-f",
+                    str(skl_reference_list),
+                    "-o",
+                    str(skl_index),
+                    "--kmer-length",
+                    "25",
+                    "--sketch-size",
+                    "2048",
+                    "--threads",
+                    str(threads),
+                    "--quiet",
+                    *(["--write-skq"] if topology == "all-to-all" else []),
+                ],
+                samples,
+                warmups,
+            )
+            skl_search = work / "skl-search.tsv"
+            if topology == "batch":
+                skl_query = [
+                    "query",
+                    str(skl_index),
+                    "-f",
+                    str(skl_query_list),
+                ]
+            else:
+                skl_query = [
+                    "precluster",
+                    str(skl_index),
+                    "--skd",
+                    str(skl_references),
+                    "--knn",
+                    str(k),
+                ]
+            skl_search_resident: list[dict] = []
+            search_query_ms["sketchlib"] = wall_of(
+                [
+                    str(sketchlib),
+                    "inverted",
+                    *skl_query,
+                    "--threads",
+                    str(threads),
+                    "-o",
+                    str(skl_search),
+                    "--quiet",
+                ],
+                samples,
+                warmups,
+                resident=skl_search_resident,
+            )
+            record_native_resident("sketchlib", "search", skl_search_resident)
+            search_cases["sketchlib"] = {"index": "native-inverted", "index_supported": True}
+            if not performance_only:
+                with skl_search.open() as handle:
+                    if topology == "batch":
+                        columns = next(handle).rstrip("\n").split("\t")[1:]
+                        for line in handle:
+                            query, *counts = line.rstrip("\n").split("\t")
+                            for reference, count in zip(columns, counts, strict=True):
+                                search_scores[
+                                    (
+                                        "sketchlib",
+                                        str(skl_names[query]),
+                                        str(skl_names[reference]),
+                                    )
+                                ] = float(count)
+                    else:
+                        for line in handle:
+                            query, reference, distance = line.rstrip("\n").split("\t")[:3]
+                            search_scores[
+                                (
+                                    "sketchlib",
+                                    str(skl_names[query]),
+                                    str(skl_names[reference]),
+                                )
+                            ] = 1 - float(distance)
+
+        if "bbtools" in selected:
+            # BBTools has no index file: the wall loads the sketch file and builds the CSR
+            # index, whose build the harness reports apart from the ranked search.
+            bb_search = work / "bb-search.tsv"
+            records = []
+            search_query_ms["bbtools"] = wall_of(
+                [
+                    *bb_query_sketch,
+                    [
+                        *bb_java,
+                        "search",
+                        str(bb_references),
+                        bb_queries,
+                        str(k),
+                        str(bb_search),
+                        bb_threads,
+                    ],
+                ],
+                samples,
+                warmups,
+                resident=records,
+                resident_skip=len(bb_query_sketch),
+            )
+            search_index_ms["bbtools"] = [r["index_build_ms"] for r in records]
+            record_native_resident("bbtools", "search", records)
+            search_cases["bbtools"] = {"index": "native-csr2", "index_supported": True}
+            if not performance_only:
+                bb_query_paths = query_list if topology == "batch" else references
+                with bb_search.open() as handle:
+                    for line in handle:
+                        query, reference, wkid = line.rstrip("\n").split("\t")
+                        search_scores[
+                            (
+                                "bbtools",
+                                str(bb_query_paths[int(query)]),
+                                str(references[int(reference)]),
+                            )
+                        ] = float(wkid)
 
         if "skani" in selected:
             skdb = work / "skdb"
@@ -2716,6 +3118,8 @@ def main(
             "dashing2": "SetSketch",
             "rabbitsketch": "FastKMV",
             "simdsketch": "bucket-b8",
+            "sketchlib": "one-perm-minhash",
+            "bbtools": "ddl",
             "cub-exact": "gpu-exact",
         }
         for tool in selected:

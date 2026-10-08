@@ -1,0 +1,32 @@
+[package]
+name = "speedytree"
+version = "0.1.0"
+authors = ["Curro Campuzano <campuzanocurro@gmail.com>"]
+edition = "2021"
+license-file = "LICENSE"
+description = "Canonical and RapidNJ implementations of Neighbor-joining in Rust"
+repository = "https://github.com/currocam/speedytree"
+readme = "README.md"
+
+exclude = ["speedytree_slides.pdf", "benchmarks/", "Makefile", "Snakefile"]
+
+[lib]
+name = "speedytree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "speedytree"
+path = "src/bin.rs"
+
+[dependencies]
+bit-set = "0.5.3"
+bit-vec = "0.6.3"
+bitvec = "1.0.1"
+clap = { version = "4.4.6", features = ["derive"] }
+dtoa = "1.0.9"
+fixedbitset = "0.4.2"
+parking_lot = "0.12.1"
+petgraph = "0.6.4"
+rand = "0.8.5"
+rayon = "1.8.0"
+rb_tree = "0.5.0"

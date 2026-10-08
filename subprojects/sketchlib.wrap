@@ -1,0 +1,6 @@
+[wrap-git]
+url = https://github.com/bacpop/sketchlib.rust.git
+revision = af384222827a34146cfdef59e7c6927ba017338d
+depth = 1
+patch_directory = sketchlib
+diff_files = sketchlib/resident-timings.patch

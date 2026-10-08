@@ -1,0 +1,310 @@
+diff --git a/src/distances/mod.rs b/src/distances/mod.rs
+index 5d34cde..e533aa8 100644
+--- a/src/distances/mod.rs
++++ b/src/distances/mod.rs
+@@ -255,24 +255,41 @@ fn self_dists_all_stream_generic<const BB: usize, W: IoWrite + Send>(
+                     let mut i = calc_row_idx(start, n);
+                     let mut j = calc_col_idx(start, i, n);
+                     let mut buf = String::with_capacity((end - start) * 24);
++                    // Jaccard distances are computed first so the comparison is timed apart
++                    // from formatting them.
++                    let jaccard_dists: Option<Vec<f32>> = k_vals.map(|(k_idx, k_f64)| {
++                        let _resident = crate::resident::comparing().enter();
++                        let (mut i, mut j) = (i, j);
++                        (start..end)
++                            .map(|_| {
++                                let c1 = completeness_vec.map(|cv| cv[i]);
++                                let c2 = completeness_vec.map(|cv| cv[j]);
++                                let j_index = jaccard_index_generic::<BB>(
++                                    sketches.get_sketch_slice(i, k_idx),
++                                    sketches.get_sketch_slice(j, k_idx),
++                                    sketches.sketchsize64,
++                                    c1,
++                                    c2,
++                                    completeness_cutoff,
++                                );
++                                j += 1;
++                                if j >= n {
++                                    i += 1;
++                                    j = i + 1;
++                                }
++                                if ani {
++                                    ani_pois(j_index, k_f64) as f32
++                                } else {
++                                    (1.0_f64 - j_index) as f32
++                                }
++                            })
++                            .collect()
++                    });
+ 
++                    let mut dists = jaccard_dists.into_iter().flatten();
+                     for _ in start..end {
+-                        if let Some((k_idx, k_f64)) = k_vals {
+-                            let c1 = completeness_vec.map(|cv| cv[i]);
+-                            let c2 = completeness_vec.map(|cv| cv[j]);
+-                            let j_index = jaccard_index_generic::<BB>(
+-                                sketches.get_sketch_slice(i, k_idx),
+-                                sketches.get_sketch_slice(j, k_idx),
+-                                sketches.sketchsize64,
+-                                c1,
+-                                c2,
+-                                completeness_cutoff,
+-                            );
+-                            let dist = if ani {
+-                                ani_pois(j_index, k_f64) as f32
+-                            } else {
+-                                (1.0_f64 - j_index) as f32
+-                            };
++                        if k_vals.is_some() {
++                            let dist = dists.next().expect("one distance per pair");
+                             let _ = writeln!(buf, "{}\t{}\t{dist}", ref_names[i], ref_names[j]);
+                         } else {
+                             let d = core_acc_dist_generic::<BB>(
+@@ -654,24 +671,41 @@ fn cross_dists_all_stream_generic<const BB: usize, W: IoWrite + Send>(
+                     let end = (start + CHUNK_SIZE).min(n_distances);
+                     let (mut i, mut j) = calc_query_indices(start, n_query);
+                     let mut buf = String::with_capacity((end - start) * 24);
++                    // Jaccard distances are computed first so the comparison is timed apart
++                    // from formatting them.
++                    let jaccard_dists: Option<Vec<f32>> = k_vals.map(|(k_idx, k_f64)| {
++                        let _resident = crate::resident::comparing().enter();
++                        let (mut i, mut j) = (i, j);
++                        (start..end)
++                            .map(|_| {
++                                let c1 = ref_completeness_vec.map(|cv| cv[i]);
++                                let c2 = query_completeness_vec.map(|cv| cv[j]);
++                                let j_index = jaccard_index_generic::<BB>(
++                                    ref_sketches.get_sketch_slice(i, k_idx),
++                                    query_sketches.get_sketch_slice(j, k_idx),
++                                    ref_sketches.sketchsize64,
++                                    c1,
++                                    c2,
++                                    completeness_cutoff,
++                                );
++                                j += 1;
++                                if j >= n_query {
++                                    i += 1;
++                                    j = 0;
++                                }
++                                if ani {
++                                    ani_pois(j_index, k_f64) as f32
++                                } else {
++                                    (1.0_f64 - j_index) as f32
++                                }
++                            })
++                            .collect()
++                    });
+ 
++                    let mut dists = jaccard_dists.into_iter().flatten();
+                     for _ in start..end {
+-                        if let Some((k_idx, k_f64)) = k_vals {
+-                            let c1 = ref_completeness_vec.map(|cv| cv[i]);
+-                            let c2 = query_completeness_vec.map(|cv| cv[j]);
+-                            let j_index = jaccard_index_generic::<BB>(
+-                                ref_sketches.get_sketch_slice(i, k_idx),
+-                                query_sketches.get_sketch_slice(j, k_idx),
+-                                ref_sketches.sketchsize64,
+-                                c1,
+-                                c2,
+-                                completeness_cutoff,
+-                            );
+-                            let dist = if ani {
+-                                ani_pois(j_index, k_f64) as f32
+-                            } else {
+-                                (1.0_f64 - j_index) as f32
+-                            };
++                        if k_vals.is_some() {
++                            let dist = dists.next().expect("one distance per pair");
+                             let _ = writeln!(buf, "{}\t{}\t{dist}", ref_names[i], query_names[j]);
+                         } else {
+                             let d = core_acc_dist_generic::<BB>(
+diff --git a/src/hashing/nthash_iterator.rs b/src/hashing/nthash_iterator.rs
+index adf48ea..97a69c3 100644
+--- a/src/hashing/nthash_iterator.rs
++++ b/src/hashing/nthash_iterator.rs
+@@ -205,6 +205,8 @@ impl NtHashIterator {
+         let mut i = 0;
+ 
+         for record in records {
++            // Reading the record is outside; packing it is in-memory work.
++            let _resident = crate::resident::sketching().enter();
+             let bases_iter = record.0.into_iter();
+             let qual = record.1;
+             for (base_idx, base) in bases_iter.enumerate() {
+diff --git a/src/lib.rs b/src/lib.rs
+index ea9eff7..099c37d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -198,6 +198,8 @@ pub mod structures;
+ 
+ pub mod hashing;
+ 
++pub mod resident;
++
+ pub mod utils;
+ use crate::utils::get_progress_bar;
+ #[cfg(not(target_arch = "wasm32"))]
+@@ -299,6 +301,7 @@ pub fn main() -> Result<(), Error> {
+             sketch_vec
+                 .save_metadata(output)
+                 .expect("Error saving metadata");
++            resident::emit("sequence_ascii", resident::sketching());
+             Ok(())
+         }
+         Commands::Dist {
+@@ -466,6 +469,7 @@ pub fn main() -> Result<(), Error> {
+                     }
+                 }
+             }
++            resident::emit("sketches", resident::comparing());
+             Ok(())
+         }
+         Commands::Merge { db1, db2, output } => {
+@@ -658,7 +662,9 @@ pub fn main() -> Result<(), Error> {
+                             .par_iter()
+                             .progress_with(progress_bar)
+                             .zip(query_names)
+-                            .map(|(q, q_name)| match query_type {
++                            .map(|(q, q_name)| {
++                                let _resident = resident::comparing().enter();
++                                match query_type {
+                                 InvertedQueryType::MatchCount => {
+                                     (q_name, inverted_index.query_against_inverted_index(q))
+                                 }
+@@ -668,6 +674,7 @@ pub fn main() -> Result<(), Error> {
+                                 InvertedQueryType::AnyBins => {
+                                     (q_name, inverted_index.any_shared_bins(q))
+                                 }
++                                }
+                             })
+                             .for_each_with(tx, |tx, dists| {
+                                 let _ = tx.send(dists);
+@@ -696,6 +703,7 @@ pub fn main() -> Result<(), Error> {
+                     }
+                     writeln!(output_file)?;
+                 }
++                resident::emit("indexed_sketches", resident::comparing());
+                 Ok(())
+             }
+             InvertedCommands::Precluster {
+@@ -784,6 +792,7 @@ pub fn main() -> Result<(), Error> {
+                     if let Some(ref mode) = retain_unmatched {
+                         log::info!("Retain unmatched mode: {mode}");
+                     }
++                    let resident_guard = resident::comparing().enter();
+                     let distances = self_dists_knn_precluster(
+                         &references,
+                         &inverted_index,
+@@ -797,6 +806,8 @@ pub fn main() -> Result<(), Error> {
+                         *completeness_cutoff,
+                         retain_unmatched,
+                     );
++                    drop(resident_guard);
++                    resident::emit("indexed_sketches", resident::comparing());
+ 
+                     // Write the results
+                     log::info!("Writing out in sparse matrix form");
+diff --git a/src/resident.rs b/src/resident.rs
+new file mode 100644
+index 0000000..f906de8
+--- /dev/null
++++ b/src/resident.rs
+@@ -0,0 +1,86 @@
++//! In-memory processing time for the micro comparison, written to the file named by
++//! `CUDDL_RESIDENT_TIMINGS`. The clock counts wall time while any thread is inside a guarded
++//! region, so concurrent workers are not summed and reading or writing outside the guards is
++//! excluded.
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::sync::LazyLock;
++use std::time::Instant;
++
++/// Wall time during which at least one guard is alive.
++pub struct ResidentClock {
++    base: Instant,
++    active: AtomicU32,
++    started_ns: AtomicU64,
++    elapsed_ns: AtomicU64,
++}
++
++impl ResidentClock {
++    fn now_ns(&self) -> u64 {
++        self.base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
++    }
++
++    /// Starts a guarded region that lasts until the returned guard drops.
++    pub fn enter(&self) -> ResidentGuard<'_> {
++        let now = self.now_ns();
++        if self.active.fetch_add(1, Ordering::SeqCst) == 0 {
++            self.started_ns.store(now, Ordering::SeqCst);
++        }
++        ResidentGuard { owner: self }
++    }
++
++    fn elapsed_ms(&self) -> f64 {
++        self.elapsed_ns.load(Ordering::SeqCst) as f64 / 1_000_000.0
++    }
++}
++
++/// Keeps its clock running while alive.
++pub struct ResidentGuard<'a> {
++    owner: &'a ResidentClock,
++}
++
++impl Drop for ResidentGuard<'_> {
++    fn drop(&mut self) {
++        let now = self.owner.now_ns();
++        if self.owner.active.fetch_sub(1, Ordering::SeqCst) == 1 {
++            let start = self.owner.started_ns.load(Ordering::SeqCst);
++            self.owner
++                .elapsed_ns
++                .fetch_add(now.saturating_sub(start), Ordering::SeqCst);
++        }
++    }
++}
++
++fn new_clock() -> ResidentClock {
++    ResidentClock {
++        base: Instant::now(),
++        active: AtomicU32::new(0),
++        started_ns: AtomicU64::new(0),
++        elapsed_ns: AtomicU64::new(0),
++    }
++}
++
++static SKETCHING: LazyLock<ResidentClock> = LazyLock::new(new_clock);
++static COMPARING: LazyLock<ResidentClock> = LazyLock::new(new_clock);
++
++/// Packing and hashing sequences already read into memory.
++pub fn sketching() -> &'static ResidentClock {
++    &SKETCHING
++}
++
++/// Comparing or searching loaded sketches, apart from sketching queries and writing results.
++pub fn comparing() -> &'static ResidentClock {
++    &COMPARING
++}
++
++/// Writes @p clock's total for @p input when `CUDDL_RESIDENT_TIMINGS` names a file.
++pub fn emit(input: &str, clock: &ResidentClock) {
++    let Some(path) = std::env::var_os("CUDDL_RESIDENT_TIMINGS") else {
++        return;
++    };
++    let payload = format!(
++        "{{\"resident_ms\":{},\"source\":\"steady_clock_cpu_wall\",\"device\":\"cpu\",\
++         \"input\":\"{input}\"}}",
++        clock.elapsed_ms()
++    );
++    std::fs::write(path, payload).expect("resident timing sidecar must write");
++}
+diff --git a/src/sketch/mod.rs b/src/sketch/mod.rs
+index e799a9e..c5bf69a 100644
+--- a/src/sketch/mod.rs
++++ b/src/sketch/mod.rs
+@@ -546,6 +546,7 @@ pub fn sketch_data<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>(
+                 panic!("{sample_name} has no valid sequence");
+             }
+             // Run the sketching
++            let _resident = crate::resident::sketching().enter();
+             Sketch::new(
+                 &mut **hash_it,
+                 &sample_name,
