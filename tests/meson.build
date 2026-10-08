@@ -40,3 +40,13 @@ result_json_test_exe = executable(
 )
 
 test('result-json-tests', result_json_test_exe)
+
+resident_sequence_test_exe = executable(
+    'test-resident-sequence',
+    files('resident_sequence_test.cu'),
+    dependencies: [cuddl_dep, gtest_dep, gtest_main_dep],
+    include_directories: include_directories('../benchmarks'),
+    cuda_args: cuda_args,
+    install: false,
+)
+test('resident-sequence-tests', resident_sequence_test_exe)

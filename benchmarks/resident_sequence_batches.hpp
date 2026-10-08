@@ -34,13 +34,18 @@ struct batch {
 // Files are decompressed and compacted by a loader pool rather than by the thread building
 // batches: parsing every genome on one core otherwise dominates a full corpus, and the whole
 // staging phase would sit on a single core while the workers wait.
+//
+// With @p whole_genomes, no genome straddles two batches: a genome that does not fit the rest
+// of a batch starts the next one, and a genome larger than @p cap gets a batch of its own.
+// Consumers that need every k-mer of a genome at once, such as exact set counts, rely on it.
 template <typename Consume>
 size_t for_each_batch(
     std::vector<std::string> const& paths,
     uint32_t k,
     size_t cap,
     Consume&& consume,
-    unsigned workers = 0
+    unsigned workers = 0,
+    bool whole_genomes = false
 ) {
     if (k == 0 || cap < k) {
         throw std::invalid_argument("resident byte budget must be at least k");
@@ -55,6 +60,9 @@ size_t for_each_batch(
                    : static_cast<size_t>(chunk_limit64));
     batch current;
     size_t batches = 0;
+    // The budget the current batch fills: @p cap, or unbounded while one oversized genome
+    // occupies a batch alone.
+    size_t limit = cap;
     auto flush = [&] {
         if (current.bases.empty()) {
             return;
@@ -67,17 +75,17 @@ size_t for_each_batch(
     size_t piece_limit = 0;
     auto refill = [&] {
         // No useful piece fits the rest of this batch; seal it first.
-        if (cap - current.bases.size() < k) {
+        if (limit - current.bases.size() < k) {
             flush();
         }
-        size_t const room = cap - current.bases.size();
+        size_t const room = limit - current.bases.size();
         piece_limit = chunk_limit < room ? chunk_limit : room;
     };
     auto append = [&](size_t genome, char const* data, size_t size) {
         if (size < k) {
             return;
         }
-        if (size > cap - current.bases.size()) {
+        if (size > limit - current.bases.size()) {
             flush();
         }
         current.chunks.push_back({genome, current.bases.size(), size});
@@ -101,6 +109,15 @@ size_t for_each_batch(
         if (!sequence) {
             throw std::runtime_error(paths[genome] + ": " + sequence.error().message());
         }
+        size_t genome_bases = 0;
+        for (auto const& extent : (*sequence)->extents) {
+            genome_bases += static_cast<size_t>(extent.end - extent.begin);
+        }
+        bool const alone = whole_genomes && genome_bases > cap;
+        if (whole_genomes && genome_bases > cap - current.bases.size()) {
+            flush();
+        }
+        if (alone) limit = std::numeric_limits<size_t>::max();
         for (auto const& extent : (*sequence)->extents) {
             auto const* const bases = extent.begin;
             auto const size = static_cast<size_t>(extent.end - extent.begin);
@@ -114,6 +131,10 @@ size_t for_each_batch(
                 // is lost at the boundary and none is counted twice.
                 start += count - (k - 1U);
             }
+        }
+        if (alone) {
+            flush();
+            limit = cap;
         }
     }
     flush();

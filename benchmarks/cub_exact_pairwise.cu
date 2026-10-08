@@ -645,9 +645,9 @@ int run_main(
                 ));
                 CUDDL_CUDA_CALL(cudaStreamSynchronize(stream));
                 sketch_device.resolve();
-                // One genome can arrive as several pieces; the loader emits them in genome order,
-                // so their valid windows add up in order and each genome's keys stay together for
-                // the sort that follows.
+                // One genome can arrive as several pieces; the loader emits them in genome order
+                // and never splits a genome across batches, so its valid windows add up here and
+                // its keys stay together for the sort that follows.
                 batch_genomes.clear();
                 batch_offsets.clear();
                 size_t elements = 0;
@@ -770,7 +770,8 @@ int run_main(
                     }
                 }
             },
-            parse_workers
+            parse_workers,
+            /*whole_genomes=*/true
         );
         // Pair buffers sized from the largest evaluated pair actually measured.
         for (size_t ordinal : evaluated) {
