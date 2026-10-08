@@ -154,7 +154,24 @@
      std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
 --- a/src/resident.cpp
 +++ b/src/resident.cpp
-@@ -69,19 +69,10 @@
+@@ -29,13 +29,11 @@
+         std::ofstream output(path_, std::ios::trunc);
+         bool const searching = search_wall_ms_ > 0;
+         bool const compare = compare_ms_ > 0;
+-        output << (searching || compare ? "{\"resident_ms\":" : "{\"active_sketch_ms\":")
++        output << "{\"resident_ms\":"
+                << (searching ? search_ms_ - index_ms_ : compare ? compare_ms_
+                    : std::chrono::duration<double, std::milli>(sketch_elapsed_).count())
+-               << ",\"source\":\""
+-               << (searching || compare ? "steady_clock_cpu_wall" : "steady_clock_overlapped_fastx_wall")
+-               << "\",\"device\":\"cpu\",\"input\":\""
+-               << (searching ? "indexed_sketches" : compare ? "sketches" : "streamed_fastx") << "\"";
++               << ",\"source\":\"steady_clock_cpu_wall\",\"device\":\"cpu\",\"input\":\""
++               << (searching ? "indexed_sketches" : compare ? "sketches" : "sequence_ascii") << "\"";
+         if (searching) {
+             output << ",\"index_build_ms\":" << index_ms_
+                    << ",\"query_wall_ms\":" << search_wall_ms_ - index_ms_;
+@@ -71,19 +69,10 @@
  
  }  // namespace
  
