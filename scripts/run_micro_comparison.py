@@ -1556,6 +1556,7 @@ def main(
             if sketch_all:
                 d2_runs.insert(0, ("-full", sketch_file_args))
             d2_marks = {}
+            d2_resident: list[dict] = []
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
@@ -1582,6 +1583,9 @@ def main(
                         ],
                         quiet=True,
                         log_tail=True,
+                        resident=d2_resident
+                        if suffix == d2_timed and rep >= warmups
+                        else None,
                     )
                     done = time.perf_counter()
                     if rep >= warmups:
@@ -1596,6 +1600,7 @@ def main(
                     if sketch_all:
                         shutil.rmtree(out_dir)
             marks = d2_marks[d2_timed]
+            record_native_resident("dashing2", "sketch", d2_resident)
             sketch_times["dashing2"] = marks
             sketch_bytes["dashing2"] = d2_sketch_bytes
             record_sketch(

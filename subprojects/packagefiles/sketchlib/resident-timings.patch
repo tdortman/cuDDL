@@ -118,19 +118,6 @@ index 5d34cde..e533aa8 100644
                              let _ = writeln!(buf, "{}\t{}\t{dist}", ref_names[i], query_names[j]);
                          } else {
                              let d = core_acc_dist_generic::<BB>(
-diff --git a/src/hashing/nthash_iterator.rs b/src/hashing/nthash_iterator.rs
-index adf48ea..97a69c3 100644
---- a/src/hashing/nthash_iterator.rs
-+++ b/src/hashing/nthash_iterator.rs
-@@ -205,6 +205,8 @@ impl NtHashIterator {
-         let mut i = 0;
- 
-         for record in records {
-+            // Reading the record is outside; packing it is in-memory work.
-+            let _resident = crate::resident::sketching().enter();
-             let bases_iter = record.0.into_iter();
-             let qual = record.1;
-             for (base_idx, base) in bases_iter.enumerate() {
 diff --git a/src/lib.rs b/src/lib.rs
 index ea9eff7..099c37d 100644
 --- a/src/lib.rs
@@ -297,14 +284,208 @@ index 0000000..f906de8
 +    std::fs::write(path, payload).expect("resident timing sidecar must write");
 +}
 diff --git a/src/sketch/mod.rs b/src/sketch/mod.rs
-index e799a9e..c5bf69a 100644
+index e799a9e..dd9b053 100644
 --- a/src/sketch/mod.rs
 +++ b/src/sketch/mod.rs
-@@ -546,6 +546,7 @@ pub fn sketch_data<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>(
-                 panic!("{sample_name} has no valid sequence");
-             }
-             // Run the sketching
-+            let _resident = crate::resident::sketching().enter();
-             Sketch::new(
-                 &mut **hash_it,
-                 &sample_name,
+@@ -1,8 +1,6 @@
+ //! Methods to sketch samples, save/load sketches
+ use std::cmp::Ordering;
+ use std::fmt;
+-#[cfg(not(target_arch = "wasm32"))]
+-use std::sync::mpsc;
+ 
+ use aligned_vec::{AVec, ConstAlign};
+ #[cfg(not(target_arch = "wasm32"))]
+@@ -558,6 +556,10 @@ pub fn sketch_data<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>(
+         .collect::<Vec<Sketch>>()
+ }
+ 
++/// FASTX bytes on disk staged per sketching batch.
++#[cfg(not(target_arch = "wasm32"))]
++const RESIDENT_BATCH_BYTES: u64 = 1 << 30;
++
+ #[cfg(not(target_arch = "wasm32"))]
+ /// Main function to create sketches from a set of input files, which is parallelised
+ /// over the input files
+@@ -593,87 +595,108 @@ pub fn sketch_files(
+     let mut serial_writer =
+         SketchArrayWriter::new(&data_filename, bin_stride, kmer_stride, sample_stride);
+ 
+-    // Set up sender (sketching) and receiver (writing)
+-    let (tx, rx) = mpsc::channel();
+     let mut sketches: Vec<Sketch> = Vec::with_capacity(input_files.len());
+ 
+     let percent = false;
+     let progress_bar = get_progress_bar(input_files.len(), percent, quiet);
+-    // With thanks to https://stackoverflow.com/a/76963325
+-    rayon::scope(|s| {
+-        s.spawn(move |_| {
+-            input_files
+-                .par_iter()
+-                .progress_with(progress_bar)
+-                .enumerate()
+-                .map(|(_idx, (name, fastxvec))| {
+-                    // Read in sequence and set up rolling hash by alphabet type
+-
+-                    let reads = if seq_type == &HashType::DNA {
+-                        // Check if we're working with reads, and initalise the filter if so
+-                        let mut reader_peek = parse_fastx_file(fastxvec[0].clone())
+-                            .unwrap_or_else(|_| panic!("Invalid path/file: {}", fastxvec[0]));
+-                        let seq_peek = reader_peek
+-                            .next()
+-                            .expect("Invalid FASTA/Q record")
+-                            .expect("Invalid FASTA/Q record");
+-                        let mut reads = false;
+-                        if seq_peek.format() == Format::Fastq {
+-                            reads = true;
+-                            if fastxvec.len() > 2 {
+-                                panic!("Input files are reads, but there are more than two input files");
+-                            }
++    // Reading and parsing each batch finish before its packing and hashing start, so the
++    // resident clock covers in-memory work only. Batches bound the staged sequence.
++    let mut start = 0;
++    while start < input_files.len() {
++        let mut end = start;
++        let mut staged = 0;
++        while end < input_files.len() && (end == start || staged < RESIDENT_BATCH_BYTES) {
++            staged += input_files[end]
++                .1
++                .iter()
++                .map(|file| std::fs::metadata(file).map_or(0, |meta| meta.len()))
++                .sum::<u64>();
++            end += 1;
++        }
++        let batch = input_files[start..end]
++            .par_iter()
++            .map(|(name, fastxvec)| {
++                let reads = if seq_type == &HashType::DNA {
++                    // Check if we're working with reads, and initalise the filter if so
++                    let mut reader_peek = parse_fastx_file(fastxvec[0].clone())
++                        .unwrap_or_else(|_| panic!("Invalid path/file: {}", fastxvec[0]));
++                    let seq_peek = reader_peek
++                        .next()
++                        .expect("Invalid FASTA/Q record")
++                        .expect("Invalid FASTA/Q record");
++                    let mut reads = false;
++                    if seq_peek.format() == Format::Fastq {
++                        reads = true;
++                        if fastxvec.len() > 2 {
++                            panic!("Input files are reads, but there are more than two input files");
+                         }
+-                        reads
+-                    } else {
+-                        false
+-                    };
+-
+-                    let opts = SketchingOpts {
+-                        name: name.clone(),
+-                        k_vals: k.to_vec(),
+-                        seq_type: seq_type.clone(),
+-                        is_reads: reads,
+-                        concat_fasta,
+-                        sketch_size,
+-                        add_rc: rc,
+-                        min_count,
+-                        min_qual,
+-                    };
+-
+-                    let mut records_readers = fastxvec.iter().map(|file| {
+-                        let reader = parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+-                        NeedletailIterator::new(reader)
+-                    }).collect::<Vec<NeedletailIterator>>();
++                    }
++                    reads
++                } else {
++                    false
++                };
++
++                let opts = SketchingOpts {
++                    name: name.clone(),
++                    k_vals: k.to_vec(),
++                    seq_type: seq_type.clone(),
++                    is_reads: reads,
++                    concat_fasta,
++                    sketch_size,
++                    add_rc: rc,
++                    min_count,
++                    min_qual,
++                };
++
++                let records = fastxvec
++                    .iter()
++                    .map(|file| {
++                        let reader = parse_fastx_file(file)
++                            .unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
++                        NeedletailIterator::new(reader).collect::<Vec<_>>()
++                    })
++                    .collect::<Vec<_>>();
++                (opts, records)
++            })
++            .collect::<Vec<_>>();
++
++        let resident = crate::resident::sketching().enter();
++        let batch_sketches = batch
++            .into_par_iter()
++            .progress_with(progress_bar.clone())
++            .enumerate()
++            .map(|(_idx, (opts, records))| {
++                let mut records_readers = records
++                    .into_iter()
++                    .map(Vec::into_iter)
++                    .collect::<Vec<_>>();
++
++                #[cfg(feature = "3di")]
++                let di = struct_strings
++                    .as_ref()
++                    .map(|structs| structs[start + _idx].clone());
+ 
++                sketch_data(
++                    &mut records_readers,
++                    opts,
+                     #[cfg(feature = "3di")]
+-                    let di = struct_strings.as_ref().map(|structs| structs[_idx].clone());
+-
+-                    sketch_data(
+-                        &mut records_readers,
+-                        opts,
+-                        #[cfg(feature = "3di")]
+-                        convert_pdb,
+-                        #[cfg(feature = "3di")]
+-                        di,
+-                    )
+-                })
+-                .for_each_with(tx, |tx, sketch| {
+-                    // Emit the sketch results to the writer thread
+-                    let _ = tx.send(sketch);
+-                });
+-        });
+-        // Write each sketch to the .skd file as it comes in
+-        for sketch_file in rx {
+-            // Note double loop as single file may contain multiple samples with concat_fasta
+-            for mut sketch in sketch_file {
+-                let index = serial_writer.write_sketch(&sketch.get_usigs());
+-                sketch.set_index(index);
+-                // Also append (without usigs) to the metadata, which is Vec<Sketch>
+-                sketches.push(sketch);
+-            }
++                    convert_pdb,
++                    #[cfg(feature = "3di")]
++                    di,
++                )
++            })
++            .collect::<Vec<_>>();
++        drop(resident);
++
++        // Note double loop as single file may contain multiple samples with concat_fasta
++        for mut sketch in batch_sketches.into_iter().flatten() {
++            let index = serial_writer.write_sketch(&sketch.get_usigs());
++            sketch.set_index(index);
++            // Also append (without usigs) to the metadata, which is Vec<Sketch>
++            sketches.push(sketch);
+         }
+-    });
++        start = end;
++    }
+ 
+     sketches
+ }

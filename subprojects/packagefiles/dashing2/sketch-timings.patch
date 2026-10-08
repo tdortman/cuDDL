@@ -1,0 +1,178 @@
+--- a/src/fastxsketch.cpp
++++ b/src/fastxsketch.cpp
+@@ -2,6 +2,7 @@
+ #include "mio.hpp"
+ #include "sketch_core.h"
+ #include <variant>
++#include "resident.h"
+ 
+ //#include <optional>
+ namespace dashing2 {
+@@ -157,6 +158,37 @@
+ }
+ 
+ 
++/// FASTX bytes on disk staged per sketching batch.
++static constexpr size_t resident_batch_bytes = size_t(1) << 30;
++
++/// Reads every record of @p path, a space-separated file list, opening files as bonsai does.
++static std::vector<std::string> staged_sequences(const std::string &path) {
++    std::vector<std::string> seqs;
++    for_each_substr([&](const std::string &subpath) {
++        const auto ends_with = [&](std::string_view suffix) {
++            return subpath.size() >= suffix.size() &&
++                   subpath.compare(subpath.size() - suffix.size(), suffix.size(), suffix) == 0;
++        };
++        std::FILE *pfp = nullptr;
++        gzFile fp = nullptr;
++        if(ends_with(".xz") || ends_with(".bz2") || ends_with(".zst")) {
++            const std::string cmd = std::string(ends_with(".xz") ? "xz" : ends_with(".bz2") ? "bzip2" : "zstd") + " -dc " + subpath;
++            pfp = ::popen(cmd.data(), "r");
++            if(!pfp) THROW_EXCEPTION(std::runtime_error("Failed to open popen call: " + cmd));
++            fp = gzdopen(::fileno(pfp), "rb");
++        } else {
++            fp = gzopen(subpath.data(), "rb");
++        }
++        if(!fp) THROW_EXCEPTION(std::runtime_error("Could not open file at " + subpath));
++        gzbuffer(fp, 1 << 18);
++        kseq_t *ks = kseq_init(fp);
++        while(kseq_read(ks) >= 0) seqs.emplace_back(ks->seq.s, ks->seq.l);
++        kseq_destroy(ks);
++        gzclose(fp);
++        if(pfp) ::pclose(pfp);
++    }, path);
++    return seqs;
++}
+ 
+ 
+ FastxSketchingResult &fastx2sketch(FastxSketchingResult &ret, Dashing2Options &opts, const std::vector<std::string> &paths, std::string outpath) {
+@@ -164,7 +196,6 @@
+     std::vector<std::pair<size_t, uint64_t>> filesizes = get_filesizes(paths);
+     const size_t nt = std::max(opts.nthreads(), 1u);
+     const size_t ss = opts.sketchsize();
+-    KSeqHolder kseqs(nt);
+     std::vector<BagMinHash> bmhs;
+     std::vector<ProbMinHash> pmhs;
+     std::vector<OPSetSketch> opss;
+@@ -299,8 +330,21 @@
+     if(opts.kmer_result_ == FULL_MMER_SET) {
+         ret.kmerfiles_.resize(ret.destination_files_.size());
+     }
++    // Each batch is read and parsed before it is hashed, so the resident clock covers
++    // in-memory work only. Batches bound the staged sequence.
++    std::vector<std::vector<std::string>> staged;
++    std::vector<uint8_t> needs_sketch;
++    for(size_t batch_start = 0, batch_end; batch_start < nitems; batch_start = batch_end) {
++    size_t staged_bytes = 0;
++    for(batch_end = batch_start; batch_end < nitems && (batch_end == batch_start || staged_bytes < resident_batch_bytes); ++batch_end) {
++        staged_bytes += filesizes[batch_end].first;
++    }
++    staged.assign(batch_end - batch_start, {});
++    needs_sketch.assign(batch_end - batch_start, 0);
++    for(int pass = 0; pass < 2; ++pass) {
+     OMP_PFOR_DYN
+-    for(size_t i = 0; i < nitems; ++i) {
++    for(size_t i = batch_start; i < batch_end; ++i) {
++        if(pass == 1 && !needs_sketch[i - batch_start]) continue;
+         int tid = 0;
+         OMP_ONLY(tid = omp_get_thread_num();)
+         //const int tid = OMP_ELSE(omp_get_thread_num(), 0);
+@@ -324,7 +368,7 @@
+         }
+         const bool dkcif = check_compressed(destkmercounts, dct);
+         if(ret.kmercountfiles_.size() > myind) ret.kmercountfiles_[myind] = destkmercounts;
+-        if(opts.cache_sketches_ &&
++        if(pass == 0 && opts.cache_sketches_ &&
+            (destisfile || (opts.kmer_result_ == FULL_MMER_COUNTDICT && dkif)) &&
+            (!opts.save_kmers_ || dkif) &&
+            ((!opts.save_kmercounts_ && opts.kmer_result_ != FULL_MMER_COUNTDICT) || dkcif)
+@@ -379,21 +423,26 @@
+ #endif
+         }
+         perform_sketch:
++        if(pass == 0) {
++            staged[i - batch_start] = staged_sequences(path);
++            needs_sketch[i - batch_start] = 1;
++            continue;
++        }
+         __RESET(tid);
+         auto perf_for_substrs = [&](const auto &func) __attribute__((__always_inline__)) {
+-            for_each_substr([&](const std::string &subpath) {
++            cuddl_resident_sketch_scope resident;
++            for(const std::string &seq: staged[i - batch_start]) {
+                 auto lfunc = [&](auto x) __attribute__((__always_inline__)) {
+                     x = maskfn(x);
+                     if((!opts.fs_ || !opts.fs_->in_set(x)) && opts.downsample_pass()) func(x);
+                 };
+                 auto lfunc2 = [&func](auto x) __attribute__((__always_inline__)) {func(maskfn(x));};
+-                const auto seqp = kseqs.kseqs_ + tid;
+ #define FUNC_FE(f) \
+ do {\
+     if(!opts.fs_ && opts.kmer_downsample_frac_ == 1.) {\
+-        f(lfunc2, subpath.data(), seqp);\
++        f(lfunc2, seq.data(), seq.size());\
+     } else {\
+-        f(lfunc, subpath.data(), seqp);\
++        f(lfunc, seq.data(), seq.size());\
+     } \
+ } while(0)
+                 if(opts.use128()) {
+@@ -420,7 +469,7 @@
+                     FUNC_FE(opts.rh_.for_each_hash);
+                 }
+ #undef FUNC_FE
+-            }, path);
++            }
+         };
+         if(
+             (opts.sspace_ == SPACE_MULTISET || opts.sspace_ == SPACE_PSET || opts.kmer_result_ == FULL_MMER_SET || opts.kmer_result_ == FULL_MMER_COUNTDICT)
+@@ -622,6 +671,8 @@
+                 std::copy(counts, counts + ss, &ret.kmercounts_[mss]);
+         } else THROW_EXCEPTION(std::runtime_error("Unexpected: Not FULL_MMER_SEQUENCE, FULL_MMER_SET, ONE_PERM, FULL_SETSKETCH, SPACE_MULTISET, or SPACE_PSET"));
+     } // parallel paths loop
++    } // staging and sketching passes
++    } // batches
+     ret.names_ = paths;
+     return ret;
+ }
+--- a/src/resident.h
++++ b/src/resident.h
+@@ -7,6 +7,14 @@
+ void cuddl_resident_compare_add(double milliseconds);
+ void cuddl_resident_index_add(double milliseconds);
+ void cuddl_resident_search_add(double resident_ms, double wall_ms);
++void cuddl_resident_sketch_begin();
++void cuddl_resident_sketch_end();
++
++/// Counts wall time while any thread hashes staged sequences.
++struct cuddl_resident_sketch_scope {
++    cuddl_resident_sketch_scope() { cuddl_resident_sketch_begin(); }
++    ~cuddl_resident_sketch_scope() { cuddl_resident_sketch_end(); }
++};
+ 
+ class cuddl_resident_compare_interval {
+     std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+--- a/src/resident.cpp
++++ b/src/resident.cpp
+@@ -69,19 +69,10 @@
+ 
+ }  // namespace
+ 
+-namespace bns {
+-
+-void cuddl_resident_begin() {
+-    timings.enter();
+-}
+-void cuddl_resident_end() {
+-    timings.leave();
+-}
+-
+-}  // namespace bns
+-
+ namespace dashing2 {
+ 
++void cuddl_resident_sketch_begin() { timings.enter(); }
++void cuddl_resident_sketch_end() { timings.leave(); }
+ void cuddl_resident_index_add(double milliseconds) { timings.add_index(milliseconds); }
+ void cuddl_resident_search_add(double resident_ms, double wall_ms) {
+     timings.add_search(resident_ms, wall_ms);
