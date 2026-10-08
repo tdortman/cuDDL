@@ -1,0 +1,6 @@
+    Blocking waiting for file lock on package cache
+error: failed to select a version for the requirement `clap = "^4.5.31"` (locked to 4.5.48)
+candidate versions found which didn't match: 4.6.7, 4.6.6, 3.2.25
+location searched: directory source `/home/tim/Projects/dynamic-demi-log/subprojects/packagefiles/rust/vendor` (which is replacing registry `crates-io`)
+required by package `simd-sketch v0.3.0 (/home/tim/Projects/dynamic-demi-log/subprojects/packagefiles/rust/vendor/simd-sketch-0.3.0)`
+note: perhaps a crate was updated and forgotten to be re-vendored?

@@ -10,12 +10,14 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
 
 - SKETCH: FASTA files to queryable sketch state. CLI tools time their
   sketch command; cuDDL times reference-database build; RabbitSketch
-  times sketching plus writing its sketch file; cub-exact times its device sketch phase.
+  times sketching plus writing its sketch file; SimdSketch times its library-driven
+  sketch command, which writes one sketch file; cub-exact times its device sketch phase.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
   cuDDL's wall is its search CLI without an index (load the reference database,
   sketch FASTX queries, compare, download results to the host and discard them);
   RabbitSketch's wall loads its reference sketch file and sketches FASTX
-  queries; cub-exact times its device phase, and the
+  queries; SimdSketch's wall loads its reference sketch file, sketches batch FASTX
+  queries, and writes one binary similarity per pair; cub-exact times its device phase, and the
   CLI tools their native compare commands. Batch queries are sketched from FASTX
   inside the wall: skani dist sketches both sides itself; Dashing2 loads cached
   reference sketches and evicts query cache entries before each rep; hypergen runs
@@ -29,7 +31,8 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
 - SEARCH: the query wall includes FASTX query sketching and getting the index
   ready: cuDDL loads a saved index file; tools without an index file format
   (RabbitSketch, Dashing2) construct it inside the timed interval, RabbitSketch
-  from its loaded sketch file.
+  from its loaded sketch file. SimdSketch and HyperGen have no search mode, so their
+  SEARCH is the exhaustive COMPARE.
 
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
@@ -44,6 +47,7 @@ passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
 work and the slowest lane on a full corpus: it can run on a host that is not
 measuring a GPU. Fixed-size sketches use 2048 entries (cuDDL buckets with DDL's
 5-bit exponent and 11-bit mantissa, Dashing2 registers, RabbitSketch slots,
+SimdSketch buckets keeping the 8 low hash bits its author recommends,
 hypergen dimensions); skani keeps its own sampling and k. Entries differ in width
 and information per tool, so tools are compared in error-versus-time space.
 
@@ -55,6 +59,7 @@ from host RAM. Large corpora evaluate a size-spread genome subset that
 fits the budget; every lane runs the same files.
 """
 
+import array
 import gzip
 import json
 import math
@@ -79,7 +84,7 @@ from hypergen_pipeline import dataset_entries, summarize
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = typer.Typer()
-DEFAULT_TOOLS = "cuddl,rabbitsketch,hypergen,skani,dashing2,cub-exact"
+DEFAULT_TOOLS = "cuddl,rabbitsketch,simdsketch,hypergen,skani,dashing2,cub-exact"
 TOOLS = tuple(DEFAULT_TOOLS.split(","))
 
 
@@ -404,6 +409,48 @@ def read_dashing2_panel(
     return rows, evaluated
 
 
+def read_simdsketch_pairs(
+    path: Path, references: list[Path], queries: list[Path], k: int, stride: int
+) -> list[dict]:
+    """Samples every @p stride-th pair, plus the last, from a SimdSketch similarity file.
+
+    The file holds one little-endian `f32` Jaccard per pair: row-major query by reference for
+    batch @p queries, or the strict upper triangle of @p references, row by row, when
+    @p queries is empty. ANI comes from the Mash distance at k-mer size @p k.
+    """
+    values = array.array("f")
+    values.frombytes(path.read_bytes())
+    if sys.byteorder != "little":
+        values.byteswap()
+    n = len(references)
+    expected = len(queries) * n if queries else n * (n - 1) // 2
+    if len(values) != expected:
+        raise ValueError(f"{path}: {len(values)} similarities, expected {expected}")
+    positions = list(range(0, len(values), stride))
+    if values and positions[-1] != len(values) - 1:
+        positions.append(len(values) - 1)
+
+    def row(query: Path, reference: Path, jaccard: float) -> dict:
+        ani = 1 + math.log(2 * jaccard / (1 + jaccard)) / k if jaccard > 0 else None
+        return {
+            "query": str(query),
+            "reference": str(reference),
+            "jaccard": jaccard,
+            "ani": ani,
+        }
+
+    if queries:
+        return [row(queries[p // n], references[p % n], values[p]) for p in positions]
+    rows = []
+    i, start = 0, 0
+    for p in positions:
+        while p >= start + n - 1 - i:
+            start += n - 1 - i
+            i += 1
+        rows.append(row(references[i], references[i + 1 + p - start], values[p]))
+    return rows
+
+
 def discover(directory: Path) -> list[Path]:
     exts = (".fa", ".fna", ".fasta", ".ffn", ".frn")
     files = {
@@ -599,8 +646,8 @@ def main(
     tools: Annotated[
         str,
         typer.Option(
-            help="Comma-separated tools to measure: cuddl, rabbitsketch, hypergen, skani, "
-            "dashing2, cub-exact."
+            help="Comma-separated tools to measure: cuddl, rabbitsketch, simdsketch, "
+            "hypergen, skani, dashing2, cub-exact."
         ),
     ] = DEFAULT_TOOLS,
     performance_only: Annotated[
@@ -823,6 +870,7 @@ def main(
     cuddl_cli = build / "examples/cuddl-reference-index"
     cuddl_dbbuild = build / "examples/cuddl-build-reference-db"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
+    simdsketch = build / "benchmarks/simdsketch-benchmark"
     # Forwarded to every cub lane that evaluates pairs, so a large corpus can be told to keep
     # less resident than the default share of host memory.
     cub_stash: list[str] = []
@@ -840,6 +888,8 @@ def main(
         required += [refbuild, cuddl_cli, cuddl_dbbuild]
     if "rabbitsketch" in selected:
         required.append(rabbit)
+    if "simdsketch" in selected:
+        required.append(simdsketch)
     for binary in required:
         if not binary.exists():
             raise typer.BadParameter(
@@ -875,6 +925,7 @@ def main(
     sketch_k: dict[str, int] = {
         "cuddl": 25,
         "rabbitsketch": 25,
+        "simdsketch": 25,
         "hypergen": 25,
         "dashing2": 25,
         "cub-exact": 25,
@@ -1651,6 +1702,67 @@ def main(
             )
             rabbit_report, rabbit_rows = payload, pipe
 
+        if "simdsketch" in selected:
+            # The timed sketch covers the same files as the other CLI lanes. COMPARE needs a
+            # sketch file holding exactly the references, in order, so it gets its own
+            # untimed file whenever the timed one also holds queries or the full corpus.
+            ss_inputs = work / "ss-sketch.txt"
+            ss_inputs.write_text("".join(f"{p}\n" for p in sketch_file_args))
+            ss_sketch = work / "ss-sketch.sk"
+            ss_resident: list[dict] = []
+            marks = wall_of(
+                [
+                    str(simdsketch),
+                    "-j",
+                    str(threads),
+                    "sketch",
+                    "-k",
+                    "25",
+                    "-s",
+                    "2048",
+                    "-b",
+                    "8",
+                    "--output",
+                    str(ss_sketch),
+                    str(ss_inputs),
+                ],
+                samples,
+                warmups,
+                resident=ss_resident,
+            )
+            record_native_resident("simdsketch", "sketch", ss_resident)
+            sketch_times["simdsketch"] = marks
+            sketch_bytes["simdsketch"] = ss_sketch.stat().st_size
+            record_sketch(
+                "simdsketch",
+                "bucket-b8",
+                marks,
+                {"sketch_bytes": sketch_bytes["simdsketch"]},
+            )
+            ss_references = ss_sketch
+            if sketch_file_args != [str(p) for p in references]:
+                ss_reference_list = work / "ss-references.txt"
+                ss_reference_list.write_text("".join(f"{p}\n" for p in references))
+                ss_references = work / "ss-references.sk"
+                run(
+                    [
+                        str(simdsketch),
+                        "-j",
+                        str(threads),
+                        "sketch",
+                        "-k",
+                        "25",
+                        "-s",
+                        "2048",
+                        "-b",
+                        "8",
+                        "--output",
+                        str(ss_references),
+                        str(ss_reference_list),
+                    ],
+                    quiet=True,
+                )
+
         if "cub-exact" in selected:
             import json as jsonlib4
 
@@ -2129,6 +2241,41 @@ def main(
             )
             measurements[-1]["metrics"].update(phases)
 
+        if "simdsketch" in selected:
+            ss_pairs = work / "ss-pairs.f32"
+            ss_compare = [
+                str(simdsketch),
+                "-j",
+                str(threads),
+                "compare",
+                "--references",
+                str(ss_references),
+                "--output",
+                str(ss_pairs),
+            ]
+            if topology == "batch":
+                ss_query_list = work / "ss-queries.txt"
+                ss_query_list.write_text("".join(f"{p}\n" for p in query_list))
+                ss_compare += ["--queries", str(ss_query_list)]
+            ss_compare_resident: list[dict] = []
+            marks = wall_of(
+                ss_compare, samples, warmups, resident=ss_compare_resident
+            )
+            record_native_resident("simdsketch", "compare", ss_compare_resident)
+            evaluated = count_pairs(references, query_list, topology)
+            stride = (
+                max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
+            )
+            rows = read_simdsketch_pairs(
+                ss_pairs,
+                references,
+                query_list if topology == "batch" else [],
+                sketch_k["simdsketch"],
+                stride,
+            )
+            record_compare("simdsketch", "bucket-b8", marks, rows, evaluated=evaluated)
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
+
         if "cub-exact" in selected:
             rows = [
                 {
@@ -2467,6 +2614,7 @@ def main(
         # These lanes expose exhaustive comparison only.
         for tool, score_key in (
             ("hypergen", "ani"),
+            ("simdsketch", "jaccard"),
             ("cub-exact", "jaccard"),
         ):
             if tool in selected:
@@ -2481,7 +2629,7 @@ def main(
             if "hypergen" in selected
             else []
         )
-        for tool, score_key in (("cub-exact", "jaccard"),):
+        for tool, score_key in (("simdsketch", "jaccard"), ("cub-exact", "jaccard")):
             if tool in selected:
                 search_query_ms[tool] = [
                     m["timings"]["wall"]["median_ms"]
@@ -2489,18 +2637,20 @@ def main(
                     if m["implementation"]["name"] == tool
                     and m["case"]["measurement"] == "micro-compare"
                 ]
-        if "hypergen" in selected:
-            for row in pair_table:
-                if row["tool"] == "hypergen" and row.get("ani") is not None:
-                    search_scores[("hypergen", row["query"], row["reference"])] = row[
-                        "ani"
-                    ]
-        for tool in ("cub-exact",):
+        # All-to-all rows hold each unordered pair once; search ranks from both ends.
+        for tool, score_key in (
+            ("hypergen", "ani"),
+            ("simdsketch", "jaccard"),
+            ("cub-exact", "jaccard"),
+        ):
             if tool in selected:
                 for row in pair_table:
-                    if row["tool"] == tool and row.get("jaccard") is not None:
+                    if row["tool"] == tool and row.get(score_key) is not None:
                         search_scores[(tool, row["query"], row["reference"])] = row[
-                            "jaccard"
+                            score_key
+                        ]
+                        search_scores[(tool, row["reference"], row["query"])] = row[
+                            score_key
                         ]
 
         def record_search(
@@ -2565,12 +2715,13 @@ def main(
             "hypergen": hypergen_device,
             "dashing2": "SetSketch",
             "rabbitsketch": "FastKMV",
+            "simdsketch": "bucket-b8",
             "cub-exact": "gpu-exact",
         }
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {"hypergen", "cub-exact"}:
+                if tool in {"hypergen", "simdsketch", "cub-exact"}:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]

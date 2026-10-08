@@ -1,0 +1,25 @@
+[package]
+name = "simdsketch-benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "simdsketch-benchmark"
+path = "main.rs"
+
+[dependencies]
+# `packed-seq` and `bincode` must match the versions `simd-sketch` uses: sequences and
+# sketches cross its API. `bincode` 3 is a deliberately broken release.
+bincode = "=2.0.1"
+clap = { version = "4.5", features = ["derive"] }
+needletail = { version = "0.6.3", default-features = false, features = ["flate2"] }
+packed-seq = "4.1.0"
+rayon = "1.10.0"
+# The default features pull bzip2, xz and zstd through native libraries; gzip is all the
+# corpora use, and needletail's `flate2` feature covers it.
+simd-sketch = { version = "=0.3.0", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

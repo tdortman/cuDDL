@@ -47,6 +47,29 @@ if build_x86_tools
     dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
 endif
 
+# SimdSketch has no C ABI; this cargo crate drives its Rust library. Its SIMD paths are chosen
+# at compile time, so it builds for the host CPU like RabbitSketch.
+simdsketch_bin = custom_target(
+    'simdsketch-benchmark',
+    output: 'simdsketch-benchmark',
+    command: [
+        'sh',
+        '-c',
+        'export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"; '
+        + '"$1" build --release --locked --offline --manifest-path "$2" --target-dir "$3" '
+        + '>"$4.log" 2>&1 || { cat "$4.log"; exit 1; }; '
+        + 'cp "$3/release/simdsketch-benchmark" "$4"',
+        '_',
+        find_program('cargo'),
+        meson.current_source_dir() / 'simdsketch' / 'Cargo.toml',
+        meson.current_build_dir() / 'simdsketch-cargo-target',
+        '@OUTPUT@',
+    ],
+    console: true,
+    build_by_default: true,
+    build_always_stale: true,
+)
+
 executable(
     'cub-exact-pairwise',
     'cub_exact_pairwise.cu',

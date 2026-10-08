@@ -57,10 +57,12 @@ def main() -> None:
             ("rabbitsketch", False, "all-to-all"),
             ("rabbitsketch", True, "batch"),
             ("rabbitsketch", False, "batch"),
+            ("simdsketch", True, "all-to-all"),
+            ("simdsketch", True, "batch"),
             ("cub-exact", False, "all-to-all"),
         ]:
             output = work / "result.json"
-            samples = 3 if tool in {"cuddl", "rabbitsketch", "dashing2"} else 1
+            samples = 3 if tool in {"cuddl", "rabbitsketch", "simdsketch", "dashing2"} else 1
             command = [
                 str(runner),
                 str(genomes),
@@ -109,14 +111,14 @@ def main() -> None:
                 resident = measurement["timings"]["resident"]
                 assert resident["median_ms"] > 0, measurement
                 assert resident["min_ms"] <= resident["median_ms"] <= resident["max_ms"]
-                if tool in {"cuddl", "rabbitsketch", "dashing2"}:
+                if tool in {"cuddl", "rabbitsketch", "simdsketch", "dashing2"}:
                     for timing in measurement["timings"].values():
                         assert timing["samples"] == samples, measurement
                 if operation == "micro-compare":
                     assert (
                         measurement["case"]["pairs"] == measurement["metrics"]["pairs"]
                     )
-                    if tool in {"cuddl", "rabbitsketch"}:
+                    if tool in {"cuddl", "rabbitsketch", "simdsketch"}:
                         assert measurement["case"]["pairs"] == (
                             6 if topology == "batch" else 3
                         ), measurement
