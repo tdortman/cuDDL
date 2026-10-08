@@ -25,7 +25,10 @@
             overlays = [ rust-overlay.overlays.default ];
           };
 
-          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-src" ];
+          };
+
           lib = pkgs.lib;
           cudaPkgs = pkgs.cudaPackages_13_4;
           llvmPkgs = pkgs.llvmPackages_22;
