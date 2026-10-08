@@ -125,13 +125,14 @@ def main(
             fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
             pu.save_figure(fig, output_dir / f"{stem}.pdf")
 
+        # One width for every time panel, so wall and resident figures line up on a slide.
+        width = max(5.5, max(len(sketch), len(compare), len(search)) * 1.15)
+
         def time_panel(
             subset: list[dict], title: str, stem: str, *, resident: bool = False
         ) -> None:
             runtime_labels = []
-            fig, ax = plt.subplots(
-                figsize=(max(5.5, len(subset) * 1.15) if resident else 5.5, 4)
-            )
+            fig, ax = plt.subplots(figsize=(width, 4))
             if not subset:
                 ax.set_title(title + (" (not recorded)" if resident else " (none)"))
                 if resident:
