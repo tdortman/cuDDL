@@ -6,6 +6,7 @@
 #include <omp.h>
 #include <rank/CanonicalKmer.h>
 #include <rank/RankStream.h>
+#include <unistd.h>
 #include <CLI/CLI.hpp>
 #include <cuddl/fastx.hpp>
 #include <exception>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -35,7 +37,7 @@ using json = nlohmann::json;
 
 struct options {
     std::vector<std::string> references, queries;
-    std::string output, name = "RabbitSketch CPU pipeline", topology = "batch";
+    std::string output, sketch_file, name = "RabbitSketch CPU pipeline", topology = "batch";
     std::string ingest = "packed";
     int k = 25, sketch_size = 4096, samples = 20, warmups = 3;
     bool performance_only = false;
@@ -189,6 +191,70 @@ collection build_files(std::vector<std::string> const& paths, api::SketchConfig 
         auto built = builder.finish(label, paths[i], std::string{});
         return std::move(built.at(0));
     });
+}
+
+// Removes a default sketch file when the run ends; an empty path keeps a caller-provided file.
+struct scratch_file {
+    std::filesystem::path path;
+    ~scratch_file() {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+};
+
+// RabbitSketch has no sketch file format, so this one stores what a query needs: per genome,
+// the bottom-k register count and the registers, references first, then queries.
+void save_sketches(std::string const& path, collection const& refs, collection const& queries) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto put = [&](void const* data, size_t bytes) {
+        out.write(static_cast<char const*>(data), static_cast<std::streamsize>(bytes));
+    };
+    for (auto const* group : {&refs, &queries}) {
+        uint64_t const count = group->size();
+        put(&count, sizeof count);
+        for (auto const& genome : *group) {
+            auto const& sketch = genome.sketch.fastKMV();
+            uint32_t const size = sketch.size();
+            put(&size, sizeof size);
+            put(sketch.getRegisters(), size * sizeof(uint64_t));
+        }
+    }
+    out.close();
+    if (!out) throw std::runtime_error("cannot write sketch file " + path);
+}
+
+collection
+load_references(std::string const& path, options const& opts, api::SketchConfig const& cfg) {
+    std::ifstream in(path, std::ios::binary);
+    auto get = [&](void* data, size_t bytes) {
+        if (!in.read(static_cast<char*>(data), static_cast<std::streamsize>(bytes))) {
+            throw std::runtime_error("truncated sketch file " + path);
+        }
+    };
+    uint64_t count = 0;
+    get(&count, sizeof count);
+    collection result;
+    result.reserve(count);
+    std::vector<uint64_t> registers;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint32_t size = 0;
+        get(&size, sizeof size);
+        registers.resize(size);
+        get(registers.data(), size * sizeof(uint64_t));
+        auto sketch = Sketch::FastKMV::fromRegisters(
+            static_cast<uint32_t>(opts.sketch_size), opts.k, opts.seed, registers
+        );
+        sketch.finalize();
+        result.emplace_back(
+            api::BuiltSketch::fromFastKMV(std::move(sketch)),
+            "genome",
+            cfg,
+            api::BuildStats{},
+            "",
+            ""
+        );
+    }
+    return result;
 }
 
 struct match {
@@ -918,6 +984,34 @@ json run(options const& opts) {
         }
         mark();
     });
+    // SKETCH persists reference and query sketches like the CLI tools; the COMPARE and SEARCH
+    // walls load the reference side back from that file.
+    scratch_file const scratch{
+        opts.sketch_file.empty() ? std::filesystem::temp_directory_path() /
+                                       ("rabbitsketch-" + std::to_string(getpid()) + ".kmv")
+                                 : std::filesystem::path{}
+    };
+    std::string const sketch_path =
+        opts.sketch_file.empty() ? scratch.path.string() : opts.sketch_file;
+    timings["sketch_file_wall"] = measure(opts, [&] {
+        save_sketches(
+            sketch_path, build_files(opts.references, cfg), build_files(opts.queries, cfg)
+        );
+    });
+    if (!opts.performance_only) {
+        auto const loaded = load_references(sketch_path, opts, cfg);
+        for (size_t i = 0; i < refs.size(); ++i) {
+            auto const& expected = refs[i].sketch.fastKMV();
+            auto const& actual = loaded[i].sketch.fastKMV();
+            if (actual.size() != expected.size() || !std::equal(
+                                                        expected.getRegisters(),
+                                                        expected.getRegisters() + expected.size(),
+                                                        actual.getRegisters()
+                                                    )) {
+                throw std::runtime_error("sketch file round trip changed registers");
+            }
+        }
+    }
     // The record and packed-input stages materialize the whole corpus, so a streamed run skips
     // them. RabbitSketch's own file ingest is the bounded path.
     if (!streamed) {
@@ -938,12 +1032,12 @@ json run(options const& opts) {
     });
     timings["resident_compare"] =
         timings[all ? "search_all_to_all_exhaustive" : "search_batch_exhaustive"];
-    // Wall scopes sketch the query side from FASTX; all-to-all queries are the reference files.
-    auto const& query_paths = all ? opts.references : opts.queries;
+    // Wall scopes load reference sketches from the file and sketch batch queries from FASTX;
+    // all-to-all queries are the loaded references.
     timings["query_fastx_compare"] = measure(opts, [&] {
-        auto q = build_files(query_paths, cfg);
-        auto hits =
-            all ? search(q, q, true, opts.match_rows) : search(refs, q, false, opts.match_rows);
+        auto r = load_references(sketch_path, opts, cfg);
+        auto hits = all ? search(r, r, true, opts.match_rows)
+                        : search(r, build_files(opts.queries, cfg), false, opts.match_rows);
         consumed_size = hits.matches.size();
     });
     if (all) {
@@ -1010,12 +1104,15 @@ json run(options const& opts) {
         if (!output) throw std::runtime_error("cannot create native search output file");
         auto const path = "/proc/self/fd/" + std::to_string(fileno(output.get()));
         timings["search_query_wall"] = measure(opts, [&] { indexed_search(resident, path); });
-        // No index file format exists, so the FASTX search wall also constructs the index.
+
+        // No index file format exists, so the search wall loads the saved sketches and also
+        // constructs the index.
         timings["query_fastx_search"] = measure(opts, [&] {
-            auto fresh = index_keys(build_files(query_paths, cfg));
+            auto fresh = index_keys(load_references(sketch_path, opts, cfg));
             build_index(fresh);
             indexed_search(fresh, path);
         });
+
         if (!opts.performance_only) {
             std::ifstream input(path);
             size_t query, reference;
@@ -1174,6 +1271,12 @@ int main(int argc, char** argv) try {
         "Skip correctness oracles and result equivalence checks"
     );
     app.add_option("--output", opts.output, "Shared-schema JSON output, stdout if omitted");
+    app.add_option(
+        "--sketch-file",
+        opts.sketch_file,
+        "Sketch file written by the SKETCH wall and read by COMPARE/SEARCH walls; a temporary "
+        "file removed at exit if omitted"
+    );
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);

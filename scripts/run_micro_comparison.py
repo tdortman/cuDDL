@@ -10,25 +10,26 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
 
 - SKETCH: FASTA files to queryable sketch state. CLI tools time their
   sketch command; cuDDL times reference-database build; RabbitSketch
-  times pipeline prepare; cub-exact times its device sketch phase.
+  times sketching plus writing its sketch file; cub-exact times its device sketch phase.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
   cuDDL's wall is its search CLI without an index (load the reference database,
   sketch FASTX queries, compare, download results to the host and discard them);
-  RabbitSketch's wall sketches FASTX
-  queries against resident references; cub-exact times its device phase, and the
+  RabbitSketch's wall loads its reference sketch file and sketches FASTX
+  queries; cub-exact times its device phase, and the
   CLI tools their native compare commands. Batch queries are sketched from FASTX
   inside the wall: skani dist sketches both sides itself; Dashing2 loads cached
   reference sketches and evicts query cache entries before each rep; hypergen runs
   `sketch` on the queries before `dist` on the saved reference sketch. All-to-all
   compares each unordered reference pair once: cuDDL reuses
-  its database rows, RabbitSketch re-sketches the reference files. Resident times
+  its database rows, RabbitSketch loads its sketch file. Resident times
   cover the comparison alone; the pipeline benchmarks' own output phases
   (per-genome metrics and a JSON sample of match rows) are recorded beside them,
   never counted as comparison. cuDDL's pipeline runs use the database file's row
   layout, index geometry, and search calls, so resident and wall time the same work.
 - SEARCH: the query wall includes FASTX query sketching and getting the index
   ready: cuDDL loads a saved index file; tools without an index file format
-  (RabbitSketch, Dashing2) construct it inside the timed interval.
+  (RabbitSketch, Dashing2) construct it inside the timed interval, RabbitSketch
+  from its loaded sketch file.
 
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
@@ -1618,6 +1619,8 @@ def main(
                     "2048",
                     "--config",
                     str(cfg),
+                    "--sketch-file",
+                    str(work / "rabbit.kmv"),
                     "--output",
                     str(rep),
                 ],
@@ -1629,17 +1632,23 @@ def main(
                 for m in payload["measurements"]
                 if m["case"].get("measurement") == "pipeline"
             )
-            prepare = pipe["timings"]["prepare_wall"]
-            native_timings[("rabbitsketch", "sketch")] = {"wall": prepare}
+            sketched = pipe["timings"]["sketch_file_wall"]
+            native_timings[("rabbitsketch", "sketch")] = {"wall": sketched}
             resident_timings[("rabbitsketch", "sketch")] = pipe["timings"][
                 "resident_sketch"
             ]
             resident_timings[("rabbitsketch", "compare")] = pipe["timings"][
                 "resident_compare"
             ]
-            marks = [prepare["median_ms"]]
+            marks = [sketched["median_ms"]]
             sketch_times["rabbitsketch"] = marks
-            record_sketch("rabbitsketch", "FastKMV", marks, {})
+            sketch_bytes["rabbitsketch"] = (work / "rabbit.kmv").stat().st_size
+            record_sketch(
+                "rabbitsketch",
+                "FastKMV",
+                marks,
+                {"sketch_bytes": sketch_bytes["rabbitsketch"]},
+            )
             rabbit_report, rabbit_rows = payload, pipe
 
         if "cub-exact" in selected:
@@ -2107,7 +2116,7 @@ def main(
                         }
                     )
             phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
-            # Wall sketches the query side from FASTX against resident reference sketches.
+            # Wall loads reference sketches from the file and sketches batch queries from FASTX.
             fastx_compare = rabbit_rows["timings"]["query_fastx_compare"]
             native_timings[("rabbitsketch", "compare")] = {"wall": fastx_compare}
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
@@ -2419,9 +2428,9 @@ def main(
             index_timing = (
                 timings["search_index_build"]
                 if index != "none"
-                else timings["prepare_wall"]
+                else timings["sketch_file_wall"]
             )
-            # No index file format: the FASTX query wall also constructs the index.
+            # No index file format: the query wall loads the sketch file and constructs the index.
             query_timing = timings["query_fastx_search"]
             search_index_ms["rabbitsketch"] = [index_timing["median_ms"]]
             search_query_ms["rabbitsketch"] = [query_timing["median_ms"]]
