@@ -30,7 +30,7 @@ ESTIMATORS = (
 )
 CUDDL = pu.FILTER_STYLES["cuddl"]
 BBTOOLS = pu.FILTER_STYLES["cuco_hll"]
-ANI_ONLY = {"skani", "hypergen"}
+ANI_ONLY = {"skani", "hypergen", "simdsketch", "sketchlib"}
 
 
 def require(data: pd.DataFrame, columns: set[str], name: str) -> None:
@@ -68,7 +68,7 @@ def main(
             help="Minimum exact_ani kept in the ANI panel only; other panels unfiltered.",
         ),
     ] = 0.0,
- ) -> None:
+) -> None:
     """Render estimation quality as a 2x3 slide-sized panel figure."""
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -108,17 +108,31 @@ def main(
         implementations.append(("skani", "skani", {"color": "#56B4E9"}))
     if "hypergen" in set(quality["implementation"]):
         implementations.append(("hypergen", "HyperGen", {"color": "#D55E00"}))
+    if "simdsketch" in set(quality["implementation"]):
+        implementations.append(("simdsketch", "SimdSketch", {"color": "#8C564B"}))
+    if "sketchlib" in set(quality["implementation"]):
+        implementations.append(("sketchlib", "sketchlib.rust", {"color": "#BCBD22"}))
     if "cub-exact" in set(quality["implementation"]):
         implementations.append(("cub-exact", "cub-exact", {"color": "#999999"}))
     lanes = [name for name, _, _ in implementations]
     labels = [label for _, label, _ in implementations]
     styles = {name: style for name, _, style in implementations}
+
     def frame_for(implementation: str, column: str) -> pd.DataFrame:
         # Estimator variants live on cuDDL rows under their own columns.
-        frame = quality[quality["implementation"] == (
-            "cuddl" if implementation in ("cuddl-bbtools", "cuddl-paper")
-            else implementation)]
-        if column == "ani_absolute_error" and ani_min_exact > 0.0 and "exact_ani" in frame:
+        frame = quality[
+            quality["implementation"]
+            == (
+                "cuddl"
+                if implementation in ("cuddl-bbtools", "cuddl-paper")
+                else implementation
+            )
+        ]
+        if (
+            column == "ani_absolute_error"
+            and ani_min_exact > 0.0
+            and "exact_ani" in frame
+        ):
             frame = frame[frame["exact_ani"] >= ani_min_exact]
         if column in SYMMETRIC_METRICS and "orientation" in frame:
             forwarded = frame[frame["orientation"] == "query_to_reference"]
@@ -126,14 +140,21 @@ def main(
                 return forwarded
         return frame
 
-    def draw(ax: mpl.axes.Axes, names: list[str], tags: dict[str, str],
-             column: str, title: str) -> None:
+    def draw(
+        ax: mpl.axes.Axes,
+        names: list[str],
+        tags: dict[str, str],
+        column: str,
+        title: str,
+    ) -> None:
         maximum = 0.0
         rows: list[tuple[float, float, float] | None] = []
         for name in names:
             source = column
             if column == "cardinality_absolute_relative_error" and name in (
-                    "cuddl-bbtools", "cuddl-paper"):
+                "cuddl-bbtools",
+                "cuddl-paper",
+            ):
                 variant = "bbtools" if name == "cuddl-bbtools" else "paper"
                 source = f"cardinality_{variant}_absolute_relative_error"
             row = stats(frame_for(name, source), source)
@@ -143,20 +164,28 @@ def main(
         limit = maximum * 1.3 if maximum else 1
         for i, (name, row) in enumerate(zip(names, rows)):
             if row is None:
-                ax.text(limit * 0.03, i,
-                        "ANI only" if name in ANI_ONLY else "No data",
-                        va="center", fontsize=9)
+                ax.text(
+                    limit * 0.03,
+                    i,
+                    "ANI only" if name in ANI_ONLY else "No data",
+                    va="center",
+                    fontsize=9,
+                )
                 continue
             low, median, high = row
-            ax.barh(i, median, height=0.6,
-                    color=styles[name]["color"], edgecolor="black",
-                    xerr=[[median - low], [high - median]], capsize=3)
-            ax.text(high + limit * 0.025, i, f"{median:.2f}",
-                    va="center", fontsize=9)
+            ax.barh(
+                i,
+                median,
+                height=0.6,
+                color=styles[name]["color"],
+                edgecolor="black",
+                xerr=[[median - low], [high - median]],
+                capsize=3,
+            )
+            ax.text(high + limit * 0.025, i, f"{median:.2f}", va="center", fontsize=9)
         ax.set_xlim(0, limit)
         display = {name: label for name, label, _ in implementations}
-        display.update({"cuddl-bbtools": "cuDDL BBTools",
-                        "cuddl-paper": "cuDDL paper"})
+        display.update({"cuddl-bbtools": "cuDDL BBTools", "cuddl-paper": "cuDDL paper"})
         pad = 0.5 if len(names) > 1 else 1.5
         ax.set_ylim(len(names) - 1 + pad, 0 - pad)
         names_shown = [tags.get(name, display.get(name, name)) for name in names]
@@ -168,20 +197,23 @@ def main(
         ax.xaxis.grid(True, alpha=pu.GRID_ALPHA)
         ax.set_axisbelow(True)
         ax.spines[["top", "right"]].set_visible(False)
+
     fig = plt.figure(figsize=(13.33, 7.5), layout="constrained")
     gs = fig.add_gridspec(2, 6)
-    axes = [fig.add_subplot(gs[0, 0:2]),
-            fig.add_subplot(gs[0, 2:4]),
-            fig.add_subplot(gs[0, 4:6]),
-            fig.add_subplot(gs[1, 1:3]),
-            fig.add_subplot(gs[1, 3:5])]
-    draw(axes[0], lanes, {},
-         "cardinality_absolute_relative_error", "Cardinality")
+    axes = [
+        fig.add_subplot(gs[0, 0:2]),
+        fig.add_subplot(gs[0, 2:4]),
+        fig.add_subplot(gs[0, 4:6]),
+        fig.add_subplot(gs[1, 1:3]),
+        fig.add_subplot(gs[1, 3:5]),
+    ]
+    draw(axes[0], lanes, {}, "cardinality_absolute_relative_error", "Cardinality")
     for (column, title), ax in zip(METRICS[1:], axes[1:]):
         draw(ax, lanes, {}, column, title)
     stem = output_dir / "estimation_quality"
     fig.savefig(stem.with_suffix(".png"), dpi=180)
     pu.save_figure(fig, stem.with_suffix(".pdf"))
+
 
 if __name__ == "__main__":
     typer.run(main)

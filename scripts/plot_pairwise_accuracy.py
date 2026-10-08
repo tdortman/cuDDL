@@ -34,6 +34,8 @@ def plot_comparison(data: pd.DataFrame, output_dir: Path) -> None:
         "dashing2": "Dashing2 FullSetSketch",
         "skani": "skani",
         "hypergen": "HyperGen",
+        "simdsketch": "SimdSketch",
+        "sketchlib": "sketchlib.rust",
         "cub-exact": "cub-exact",
     }
     unknown = set(data["implementation"]) - labels.keys()
@@ -70,8 +72,14 @@ def plot_comparison(data: pd.DataFrame, output_dir: Path) -> None:
                 except KeyError:
                     values = None
                 if values is None or values.isna().all().all():
-                    ax.text(0.5, 0.5, pu.paper_text("no data"),
-                            ha="center", va="center", transform=ax.transAxes)
+                    ax.text(
+                        0.5,
+                        0.5,
+                        pu.paper_text("no data"),
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
                     ax.set_xticks([])
                     ax.set_yticks([])
                     if row == 0:

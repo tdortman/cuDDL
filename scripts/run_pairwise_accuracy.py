@@ -363,9 +363,11 @@ def write_genome_cases(
                         "reference_bases": bases[reference],
                         "query_bases": bases[query],
                         "reference_sha256": hashlib.sha256(
-                            Path(reference).read_bytes()).hexdigest(),
+                            Path(reference).read_bytes()
+                        ).hexdigest(),
                         "query_sha256": hashlib.sha256(
-                            Path(query).read_bytes()).hexdigest(),
+                            Path(query).read_bytes()
+                        ).hexdigest(),
                         "reference_path": reference,
                         "query_path": query,
                     }
@@ -520,28 +522,48 @@ def main(
         str,
         typer.Option(
             help="Comma-separated lanes to run: cuddl, bbtools, rabbitsketch, "
-            "cuco_hll, dashing2, skani, hypergen, cub-exact. cuDDL and BBTools "
-            "always run, they define cases and the CSV all lanes validate against."
+            "cuco_hll, dashing2, skani, hypergen, simdsketch, sketchlib, cub-exact. "
+            "cuDDL and BBTools always run, they define cases and the CSV all lanes "
+            "validate against."
         ),
-    ] = "cuddl,bbtools,rabbitsketch,cuco_hll,dashing2,skani,hypergen,cub-exact",
+    ] = "cuddl,bbtools,rabbitsketch,cuco_hll,dashing2,skani,hypergen,simdsketch,sketchlib,cub-exact",
 ) -> None:
     """Build and run all implementations, then publish one JSON result."""
     selected = [name.strip() for name in implementations.split(",") if name.strip()]
-    unknown = [name for name in selected if name not in
-               ("cuddl", "bbtools", "rabbitsketch", "cuco_hll", "dashing2",
-                "skani", "hypergen", "cub-exact")]
+    unknown = [
+        name
+        for name in selected
+        if name
+        not in (
+            "cuddl",
+            "bbtools",
+            "rabbitsketch",
+            "cuco_hll",
+            "dashing2",
+            "skani",
+            "hypergen",
+            "simdsketch",
+            "sketchlib",
+            "cub-exact",
+        )
+    ]
     if unknown or not selected:
         raise typer.BadParameter(
-            f"unknown implementations: {', '.join(unknown) or 'none'}")
+            f"unknown implementations: {', '.join(unknown) or 'none'}"
+        )
     genome_mode = genome_dir is not None
     synthetic_touched = (
-        powers is not None or ani_levels is not None
-        or size_ratios is not None or trials != 8 or seed != 42
+        powers is not None
+        or ani_levels is not None
+        or size_ratios is not None
+        or trials != 8
+        or seed != 42
     )
     if genome_mode and synthetic_touched:
         raise typer.BadParameter(
             "genome-dir rejects synthetic options "
-            "(--power, --ani, --size-ratio, --trials, --seed)")
+            "(--power, --ani, --size-ratio, --trials, --seed)"
+        )
     if not genome_mode and ani_min_aligned_fraction != 0.15:
         raise typer.BadParameter(
             "--ani-min-aligned-fraction applies to --genome-dir runs only; "
@@ -555,7 +577,8 @@ def main(
         if len(found) < genome_count:
             raise typer.BadParameter(
                 f"genome directory holds {len(found)} FASTX files, "
-                f"fewer than genome-count={genome_count}")
+                f"fewer than genome-count={genome_count}"
+            )
     else:
         powers = powers or list(DEFAULT_POWERS)
         ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
@@ -603,8 +626,7 @@ def main(
     with tempfile.TemporaryDirectory(prefix="cuddl-pairwise-accuracy-") as temporary:
         temporary_dir = Path(temporary)
         if genome_mode:
-            cases_csv = write_genome_cases(
-                temporary_dir, found, seed, genome_count)
+            cases_csv = write_genome_cases(temporary_dir, found, seed, genome_count)
         else:
             cases_csv = write_cases(
                 temporary_dir, powers, ani_levels, size_ratios, trials, seed
@@ -627,37 +649,42 @@ def main(
             cuddl_json, operation="pairwise_accuracy"
         )
         aligned_fraction: dict[tuple[str, str], float] = {}
+        genome_tri: dict[tuple[str, str], tuple[float, float]] = {}
         if genome_mode:
             skani_bin = build_dir / "subprojects/skani/skani"
             if not skani_bin.is_file():
-                raise typer.BadParameter(
-                    f"skani binary was not built: {skani_bin}")
+                raise typer.BadParameter(f"skani binary was not built: {skani_bin}")
             with cases_csv.open(newline="") as handle:
                 case_rows = list(csv.DictReader(handle))
             tri_genomes = sorted(
-                {r["reference_path"] for r in case_rows} |
-                {r["query_path"] for r in case_rows})
-            genome_tri = skani_triangle(
-                skani_bin, tri_genomes, temporary_dir, threads)
+                {r["reference_path"] for r in case_rows}
+                | {r["query_path"] for r in case_rows}
+            )
+            genome_tri = skani_triangle(skani_bin, tri_genomes, temporary_dir, threads)
             for row in cuddl_result["measurements"]:
                 task = row["case"]
-                ref = next(r["reference_path"] for r in case_rows
-                           if r["reference_sha256"] == task["reference_sha256"])
-                qry = next(r["query_path"] for r in case_rows
-                           if r["query_sha256"] == task["query_sha256"])
+                ref = next(
+                    r["reference_path"]
+                    for r in case_rows
+                    if r["reference_sha256"] == task["reference_sha256"]
+                )
+                qry = next(
+                    r["query_path"]
+                    for r in case_rows
+                    if r["query_sha256"] == task["query_sha256"]
+                )
                 key = (qry, ref)
                 if key not in genome_tri:
                     raise RuntimeError(f"skani triangle lacks pair {key}")
                 ani, af = genome_tri[key]
-                aligned_fraction[
-                    (task["reference_sha256"], task["query_sha256"])] = af
+                aligned_fraction[(task["reference_sha256"], task["query_sha256"])] = af
                 row["case"]["actual_ani"] = ani
                 row["case"]["requested_ani"] = ani
                 row["metrics"]["exact_ani"] = ani
-                row["metrics"]["ani_signed_error"] = (
-                    row["metrics"]["sketch_ani"] - ani)
+                row["metrics"]["ani_signed_error"] = row["metrics"]["sketch_ani"] - ani
                 row["metrics"]["ani_absolute_error"] = abs(
-                    row["metrics"]["ani_signed_error"])
+                    row["metrics"]["ani_signed_error"]
+                )
                 row["metrics"]["skani_aligned_fraction"] = af
         hll_measurements = [
             row
@@ -759,7 +786,8 @@ def main(
             dashing2_bin = build_dir / "subprojects/dashing2/dashing2"
             if not dashing2_bin.is_file():
                 raise typer.BadParameter(
-                    f"Dashing2 binary was not built: {dashing2_bin}")
+                    f"Dashing2 binary was not built: {dashing2_bin}"
+                )
             dashing2_json = temporary_dir / "dashing2.json"
             run(
                 [
@@ -771,34 +799,23 @@ def main(
                 ]
             )
             dashing2_result = benchmark_schema.load_result(
-                dashing2_json, "pairwise_accuracy")
+                dashing2_json, "pairwise_accuracy"
+            )
             dashing2_rows = benchmark_schema.flatten_measurements(dashing2_result)
             if len(dashing2_rows) != len(original_rows):
-                raise RuntimeError(
-                    "Dashing2 emitted a different number of cases")
+                raise RuntimeError("Dashing2 emitted a different number of cases")
             for index, (original, dashing2) in enumerate(
                 zip(original_rows, dashing2_rows, strict=True)
             ):
                 if dashing2["implementation"] != "dashing2" or any(
                     original[field] != dashing2[field] for field in KEY_FIELDS
                 ):
-                    raise RuntimeError(
-                        f"Dashing2 case metadata differs at row {index}")
+                    raise RuntimeError(f"Dashing2 case metadata differs at row {index}")
         skani_skipped = 0
-        genome_tri: dict[tuple[str, str], tuple[float, float]] = {}
         skani_bin = build_dir / "subprojects/skani/skani"
         if "skani" in selected:
             if not skani_bin.is_file():
-                raise typer.BadParameter(
-                    f"skani binary was not built: {skani_bin}")
-            if genome_mode:
-                with cases_csv.open(newline="") as handle:
-                    case_rows = list(csv.DictReader(handle))
-                tri_genomes = sorted(
-                    {r["reference_path"] for r in case_rows} |
-                    {r["query_path"] for r in case_rows})
-                genome_tri = skani_triangle(
-                    skani_bin, tri_genomes, temporary_dir, threads)
+                raise typer.BadParameter(f"skani binary was not built: {skani_bin}")
             skani_json = temporary_dir / "skani.json"
             run(
                 [
@@ -810,26 +827,32 @@ def main(
                     str(threads),
                 ]
             )
-            skani_result = benchmark_schema.load_result(
-                skani_json, "pairwise_accuracy")
+            skani_result = benchmark_schema.load_result(skani_json, "pairwise_accuracy")
             skani_rows = benchmark_schema.flatten_measurements(skani_result)
             # ANI-only lane on synthetic pairs below the detection floor:
             # subset match on KEY_FIELDS, not row-count equality.
             for index, skani in enumerate(skani_rows):
                 if skani["implementation"] != "skani":
                     raise RuntimeError(
-                        f"skani emitted an unexpected implementation at row {index}")
-                match = [o for o in original_rows if all(
-                    o[field] == skani[field] for field in CASE_FIELDS
-                    if field in o and field in skani)]
+                        f"skani emitted an unexpected implementation at row {index}"
+                    )
+                match = [
+                    o
+                    for o in original_rows
+                    if all(
+                        o[field] == skani[field]
+                        for field in CASE_FIELDS
+                        if field in o and field in skani
+                    )
+                ]
                 if not match:
-                    raise RuntimeError(
-                        f"skani case metadata differs at row {index}")
+                    raise RuntimeError(f"skani case metadata differs at row {index}")
             skani_skipped = len(original_rows) - len(skani_rows)
             if skani_skipped:
                 typer.echo(
                     f"skani skipped {skani_skipped} of {len(original_rows)} "
-                    "pairs below the detection floor")
+                    "pairs below the detection floor"
+                )
             if genome_mode:
                 # Split truth: skani triangle is the ANI oracle on real
                 # genomes. cub-exact stays the set-metric oracle. Paths
@@ -838,28 +861,34 @@ def main(
                 with cases_csv.open(newline="") as handle:
                     sha_paths = {
                         (r["reference_sha256"], r["query_sha256"]): (
-                            r["query_path"], r["reference_path"])
-                        for r in csv.DictReader(handle)}
+                            r["query_path"],
+                            r["reference_path"],
+                        )
+                        for r in csv.DictReader(handle)
+                    }
                 for row in skani_result["measurements"]:
                     task = row["case"]
-                    key = sha_paths[(
-                        task["reference_sha256"], task["query_sha256"])]
+                    key = sha_paths[(task["reference_sha256"], task["query_sha256"])]
                     if key not in genome_tri:
-                        raise RuntimeError(
-                            f"skani triangle lacks pair {key}")
+                        raise RuntimeError(f"skani triangle lacks pair {key}")
                     ani, af = genome_tri[key]
                     row["metrics"]["exact_ani"] = ani
                     row["metrics"]["ani_signed_error"] = (
-                        row["metrics"]["sketch_ani"] - ani)
+                        row["metrics"]["sketch_ani"] - ani
+                    )
                     row["metrics"]["ani_absolute_error"] = abs(
-                        row["metrics"]["ani_signed_error"])
+                        row["metrics"]["ani_signed_error"]
+                    )
                     row["metrics"]["skani_aligned_fraction"] = af
                 skani_rows = benchmark_schema.flatten_measurements(skani_result)
+        ani_lane_results: dict[str, dict] = {}
+        ani_lane_rows: dict[str, list] = {}
         if "hypergen" in selected:
             hypergen_bin = build_dir / "subprojects/hypergen/hyper-gen"
             if not hypergen_bin.is_file():
                 raise typer.BadParameter(
-                    f"hyper-gen binary was not built: {hypergen_bin}")
+                    f"hyper-gen binary was not built: {hypergen_bin}"
+                )
             hypergen_json = temporary_dir / "hypergen.json"
             run(
                 [
@@ -871,48 +900,92 @@ def main(
                     str(threads),
                 ]
             )
-            hypergen_result = benchmark_schema.load_result(
-                hypergen_json, "pairwise_accuracy")
-            hypergen_rows = benchmark_schema.flatten_measurements(hypergen_result)
-            # ANI lanes emit one row per triangle pair, not per orientation.
+            ani_lane_results["hypergen"] = benchmark_schema.load_result(
+                hypergen_json, "pairwise_accuracy"
+            )
+        jaccard_lanes = {
+            "simdsketch": (
+                "simdsketch-benchmark",
+                build_dir / "benchmarks/simdsketch-benchmark",
+            ),
+            "sketchlib": (
+                "subprojects/sketchlib/sketchlib",
+                build_dir / "subprojects/sketchlib/sketchlib",
+            ),
+        }
+        for lane, (target, lane_bin) in jaccard_lanes.items():
+            if lane not in selected:
+                continue
+            run(
+                ["meson", "compile", "-C", str(build_dir), target]
+                if lane == "simdsketch"
+                else ["ninja", "-C", str(build_dir), target]
+            )
+            lane_json = temporary_dir / f"{lane}.json"
+            run(
+                [
+                    str(ROOT / "benchmarks/jaccard_pairwise_accuracy.py"),
+                    lane,
+                    str(cases_csv),
+                    str(cuddl_json),
+                    str(lane_json),
+                    str(lane_bin),
+                    str(threads),
+                ]
+            )
+            ani_lane_results[lane] = benchmark_schema.load_result(
+                lane_json, "pairwise_accuracy"
+            )
+        if ani_lane_results and genome_mode:
+            with cases_csv.open(newline="") as handle:
+                ani_sha_paths = {
+                    (r["reference_sha256"], r["query_sha256"]): (
+                        r["query_path"],
+                        r["reference_path"],
+                    )
+                    for r in csv.DictReader(handle)
+                }
+        for lane, lane_result in ani_lane_results.items():
+            # ANI lanes emit one row per ordered pair, not per orientation.
             # Every row must match a cuDDL case on shared fields.
-            for index, hypergen in enumerate(hypergen_rows):
-                if hypergen["implementation"] != "hypergen":
+            for index, lane_row in enumerate(
+                benchmark_schema.flatten_measurements(lane_result)
+            ):
+                if lane_row["implementation"] != lane:
                     raise RuntimeError(
-                        f"hypergen emitted an unexpected implementation at row {index}")
-                match = [o for o in original_rows if all(
-                    o[field] == hypergen[field] for field in CASE_FIELDS
-                    if field in o and field in hypergen)]
-                if not match:
-                    raise RuntimeError(
-                        f"hypergen case metadata differs at row {index}")
+                        f"{lane} emitted an unexpected implementation at row {index}"
+                    )
+                if not any(
+                    all(
+                        o[field] == lane_row[field]
+                        for field in CASE_FIELDS
+                        if field in o and field in lane_row
+                    )
+                    for o in original_rows
+                ):
+                    raise RuntimeError(f"{lane} case metadata differs at row {index}")
             if genome_mode:
-                with cases_csv.open(newline="") as handle:
-                    hg_sha_paths = {
-                        (r["reference_sha256"], r["query_sha256"]): (
-                            r["query_path"], r["reference_path"])
-                        for r in csv.DictReader(handle)}
-                for row in hypergen_result["measurements"]:
+                for row in lane_result["measurements"]:
                     task = row["case"]
-                    key = hg_sha_paths[(
-                        task["reference_sha256"], task["query_sha256"])]
+                    key = ani_sha_paths[
+                        (task["reference_sha256"], task["query_sha256"])
+                    ]
                     if key not in genome_tri:
-                        raise RuntimeError(
-                            f"skani triangle lacks pair {key}")
+                        raise RuntimeError(f"skani triangle lacks pair {key}")
                     ani, af = genome_tri[key]
                     row["metrics"]["exact_ani"] = ani
                     row["metrics"]["ani_signed_error"] = (
-                        row["metrics"]["sketch_ani"] - ani)
+                        row["metrics"]["sketch_ani"] - ani
+                    )
                     row["metrics"]["ani_absolute_error"] = abs(
-                        row["metrics"]["ani_signed_error"])
+                        row["metrics"]["ani_signed_error"]
+                    )
                     row["metrics"]["skani_aligned_fraction"] = af
-                hypergen_rows = benchmark_schema.flatten_measurements(
-                    hypergen_result)
+            ani_lane_rows[lane] = benchmark_schema.flatten_measurements(lane_result)
         if "cub-exact" in selected:
             cub_bin = build_dir / "benchmarks/cub-exact-pairwise"
             if not cub_bin.is_file():
-                raise typer.BadParameter(
-                    f"cub-exact binary was not built: {cub_bin}")
+                raise typer.BadParameter(f"cub-exact binary was not built: {cub_bin}")
             cub_json = temporary_dir / "cub.json"
             run(
                 [
@@ -923,21 +996,21 @@ def main(
                     str(cub_bin),
                 ]
             )
-            cub_result = benchmark_schema.load_result(
-                cub_json, "pairwise_accuracy")
+            cub_result = benchmark_schema.load_result(cub_json, "pairwise_accuracy")
             cub_rows = benchmark_schema.flatten_measurements(cub_result)
             if len(cub_rows) != len(original_rows):
-                raise RuntimeError(
-                    "cub-exact emitted a different number of cases")
+                raise RuntimeError("cub-exact emitted a different number of cases")
             for index, (original, cub) in enumerate(
                 zip(original_rows, cub_rows, strict=True)
             ):
                 if cub["implementation"] != "cub-exact" or any(
-                    original[field] != cub[field] for field in CASE_FIELDS
+                    original[field] != cub[field]
+                    for field in CASE_FIELDS
                     if field in original and field in cub
                 ):
                     raise RuntimeError(
-                        f"cub-exact case metadata differs at row {index}")
+                        f"cub-exact case metadata differs at row {index}"
+                    )
 
     if reference_fields != list(CSV_FIELDS):
         raise RuntimeError("BBTools emitted a different CSV schema")
@@ -960,15 +1033,30 @@ def main(
     typed_rows = [coerce_row(row) for row in (*rows, *reference)]
     base_case = CASE_FIELDS
     cuddl_variants = (
-        ("cuddl", "sketch_cardinality", "cardinality_signed_error",
-         "cardinality_absolute_error", "cardinality_relative_error",
-         "cardinality_absolute_relative_error"),
-        ("cuddl-bbtools", "sketch_cardinality_bbtools", "cardinality_bbtools_signed_error",
-         "cardinality_bbtools_absolute_error", "cardinality_bbtools_relative_error",
-         "cardinality_bbtools_absolute_relative_error"),
-        ("cuddl-paper", "sketch_cardinality_paper", "cardinality_paper_signed_error",
-         "cardinality_paper_absolute_error", "cardinality_paper_relative_error",
-         "cardinality_paper_absolute_relative_error"),
+        (
+            "cuddl",
+            "sketch_cardinality",
+            "cardinality_signed_error",
+            "cardinality_absolute_error",
+            "cardinality_relative_error",
+            "cardinality_absolute_relative_error",
+        ),
+        (
+            "cuddl-bbtools",
+            "sketch_cardinality_bbtools",
+            "cardinality_bbtools_signed_error",
+            "cardinality_bbtools_absolute_error",
+            "cardinality_bbtools_relative_error",
+            "cardinality_bbtools_absolute_relative_error",
+        ),
+        (
+            "cuddl-paper",
+            "sketch_cardinality_paper",
+            "cardinality_paper_signed_error",
+            "cardinality_paper_absolute_error",
+            "cardinality_paper_relative_error",
+            "cardinality_paper_absolute_relative_error",
+        ),
     )
     result = benchmark_schema.make_result(
         name="Pairwise sketch accuracy",
@@ -996,18 +1084,18 @@ def main(
             case_fields=base_case,
             omit_fields=PATH_FIELDS,
         )
-        for normalized, original in zip(
-            normalized_variants, variant_rows, strict=True
-        ):
+        for normalized, original in zip(normalized_variants, variant_rows, strict=True):
             normalized["implementation"] = {"name": original["implementation"]}
         result["measurements"].extend(normalized_variants)
     for row in typed_rows:
         if row["implementation"] == "bbtools":
-            result["measurements"].extend(benchmark_schema.measurements_from_rows(
-                [row],
-                case_fields=base_case,
-                omit_fields=PATH_FIELDS,
-            ))
+            result["measurements"].extend(
+                benchmark_schema.measurements_from_rows(
+                    [row],
+                    case_fields=base_case,
+                    omit_fields=PATH_FIELDS,
+                )
+            )
     rabbit_measurements = benchmark_schema.measurements_from_rows(
         rabbit_rows,
         case_fields=(*CASE_FIELDS, "hash_seed", "sketch_size"),
@@ -1031,7 +1119,10 @@ def main(
         result["measurements"].extend(dashing2_measurements)
     for lane, lane_rows, lane_result in (
         ("skani", skani_rows, skani_result if "skani" in selected else None),
-        ("hypergen", hypergen_rows, hypergen_result if "hypergen" in selected else None),
+        *(
+            (lane, ani_lane_rows[lane], ani_lane_results[lane])
+            for lane in ani_lane_results
+        ),
         ("cub-exact", cub_rows, cub_result if "cub-exact" in selected else None),
     ):
         if lane not in selected:
@@ -1061,8 +1152,7 @@ def main(
         for measurement in result["measurements"]:
             case = measurement["case"]
             case["case_source"] = "refseq"
-            aligned = aligned_fraction[
-                (case["reference_sha256"], case["query_sha256"])]
+            aligned = aligned_fraction[(case["reference_sha256"], case["query_sha256"])]
             metrics = measurement["metrics"]
             metrics["ani_scored"] = aligned >= ani_min_aligned_fraction
             if metrics["ani_scored"]:
@@ -1070,8 +1160,10 @@ def main(
             for field in ("ani_signed_error", "ani_absolute_error"):
                 metrics.pop(field, None)
         scored = sum(
-            1 for measurement in result["measurements"]
-            if measurement["metrics"]["ani_scored"])
+            1
+            for measurement in result["measurements"]
+            if measurement["metrics"]["ani_scored"]
+        )
         typer.echo(
             f"ANI scored on {scored} of {len(result['measurements'])} rows; the rest are "
             f"below the {ani_min_aligned_fraction:.0%} aligned-fraction floor"
