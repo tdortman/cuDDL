@@ -12,7 +12,8 @@ exact_ani (realised aligned-base ANI), NOT exact_set_derived_ani.
 
 Small synthetic pairs (< ~20 marker k-mers) are below skani's detection
 floor and yield no row; those rows are skipped and reported on stderr.
-Orientation-independent: one invocation covers both row orientations.
+One `skani dist` call scores every genome against every genome, so each ordered pair's ANI
+comes from the same per-pair computation without a process per pair.
 """
 
 import csv
@@ -22,22 +23,24 @@ import sys
 from pathlib import Path
 
 
-def dist_ani(binary: str, query: str, reference: str, out: Path, threads: int) -> float | None:
-    cmd = [binary, "dist", query, reference, "-o", str(out),
-           "-t", str(threads), "--min-af", "0"]
+def all_pairs_ani(
+    binary: str, genomes: list[str], work: Path, threads: str
+) -> dict[tuple[str, str], float]:
+    """ANI keyed by (reference, query) path for every pair skani reports."""
+    listing, out = work / "genomes.txt", work / "dist.tsv"
+    listing.write_text("".join(f"{path}\n" for path in genomes))
+    cmd = [binary, "dist", "--ql", str(listing), "--rl", str(listing), "-o", str(out),
+           "-t", threads, "--min-af", "0"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"skani failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
+    ani = {}
     for line in out.read_text().splitlines():
         if not line or line.startswith("Ref_file"):
             continue
-        fields = line.split()
-        if len(fields) >= 3:
-            try:
-                return float(fields[2]) / 100.0
-            except ValueError:
-                continue
-    return None
+        reference, query, value = line.split("\t")[:3]
+        ani[(reference, query)] = float(value) / 100.0
+    return ani
 
 
 def main(cases_path: str, truth_path: str, output_path: str, binary: str, threads: str) -> None:
@@ -55,7 +58,8 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
 
     work = Path(output_path).parent / "skani-work"
     work.mkdir(parents=True, exist_ok=True)
-    seen: dict[tuple[str, str], float | None] = {}
+    genomes = sorted({path for pair in paths.values() for path in pair})
+    seen = all_pairs_ani(binary, genomes, work, threads)
     emitted: set[tuple[str, str]] = set()
     out_rows = []
     skipped = 0
@@ -67,9 +71,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
         except KeyError:
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         key = (ref_path, qry_path)
-        if key not in seen:
-            seen[key] = dist_ani(binary, qry_path, ref_path, work / f"n{n}.tsv", int(threads))
-        ani = seen[key]
+        ani = seen.get(key)
         if ani is None:
             skipped += 1
             continue
@@ -93,8 +95,6 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
                               "right_cardinality", "intersection")},
             "metrics": metrics,
         })
-        if (n + 1) % 200 == 0:
-            print(f"skani: {n + 1}/{len(rows)}", file=sys.stderr)
 
     truth_report = json.loads(Path(truth_path).read_text())
     report_out = {

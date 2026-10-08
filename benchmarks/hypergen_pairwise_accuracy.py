@@ -7,13 +7,15 @@
 
 hyper-gen reports ANI percent, not k-mer set membership, so only the ANI
 error columns are populated. ANI truth is the row's exact_ani (realised
-aligned-base ANI). Orientation-independent: one invocation covers both row
-orientations. Sketch staging uses a symlink farm (hyper-gen sketches
-directories, not files); dist runs with -a 0 to disable thresholding.
+aligned-base ANI). Every genome is sketched once from a symlink farm (hyper-gen sketches
+directories, not files), and one dist call scores the full matrix. The query side is a copy
+of the same sketch file, because hyper-gen only scores one triangle when both paths match.
+dist runs with -a 0 to disable thresholding.
 """
 
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,29 +27,31 @@ def run(cmd: list[str]) -> None:
         raise RuntimeError(f"hyper-gen failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
 
 
-def dist_ani(binary: str, query: str, reference: str, work: Path, tag: str, threads: int) -> float:
-    farm_r = work / f"{tag}.r"
-    farm_q = work / f"{tag}.q"
-    for farm, src in ((farm_r, reference), (farm_q, query)):
-        farm.mkdir(parents=True, exist_ok=True)
-        link = farm / "0.fna"
+def all_pairs_ani(
+    binary: str, genomes: list[str], work: Path, threads: str
+) -> dict[tuple[str, str], float]:
+    """ANI keyed by (reference, query) path for every ordered genome pair."""
+    farm = work / "farm"
+    farm.mkdir(parents=True, exist_ok=True)
+    links = {}
+    for index, src in enumerate(genomes):
+        link = farm / f"g{index}.fna"
         if link.is_symlink() or link.exists():
             link.unlink()
         link.symlink_to(Path(src).resolve())
-    ref_sk, qry_sk = work / f"{tag}.r.sk", work / f"{tag}.q.sk"
-    run([binary, "sketch", "-p", str(farm_r), "-o", str(ref_sk), "-t", str(threads)])
-    run([binary, "sketch", "-p", str(farm_q), "-o", str(qry_sk), "-t", str(threads)])
-    out = work / f"{tag}.out"
+        links[str(link)] = src
+    ref_sk, qry_sk, out = work / "r.sk", work / "q.sk", work / "dist.tsv"
+    run([binary, "sketch", "-p", str(farm), "-o", str(ref_sk), "-t", threads])
+    shutil.copyfile(ref_sk, qry_sk)
     run([binary, "dist", "-r", str(ref_sk), "-q", str(qry_sk),
-         "-o", str(out), "-t", str(threads), "-a", "0"])
+         "-o", str(out), "-t", threads, "-a", "0"])
+    ani = {}
     for line in out.read_text().splitlines():
         if not line.strip():
             continue
-        try:
-            return float(line.split()[-1]) / 100.0
-        except ValueError:
-            continue
-    raise RuntimeError(f"hyper-gen dist emitted no ANI row in {out}")
+        reference, query, value = line.split("\t")
+        ani[(links[reference], links[query])] = float(value) / 100.0
+    return ani
 
 
 def main(cases_path: str, truth_path: str, output_path: str, binary: str, threads: str) -> None:
@@ -65,7 +69,8 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
 
     work = Path(output_path).parent / "hypergen-work"
     work.mkdir(parents=True, exist_ok=True)
-    seen: dict[tuple[str, str], float] = {}
+    genomes = sorted({path for pair in paths.values() for path in pair})
+    seen = all_pairs_ani(binary, genomes, work, threads)
     emitted: set[tuple[str, str]] = set()
     out_rows = []
     for n, row in enumerate(rows):
@@ -77,7 +82,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         key = (ref_path, qry_path)
         if key not in seen:
-            seen[key] = dist_ani(binary, qry_path, ref_path, work, f"n{n}", int(threads))
+            raise RuntimeError(f"hyper-gen dist lacks pair {key}")
         ani = seen[key]
         if key in emitted:
             continue
@@ -99,8 +104,6 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
                               "right_cardinality", "intersection")},
             "metrics": metrics,
         })
-        if (n + 1) % 200 == 0:
-            print(f"hypergen: {n + 1}/{len(rows)}", file=sys.stderr)
 
     truth_report = json.loads(Path(truth_path).read_text())
     report_out = {

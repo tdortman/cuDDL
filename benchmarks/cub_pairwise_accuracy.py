@@ -8,8 +8,9 @@
 cub-exact computes the same sorted unique k-mer sets the cuDDL benchmark
 derives truth from, so its containment/completeness/wkid errors should be
 bit-zero and its ANI (mash_ani, set-derived) lands near exact_set_derived_ani.
-One invocation per distinct (reference, query) pair; orientation only swaps
-which side is left, and both orientations share the pair result.
+One batch run scores every case reference against every case query, so the
+k-mer sets are parsed and sorted once rather than once per pair. Orientation
+only swaps which side is left, and both orientations share the pair result.
 """
 
 import csv
@@ -19,16 +20,18 @@ import sys
 from pathlib import Path
 
 
-def pair_result(binary: str, reference: str, query: str, out: Path) -> dict:
-    cmd = [binary, "--topology", "batch", "--reference", reference,
-           "--query", query, "--samples", "1", "--output", str(out)]
+def pair_results(
+    binary: str, references: list[str], queries: list[str], out: Path
+) -> dict[tuple[str, str], dict]:
+    """Pair rows keyed by (reference, query) path."""
+    cmd = [binary, "--topology", "batch", "--reference", *references,
+           "--query", *queries, "--samples", "1", "--warmups", "0",
+           "--max-pairs", "0", "--match-rows", "0", "--output", str(out)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"cub-exact failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
-    pairs = json.loads(out.read_text())["pairs"]
-    if len(pairs) != 1:
-        raise RuntimeError(f"expected 1 cub pair row, got {len(pairs)} in {out}")
-    return pairs[0]
+        raise RuntimeError(f"cub-exact failed ({' '.join(cmd[:4])} ...):\n{proc.stderr[-2000:]}")
+    return {(pair["reference"], pair["query"]): pair
+            for pair in json.loads(out.read_text())["pairs"]}
 
 
 def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> None:
@@ -46,7 +49,12 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
 
     work = Path(output_path).parent / "cub-work"
     work.mkdir(parents=True, exist_ok=True)
-    seen: dict[tuple[str, str], dict] = {}
+    seen = pair_results(
+        binary,
+        sorted({ref for ref, _ in paths.values()}),
+        sorted({qry for _, qry in paths.values()}),
+        work / "pairs.json",
+    )
     out_rows = []
     for n, row in enumerate(rows):
         task, truth = row["case"], row["metrics"]
@@ -61,7 +69,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         key = (ref_path, qry_path)
         if key not in seen:
-            seen[key] = pair_result(binary, ref_path, qry_path, work / f"n{n}.json")
+            raise RuntimeError(f"cub-exact lacks pair {key}")
         pair = seen[key]
         # cub names sides by CLI arg: a=query-arg, b=reference-arg (verified:
         # small-query run reports distinct_a=small, containment_a_in_b=1.0).
