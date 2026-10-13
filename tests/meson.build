@@ -50,3 +50,24 @@ resident_sequence_test_exe = executable(
     install: false,
 )
 test('resident-sequence-tests', resident_sequence_test_exe)
+
+# Distributed sketching across MPI ranks; the ranks may share one GPU.
+mpiexec = find_program('mpiexec', required: false)
+if mpi_dep.found() and mpiexec.found()
+    distributed_test_exe = executable(
+        'test-distributed',
+        files('distributed_test.cu'),
+        dependencies: [cuddl_distributed_dep, gtest_dep],
+        cuda_args: cuda_args,
+        install: false,
+    )
+    foreach ranks : [1, 2, 3]
+        test(
+            'distributed-tests-@0@-ranks'.format(ranks),
+            mpiexec,
+            args: ['-n', ranks.to_string(), distributed_test_exe],
+            is_parallel: false,
+            timeout: 300,
+        )
+    endforeach
+endif

@@ -61,6 +61,10 @@ cuddl_dep = declare_dependency(
     compile_args: ['-DCUDDL_HAS_NVCOMP=' + (nvcomp_enabled ? '1' : '0')],
 )
 
+# MPI is optional; only include/cuddl/distributed.cuh needs it.
+mpi_dep = dependency('mpi', language: 'cpp', required: false)
+cuddl_distributed_dep = mpi_dep.found() ? declare_dependency(dependencies: [cuddl_dep, mpi_dep]) : disabler()
+
 build_examples = (
     get_option('examples').enabled()
     or (get_option('examples').auto() and not meson.is_subproject())

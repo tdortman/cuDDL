@@ -93,6 +93,9 @@
 
             # OpenMP headers + libomp runtime.
             llvmPkgs.openmp
+
+            # Ranks of the multi-GPU (and multi-node) all-to-all benchmark.
+            pkgs.mpi
           ];
 
           nativeBuildInputs = with pkgs; [
