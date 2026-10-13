@@ -35,4 +35,5 @@ build/test_artifacts/
 results
 
 !docs/reference-database.md
+!docs/near-duplicate-references.md
 target

@@ -88,6 +88,12 @@ The check exercises the CLI with isolated assembly tables, covering date boundar
 historical records, the row filter, both header styles, reuse of existing metadata
 and preservation of the URL list on malformed input.
 
+To benchmark while the download runs, fix a genome set first.
+`scripts/snapshot_genomes.py DIR COUNT OUT` links the first `COUNT` completed files
+of `DIR`, in name order, into a new directory `OUT`. Files that still have an aria2
+`.aria2` control file are skipped, and an existing `OUT` is an error, so the same
+snapshot gives the same database later.
+
 ## Blacklist construction
 
 BBTools DDL blacklists are FASTA sequence files, often gzip-compressed. Headers such as
@@ -224,10 +230,10 @@ These measurements exclude parsing, upload, and database serialization.
 
 `path_build_options::decompression` picks one of four backends:
 
-- `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP it uses `coherent` on a coherent-memory GPU with more than one loader, `cpu` on a coherent-memory GPU with one loader, and `gpu` everywhere else.
+- `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP it uses `hybrid` on a coherent-memory GPU with more than one loader, `cpu` on a coherent-memory GPU with one loader, and `gpu` everywhere else. The fastest backend depends on the GPU and the cores per GPU, so measure on your system: on an RTX 5070 Ti with 24 loaders, 3,000 genomes took 2.5–2.8 s with `gpu` and 3.0–3.4 s with `hybrid`.
 - `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU. Host workers read plain files into the reusable buffers that also hold inflated files, so the transfer mode applies to both kinds alike.
 - `gpu` inflates eligible gzip files with nvCOMP and copies plain FASTA files to the GPU unchanged. The CPU still reads the files and hands anything the GPU can't take to the host loader.
-- `coherent` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It needs a GPU that reads pageable host memory, such as GH200, GB300, or GB10. cuDDL checks for that capability, not for a device name.
+- `hybrid` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It moves the same bytes over the bus as `cpu`, but takes FASTA compaction, about a quarter of the host work, off the CPU. On an A40 node with 8 ranks of 16 loaders and 100,000 genomes in the page cache, `hybrid` sketched in 13.4 s, `cpu` in 15.1–15.6 s, and `gpu` in 16–25 s.
 
 `reference_database_file::build`, `build_sketch_store`, and `query_sketch_batch::sketch` all take the same options:
 
@@ -238,7 +244,7 @@ auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(
 )));
 ```
 
-`cuddl-build-reference-db`, `cuddl-reference-index`, and the reference-build benchmark take the same choice as `--decompression automatic|cpu|gpu|coherent`:
+`cuddl-build-reference-db`, `cuddl-reference-index`, and the reference-build benchmark take the same choice as `--decompression automatic|cpu|gpu|hybrid`:
 
 ```sh
 cuddl-build-reference-db genomes/ --workers 4 --decompression gpu
@@ -246,7 +252,7 @@ cuddl-build-reference-db genomes/ --workers 4 --decompression gpu
 
 ### Build with or without nvCOMP
 
-Meson defaults to `-Dnvcomp=auto`, which enables GPU decompression when it finds the nvCOMP library and headers. Pass `-Dnvcomp=enabled` to require nvCOMP, or `-Dnvcomp=disabled` to build without it. CUDA is required either way. Without nvCOMP, explicit `gpu` and `coherent` requests return an error, and `automatic` falls back to `cpu`.
+Meson defaults to `-Dnvcomp=auto`, which enables GPU decompression when it finds the nvCOMP library and headers. Pass `-Dnvcomp=enabled` to require nvCOMP, or `-Dnvcomp=disabled` to build without it. CUDA 13.3 or newer is required either way. Without nvCOMP, explicit `gpu` and `hybrid` requests return an error, and `automatic` falls back to `cpu`.
 
 Consumers of `cuddl_dep` get the right macro and link flags. If you include the headers directly, they default to CPU decompression. To turn on nvCOMP, compile every translation unit with `-DCUDDL_HAS_NVCOMP=1`, add nvCOMP's include and library paths, and link `-lnvcomp`. The Nix development shell ships nvCOMP.
 
@@ -267,13 +273,13 @@ Host workers compact and pack FASTA in cache-sized blocks. Neighbouring blocks o
 
 Line scanning, FASTA compaction, base packing, and the gzip signature scan have AVX-512, AVX2, and AArch64 NEON versions, with portable fallbacks. On x86 the loader picks the widest version the CPU supports. AVX-512 byte compaction also needs VBMI2.
 
-## How the coherent path loads files
+## How the hybrid path loads files
 
-On the `coherent` backend, CPU workers inflate into reusable pageable buffers and the GPU reads them:
+On the `hybrid` backend, CPU workers inflate into reusable host buffers and the GPU copies them:
 
 - A mapping thread feeds the inflation workers through a bounded queue, at most eight files per worker ahead of the consumer.
 - Six GPU batches copy and normalise FASTA asynchronously. Each finished load keeps its reference ID, so database row order does not depend on which file finishes first.
-- CUDA 13.3 and newer copy with batched runtime copies and a compute-overlap hint. Older toolkits use CUB batched copies.
+- Batched runtime copies move the FASTA with a compute-overlap hint.
 - Normalisation asks for streaming L2 eviction on the raw FASTA, within the device's access-policy window.
 - FASTQ and files larger than one GPU batch go to the CPU parser. If normalisation runs out of header slots, the CPU parses the bytes it already inflated instead of reading the file again.
 - A separate thread unmaps finished files from its own queue, so unmapping never blocks loading. A plain FASTA mapping stays alive until the GPU has read it.
@@ -299,7 +305,11 @@ Every other token, including long and overlapping matches, goes through the unch
 - `staged` decompresses into a heap buffer and copies it to the device.
 - `in_place` lets the kernels read the heap buffer directly. Only coherent-memory GPUs support it.
 
-The transfer mode never changes the decompression backend. Loaders reuse buffers in release order, and a loader waits until the GPU has read a buffer before it writes new bytes into it.
+The transfer mode never changes the decompression backend. Loaders reuse buffers in release order. A buffer returns once the GPU has copied it; when kernels read buffers in place, a loader waits for those kernels before it writes new bytes into a buffer.
+
+Page-locked buffers come from pools that only their device can access. CCCL's default pinned pool maps every allocation into every visible GPU: with 8 ranks per A40 node, each seeing all 8 GPUs, a loader buffer allocation took 27 ms instead of 1.3 ms, and loaders spent most of their time waiting on the driver. Buffers the device writes, such as downloaded results, sit on the device's host NUMA node: with 8 ranks, downloads took 0.39 s per sample there against 1.3 s from the default pool. Buffers that loader threads fill use any node, since the loaders run on every node: device-node loader buffers made the 100,000-genome sketch slower (18.6 against 15.1 s with `cpu`).
+
+Ranks of the end-to-end pipeline that saw only their own GPU sketched 100,000 genomes in 11.8–12.3 s against 13.4 s with all GPUs visible; `logs/own-gpu.sh` sets `CUDA_VISIBLE_DEVICES` to the OpenMPI node-local rank. Do not use it for runs with fewer ranks than GPUs: rank placement then ignores the PCIe topology, and two ranks downloading through one PCIe switch took 1.5 s per sample against 0.81 s on separate switches.
 
 ## Save and load a database
 
@@ -427,6 +437,8 @@ CUDDL_UNWRAP(database.search_batch_async(
 ));
 ```
 
+To download tile after tile, create one `cuddl::host_batch_results host(stream, pool)` and call `cuddl::download(tile, stream, host)` for each tile. Its pinned buffers grow only when a tile needs more. With several GPUs, put each GPU's pool on its host NUMA node. `replicated_database` below does this for you. On an 8-GPU A40 node, downloads into the default pool, which lives on NUMA node 0, ran 21 times slower with 8 GPUs because every copy crossed the socket interconnect.
+
 If you visit each result once, call `cuddl::for_each_passing(tile, stream, f)` instead of `download`. It copies the tile in chunks through two pinned buffers and runs `f` on one chunk while the next one copies, so it never holds the whole tile on the host. On RefSeq bacteria with 4,096 queries, visiting all 82 million exhaustive results this way took about 80 ms including the search, against about 97 ms through `download`.
 
 To look up one pair, call `find(query_id, reference_id)` on `host.tile()` or on the device tile. It returns an empty optional if the pair did not pass. `passed`, `match_count`, and `count` answer the related questions. The tile's methods also work in device code.
@@ -434,6 +446,129 @@ To look up one pair, call `find(query_id, reference_id)` on `host.tile()` or on 
 Each result takes 8 bytes as a `cuddl::packed_pairwise_counts`. Its position implies the pair, and both-empty equals the bucket count minus the other three counts. Size result storage as `maximum_pair_count` elements of `database_type::batch_result_type`. The accessors unpack each result into a full `batch_search_result`.
 
 On the device, every pair has a fixed slot. A tile holds one row of `reference_count` slots per query, or the upper triangle for all-to-all. A threshold search writes only the passing slots and marks them in a pass bitmap. `download` gathers the passing results on the device first, so only they cross the bus.
+
+## Search all-to-all on several GPUs
+
+Include `<cuddl/replicated_database.cuh>`. A `cuddl::replicated_database<K, BucketCount, Layout>` keeps one replica of a database on each device you name. It searches all-to-all with all of them at once:
+
+```cpp
+std::vector<cuda::device_ref> devices{cuda::devices[0], cuda::devices[2]};
+auto group = CUDDL_UNWRAP(
+    (cuddl::replicated_database<K, BucketCount>::upload(file, devices))
+);
+CUDDL_UNWRAP(group.load_index("references.index"));  // optional
+std::atomic<uint64_t> pairs = 0;
+CUDDL_UNWRAP(group.search_all_to_all(
+    [&](cuddl::replica_tile const& tile) {
+        pairs += CUDDL_UNWRAP(tile.download())->passing().size();
+    },
+    {.minimum_matches = 20}
+));
+```
+
+`adopt` takes databases you already built, one per device, instead of a file. The devices may differ in architecture, memory size and speed. Each replica sizes its own storage, and replicas claim query tiles from a shared queue until it runs dry, largest tiles first. A faster GPU therefore claims more tiles, and nothing assumes a node layout. Each replica gets its own stream, and its downloads land in pinned memory on its GPU's host NUMA node.
+
+Each replica calls your callback from its own thread, so the callback must be thread-safe. `tile.replica` gives the replica's position in the device list. Pass `{.in_query_order = true}` as the last argument to get tiles one at a time in query order instead. Replicas then wait for their turn, which costs some overlap, but output written from the callback no longer depends on the devices. If the callback throws, the other replicas stop and the exception reaches the caller.
+
+To split one search across processes, such as MPI ranks, give each its own group and pass `{.shard = {.index = rank, .count = ranks}}`. The parts cover every pair exactly once. They take tiles in turn, reversing direction each round (0, 1, 2, 2, 1, 0, ...), so the early, larger tiles of the triangle spread over all parts. This fixed split suits processes of equal speed. A single-database `search_all_to_all_async` takes the same `all_to_all_shard`, or an `all_to_all_tile_queue` for your own scheduling.
+
+When the processes differ in speed, for example different GPU models or ranks with different numbers of GPUs, also pass a `next_tile` function that every process shares. It returns the next unclaimed tile number of the whole search, counting from 0. Each process then claims tiles one at a time, largest first, until none are left, so a faster process does more of the search, as a faster GPU does within one group. `shard.count` must still give the number of processes, because it sets the tile size. `<cuddl/distributed.cuh>` provides `cuddl::shared_tile_counter` for MPI ranks (see below). `in_query_order` cannot be combined with `next_tile`, because another process may hold the next tile.
+
+Every public function that takes a stream runs on that stream's device, whatever device the calling thread has selected.
+
+```sh
+cuddl-reference-index search references.cuddl --all-to-all --minimum-matches 0 --devices 0 1 2 3 -o pairs.bin
+```
+
+`--devices` takes GPU ordinals and writes tiles in query order, so its output matches a single-GPU run byte for byte.
+
+### Sketch across nodes
+
+Include `<cuddl/distributed.cuh>` and link `cuddl_distributed_dep` to split sketching across the ranks of an MPI communicator. The header needs MPI; `cuddl.cuh` does not include it. Every rank makes the same three calls:
+
+```cpp
+auto slice = CUDDL_UNWRAP(cuddl::slice_genomes("genomes/", MPI_COMM_WORLD));
+auto mine = CUDDL_UNWRAP(
+    (cuddl::reference_database_file::build<K, BucketCount>(slice.mine(), stream))
+);
+auto file = CUDDL_UNWRAP(cuddl::gather_sketches(mine, slice, MPI_COMM_WORLD));
+```
+
+`slice_genomes` takes a directory or a text file with one path per line. Rank 0 lists it with `cuddl::genome_paths`, which never looks up the files it lists. Every rank then reads the sizes of an equal share of the files, using several threads, because each lookup on a parallel file system waits for a metadata round trip. Each rank gets a contiguous run of genomes holding about the same number of bytes. On 100,000 RefSeq genomes on Lustre, rank 0 alone took about 12 s to list and size the files when they were cached, and about 65 s when they were not.
+
+`gather_sketches` sends every rank's rows to every rank over MPI. It checks that all ranks sketched with the same k, buckets, layout and blacklist. The result is the file a single-process build of `slice.paths` gives, with the same reference IDs and labels, so you can `save` it or upload it.
+
+To search the file across the ranks, upload it to a `replicated_database` on each rank and call `cuddl::search_all_to_all` with the communicator on every rank. The ranks share tiles through a counter the call creates, and every pair reaches `on_tile` on exactly one rank. Every GPU holds every row, so the collection must fit in each GPU's memory: `BucketCount` × 2 bytes per genome (about 4 GB per million genomes with 2,048 buckets), plus the index and search storage:
+
+```cpp
+auto group = CUDDL_UNWRAP((cuddl::replicated_database<K, BucketCount>::upload(file, devices)));
+CUDDL_UNWRAP(cuddl::search_all_to_all(group, on_tile, MPI_COMM_WORLD));
+// With an index: group.build_index(), then
+CUDDL_UNWRAP(cuddl::search_all_to_all(group, on_tile, {.minimum_matches = 20}, MPI_COMM_WORLD));
+```
+
+Code that runs many short searches can create one `shared_tile_counter` and pass it as `replica_search::next_tile`, calling `reset()` between searches, to avoid creating the MPI window each time.
+
+Rank 0 holds the count in an MPI window, and each claim is one remote fetch-and-add, which takes about 20 µs across nodes while a tile takes milliseconds. Open MPI completes a claim from another node only while rank 0 is inside an MPI call, even with InfiniBand hardware atomics: while rank 0 waited on its GPU, claims from the other node took 70–130 ms, and at 12 GPUs on two A100 nodes, six ranks claimed almost no tiles. Rank 0 therefore runs a thread that polls MPI without sleeping (it yields the core to other threads) while the counter exists; with a 20 µs sleep between polls, claims took 10–21 ms. Initialise MPI with `MPI_Init_thread` and `MPI_THREAD_MULTIPLE`. A counter serves one search; call `counter.reset()` on every rank before the next. Making, resetting and destroying the counter are collective. A failed claim aborts the communicator, because a lost tile would silently drop pairs.
+
+If one rank fails inside `slice_genomes` or `gather_sketches`, it returns its error and every other rank returns an error naming it, so no rank waits forever in a collective call. A rank that fails between the calls, for example while sketching, must still make the next call or abort the communicator.
+
+### Benchmark across GPUs and nodes
+
+`cuddl-multi-gpu-all-to-all-benchmark` runs one MPI rank per GPU. The first rank of each node reads the database file into MPI shared memory, and every rank of the node uploads its rows from there. With 100,000 genomes (410 MB of rows) on an 8-GPU A40 node, setup then took 650–715 ms per rank (load 382 ms, upload 94–162 ms, build and index about 170 ms). With rank 0 broadcasting the rows, the broadcast alone took 620–780 ms; with every rank reading the file itself, loads took 170–630 ms, because 8 reads and 16 copies of 410 MB compete for host memory bandwidth. One launch sweeps rank counts by splitting the world communicator. For each count it first downloads every result, checks the pair total, an order-independent fingerprint against the first count, and a spread of pairs against a host oracle. NVBench then times the search, with results kept on the GPU (`device`) or downloaded per tile (`host`). Each sample starts after a barrier and ends when the slowest rank is done.
+
+Each rank holds a one-device `replicated_database` and searches its shard. Ranks on one node take GPUs farthest-first by NVML topology, so runs with fewer ranks than GPUs use separate PCIe switches. CPU binding is left to the launcher.
+
+```sh
+mpirun -n 8 build/benchmarks/cuddl-multi-gpu-all-to-all-benchmark references.cuddl \
+  --ranks 1 2 4 8 --samples 5 -o all-to-all.json
+```
+
+For each rank count, the report also holds results from untimed runs:
+
+- `rank_timeline`: when each of a rank's tiles finished on its GPU and how long the rank then waited at the closing barrier. `load_balance` gives the slowest and mean rank time.
+- `phases`: each rank's search time with downloads, the part spent inside `download()` after its tile's search finished, and its wait.
+- `communication`: the time and bandwidth of an MPI broadcast of the database over the ranks of that count, and MPI barrier latency.
+
+`setup` records every rank's load, upload, build and index times. The phase figure of `scripts/plot_multi_gpu_scaling.py` shows them per rank, and below them each rank's search with results kept on the GPU next to the same search with every result copied to the host. The copies overlap the search of later tiles, so the difference is what downloading costs: with 8 GPUs on one node, 190 against 389 ms.
+
+`--weak` runs weak scaling: P ranks search n·√(P/P_max) references, evenly spaced over the file, so every GPU gets about the same number of pairs. Spacing keeps the share of near-duplicate references close to the whole file's. That share sets the cost per pair: on the 100,000-genome RefSeq snapshot, the first 25,000 genomes searched at 6.67 Gpairs/s on an RTX 5070 Ti and every fourth genome at 4.64 Gpairs/s, because 58% and 37% of their rows were near-duplicates. `--thresholds 0 5 20 ... --write-dir DIR` sweeps the minimum index matches at `--sweep-ranks` ranks. Threshold 0 reports every pair without the index. Each threshold records the pairs emitted, the bytes written to `DIR` as raw 24-byte records, and the search, download and write times of the slowest rank. Point `DIR` at node-local storage.
+
+`scripts/plot_multi_gpu_scaling.py` takes one or more reports and draws:
+
+- speedup and efficiency (strong and weak scaling);
+- per-rank Gantt charts and max/mean rank time;
+- per-rank phases and communication costs;
+- the threshold sweep;
+- per-GPU throughput, with `--roofline-pairs-per-second` as an optional measured ALU ceiling (see below).
+
+Each run is compared with the 1-GPU run of its own report. When reports repeat a point, the first one wins.
+
+### Run the whole pipeline on several nodes
+
+`cuddl-distributed-all-to-all-benchmark` goes from compressed FASTA files to filtered results with one rank per GPU, using `<cuddl/distributed.cuh>`. Ranks list and slice the genomes with `slice_genomes`, sketch their slices, gather all rows with `gather_sketches`, and upload the result to their GPU. Each rank then builds an index for a threshold search, searches with `search_all_to_all`, and writes the tiles it claimed to `rank-<r>.bin` in `--output-dir`. Barriers separate the phases (`list`, `sketch`, `allgather`, `build`, `index`, `search`), and every rank records its time per phase. The reference IDs match `cuddl-build-reference-db` on the same directory.
+
+`--records similarity` (the default) writes each pair's weighted k-mer identity, `equal / max(equal + min(lower, higher), 6)` (`cuddl::weighted_kmer_identity`), as a 4-byte float. An exhaustive search computes it on the GPU and writes each tile as its first query ID and query count (two `uint32`) followed by one float per pair, query-major, each query against every later reference; with 100,000 genomes that is 20 GB instead of 120 GB. A threshold search writes 12-byte records of query ID, reference ID and float. `--records counts` writes the 24-byte records of `cuddl-reference-index search --all-to-all`, with the raw bucket counts. On 3,000 genomes the two agree exactly, and every-pair download plus write took 31 against 173 ms.
+
+```sh
+mpirun -n 16 build/benchmarks/cuddl-distributed-all-to-all-benchmark genomes/ \
+  --minimum-matches 20 --output-dir /localscratch/out -o end-to-end.json
+```
+
+`scripts/plot_distributed_end_to_end.py` draws per-rank phases and wall time per phase. `scripts/compare_cpu_gpu.py` lists these reports next to the SimdSketch runs of `logs/cpu-baseline.sh` on the same genomes. `logs/simdsketch-nodes.sh` runs SimdSketch across the first N nodes of a job, split the way cuDDL splits the pipeline: every node sketches a contiguous slice, the sketch files are exchanged through Lustre, and every node compares an interleaved share of the rows (`simdsketch-benchmark compare --shard I --shards N`) and writes it to node-local scratch. `logs/mgpu-eval.sh` and `logs/sketch-scaling.sh` run it at every node count after cuDDL, with as many threads per node as the node's cuDDL ranks had cores and with the page cache their runs warmed. Both tools sketch with k=25 and 2048 buckets. SimdSketch writes one 4-byte similarity per pair and has no threshold.
+
+Both tools inflate gzip on the CPU unless cuDDL uses nvCOMP, and inflating dominates sketching. On one A40 node (8 GPUs, 128 EPYC 7713 cores) with 100,000 genomes in the page cache, SimdSketch sketched in 27.2 s. cuDDL, with 8 ranks of 16 loaders each seeing only its own GPU, sketched in 11.8–12.3 s with `--decompression hybrid` and 14.5–15.2 s with `cpu`. On the `cpu` path cuDDL spends 66% of its host time in libdeflate and 27% compacting FASTA, while the GPU sketch kernels take 0.4 s of a 6.6 s single-rank build of 12,500 genomes; `hybrid` moves the compaction to the GPU. nvCOMP (`gpu`) inflates one gzip file per thread block and reached about 2.6 GB/s of gzip per A40, no faster than the 16 cores each rank has.
+
+`logs/sketch-scaling.sh` runs the end-to-end pipeline with one GPU per node: strong scaling with 100,000 genomes and weak scaling with 25,000 genomes per node, 4 runs per configuration. Weak runs below 100,000 genomes read `genomes-<N>k-spread`, genomes evenly spaced over `genomes-100k` (`scripts/snapshot_genomes.py --spread`). The first 25,000 accessions average 1.14 MB of gzip per genome, the whole set 1.24 MB. `scripts/plot_sketch_scaling.py` plots its reports as phase wall times per node count, strong scaling above weak scaling, and as sketch efficiency in compressed input bytes per second per node. Given the SimdSketch reports too, it draws a hatched SimdSketch bar (sketch, gather, compare and write) next to each cuDDL bar.
+
+`scripts/all_to_all_roofline.py` reads an Nsight Compute export of one exhaustive search. It prints instructions and bytes per pair, and the issue, ALU, FMA and DRAM ceilings for a GPU.
+
+The search's work is integer ALU instructions, about 80% `LOP3`, which issues at half a warp instruction per SM sub-partition per clock on both the A40 and the RTX 5070 Ti. `alu-power-ceiling` measures how many ALU warp instructions per second a GPU sustains with that mix under its power limit: it saturates the ALU pipes on every SM for `--seconds`, leaves out `--warmup-seconds`, and samples clock, power and clock-limit reasons through NVML. Dividing its rate by the search's ALU warp instructions per pair gives a pairs/s ceiling that needs no assumed clock. On an A40 at its 300 W limit it drew 253–260 W, never hit the power limit, held 1,740 MHz and sustained 2.84 × 10¹¹ ALU warp instructions/s. With the 59.9 ALU instructions per pair Nsight Compute counted on an RTX 5070 Ti for the 100,000-genome snapshot, that is 4.75 Gpairs/s per A40. The search itself reaches the power limit and drops to about 1,660 MHz, so the power drawn by its other work (shared-memory, cache and DRAM traffic) keeps it below that ceiling. The instruction count depends on the data, because near-duplicate references are cheaper, and comes from Blackwell machine code, which may differ from Ampere's.
+
+Meson builds the target only when it finds MPI; the Nix shell provides it. Two options help on clusters whose compute nodes have no internet access or whose CUDA toolkit ships only stub driver libraries:
+
+- `-Drapids_cmake_source=DIR` points NVBench at a pre-fetched rapids-cmake checkout. NVBench loads rapids-cmake before CMake's `project()`, so `CPM_SOURCE_CACHE` does not cover it.
+- `-Ddriver_library_dir=DIR` names the directory holding the real `libcuda.so` and `libnvidia-ml.so`. Without it, CMake can pick the toolkit's stubs, and the stub directory lands in the binaries' RPATH, where it hides the driver at run time.
 
 ## Database file layout
 

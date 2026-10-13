@@ -28,6 +28,8 @@ A child's base always has a higher ID than the child. All-to-all searches fill o
 
 Hashing exact scores misses rows that differ inside every signature, so some near duplicates stay bases. The closest-base pass takes about 0.16 ms of GPU time for 43,897 rows on an RTX 5070 Ti.
 
+Comparing every pair exactly finds the best grouping this targeting rule allows, but it does not pay for itself. On one 30,000-genome RefSeq sample it found 14,583 children with 812,896 changed buckets, against 13,870 and 850,539 from the signatures, and exhaustive all-to-all took 83.9 ms instead of 90.5 ms on an RTX 5070 Ti. On the 30,000-genome snapshot used on MOGON it left A40 search times unchanged, while database construction went from 52.5 ms to 137.6 ms.
+
 ## How a search uses the groups
 
 `launch_batch_exhaustive` runs two kernels per query tile:

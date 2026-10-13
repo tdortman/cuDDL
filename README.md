@@ -28,7 +28,7 @@ Each input file represents one genome, including all of its sequence records. Re
 ### Requirements
 
 - Linux and an NVIDIA GPU with a compatible driver.
-- A CUDA toolkit and host compiler with C++20 support. The supplied Nix environment uses CUDA 13.3.
+- CUDA 13.3 or newer and a host compiler with C++20 support. The supplied Nix environment uses CUDA 13.4.
 - Optional nvCOMP 5, used to inflate gzip genomes on the GPU.
 - Meson 1.3 or newer, Ninja, and Git.
 
@@ -92,7 +92,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
-| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `coherent`. `cpu` inflates every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `coherent` uses CPU inflation followed by GPU FASTA normalisation on a coherent GPU. `gpu` and `coherent` need nvCOMP. |
+| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `hybrid`. `cpu` inflates and parses every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `hybrid` inflates on the host loaders and strips FASTA headers and line breaks on the GPU. `gpu` and `hybrid` need nvCOMP. `automatic` picks `gpu` on discrete GPUs; with few cores per GPU, `hybrid` can be faster. |
 
 ### 2. Search without an index
 
@@ -103,7 +103,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
   > matches.tsv
 ```
 
-`--minimum-matches 0` compares each query against every reference. Queries are sketched with the configuration compiled into the tool, which must match the database. `--decompression automatic|cpu|gpu|coherent` selects how query genomes are inflated, with the same values as the builder.
+`--minimum-matches 0` compares each query against every reference. Queries are sketched with the configuration compiled into the tool, which must match the database. `--decompression automatic|cpu|gpu|hybrid` selects how query genomes are inflated, with the same values as the builder.
 
 ### 3. Optionally build and use an index
 
@@ -122,7 +122,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 
 `--minimum-matches` counts matching indexed buckets, not matching k-mers or a percentage identity. A positive threshold filters candidates and is not an exhaustive comparison. Omit `--index` to search directly against the database.
 
-To compare the references with each other instead of with separate queries, replace `--query` with `--all-to-all`. Each unordered pair is searched once and reported with `query_id < reference_id`; both IDs are reference IDs. Long query lists can go in a TOML file passed as `--config options.toml` before `search`, with `query = [...]` under a `[search]` section.
+To compare the references with each other instead of with separate queries, replace `--query` with `--all-to-all`. Each unordered pair is searched once and reported with `query_id < reference_id`; both IDs are reference IDs. `--devices 0 1 2` splits an all-to-all search across the listed GPU ordinals. Each GPU holds its own copy of the database (and of the index, if one is given) and claims work as it finishes, so mixed GPUs share the load. The output is identical for any device list, because results are still written in query order. Long query lists can go in a TOML file passed as `--config options.toml` before `search`, with `query = [...]` under a `[search]` section.
 
 ### Reading the output
 
@@ -146,7 +146,9 @@ Include `<cuddl/cuddl.cuh>` for the main API. File-based reference database I/O 
 | `cuddl::query_sketch_batch<K, BucketCount>`                      | Sketch a batch of genome files for queries.                                    |
 | `cuddl::reference_database<K, BucketCount>`                      | Store reference sketches and search them on the GPU.                           |
 | `cuddl::reference_index<K, BucketCount>`                         | Build optional dense or sparse search acceleration data.                       |
+| `cuddl::replicated_database<K, BucketCount>`                     | Search all-to-all on several GPUs, one database replica per device.            |
 | `cuddl::reference_database_file` / `cuddl::reference_index_file` | Save and load databases and indexes.                                           |
+| `cuddl::slice_genomes` / `cuddl::gather_sketches`                | Sketch one genome collection across MPI ranks (`<cuddl/distributed.cuh>`).     |
 
 Start with the runnable [sketch example](examples/main.cu), [database builder](examples/build_reference_database.cu), or [search implementation](examples/reference_index.cu).
 
