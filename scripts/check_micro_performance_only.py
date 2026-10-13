@@ -86,7 +86,7 @@ def main() -> None:
             ]
             if performance_only:
                 # Performance-only must override even an explicit ANI oracle request.
-                command += ["--performance-only", "--skani-truth"]
+                command += ["--performance-only", "--ani-truth"]
             if topology == "batch":
                 command += ["--topology", "batch", "--query-count", "2"]
                 if tool == "dashing2":
@@ -116,7 +116,16 @@ def main() -> None:
                     assert (
                         measurement["case"]["pairs"] == measurement["metrics"]["pairs"]
                     )
-                    if tool in {"cuddl", "rabbitsketch", "simdsketch", "sketchlib", "bbtools"}:
+                    if tool in {
+                        "cuddl",
+                        "rabbitsketch",
+                        "simdsketch",
+                        "sketchlib",
+                        "bbtools",
+                        "skani",
+                        "hypergen",
+                        "dashing2",
+                    }:
                         assert measurement["case"]["pairs"] == (
                             6 if topology == "batch" else 3
                         ), measurement
@@ -176,7 +185,7 @@ def main() -> None:
                     assert (
                         not {
                             "jaccard_mae_vs_exact",
-                            "ani_mae_vs_skani",
+                            "ani_mae_vs_anim",
                             "recall_at_k",
                             "top1_rate",
                             "queries_scored",

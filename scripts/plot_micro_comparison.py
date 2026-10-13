@@ -7,11 +7,13 @@
 
 Twelve single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
 resident processing time for each of those operations,
-Jaccard MAE vs exact, ANI MAE vs skani, SEARCH recall and top-1, COMPARE
+Jaccard MAE vs exact, ANI MAE vs ANIm, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
 for a panel are absent from it, which is itself information. Exact-zero
 errors plot at the floor with an "exact" tag.
 Timing bars use log axes and label median milliseconds above min/max error bars.
+Wall labels carry each tool's fastest thread count and name walls that are not a timed
+child process: an in-process timer, or a JVM start-up included.
 Resident-only bars show measured CPU, GPU, or hybrid processing.
 Missing resident measurements are omitted, never inferred from wall time.
 """
@@ -51,8 +53,9 @@ def read_micro(path: Path) -> list[dict]:
                     "wall_ms": query["median_ms"],
                     "lo_ms": query["min_ms"],
                     "hi_ms": query["max_ms"],
-                    "index_ms": index["median_ms"],
                     "resident": resident,
+                    "threads": case.get("threads"),
+                    "timing_scope": case.get("timing_scope", "process"),
                     "resident_device": case.get("resident_device"),
                     "resident_reuses_compare": case.get(
                         "resident_reuses_compare", False
@@ -74,6 +77,8 @@ def read_micro(path: Path) -> list[dict]:
                 "lo_ms": wall["min_ms"],
                 "hi_ms": wall["max_ms"],
                 "resident": resident,
+                "threads": case.get("threads"),
+                "timing_scope": case.get("timing_scope", "process"),
                 "resident_device": case.get("resident_device"),
                 "resident_reuses_compare": case.get("resident_reuses_compare", False),
                 "metrics": m.get("metrics", {}),
@@ -84,9 +89,19 @@ def read_micro(path: Path) -> list[dict]:
     return rows
 
 
-def label(row: dict) -> str:
+SCOPE_NOTES = {"in_process": "in-process timer", "process_jvm": "incl. JVM start"}
+
+
+def label(row: dict, wall: bool = True) -> str:
     name = f"{row['tool']}\n{row['variant']}" if row["variant"] else row["tool"]
-    return name if row["op"] == "search" else f"{name}\nk={row['k']}"
+    if row["op"] != "search":
+        name += f"\nk={row['k']}"
+    if not wall:
+        return name
+    if row["threads"] is not None:
+        name += f", {row['threads']} thr"
+    note = SCOPE_NOTES.get(row["timing_scope"])
+    return f"{name}\n{note}" if note else name
 
 
 def main(
@@ -138,7 +153,7 @@ def main(
                 if resident:
                     ax.set_axis_off()
             else:
-                names = [label(r) for r in subset]
+                names = [label(r, wall=not resident) for r in subset]
                 if resident:
                     for index, row in enumerate(subset):
                         device = {
@@ -205,7 +220,7 @@ def main(
                         "per_pair_ms",
                         row["wall_ms"] / max(row["metrics"].get("pairs", 1), 1),
                     )
-                    reported = row["metrics"].get("skani_reported_pairs")
+                    reported = row["metrics"].get("anim_scored_pairs")
                     count = (
                         f"n={reported}"
                         if reported is not None
@@ -232,8 +247,8 @@ def main(
             "micro_error_jaccard",
         )
         scatter_panel(
-            "ani_mae_vs_skani",
-            "ANI MAE vs skani",
+            "ani_mae_vs_anim",
+            "ANI MAE vs ANIm",
             "MAE, log scale (floor = exact)",
             "micro_error_ani",
         )
@@ -241,7 +256,8 @@ def main(
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
         if search:
             names = [
-                f"{label(r)}\nn={r['metrics'].get('queries_scored', 0)}" for r in search
+                f"{label(r, wall=False)}\nn={r['metrics'].get('queries_scored', 0)}"
+                for r in search
             ]
             x = range(len(search))
             width = 0.35
@@ -267,18 +283,18 @@ def main(
         save_both(fig, "micro_search_recall")
 
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
-        cover_names = [label(r) for r in compare]
+        cover_names = [label(r, wall=False) for r in compare]
         cover_x = range(len(compare))
         cover_width = 0.35
         ax.bar(
             [i - cover_width / 2 for i in cover_x],
             [
-                r["metrics"].get("skani_reported_pairs", 0)
+                r["metrics"].get("anim_scored_pairs", 0)
                 / max(r["metrics"].get("pairs", 1), 1)
                 for r in compare
             ],
             cover_width,
-            label="ANI scored vs skani",
+            label="ANI scored vs ANIm",
         )
         ax.bar(
             [i + cover_width / 2 for i in cover_x],
@@ -304,14 +320,14 @@ def main(
             "micro_maxerr_jaccard",
         )
         scatter_panel(
-            "ani_max_err_vs_skani",
-            "ANI max error vs skani",
+            "ani_max_err_vs_anim",
+            "ANI max error vs ANIm",
             "Max error, log scale (floor = exact)",
             "micro_maxerr_ani",
         )
 
         typer.echo(
-            f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/skani':>10}"
+            f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/anim':>10}"
         )
         for row in sketch + compare:
             metrics = row["metrics"]
@@ -321,7 +337,7 @@ def main(
             typer.echo(
                 f"{row['tool']:<14}{row['op']:<9}{row['wall_ms']:>10.1f}{unit:>13.2f}"
                 f"{metrics.get('jaccard_mae_vs_exact', float('nan')):>10.4f}"
-                f"{metrics.get('ani_mae_vs_skani', float('nan')):>10.4f}"
+                f"{metrics.get('ani_mae_vs_anim', float('nan')):>10.4f}"
             )
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error

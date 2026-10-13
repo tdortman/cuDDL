@@ -19,12 +19,14 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
   queries; SimdSketch's wall loads its reference sketch file, sketches batch FASTX
   queries, and writes one binary similarity per pair; cub-exact times its device phase, and the
   CLI tools their native compare commands. Batch queries are sketched from FASTX
-  inside the wall: skani dist sketches both sides itself; Dashing2 loads cached
-  reference sketches and evicts query cache entries before each rep; hypergen runs
-  `sketch` on the queries before `dist` on the saved reference sketch. All-to-all
-  compares each unordered reference pair once: cuDDL reuses
-  its database rows, RabbitSketch loads its sketch file. Resident times
-  cover the comparison alone; the pipeline benchmarks' own output phases
+  inside the wall: skani sketches them and runs dist against reference sketches saved
+  beforehand; Dashing2 loads cached reference sketches and evicts query cache entries before
+  each rep; hypergen runs `sketch` on the queries before `dist` on the saved reference sketch.
+  Every tool evaluates the same pair set. All-to-all compares each unordered reference pair
+  once: cuDDL reuses its database rows, RabbitSketch loads its sketch file, Dashing2 writes its
+  upper-triangular matrix, hypergen runs its symmetric dist, and skani runs `triangle` over its
+  saved sketches. Per-pair rates divide by that pair set, never by the rows a tool chose to
+  report. Resident times cover the comparison alone; the pipeline benchmarks' own output phases
   (per-genome metrics and a JSON sample of match rows) are recorded beside them,
   never counted as comparison. cuDDL's pipeline runs use the database file's row
   layout, index geometry, and search calls, so resident and wall time the same work.
@@ -36,6 +38,13 @@ outputs; accuracy joins against exact oracles afterwards unless --performance-on
   times the build apart from the ranked search. SimdSketch and HyperGen have no search mode,
   so their SEARCH is the exhaustive COMPARE.
 
+Every CPU tool is timed at each thread count in --threads and reports its fastest, with the
+count in `case.threads`. CPU lanes run with OpenMP threads bound to cores and, on hosts with
+several NUMA nodes, confined to one node when their threads fit its physical cores.
+`case.timing_scope` names what a wall covers: `process` is a timed child process,
+`process_jvm` adds JVM start-up and the BBTools driver, and `in_process` is the tool's own
+timer around the operation (RabbitSketch, cub-exact, and cuDDL's reference build).
+
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
 per-genome statistics and per-pair JSON rows are not generated.
@@ -44,20 +53,22 @@ They exclude parsing and transfers. RabbitSketch native indexed search retains
 its coupled text formatting, writing to /dev/null for the resident interval.
 
 Truth comes from cub-exact-pairwise (exact Jaccard and containment,
-verified bit-identical against a Python oracle) and, when --skani-truth is
-passed, chunked skani dist (ANI). The ANI oracle is opt-in because it is CPU
-work and the slowest lane on a full corpus: it can run on a host that is not
-measuring a GPU. Fixed-size sketches use 2048 entries (cuDDL buckets with DDL's
+verified bit-identical against a Python oracle) and, when --ani-truth is
+passed, ANIm: MUMmer nucmer alignments filtered to 1-to-1 with delta-filter, scored as
+percent identity over aligned query bases. Alignment involves no sketching, so ANI errors
+measure each tool against the sequence rather than against another estimator. It runs on a
+stride sample of the exact oracle's pairs whose exact Mash ANI reaches 80 percent, the range
+every ANI tool here targets. Fixed-size sketches use 2048 entries (cuDDL buckets with DDL's
 5-bit exponent and 11-bit mantissa, Dashing2 registers, RabbitSketch slots,
 SimdSketch buckets keeping the 8 low hash bits its author recommends, sketchlib.rust
 one-permutation bins, BBTools DynamicDemiLog buckets with the same exponent as cuDDL,
 hypergen dimensions); skani keeps its own sampling and k. Entries differ in width
 and information per tool, so tools are compared in error-versus-time space.
 
-Caps are automatic unless passed explicitly: threads default to the CPU
-count, max-kmers derives from free VRAM, the evaluated pair set derives
-from a short cub probe against a per-invocation time budget, stored rows
-derive from a pairs-output size target, and the skani truth chunk derives
+Caps are automatic unless passed explicitly: thread counts default to half the physical
+cores, all physical cores, and all logical CPUs, max-kmers derives from free VRAM, the
+evaluated pair set derives from a short cub probe against a per-invocation time budget,
+stored rows derive from a pairs-output size target, and skani's reference block derives
 from host RAM. Large corpora evaluate a size-spread genome subset that
 fits the budget; every lane runs the same files.
 """
@@ -74,6 +85,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
@@ -342,6 +354,7 @@ def wall_of(
     resident: list[dict] | None = None,
     prepare: Callable[[], None] | None = None,
     resident_skip: int = 0,
+    log_tail: bool = False,
 ) -> list[float]:
     """Times @p command, a command or a group run back to back, per rep.
 
@@ -359,6 +372,7 @@ def wall_of(
             run(
                 item,
                 quiet=True,
+                log_tail=log_tail,
                 resident=resident_parts if index >= resident_skip else None,
             )
         done = time.perf_counter()
@@ -417,6 +431,96 @@ def read_dashing2_panel(
 def mash_ani(jaccard: float, k: int) -> float | None:
     """ANI as one minus the Mash distance at k-mer size @p k; undefined without shared k-mers."""
     return 1 + math.log(2 * jaccard / (1 + jaccard)) / k if jaccard > 0 else None
+
+
+def _cpu_list(text: str) -> set[int]:
+    """Parses a sysfs CPU list such as `0-11,24-35`."""
+    cpus: set[int] = set()
+    for part in text.strip().split(","):
+        if part:
+            low, _, high = part.partition("-")
+            cpus.update(range(int(low), int(high or low) + 1))
+    return cpus
+
+
+def cpu_layout() -> list[tuple[list[int], int]]:
+    """Returns this process's usable CPUs per NUMA node, with each node's physical core count."""
+    allowed = os.sched_getaffinity(0)
+    nodes = [
+        _cpu_list((node / "cpulist").read_text()) & allowed
+        for node in sorted(Path("/sys/devices/system/node").glob("node[0-9]*"))
+    ]
+    layout = []
+    for cpus in [node for node in nodes if node] or [allowed]:
+        cores = set()
+        for cpu in cpus:
+            topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+            cores.add(
+                (
+                    (topology / "physical_package_id").read_text(),
+                    (topology / "core_id").read_text(),
+                )
+            )
+        layout.append((sorted(cpus), len(cores)))
+    return layout
+
+
+def placement(threads: int, layout: list[tuple[list[int], int]]) -> list[str]:
+    """Returns the command prefix that places a CPU lane running @p threads threads.
+
+    OpenMP threads bind to cores. On a multi-socket host a lane whose threads fit one node's
+    physical cores stays on that node, so first-touch memory is local; a wider lane spans the
+    nodes with interleaved pages when numactl is available, so no socket serves all of them.
+    Rayon and JVM pools have no binding knob; the node confinement covers them too.
+    """
+    prefix = ["env", "OMP_PROC_BIND=close", "OMP_PLACES=cores"]
+    if len(layout) < 2:
+        return prefix
+    cpus, cores = layout[0]
+    if threads <= cores:
+        return [*prefix, "taskset", "-c", ",".join(map(str, cpus))]
+    if shutil.which("numactl"):
+        return [*prefix, "numactl", "--interleave=all"]
+    return prefix
+
+
+def anim(
+    nucmer: Path, delta_filter: Path, work: Path, reference: Path, query: Path
+) -> float | None:
+    """Returns ANIm of @p query against @p reference in percent, or None without alignments.
+
+    nucmer aligns the pair and `delta-filter -1` keeps the 1-to-1 alignments. Identity is
+    1 - errors / aligned query bases summed over them, pyani's ANIm definition. nucmer runs
+    single-threaded; callers parallelise over pairs.
+    """
+    pair_dir = Path(tempfile.mkdtemp(dir=work, prefix="anim-"))
+    delta = pair_dir / "out.delta"
+    run(
+        [str(nucmer), "-t", "1", f"--delta={delta}", str(reference), str(query)],
+        quiet=True,
+        log_tail=True,
+    )
+    filtered = run([str(delta_filter), "-1", str(delta)], capture=True)
+    shutil.rmtree(pair_dir)
+    aligned = errors = 0
+    for line in filtered.splitlines():
+        fields = line.split()
+        # Alignment headers carry seven integers: the start and end in each sequence, then
+        # errors, similarity errors, and stop codons. Indel lines carry one.
+        if len(fields) == 7 and not line.startswith(">"):
+            aligned += abs(int(fields[3]) - int(fields[2])) + 1
+            errors += int(fields[4])
+    return 100 * (1 - errors / aligned) if aligned else None
+
+
+def plain_fasta(path: Path, cache: Path, index: int) -> Path:
+    """Returns @p path, or an uncompressed copy in @p cache for gzip input, which nucmer lacks."""
+    if path.suffix != ".gz":
+        return path
+    copy = cache / f"{index}.fna"
+    with gzip.open(path, "rb") as source, copy.open("wb") as target:
+        shutil.copyfileobj(source, target)
+    return copy
 
 
 def read_f32_pairs(
@@ -562,10 +666,7 @@ _PROBE_GENOMES = 24  # probe slice, sized so the pair gap below is measurable
 _PROBE_PAIRS = 30  # first probe size
 _PROBE_PAIRS_HIGH = 240  # second probe size; the gap has to dwarf probe-to-probe noise
 _PROBE_MIN_PAIRS = 12  # at or below this, skip the probe and run everything
-_CHUNK_ROW_BYTES = 200  # estimated skani dist TSV bytes per pair row
-_CHUNK_BUDGET_BYTES = 1 << 30  # per-invocation truth output target
-_CHUNK_MIN_ROWS = 8 << 20  # row floor, so loading the reference sketches amortises
-_CHUNK_MAX_QUERIES = 50  # skani dist switches to its hash-table index path above this
+_ANI_TRUTH_FLOOR = 80.0  # exact Mash ANI, percent, a pair needs before ANIm scores it
 _SKANI_REF_ROM_BYTES = (
     4 << 20
 )  # resident per reference sketch: measured 1.07 MB, 2.2 MB at 100k
@@ -702,11 +803,14 @@ def main(
         typer.Option(min=0, help="Untimed repetitions before the timed ones."),
     ] = 1,
     threads: Annotated[
-        int,
+        list[int] | None,
         typer.Option(
-            min=1, help="CPU threads one lane may use. Defaults to the core count."
+            min=1,
+            help="CPU thread count to time each CPU tool at; repeat to sweep. Every CPU tool "
+            "reports its fastest count. Defaults to half the physical cores, all physical cores, "
+            "and all logical CPUs.",
         ),
-    ] = os.cpu_count() or 8,
+    ] = None,
     output: Annotated[
         Path,
         typer.Option(help="Results JSON, in the schema the plot scripts read."),
@@ -753,32 +857,32 @@ def main(
             "32 MiB row budget.",
         ),
     ] = None,
-    skani_chunk: Annotated[
-        int | None,
-        typer.Option(
-            min=1,
-            help="Queries per skani dist invocation, held at or below 50 so skani stays off its "
-            "hash-table index path, which screens differently from the linear path.",
-        ),
-    ] = None,
     skani_refs: Annotated[
         int | None,
         typer.Option(
             min=1,
-            help="Reference sketches per skani dist invocation. skani holds every reference "
+            help="Reference sketches per skani compare block. skani holds a block's sketches "
             "resident, so this is what bounds its memory; it defaults to a quarter of host RAM "
             "at 4 MB per reference, 16000 on a 250 GiB host.",
         ),
     ] = None,
-    skani_truth: Annotated[
+    ani_truth: Annotated[
         bool,
         typer.Option(
-            "--skani-truth/--no-skani-truth",
-            help="Run the chunked skani dist ANI oracle. Off by default: it is the slowest lane "
-            "on a full corpus and it is CPU work, so it can run on a host that is not measuring "
-            "a GPU. Without it the ANI error metrics are omitted.",
+            "--ani-truth/--no-ani-truth",
+            help="Score ANI against ANIm (MUMmer alignment) on a sample of the exact oracle's "
+            "pairs, which needs cub-exact. Off by default: alignment is CPU work, so it can run "
+            "on a host that is not measuring a GPU. Without it the ANI error metrics are omitted.",
         ),
     ] = False,
+    ani_truth_pairs: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Pairs ANIm aligns, an even stride over the exact oracle's pairs at or above "
+            "80 percent exact Mash ANI.",
+        ),
+    ] = 1000,
     budget_secs: Annotated[
         float,
         typer.Option(
@@ -805,7 +909,7 @@ def main(
         int | None,
         typer.Option(
             min=1,
-            help="Loader workers for all cuDDL stages. Unset uses the thread count, "
+            help="Loader workers for all cuDDL stages. Unset uses the largest --threads count, "
             "which past the machine's decompression bandwidth costs instead of saving: on a "
             "24 thread desktop 8 workers built the 5000 genome corpus 18 percent faster.",
         ),
@@ -840,9 +944,18 @@ def main(
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
     if performance_only:
-        skani_truth = False
+        ani_truth = False
+    layout = cpu_layout()
+    threads_auto = threads is None
+    if threads is None:
+        physical = sum(cores for _, cores in layout)
+        logical = sum(len(cpus) for cpus, _ in layout)
+        threads = [max(1, physical // 2), physical, logical]
+    thread_counts = sorted(set(threads))
+    # Untimed helpers (oracles, reference-only sketch files) run at the widest count.
+    max_threads = thread_counts[-1]
     if cuddl_workers is None:
-        cuddl_workers = threads
+        cuddl_workers = max_threads
     selected = [t.strip() for t in tools.split(",") if t.strip()]
     unknown = sorted({t for t in selected if t not in TOOLS})
     if unknown:
@@ -913,7 +1026,15 @@ def main(
     if cub_stash_mb is not None:
         cub_stash += ["--stash-mb", str(cub_stash_mb)]
 
-    required = [skani] if skani_truth else []  # the ANI oracle is opt-in
+    nucmer = build / "subprojects/mummer-4.0.1/nucmer"
+    delta_filter = build / "subprojects/mummer-4.0.1/delta-filter"
+    required = [nucmer, delta_filter] if ani_truth else []  # the ANI oracle is opt-in
+    if ani_truth and "cub-exact" not in selected:
+        raise typer.BadParameter(
+            "--ani-truth samples the exact oracle's pairs, so it needs cub-exact"
+        )
+    if "skani" in selected:
+        required.append(skani)
     if "hypergen" in selected:
         required.append(hypergen)
     if "dashing2" in selected:
@@ -962,6 +1083,44 @@ def main(
             "resident_input": first["input"],
         }
 
+    # Fastest thread count per (tool, operation) for the CPU lanes; it becomes `case.threads`.
+    chosen_threads: dict[tuple[str, str], int] = {}
+
+    def sweep(
+        tool: str,
+        operation: str,
+        command: Callable[[int], list[str] | list[list[str]]],
+        resident: list[dict] | None = None,
+        **options,
+    ) -> list[float]:
+        """Times @p command at every thread count and returns the fastest count's marks.
+
+        @p command builds the command, or group, for a thread count, and each count runs under
+        its placement. @p resident receives the fastest count's resident records. Output files
+        are the last count's; thread counts change how fast a tool runs, not what it writes.
+        """
+        best: tuple[list[float], list[dict] | None, int] | None = None
+        for count in thread_counts:
+            built = command(count)
+            groups = built if built and isinstance(built[0], list) else [built]
+            records = [] if resident is not None else None
+            marks = wall_of(
+                [[*placement(count, layout), *group] for group in groups],
+                samples,
+                warmups,
+                resident=records,
+                **options,
+            )
+            if best is None or statistics.median(marks) < statistics.median(best[0]):
+                best = (marks, records, count)
+        marks, records, count = best
+        if resident is not None:
+            resident.extend(records)
+        chosen_threads[(tool, operation)] = count
+        if len(thread_counts) > 1:
+            typer.echo(f"  {tool} {operation}: fastest at {count} threads")
+        return marks
+
     pair_table: list[dict] = []
     sketch_times: dict[str, list[float]] = {}
     sketch_bytes: dict[str, int] = {}
@@ -997,11 +1156,10 @@ def main(
             query_list = _spread_pick(references, sizes, count)
         typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
         auto_flags = {
-            "threads": threads is None,
+            "threads": threads_auto,
             "max_kmers": max_kmers is None,
             "max_pairs": max_pairs is None,
             "match_rows": match_rows is None,
-            "skani_chunk": skani_chunk is None,
             "skani_refs": skani_refs is None,
         }
         need_cub = "cub-exact" in selected
@@ -1105,44 +1263,6 @@ def main(
                 probe_per_pair_ms = probe_wall2_ms / max(probe_eval2, 1)
             return probe_per_pair_ms
 
-        def skani_probe_rate() -> float:
-            # No cub oracle selected: rate the skani ANI truth over a
-            # size-spread slice so large corpora still subset. Self-pairs and
-            # unrefined rows make this overestimate the per-pair cost, which
-            # only tightens the subset.
-            slice_refs = (
-                _spread_pick(references, sizes, 16)
-                if len(references) > 16
-                else references
-            )
-            slice_queries = (
-                _spread_pick(query_list, sizes, 16)
-                if topology == "batch" and len(query_list) > 16
-                else query_list
-            )
-            if topology == "batch":
-                pairs = len(slice_queries) * len(slice_refs)
-            else:
-                slice_queries = slice_refs
-                pairs = max(1, len(slice_refs) * (len(slice_refs) - 1) // 2)
-            tick = time.perf_counter()
-            run(
-                [
-                    str(skani),
-                    "dist",
-                    "-q",
-                    *[str(p) for p in slice_queries],
-                    "-r",
-                    *[str(p) for p in slice_refs],
-                    "-o",
-                    str(work / "skani-probe.tsv"),
-                    "-t",
-                    str(threads),
-                ],
-                quiet=True,
-            )
-            return (time.perf_counter() - tick) * 1000 / pairs
-
         # A corpus at or below the probe floor, or an explicit --max-pairs, runs without a
         # probe. Then there is no measured per-pair rate to name or to budget against, and the
         # report says so instead of reading names the probe never bound.
@@ -1161,12 +1281,9 @@ def main(
                 if topology == "batch" and len(query_list) > _PROBE_GENOMES
                 else query_list
             )
-            # Size the subset by the slowest compare lane we can measure. The exact oracle is
-            # fast per pair and the ANI truth is not, and a budget that only fits the oracle
-            # still leaves the other lane running for hours.
-            # Neither binary is touched unless it is in play, and a run whose oracles are all
-            # opted out has nothing to rate and nothing to subset for.
-            rates = {"skani": skani_probe_rate()} if skani_truth else {}
+            # Size the subset by the exact oracle's measured per-pair rate. A run without it has
+            # nothing to rate and nothing to subset for.
+            rates = {}
             if need_cub:
                 rates["cub-exact"] = cub_probe_rate(probe_refs, probe_queries)
             if rates:
@@ -1225,24 +1342,13 @@ def main(
         # device memory and does not grow with the corpus.
         cuddl_ingest = "sequence"
         if skani_refs is None:
-            # skani holds every reference sketch resident for the whole invocation, so the
-            # reference side is chunked as well as the query side. Without this a full corpus
-            # never fits: 100k references reached 215 GB on a 250 GB host and OOM'd it.
+            # skani holds every reference sketch of an invocation resident, so a corpus is
+            # compared in reference blocks. Without this a full corpus never fits: 100k
+            # references reached 215 GB on a 250 GB host and OOM'd it.
             skani_refs = max(
                 1, (_host_ram_bytes() // _SKANI_RAM_FRACTION) // _SKANI_REF_ROM_BYTES
             )
         skani_refs = max(1, min(skani_refs, len(references)))
-        if skani_chunk is None:
-            # A chunk has to be big enough for one reference chunk's load to disappear into the
-            # work, so take the larger of a byte target and a row target against that reference
-            # chunk rather than the whole corpus.
-            # Stay at or below _CHUNK_MAX_QUERIES: above it skani dist builds a marker
-            # hash table over the references per invocation. On a redundant corpus the
-            # screened path is both slower and a different filter, so the chunk never
-            # crosses that line.
-            target = max(_CHUNK_BUDGET_BYTES, _CHUNK_MIN_ROWS * _CHUNK_ROW_BYTES)
-            by_output = max(1, target // (max(1, skani_refs) * _CHUNK_ROW_BYTES))
-            skani_chunk = min(_CHUNK_MAX_QUERIES, by_output)
         reference_paths = set(references)
         file_args = [str(p) for p in references] + [
             str(p) for p in query_list if p not in reference_paths
@@ -1299,10 +1405,10 @@ def main(
                     f"lane ({slowest} at {probe_per_pair_ms:.3f}ms/pair)"
                 )
         typer.echo(
-            f"auto: threads={threads} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_chunk={skani_chunk} skani_refs={skani_refs} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
+            f"auto: threads={','.join(map(str, thread_counts))} max_kmers={max_kmers} pairs={total_pairs}/{orig_pairs} ({subset_note}) match_rows={match_rows} skani_refs={skani_refs} budget_secs={budget_secs} per_pair_ms={probe_per_pair_ms:.3f} ({rate_note}) gpu={gpu_name}"
         )
         autoscale_case = {
-            "threads": threads,
+            "threads": ",".join(map(str, thread_counts)),
             "max_kmers": max_kmers,
             "pair_budget_secs": budget_secs,
             "cub_per_pair_ms": round(probe_per_pair_ms, 3),
@@ -1315,93 +1421,53 @@ def main(
             "gpu": gpu_name,
         }
 
-        # ANI oracle from skani dist, chunked per query group so memory stays
-        # bounded: triangle materializes the full N x N matrix. Rows with
-        # non-positive ANI are treated as unreported, as with triangle. Opt in with
-        # --skani-truth: on a full corpus it is the slowest lane in the harness by a wide margin,
-        # and it is CPU work, so it is the lane to leave off the host that is measuring a GPU.
-        skani_ani: dict[tuple[str, str], float] = {}
-        reference_sketches: list[str] = []
-        truth_queries: list[str] = []
-        if skani_truth:
-            # Sketch both sides once. The truth runs per query chunk, and handing skani raw FASTAs
-            # would re-sketch every reference in every chunk: on a full corpus that is the whole
-            # corpus read once per chunk.
-            truth_db = work / "skani-truth-db"
-            run_timed(
-                f"skani truth: sketch {len(references)} references",
-                [
-                    str(skani),
-                    "sketch",
-                    "--separate-sketches",
-                    "-l",
-                    str(skani_list(work, "truth-refs", [str(p) for p in references])),
-                    "-o",
-                    str(truth_db),
-                    "-t",
-                    str(threads),
-                ],
+        # ANI oracle: ANIm on a stride sample of the exact oracle's pairs at or above the floor.
+        # Below it every ANI tool here either reports nothing or extrapolates, and ANIm itself
+        # overestimates, so those pairs measure nothing. Opt in with --ani-truth: alignment is
+        # CPU work, so it is the lane to leave off the host that is measuring a GPU.
+        ani_oracle: dict[tuple[str, str], float] = {}
+        if ani_truth:
+            eligible = sorted(
+                key
+                for key, row in oracle.items()
+                if row["mash_ani"] >= _ANI_TRUTH_FLOOR and key[0] != key[1]
             )
-            reference_sketches = sorted(str(p) for p in truth_db.glob("*.sketch"))
-            if topology == "batch":
-                query_db = work / "skani-truth-queries"
-                run_timed(
-                    f"skani truth: sketch {len(query_list)} queries",
-                    [
-                        str(skani),
-                        "sketch",
-                        "--separate-sketches",
-                        "-l",
-                        str(
-                            skani_list(
-                                work, "truth-queries", [str(p) for p in query_list]
-                            )
+            sampled = eligible[:: max(1, math.ceil(len(eligible) / ani_truth_pairs))]
+            fasta_cache = work / "anim-fasta"
+            fasta_cache.mkdir()
+            genomes_needed = sorted({path for pair in sampled for path in pair})
+            with ThreadPoolExecutor(max_threads) as pool:
+                plain = dict(
+                    zip(
+                        genomes_needed,
+                        pool.map(
+                            lambda indexed: plain_fasta(
+                                Path(indexed[1]), fasta_cache, indexed[0]
+                            ),
+                            enumerate(genomes_needed),
                         ),
-                        "-o",
-                        str(query_db),
-                        "-t",
-                        str(threads),
-                    ],
+                    )
                 )
-                truth_queries = sorted(str(p) for p in query_db.glob("*.sketch"))
-            else:
-                truth_queries = reference_sketches
-        for ref_base in range(0, len(reference_sketches), skani_refs):
-            ref_chunk = reference_sketches[ref_base : ref_base + skani_refs]
-            ref_list = skani_list(work, f"truth-refs-{ref_base}", ref_chunk)
-            for chunk_base in range(0, len(truth_queries), skani_chunk):
-                chunk = truth_queries[chunk_base : chunk_base + skani_chunk]
-                chunk_tsv = work / f"skani-truth-{ref_base}-{chunk_base}.tsv"
-                run(
-                    [
-                        str(skani),
-                        "dist",
-                        "--ql",
-                        str(
-                            skani_list(work, f"truth-q-{ref_base}-{chunk_base}", chunk)
-                        ),
-                        "--rl",
-                        str(ref_list),
-                        "-o",
-                        str(chunk_tsv),
-                        "-t",
-                        str(threads),
-                    ],
-                    quiet=True,
-                    log_tail=True,
+                tick = time.perf_counter()
+                typer.echo(
+                    f"  ANIm truth: aligning {len(sampled)} of {len(eligible)} pairs at or "
+                    f"above {_ANI_TRUTH_FLOOR:g} percent exact Mash ANI ..."
                 )
-                for line in chunk_tsv.read_text().splitlines():
-                    if not line or line.startswith("#"):
-                        continue
-                    fields = line.split()
-                    if len(fields) >= 3:
-                        try:
-                            value = float(fields[2])
-                        except ValueError:
-                            continue
-                        if value > 0:
-                            skani_ani[(fields[1], fields[0])] = value
-                            skani_ani[(fields[0], fields[1])] = value
+                values = pool.map(
+                    lambda pair: anim(
+                        nucmer, delta_filter, work, plain[pair[1]], plain[pair[0]]
+                    ),
+                    sampled,
+                )
+                for (query, reference), value in zip(sampled, values):
+                    if value is not None:
+                        ani_oracle[(query, reference)] = value
+                        ani_oracle[(reference, query)] = value
+            shutil.rmtree(fasta_cache)
+            typer.echo(
+                f"  ANIm truth: {len(ani_oracle) // 2} aligned pairs in "
+                f"{time.perf_counter() - tick:.1f}s"
+            )
 
         def record_sketch(
             tool: str, variant: str, marks: list[float], extra: dict | None = None
@@ -1414,7 +1480,6 @@ def main(
                         "topology": topology,
                         "genomes": len(sketch_file_args),
                         "k": sketch_k.get(tool, 0),
-                        "threads": threads,
                     },
                     "timings": {"wall": summarize(marks)},
                     "metrics": {
@@ -1436,8 +1501,7 @@ def main(
             timed_suffix = "-full" if sketch_all else ""
             if sketch_all:
                 hg_runs.insert(0, ("-full", sketch_references, sketch_queries))
-            hg_marks = {}
-            hg_resident = {}
+            hg_resident: list[dict] = []
             for suffix, refs, run_queries in hg_runs:
                 for role, files in (
                     (f"hgrefs{suffix}", refs),
@@ -1452,35 +1516,21 @@ def main(
                         link.symlink_to(path.resolve())
                         # hypergen names genomes by the staged path; rows join on the real one.
                         staged_to_real[str(link)] = str(path)
-                sketch_cmds = [
-                    [
-                        str(hypergen),
-                        "sketch",
-                        "-p",
-                        str(work / f"hgrefs{suffix}"),
-                        "-o",
-                        str(work / f"hgr{suffix}.sk"),
-                        "-t",
-                        str(threads),
-                        "-k",
-                        "25",
-                        "-D",
-                        hypergen_device,
-                        "-d",
-                        "2048",
-                    ]
-                ]
-                if topology == "batch":
-                    sketch_cmds.append(
+
+                def hg_sketch(count: int, suffix: str = suffix) -> list[list[str]]:
+                    roles = [("hgrefs", "hgr")]
+                    if topology == "batch":
+                        roles.append(("hgqueries", "hgq"))
+                    return [
                         [
                             str(hypergen),
                             "sketch",
                             "-p",
-                            str(work / f"hgqueries{suffix}"),
+                            str(work / f"{inputs}{suffix}"),
                             "-o",
-                            str(work / f"hgq{suffix}.sk"),
+                            str(work / f"{output}{suffix}.sk"),
                             "-t",
-                            str(threads),
+                            str(count),
                             "-k",
                             "25",
                             "-D",
@@ -1488,16 +1538,17 @@ def main(
                             "-d",
                             "2048",
                         ]
-                    )
-                # The subset sketch only feeds dist; its timing is the full run's. One pass is
-                # enough, and repeating it four times just clutters the log.
-                reps = (samples, warmups) if suffix == timed_suffix else (1, 0)
-                hg_resident[suffix] = []
-                hg_marks[suffix] = wall_of(
-                    sketch_cmds, reps[0], reps[1], resident=hg_resident[suffix]
-                )
-            marks = hg_marks[timed_suffix]
-            record_native_resident("hypergen", "sketch", hg_resident[timed_suffix])
+                        for inputs, output in roles
+                    ]
+
+                # The subset sketch only feeds dist; its timing is the full run's, so it runs
+                # once.
+                if suffix == timed_suffix:
+                    marks = sweep("hypergen", "sketch", hg_sketch, resident=hg_resident)
+                else:
+                    for command in hg_sketch(max_threads):
+                        run(command, quiet=True, log_tail=True)
+            record_native_resident("hypergen", "sketch", hg_resident)
             sketch_times["hypergen"] = marks
             sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
             if topology == "batch":
@@ -1511,35 +1562,29 @@ def main(
                 {"sketch_bytes": sketch_bytes["hypergen"]},
             )
         if "skani" in selected:
-            marks = []
-            skani_resident = []
+            skani_resident: list[dict] = []
             sketch_list = work / "skani-list.txt"
             sketch_list.write_text("".join(p + "\n" for p in sketch_file_args))
             out_dir = work / "skdb"
-            for rep in range(warmups + samples):
-                # One database at a time. skani sketches into this directory, and only the last
-                # rep is measured for size, so a full-corpus copy per rep only grows the work
-                # directory. Clearing it keeps each rep a real sketch rather than a reuse.
-                shutil.rmtree(out_dir, ignore_errors=True)
-                tick = time.perf_counter()
-                run(
-                    [
-                        str(skani),
-                        "sketch",
-                        "-l",
-                        str(sketch_list),
-                        "-o",
-                        str(out_dir),
-                        "-t",
-                        str(threads),
-                    ],
-                    quiet=True,
-                    log_tail=True,
-                    resident=skani_resident if rep >= warmups else [],
-                )
-                done = time.perf_counter()
-                if rep >= warmups:
-                    marks.append((done - tick) * 1000)
+            # One database at a time. skani refuses an existing output directory, and clearing
+            # it keeps each rep a real sketch rather than a reuse.
+            marks = sweep(
+                "skani",
+                "sketch",
+                lambda count: [
+                    str(skani),
+                    "sketch",
+                    "-l",
+                    str(sketch_list),
+                    "-o",
+                    str(out_dir),
+                    "-t",
+                    str(count),
+                ],
+                resident=skani_resident,
+                prepare=lambda: shutil.rmtree(out_dir, ignore_errors=True),
+                log_tail=True,
+            )
             sketch_times["skani"] = marks
             record_native_resident("skani", "sketch", skani_resident)
             sketch_bytes["skani"] = sum(
@@ -1556,51 +1601,52 @@ def main(
             d2_timed = "-full" if sketch_all else ""
             if sketch_all:
                 d2_runs.insert(0, ("-full", sketch_file_args))
-            d2_marks = {}
+            d2_marks = []
             d2_resident: list[dict] = []
             for suffix, args in d2_runs:
                 list_path = work / f"d2list{suffix}.txt"
                 list_path.write_text("".join(p + "\n" for p in args))
-                # As with hypergen: the subset sketch only feeds cmp, so it runs once.
-                d2_reps = warmups + samples if suffix == d2_timed else 1
-                rep_marks = []
                 out_dir = work / f"d2{suffix}"
-                for rep in range(d2_reps):
+
+                def d2_sketch(
+                    count: int, out_dir: Path = out_dir, list_path: Path = list_path
+                ) -> list[str]:
+                    return [
+                        str(dashing2),
+                        "sketch",
+                        "-k25",
+                        "-S2048",
+                        f"-p{count}",
+                        "--cache",
+                        "--outprefix",
+                        str(out_dir),
+                        "-F",
+                        str(list_path),
+                    ]
+
+                def d2_fresh(out_dir: Path = out_dir) -> None:
                     shutil.rmtree(out_dir, ignore_errors=True)
                     out_dir.mkdir()
-                    tick = time.perf_counter()
-                    run(
-                        [
-                            str(dashing2),
-                            "sketch",
-                            "-k25",
-                            "-S2048",
-                            f"-p{threads}",
-                            "--cache",
-                            "--outprefix",
-                            str(out_dir),
-                            "-F",
-                            str(list_path),
-                        ],
-                        quiet=True,
-                        log_tail=True,
-                        resident=d2_resident
-                        if suffix == d2_timed and rep >= warmups
-                        else None,
-                    )
-                    done = time.perf_counter()
-                    if rep >= warmups:
-                        rep_marks.append((done - tick) * 1000)
-                d2_marks[suffix] = rep_marks
-                if suffix == d2_timed:
-                    d2_sketch_bytes = sum(
-                        path.stat().st_size
-                        for path in out_dir.rglob("*")
-                        if path.is_file()
-                    )
-                    if sketch_all:
-                        shutil.rmtree(out_dir)
-            marks = d2_marks[d2_timed]
+
+                # As with hypergen: the subset sketch only feeds cmp, so it runs once.
+                if suffix != d2_timed:
+                    d2_fresh()
+                    run(d2_sketch(max_threads), quiet=True, log_tail=True)
+                    continue
+                d2_marks = sweep(
+                    "dashing2",
+                    "sketch",
+                    d2_sketch,
+                    resident=d2_resident,
+                    prepare=d2_fresh,
+                    log_tail=True,
+                )
+                d2_sketch_bytes = sum(
+                    path.stat().st_size for path in out_dir.rglob("*") if path.is_file()
+                )
+                if sketch_all:
+                    shutil.rmtree(out_dir)
+            marks = d2_marks
             record_native_resident("dashing2", "sketch", d2_resident)
             sketch_times["dashing2"] = marks
             sketch_bytes["dashing2"] = d2_sketch_bytes
@@ -1692,7 +1738,6 @@ def main(
                     else ""
                 )
             )
-            rep = work / "rabbit.json"
             rabbit_samples = max(samples, 2)
             # Time canonicalisation as part of sketching, using bounded ASCII batches.
             staged_bytes = sum(sizes.get(p, 0) for p in (*references, *query_list))
@@ -1700,49 +1745,68 @@ def main(
             typer.echo(
                 f"  rabbitsketch: sequence ingest, {staged_bytes >> 30} GiB of input"
             )
-            run(
-                [
-                    str(rabbit),
-                    "--threads",
-                    str(threads),
-                    "--topology",
-                    topology,
-                    "--samples",
-                    str(rabbit_samples),
-                    "--warmups",
-                    str(warmups),
-                    *(["--performance-only"] if performance_only else []),
-                    "--k",
-                    "25",
-                    "--ingest",
-                    "sequence",
-                    "--resident-bytes",
-                    str(resident_cap),
-                    "--sketch-size",
-                    "2048",
-                    "--config",
-                    str(cfg),
-                    "--sketch-file",
-                    str(work / "rabbit.kmv"),
-                    "--output",
-                    str(rep),
-                ],
-                quiet=True,
-            )
-            payload = jsonlib3.loads(rep.read_text())
-            pipe = next(
-                m
-                for m in payload["measurements"]
-                if m["case"].get("measurement") == "pipeline"
-            )
-            sketched = pipe["timings"]["sketch_file_wall"]
+            # One process times every operation, so each thread count is one run and each
+            # operation takes the run where it was fastest.
+            rabbit_runs: list[tuple[int, dict, dict]] = []
+            for count in thread_counts:
+                rep = work / f"rabbit-{count}.json"
+                run(
+                    [
+                        *placement(count, layout),
+                        str(rabbit),
+                        "--threads",
+                        str(count),
+                        "--topology",
+                        topology,
+                        "--samples",
+                        str(rabbit_samples),
+                        "--warmups",
+                        str(warmups),
+                        *(["--performance-only"] if performance_only else []),
+                        "--k",
+                        "25",
+                        "--ingest",
+                        "sequence",
+                        "--resident-bytes",
+                        str(resident_cap),
+                        "--sketch-size",
+                        "2048",
+                        "--config",
+                        str(cfg),
+                        "--sketch-file",
+                        str(work / "rabbit.kmv"),
+                        "--output",
+                        str(rep),
+                    ],
+                    quiet=True,
+                )
+                payload = jsonlib3.loads(rep.read_text())
+                pipe = next(
+                    m
+                    for m in payload["measurements"]
+                    if m["case"].get("measurement") == "pipeline"
+                )
+                rabbit_runs.append((count, payload, pipe))
+            rabbit_timed: dict[str, dict] = {}
+            for operation, timing in (
+                ("sketch", "sketch_file_wall"),
+                ("compare", "query_fastx_compare"),
+                ("search", "query_fastx_search"),
+            ):
+                count, _, pipe = min(
+                    rabbit_runs,
+                    key=lambda entry: entry[2]["timings"][timing]["median_ms"],
+                )
+                rabbit_timed[operation] = pipe
+                chosen_threads[("rabbitsketch", operation)] = count
+            sketched = rabbit_timed["sketch"]["timings"]["sketch_file_wall"]
             native_timings[("rabbitsketch", "sketch")] = {"wall": sketched}
-            resident_timings[("rabbitsketch", "sketch")] = pipe["timings"][
-                "resident_sketch"
-            ]
-            resident_timings[("rabbitsketch", "compare")] = pipe["timings"][
-                "resident_compare"
-            ]
+            resident_timings[("rabbitsketch", "sketch")] = rabbit_timed["sketch"][
+                "timings"
+            ]["resident_sketch"]
+            resident_timings[("rabbitsketch", "compare")] = rabbit_timed["compare"][
+                "timings"
+            ]["resident_compare"]
             marks = [sketched["median_ms"]]
             sketch_times["rabbitsketch"] = marks
             sketch_bytes["rabbitsketch"] = (work / "rabbit.kmv").stat().st_size
@@ -1752,7 +1816,8 @@ def main(
                 marks,
                 {"sketch_bytes": sketch_bytes["rabbitsketch"]},
             )
-            rabbit_report, rabbit_rows = payload, pipe
+            # Match rows are the same at every thread count; take the last run's.
+            _, rabbit_report, rabbit_rows = rabbit_runs[-1]
 
         if "simdsketch" in selected:
             # The timed sketch covers the same files as the other CLI lanes. COMPARE needs a
@@ -1762,11 +1827,12 @@ def main(
             ss_inputs.write_text("".join(f"{p}\n" for p in sketch_file_args))
             ss_sketch = work / "ss-sketch.sk"
             ss_resident: list[dict] = []
-            marks = wall_of(
-                [
+
+            def ss_sketch_command(count: int, inputs: Path, output: Path) -> list[str]:
+                return [
                     str(simdsketch),
                     "-j",
-                    str(threads),
+                    str(count),
                     "sketch",
                     "-k",
                     "25",
@@ -1775,11 +1841,14 @@ def main(
                     "-b",
                     "8",
                     "--output",
-                    str(ss_sketch),
-                    str(ss_inputs),
-                ],
-                samples,
-                warmups,
+                    str(output),
+                    str(inputs),
+                ]
+
+            marks = sweep(
+                "simdsketch",
+                "sketch",
+                lambda count: ss_sketch_command(count, ss_inputs, ss_sketch),
                 resident=ss_resident,
             )
             record_native_resident("simdsketch", "sketch", ss_resident)
@@ -1797,28 +1866,17 @@ def main(
                 ss_reference_list.write_text("".join(f"{p}\n" for p in references))
                 ss_references = work / "ss-references.sk"
                 run(
-                    [
-                        str(simdsketch),
-                        "-j",
-                        str(threads),
-                        "sketch",
-                        "-k",
-                        "25",
-                        "-s",
-                        "2048",
-                        "-b",
-                        "8",
-                        "--output",
-                        str(ss_references),
-                        str(ss_reference_list),
-                    ],
+                    ss_sketch_command(max_threads, ss_reference_list, ss_references),
                     quiet=True,
                 )
 
         if "sketchlib" in selected:
             # Same file set and reference-only reuse rule as SimdSketch. Index names stand in
             # for paths: `r` references, `q` batch queries, `s` anything else.
-            skl_flags = ["-k", "25", "-s", "2048", "--threads", str(threads), "--quiet"]
+
+            def skl_flags(count: int) -> list[str]:
+                return ["-k", "25", "-s", "2048", "--threads", str(count), "--quiet"]
+
             skl_reference_list = work / "skl-references.tsv"
             write_sketchlib_list(skl_reference_list, "r", references)
             skl_reuses = sketch_file_args == [str(p) for p in references]
@@ -1828,18 +1886,18 @@ def main(
             )
             skl_sketch = work / "skl-sketch"
             skl_resident: list[dict] = []
-            marks = wall_of(
-                [
+            marks = sweep(
+                "sketchlib",
+                "sketch",
+                lambda count: [
                     str(sketchlib),
                     "sketch",
                     "-f",
                     str(skl_sketch_list),
                     "-o",
                     str(skl_sketch),
-                    *skl_flags,
+                    *skl_flags(count),
                 ],
-                samples,
-                warmups,
                 resident=skl_resident,
             )
             record_native_resident("sketchlib", "sketch", skl_resident)
@@ -1865,7 +1923,7 @@ def main(
                         str(skl_reference_list),
                         "-o",
                         str(skl_references),
-                        *skl_flags,
+                        *skl_flags(max_threads),
                     ],
                     quiet=True,
                 )
@@ -1893,15 +1951,20 @@ def main(
                 f"{bb_classes}:{bbtools_jar}",
                 "BBToolsMicro",
             ]
-            bb_threads = str(threads)
             bb_sketch_list = work / "bb-sketch.txt"
             bb_sketch_list.write_text("".join(f"{p}\n" for p in sketch_file_args))
             bb_sketch = work / "bb-sketch.tsv"
             bb_resident: list[dict] = []
-            marks = wall_of(
-                [*bb_java, "sketch", str(bb_sketch_list), str(bb_sketch), bb_threads],
-                samples,
-                warmups,
+            marks = sweep(
+                "bbtools",
+                "sketch",
+                lambda count: [
+                    *bb_java,
+                    "sketch",
+                    str(bb_sketch_list),
+                    str(bb_sketch),
+                    str(count),
+                ],
                 resident=bb_resident,
             )
             record_native_resident("bbtools", "sketch", bb_resident)
@@ -1921,19 +1984,22 @@ def main(
                         "sketch",
                         str(bb_reference_list),
                         str(bb_references),
-                        bb_threads,
+                        str(max_threads),
                     ],
                     quiet=True,
                 )
             # Batch queries are sketched inside each COMPARE and SEARCH wall, then compared.
-            bb_query_sketch: list[list[str]] = []
             bb_queries = "-"
+            bb_query_list = work / "bb-queries.txt"
             if topology == "batch":
-                bb_query_list = work / "bb-queries.txt"
                 bb_query_list.write_text("".join(f"{p}\n" for p in query_list))
                 bb_queries = str(work / "bb-queries.tsv")
-                bb_query_sketch = [
-                    [*bb_java, "sketch", str(bb_query_list), bb_queries, bb_threads]
+
+            def bb_query_sketch(count: int) -> list[list[str]]:
+                if topology != "batch":
+                    return []
+                return [
+                    [*bb_java, "sketch", str(bb_query_list), bb_queries, str(count)]
                 ]
 
         if "cub-exact" in selected:
@@ -2023,7 +2089,7 @@ def main(
             native_timings[("cub-exact", "compare")] = {"wall": cub_phases["compare"]}
             resident_timings[("cub-exact", "compare")] = cub_phases["resident_compare"]
 
-        # COMPARE op per tool; errors join cub-exact Jaccard and skani ANI.
+        # COMPARE op per tool; errors join cub-exact Jaccard and ANIm.
         def record_compare(
             tool: str,
             variant: str,
@@ -2039,21 +2105,21 @@ def main(
                 else 1
             )
             for index, row in enumerate(rows):
-                # Tool ANI scales differ (fraction vs percent); skani truth is percent.
+                # Tool ANI scales differ (fraction vs percent); ANIm truth is percent.
                 if row.get("ani") is not None and 0 < row["ani"] <= 1.5:
                     row["ani"] = row["ani"] * 100
                 key = (row["query"], row["reference"])
                 truth = oracle.get(key, oracle.get((key[1], key[0])))
                 if truth is not None and row.get("jaccard") is not None:
                     jaccard_errors.append(abs(row["jaccard"] - truth["jaccard"]))
-                ani_truth = skani_ani.get(key, skani_ani.get((key[1], key[0])))
+                ani_truth = ani_oracle.get(key, ani_oracle.get((key[1], key[0])))
                 if ani_truth is not None and row.get("ani") is not None:
                     reported += 1
                     ani_errors.append(abs(row["ani"] - ani_truth))
                 if index % stride == 0 or index == len(rows) - 1:
                     pair_table.append({"tool": tool, **row})
-            # Rows may be a sample of what the tool evaluated, so the rate divides by the
-            # tool's own count when it reports one.
+            # Rows may be a sample of what the tool evaluated, or only the pairs it chose to
+            # report, so the rate divides by the tool's evaluated count when it reports one.
             pairs = evaluated if evaluated is not None else len(rows)
             metrics: dict = {
                 "pairs": pairs,
@@ -2068,9 +2134,9 @@ def main(
                 )
                 metrics["jaccard_max_err_vs_exact"] = max(jaccard_errors)
             if ani_errors:
-                metrics["ani_mae_vs_skani"] = sum(ani_errors) / len(ani_errors)
-                metrics["ani_max_err_vs_skani"] = max(ani_errors)
-                metrics["skani_reported_pairs"] = reported
+                metrics["ani_mae_vs_anim"] = sum(ani_errors) / len(ani_errors)
+                metrics["ani_max_err_vs_anim"] = max(ani_errors)
+                metrics["anim_scored_pairs"] = reported
             measurements.append(
                 {
                     "implementation": {"name": tool, "variant": variant},
@@ -2079,7 +2145,6 @@ def main(
                         "topology": topology,
                         "pairs": pairs,
                         "k": sketch_k.get(tool, 0),
-                        "threads": threads,
                     },
                     "timings": {"wall": summarize(marks)},
                     "metrics": metrics,
@@ -2090,13 +2155,12 @@ def main(
             )
 
         if "dashing2" in selected:
-            # `cmp` writes a value per pair. A square matrix over a full corpus is about ten
-            # billion numbers, which no host can hold, so the queries go in by file: the
-            # rectangular panel holds one row per reference and one column per query, which is
-            # the same asymmetric comparison bounded by the query count. References load from
-            # the sketch cache the sketch lane filled. Batch queries enter under their own
-            # names, and their cache entries are removed before every rep, so each timed pass
-            # sketches them from FASTX; all-to-all queries are the cached references.
+            # `cmp` writes a value per pair. Batch queries go in by file: the rectangular panel
+            # holds one row per reference and one column per query. All-to-all writes Dashing2's
+            # default upper-triangular matrix, each unordered pair once, like every other lane.
+            # References load from the sketch cache the sketch lane filled. Batch queries enter
+            # under their own names, and their cache entries are removed before every rep, so
+            # each timed pass sketches them from FASTX.
             d2_dir = work / "d2"
             d2_dir.mkdir(exist_ok=True)
             panel_queries = query_list or references
@@ -2120,32 +2184,34 @@ def main(
             reference_list.write_text("".join(f"{p}\n" for p in references))
             query_listing.write_text("".join(f"{p}\n" for p in d2_query_inputs))
             panel = work / "d2panel.txt"
-            cmp_cmd = [
-                str(dashing2),
-                "cmp",
-                "-k25",
-                "-S2048",
-                f"-p{threads}",
-                "--cache",
-                "--outprefix",
-                str(d2_dir),
-                "-F",
-                str(reference_list),
-                "-Q",
-                str(query_listing),
-                "--cmpout",
-                str(panel),
-            ]
+
+            def d2_cmp(count: int) -> list[str]:
+                return [
+                    str(dashing2),
+                    "cmp",
+                    "-k25",
+                    "-S2048",
+                    f"-p{count}",
+                    "--cache",
+                    "--outprefix",
+                    str(d2_dir),
+                    "-F",
+                    str(reference_list),
+                    *(["-Q", str(query_listing)] if topology == "batch" else []),
+                    "--cmpout",
+                    str(panel),
+                ]
+
             d2_compare_resident = []
-            marks = wall_of(
-                [cmp_cmd],
-                samples,
-                warmups,
+            marks = sweep(
+                "dashing2",
+                "compare",
+                d2_cmp,
                 resident=d2_compare_resident,
                 prepare=d2_prepare,
             )
             record_native_resident("dashing2", "compare", d2_compare_resident)
-            panel_pairs = len(references) * len(panel_queries)
+            panel_pairs = count_pairs(references, query_list, topology)
             panel_stride = (
                 max(1, (panel_pairs + match_rows - 1) // match_rows)
                 if match_rows
@@ -2160,44 +2226,53 @@ def main(
             query_sketch = (
                 str(work / "hgq.sk") if topology == "batch" else str(work / "hgr.sk")
             )
-            hg_dist = [
-                str(hypergen),
-                "dist",
-                "-r",
-                str(work / "hgr.sk"),
-                "-q",
-                query_sketch,
-                "-o",
-                str(dist_out),
-                "-a",
-                "0",
-                "-t",
-                str(threads),
-            ]
-            # dist only reads sketch files, so batch walls sketch the FASTX queries first;
-            # resident time stays the comparison alone. All-to-all queries are the reference
-            # sketch file.
-            hg_query_sketch = [
-                str(hypergen),
-                "sketch",
-                "-p",
-                str(work / "hgqueries"),
-                "-o",
-                query_sketch,
-                "-t",
-                str(threads),
-                "-k",
-                "25",
-                "-D",
-                hypergen_device,
-                "-d",
-                "2048",
-            ]
+
+            def hg_compare(count: int) -> list[list[str]]:
+                dist = [
+                    str(hypergen),
+                    "dist",
+                    "-r",
+                    str(work / "hgr.sk"),
+                    "-q",
+                    query_sketch,
+                    "-o",
+                    str(dist_out),
+                    "-a",
+                    "0",
+                    "-t",
+                    str(count),
+                ]
+                if topology != "batch":
+                    return [dist]
+                # dist only reads sketch files, so batch walls sketch the FASTX queries first;
+                # resident time stays the comparison alone.
+                return [
+                    [
+                        str(hypergen),
+                        "sketch",
+                        "-p",
+                        str(work / "hgqueries"),
+                        "-o",
+                        query_sketch,
+                        "-t",
+                        str(count),
+                        "-k",
+                        "25",
+                        "-D",
+                        hypergen_device,
+                        "-d",
+                        "2048",
+                    ],
+                    dist,
+                ]
+
+            # All-to-all passes the reference sketch as both sides, which hypergen detects and
+            # compares as the unique pairs.
             hg_compare_resident = []
-            marks = wall_of(
-                [hg_query_sketch, hg_dist] if topology == "batch" else [hg_dist],
-                samples,
-                warmups,
+            marks = sweep(
+                "hypergen",
+                "compare",
+                hg_compare,
                 resident=hg_compare_resident,
                 resident_skip=1 if topology == "batch" else 0,
             )
@@ -2217,68 +2292,154 @@ def main(
                         )
                     except ValueError:
                         continue
-            record_compare("hypergen", hypergen_device, marks, rows)
-        if "skani" in selected:
-            # Chunked like the truth lane: one invocation per reference chunk, so skani never
-            # holds the whole corpus resident. The sample is the sum over chunks, which is what a
-            # host-sized run costs.
-            compare_commands: list[list[str]] = []
-            compare_outs: list[Path] = []
-            # skani compares each query against each reference. A batch run's query side is the
-            # query set, not every file: putting file_args on both sides made this lane square the
-            # corpus, 50256 x 50256 pairs across 4024 invocations instead of 256 x 50000.
-            compare_queries = (
-                query_list if topology == "batch" and query_list else file_args
+            record_compare(
+                "hypergen",
+                hypergen_device,
+                marks,
+                rows,
+                evaluated=count_pairs(references, query_list, topology),
             )
-            for ref_base in range(0, len(file_args), skani_refs):
-                ref_chunk = file_args[ref_base : ref_base + skani_refs]
-                ref_list = skani_list(work, f"compare-r-{ref_base}", ref_chunk)
-                for q_base in range(0, len(compare_queries), skani_chunk):
-                    q_chunk = compare_queries[q_base : q_base + skani_chunk]
-                    chunk_out = work / f"skani-dist-{ref_base}-{q_base}.tsv"
-                    compare_outs.append(chunk_out)
-                    compare_commands.append(
+        if "skani" in selected:
+            # References are sketched once, untimed, like every other tool's saved reference
+            # sketches; the wall loads them. Batch walls sketch the FASTX queries first, then
+            # run dist; all-to-all runs triangle, each unordered pair once. skani holds an
+            # invocation's sketches resident, so a corpus above skani_refs is compared in
+            # reference blocks: triangle within a block, dist between blocks.
+            names = [p.name for p in references]
+            if len(set(names)) != len(names):
+                raise typer.BadParameter(
+                    "skani names sketch files by genome file name; references must have "
+                    "unique file names"
+                )
+            skani_refs_db = work / "skani-compare-refs"
+            run(
+                [
+                    str(skani),
+                    "sketch",
+                    "--separate-sketches",
+                    "-l",
+                    str(skani_list(work, "compare-refs", [str(p) for p in references])),
+                    "-o",
+                    str(skani_refs_db),
+                    "-t",
+                    str(max_threads),
+                ],
+                quiet=True,
+                log_tail=True,
+            )
+            ref_sketches = [str(skani_refs_db / f"{name}.sketch") for name in names]
+            block_lists = [
+                skani_list(
+                    work, f"compare-r-{base}", ref_sketches[base : base + skani_refs]
+                )
+                for base in range(0, len(ref_sketches), skani_refs)
+            ]
+            skani_query_db = work / "skani-compare-queries"
+            query_sketch_list = skani_list(
+                work,
+                "compare-q",
+                [str(skani_query_db / f"{p.name}.sketch") for p in query_list],
+            )
+            compare_outs: list[Path] = []
+
+            def skani_compare(count: int) -> list[list[str]]:
+                compare_outs.clear()
+                commands = []
+                if topology == "batch":
+                    commands.append(
                         [
                             str(skani),
-                            "dist",
-                            "--ql",
+                            "sketch",
+                            "--separate-sketches",
+                            "-l",
                             str(
                                 skani_list(
-                                    work, f"compare-q-{ref_base}-{q_base}", q_chunk
+                                    work,
+                                    "compare-fastx-q",
+                                    [str(p) for p in query_list],
                                 )
                             ),
-                            "--rl",
-                            str(ref_list),
                             "-o",
-                            str(chunk_out),
+                            str(skani_query_db),
                             "-t",
-                            str(threads),
+                            str(count),
                         ]
                     )
+                for index, block in enumerate(block_lists):
+                    if topology == "all-to-all":
+                        out = work / f"skani-triangle-{index}.tsv"
+                        compare_outs.append(out)
+                        commands.append(
+                            [
+                                str(skani),
+                                "triangle",
+                                "-E",
+                                "-l",
+                                str(block),
+                                "-o",
+                                str(out),
+                                "-t",
+                                str(count),
+                            ]
+                        )
+                    partners = (
+                        [query_sketch_list]
+                        if topology == "batch"
+                        else block_lists[index + 1 :]
+                    )
+                    for other_index, other in enumerate(partners):
+                        out = work / f"skani-dist-{index}-{other_index}.tsv"
+                        compare_outs.append(out)
+                        commands.append(
+                            [
+                                str(skani),
+                                "dist",
+                                "--ql",
+                                str(other),
+                                "--rl",
+                                str(block),
+                                "-o",
+                                str(out),
+                                "-t",
+                                str(count),
+                            ]
+                        )
+                return commands
+
             skani_compare_resident = []
-            marks = wall_of(
-                compare_commands, samples, warmups, resident=skani_compare_resident
+            marks = sweep(
+                "skani",
+                "compare",
+                skani_compare,
+                resident=skani_compare_resident,
+                resident_skip=1 if topology == "batch" else 0,
+                prepare=lambda: shutil.rmtree(skani_query_db, ignore_errors=True),
+                log_tail=True,
             )
             record_native_resident("skani", "compare", skani_compare_resident)
             rows = []
             for dist_out in compare_outs:
                 for line in dist_out.read_text().splitlines():
-                    if not line or line.startswith("#"):
+                    if not line or line.startswith("#") or line.startswith("Ref_file"):
                         continue
-                    fields = line.split()
+                    fields = line.split("\t")
                     if len(fields) >= 4:
-                        try:
-                            rows.append(
-                                {
-                                    "query": fields[1],
-                                    "reference": fields[0],
-                                    "jaccard": None,
-                                    "ani": float(fields[2]),
-                                }
-                            )
-                        except ValueError:
-                            continue
-            record_compare("skani", "cpu", marks, rows)
+                        rows.append(
+                            {
+                                "query": fields[1],
+                                "reference": fields[0],
+                                "jaccard": None,
+                                "ani": float(fields[2]),
+                            }
+                        )
+            # skani writes only the pairs past its ANI screen; it evaluated all of them.
+            record_compare(
+                "skani",
+                "cpu",
+                marks,
+                rows,
+                evaluated=count_pairs(references, query_list, topology),
+            )
 
         if "cuddl" in selected:
             import json as jsonlib5
@@ -2402,7 +2563,7 @@ def main(
                     )
             phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
             # Wall loads reference sketches from the file and sketches batch queries from FASTX.
-            fastx_compare = rabbit_rows["timings"]["query_fastx_compare"]
+            fastx_compare = rabbit_timed["compare"]["timings"]["query_fastx_compare"]
             native_timings[("rabbitsketch", "compare")] = {"wall": fastx_compare}
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
             record_compare(
@@ -2416,22 +2577,28 @@ def main(
 
         if "simdsketch" in selected:
             ss_pairs = work / "ss-pairs.f32"
-            ss_compare = [
-                str(simdsketch),
-                "-j",
-                str(threads),
-                "compare",
-                "--references",
-                str(ss_references),
-                "--output",
-                str(ss_pairs),
-            ]
+            ss_query_args: list[str] = []
             if topology == "batch":
                 ss_query_list = work / "ss-queries.txt"
                 ss_query_list.write_text("".join(f"{p}\n" for p in query_list))
-                ss_compare += ["--queries", str(ss_query_list)]
+                ss_query_args = ["--queries", str(ss_query_list)]
             ss_compare_resident: list[dict] = []
-            marks = wall_of(ss_compare, samples, warmups, resident=ss_compare_resident)
+            marks = sweep(
+                "simdsketch",
+                "compare",
+                lambda count: [
+                    str(simdsketch),
+                    "-j",
+                    str(count),
+                    "compare",
+                    "--references",
+                    str(ss_references),
+                    "--output",
+                    str(ss_pairs),
+                    *ss_query_args,
+                ],
+                resident=ss_compare_resident,
+            )
             record_native_resident("simdsketch", "compare", ss_compare_resident)
             evaluated = count_pairs(references, query_list, topology)
             stride = (
@@ -2458,26 +2625,30 @@ def main(
             # Batch queries are sketched into their own database inside the wall, then compared;
             # all-to-all compares the reference database with itself.
             skl_dists = work / "skl-dists.tsv"
-            skl_dist = [
-                str(sketchlib),
-                "dist",
-                str(skl_references),
-                "-k",
-                "25",
-                "--threads",
-                str(threads),
-                "-o",
-                str(skl_dists),
-                "--quiet",
-            ]
             skl_names = {f"r{i}": p for i, p in enumerate(references)}
             if topology == "batch":
                 skl_query_list = work / "skl-queries.tsv"
                 write_sketchlib_list(skl_query_list, "q", query_list)
                 skl_names |= {f"q{i}": p for i, p in enumerate(query_list)}
                 skl_queries = work / "skl-queries"
-                skl_dist.insert(3, str(skl_queries))
-                skl_compare = [
+
+            def skl_compare(count: int) -> list[list[str]]:
+                dist = [
+                    str(sketchlib),
+                    "dist",
+                    str(skl_references),
+                    *([str(skl_queries)] if topology == "batch" else []),
+                    "-k",
+                    "25",
+                    "--threads",
+                    str(count),
+                    "-o",
+                    str(skl_dists),
+                    "--quiet",
+                ]
+                if topology != "batch":
+                    return [dist]
+                return [
                     [
                         str(sketchlib),
                         "sketch",
@@ -2485,19 +2656,18 @@ def main(
                         str(skl_query_list),
                         "-o",
                         str(skl_queries),
-                        *skl_flags,
+                        *skl_flags(count),
                     ],
-                    skl_dist,
+                    dist,
                 ]
-            else:
-                skl_compare = [skl_dist]
+
             skl_compare_resident: list[dict] = []
-            marks = wall_of(
+            marks = sweep(
+                "sketchlib",
+                "compare",
                 skl_compare,
-                samples,
-                warmups,
                 resident=skl_compare_resident,
-                resident_skip=len(skl_compare) - 1,
+                resident_skip=1 if topology == "batch" else 0,
             )
             record_native_resident("sketchlib", "compare", skl_compare_resident)
             evaluated = count_pairs(references, query_list, topology)
@@ -2520,22 +2690,22 @@ def main(
             # DDL reports ANI and WKID, not Jaccard, like cuDDL.
             bb_pairs = work / "bb-pairs.f32"
             bb_compare_resident: list[dict] = []
-            marks = wall_of(
-                [
-                    *bb_query_sketch,
+            marks = sweep(
+                "bbtools",
+                "compare",
+                lambda count: [
+                    *bb_query_sketch(count),
                     [
                         *bb_java,
                         "compare",
                         str(bb_references),
                         bb_queries,
                         str(bb_pairs),
-                        bb_threads,
+                        str(count),
                     ],
                 ],
-                samples,
-                warmups,
                 resident=bb_compare_resident,
-                resident_skip=len(bb_query_sketch),
+                resident_skip=1 if topology == "batch" else 0,
             )
             record_native_resident("bbtools", "compare", bb_compare_resident)
             evaluated = count_pairs(references, query_list, topology)
@@ -2754,8 +2924,10 @@ def main(
             # queries count matching bins per reference; all-to-all preclusters through the
             # index and keeps each genome's k nearest Jaccard neighbours.
             skl_index = work / "skl-index"
-            search_index_ms["sketchlib"] = wall_of(
-                [
+            search_index_ms["sketchlib"] = sweep(
+                "sketchlib",
+                "search-index",
+                lambda count: [
                     str(sketchlib),
                     "inverted",
                     "build",
@@ -2768,12 +2940,10 @@ def main(
                     "--sketch-size",
                     "2048",
                     "--threads",
-                    str(threads),
+                    str(count),
                     "--quiet",
                     *(["--write-skq"] if topology == "all-to-all" else []),
                 ],
-                samples,
-                warmups,
             )
             skl_search = work / "skl-search.tsv"
             if topology == "batch":
@@ -2793,19 +2963,19 @@ def main(
                     str(k),
                 ]
             skl_search_resident: list[dict] = []
-            search_query_ms["sketchlib"] = wall_of(
-                [
+            search_query_ms["sketchlib"] = sweep(
+                "sketchlib",
+                "search",
+                lambda count: [
                     str(sketchlib),
                     "inverted",
                     *skl_query,
                     "--threads",
-                    str(threads),
+                    str(count),
                     "-o",
                     str(skl_search),
                     "--quiet",
                 ],
-                samples,
-                warmups,
                 resident=skl_search_resident,
             )
             record_native_resident("sketchlib", "search", skl_search_resident)
@@ -2845,9 +3015,11 @@ def main(
             # index, whose build the harness reports apart from the ranked search.
             bb_search = work / "bb-search.tsv"
             records = []
-            search_query_ms["bbtools"] = wall_of(
-                [
-                    *bb_query_sketch,
+            search_query_ms["bbtools"] = sweep(
+                "bbtools",
+                "search",
+                lambda count: [
+                    *bb_query_sketch(count),
                     [
                         *bb_java,
                         "search",
@@ -2855,13 +3027,11 @@ def main(
                         bb_queries,
                         str(k),
                         str(bb_search),
-                        bb_threads,
+                        str(count),
                     ],
                 ],
-                samples,
-                warmups,
                 resident=records,
-                resident_skip=len(bb_query_sketch),
+                resident_skip=1 if topology == "batch" else 0,
             )
             search_index_ms["bbtools"] = [r["index_build_ms"] for r in records]
             record_native_resident("bbtools", "search", records)
@@ -2883,8 +3053,10 @@ def main(
             skdb = work / "skdb"
             search_out = work / "skani-search.tsv"
             skani_search_resident = []
-            marks = wall_of(
-                [
+            marks = sweep(
+                "skani",
+                "search",
+                lambda count: [
                     str(skani),
                     "search",
                     "-d",
@@ -2896,10 +3068,8 @@ def main(
                     "--min-af",
                     "0",
                     "-t",
-                    str(threads),
+                    str(count),
                 ],
-                samples,
-                warmups,
                 resident=skani_search_resident,
             )
             record_native_resident("skani", "search", skani_search_resident)
@@ -2921,25 +3091,28 @@ def main(
             records = []
             if topology == "all-to-all":
                 neighbors = work / "d2-neighbors.tsv"
-                command = [
-                    str(dashing2),
-                    "cmp",
-                    "-k25",
-                    "-S2048",
-                    f"-p{threads}",
-                    "--cache",
-                    "--outprefix",
-                    str(d2_dir),
-                    "-F",
-                    str(reference_list),
-                    "--topk",
-                    str(k),
-                    "--cmpout",
-                    str(neighbors),
-                ]
+
+                def d2_topk(count: int) -> list[str]:
+                    return [
+                        str(dashing2),
+                        "cmp",
+                        "-k25",
+                        "-S2048",
+                        f"-p{count}",
+                        "--cache",
+                        "--outprefix",
+                        str(d2_dir),
+                        "-F",
+                        str(reference_list),
+                        "--topk",
+                        str(k),
+                        "--cmpout",
+                        str(neighbors),
+                    ]
+
                 # No index file format: the process wall loads cached sketches, builds the
                 # LSH index, and queries it.
-                marks = wall_of(command, samples, warmups, resident=records)
+                marks = sweep("dashing2", "search", d2_topk, resident=records)
                 if any(record.get("index_build_ms", 0) <= 0 for record in records):
                     raise ValueError("Dashing2 did not execute its native LSH index")
                 search_index_ms["dashing2"] = [r["index_build_ms"] for r in records]
@@ -2960,8 +3133,8 @@ def main(
                     "index_supported": True,
                 }
             else:
-                search_query_ms["dashing2"] = wall_of(
-                    cmp_cmd, samples, warmups, resident=records, prepare=d2_prepare
+                search_query_ms["dashing2"] = sweep(
+                    "dashing2", "search", d2_cmp, resident=records, prepare=d2_prepare
                 )
                 search_index_ms["dashing2"] = sketch_times["dashing2"]
                 search_cases["dashing2"] = {
@@ -2983,8 +3156,8 @@ def main(
             record_native_resident("dashing2", "search", records)
 
         if "rabbitsketch" in selected:
-            timings = rabbit_rows["timings"]
-            index = rabbit_rows["case"]["search_index"]
+            timings = rabbit_timed["search"]["timings"]
+            index = rabbit_timed["search"]["case"]["search_index"]
             index_timing = (
                 timings["search_index_build"]
                 if index != "none"
@@ -3093,7 +3266,6 @@ def main(
                         "topology": topology,
                         "queries": len(query_set),
                         "k": k,
-                        "threads": threads,
                         **search_cases.get(tool, {}),
                     },
                     "timings": {
@@ -3182,6 +3354,28 @@ def main(
                 if measurement["case"]["measurement"] == "micro-compare"
                 else cuddl_index
             )
+        if tool == "cuddl":
+            measurement["case"]["threads"] = cuddl_workers
+        elif tool != "cub-exact":
+            swept = (
+                "compare"
+                if measurement["case"].get("resident_reuses_compare")
+                else operation
+            )
+            measurement["case"]["threads"] = chosen_threads[(tool, swept)]
+            measurement["case"]["thread_candidates"] = ",".join(map(str, thread_counts))
+            if operation == "search" and (tool, "search-index") in chosen_threads:
+                measurement["case"]["index_threads"] = chosen_threads[
+                    (tool, "search-index")
+                ]
+        measurement["case"]["timing_scope"] = (
+            "in_process"
+            if tool in {"rabbitsketch", "cub-exact"}
+            or (tool, operation) == ("cuddl", "sketch")
+            else "process_jvm"
+            if tool == "bbtools"
+            else "process"
+        )
 
     datasets = dataset_entries("reference", references, 8)
     datasets.update(dataset_entries("query", query_list, 8))
@@ -3203,7 +3397,7 @@ def main(
                     )
                     + "\n"
                 )
-    header = f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/skani':>10}"
+    header = f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/anim':>10}"
     typer.echo(header)
     for m in measurements:
         if m["case"]["measurement"] == "micro-search":
@@ -3215,7 +3409,7 @@ def main(
         typer.echo(
             f"{m['implementation']['name']:<14}{op:<9}{wall:>10.1f}{unit:>13.2f}"
             f"{metrics.get('jaccard_mae_vs_exact', float('nan')):>10.4f}"
-            f"{metrics.get('ani_mae_vs_skani', float('nan')):>10.4f}"
+            f"{metrics.get('ani_mae_vs_anim', float('nan')):>10.4f}"
         )
     # The pipeline lanes' query interval also runs each benchmark's own output phase. Say what
     # is not in the numbers above it, so nobody reads it as comparison time.
