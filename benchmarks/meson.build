@@ -44,6 +44,8 @@ cuco_bench_dep = subproject('cuco').get_variable('cuco_dep')
 hypergen_bin = subproject('hypergen').get_variable('hypergen_bin')
 skani_bin = subproject('skani').get_variable('skani_binary')
 sketchlib_bin = subproject('sketchlib').get_variable('sketchlib_binary')
+# nucmer and delta-filter for the ANIm oracle in scripts/run_micro_comparison.py.
+mummer_bins = subproject('mummer').get_variable('mummer_bins')
 if build_x86_tools
     dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
 endif
