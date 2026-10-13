@@ -22,7 +22,7 @@ hypergen_bin = custom_target(
         'sh',
         '-c',
         'export CUDA_ROOT="${CUDA_ROOT:-$CUDA_HOME}"; '
-        + 'export RUSTFLAGS="${RUSTFLAGS:-} -L native=$CUDA_ROOT/lib/stubs"; '
+        + 'export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native -L native=$CUDA_ROOT/lib/stubs"; '
         + 'feature="$1"; cargo_bin="$2"; manifest="$3"; targetdir="$4"; out="$5"; '
         + 'if [ -n "$feature" ]; then set -- --features "$feature"; else set --; fi; '
         + '"$cargo_bin" build --release --locked --offline --bin hyper-gen "$@" --manifest-path "$manifest" '

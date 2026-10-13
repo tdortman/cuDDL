@@ -13,7 +13,8 @@ skani_binary = custom_target(
     command: [
         'sh',
         '-c',
-        '"$1" build --release --locked --offline --bin skani --manifest-path "$2" --target-dir "$3" >"$4.log" 2>&1 || { cat "$4.log"; exit 1; }; cp "$3/release/skani" "$4"',
+        'export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"; '
+        + '"$1" build --release --locked --offline --bin skani --manifest-path "$2" --target-dir "$3" >"$4.log" 2>&1 || { cat "$4.log"; exit 1; }; cp "$3/release/skani" "$4"',
         '_',
         cargo,
         meson.current_source_dir() / 'Cargo.toml',
