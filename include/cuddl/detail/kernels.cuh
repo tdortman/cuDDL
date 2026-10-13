@@ -1747,6 +1747,38 @@ next_cell(uint32_t* cell_counter, uint32_t cell, uint32_t& claimed) {
     return claimed;
 }
 
+/// @brief How a refinement-style block splits a tile: cell `c` holds query group `c % groups`
+/// and the reference words from `first_word + (c / groups) * block_words`.
+struct refine_cells {
+    uint32_t groups;
+    uint32_t first_word;
+    uint32_t block_words;
+    uint32_t cell_count;
+};
+
+/// @brief Splits a tile into @ref refine_cells, filling the grid for small batches without
+/// spilling whole query groups into a second wave. Every query of an upper-triangle tile follows
+/// @p query_id_offset, so words wholly before it hold no pairs and get no cells; otherwise those
+/// empty cells would take most of the split for tiles far down the triangle.
+template <bool UpperTriangle>
+__device__ __forceinline__ refine_cells make_refine_cells(
+    uint32_t query_id_offset,
+    uint32_t query_count,
+    uint32_t group,
+    uint32_t words_per_query,
+    uint32_t max_block_words
+) {
+    auto const groups = (query_count + group - 1U) / group;
+    auto const first_word =
+        UpperTriangle ? cuda::std::min(query_id_offset / 32U, words_per_query) : 0U;
+    auto const words = words_per_query - first_word;
+    auto const blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
+    auto const block_words = cuda::std::max(
+        1U, cuda::std::min(max_block_words, (words + blocks_per_wave - 1U) / blocks_per_wave)
+    );
+    return {groups, first_word, block_words, groups * ((words + block_words - 1U) / block_words)};
+}
+
 /// @brief Pairs @ref refine_batch_bitmap_kernel compares.
 enum class refine_candidates {
     /// Exactly the pairs set in a pass bitmap.
@@ -1927,25 +1959,20 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
 
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
-    auto const groups = (query_count + group - 1U) / group;
-    // Fill the grid for small batches without spilling whole query groups into a second wave.
-    auto const reference_blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
-    auto const block_words = cuda::std::min(
-        max_block_words,
-        (words_per_query + reference_blocks_per_wave - 1U) / reference_blocks_per_wave
+    auto const cells = make_refine_cells<UpperTriangle>(
+        query_id_offset, query_count, group, words_per_query, max_block_words
     );
-    auto const reference_blocks = (words_per_query + block_words - 1U) / block_words;
-    auto const cell_count = groups * reference_blocks;
+    auto const groups = cells.groups;
     auto const indexed_groups = indexed_bucket_count / warp_width;
     auto const thresholded = CountMatches && pass_bits != nullptr;
 
     for (auto cell = next_cell(cell_counter, blockIdx.x - gridDim.x, claimed_cell);
-         cell < cell_count;
+         cell < cells.cell_count;
          cell = next_cell(cell_counter, cell, claimed_cell)) {
         auto const first_query = (cell % groups) * group;
         auto const group_size = cuda::std::min(group, query_count - first_query);
-        auto const first_word = (cell / groups) * block_words;
-        auto const last_word = cuda::std::min(first_word + block_words, words_per_query);
+        auto const first_word = cells.first_word + (cell / groups) * cells.block_words;
+        auto const last_word = cuda::std::min(first_word + cells.block_words, words_per_query);
         // Tile query index of group member m: with @p query_order, the low half of its entry.
         auto const member_query = [&](uint32_t m) {
             return query_order == nullptr ? first_query + m
@@ -2205,14 +2232,10 @@ __global__ __launch_bounds__(match_filter_block_size, 1) void match_filter_kerne
 
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
-    auto const groups = (query_count + group - 1U) / group;
-    auto const reference_blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
-    auto const block_words = cuda::std::min(
-        max_block_words,
-        (words_per_query + reference_blocks_per_wave - 1U) / reference_blocks_per_wave
+    auto const cells = make_refine_cells<UpperTriangle>(
+        query_id_offset, query_count, group, words_per_query, max_block_words
     );
-    auto const reference_blocks = (words_per_query + block_words - 1U) / block_words;
-    auto const cell_count = groups * reference_blocks;
+    auto const groups = cells.groups;
     auto const indexed_groups = indexed_bucket_count / warp_width;
     // Unindexed buckets are seeded as differing, so they never count toward the bound.
     uint32_t excluded_lanes[lane_groups];
@@ -2222,12 +2245,12 @@ __global__ __launch_bounds__(match_filter_block_size, 1) void match_filter_kerne
     }
 
     for (auto cell = next_cell(cell_counter, blockIdx.x - gridDim.x, claimed_cell);
-         cell < cell_count;
+         cell < cells.cell_count;
          cell = next_cell(cell_counter, cell, claimed_cell)) {
         auto const first_query = (cell % groups) * group;
         auto const group_size = cuda::std::min(group, query_count - first_query);
-        auto const first_word = (cell / groups) * block_words;
-        auto const last_word = cuda::std::min(first_word + block_words, words_per_query);
+        auto const first_word = cells.first_word + (cell / groups) * cells.block_words;
+        auto const last_word = cuda::std::min(first_word + cells.block_words, words_per_query);
         auto const* group_planes = reinterpret_cast<uint4 const*>(
             query_planes + static_cast<size_t>(first_query) * row_words
         );
@@ -2359,13 +2382,20 @@ __global__ __launch_bounds__(match_filter_block_size, 1) void match_filter_kerne
 /// registers, so a block holds fewer threads than a refine block.
 constexpr uint32_t all_pairs_block_size = 512U;
 
+/// @brief Parts a @ref refine_all_pairs_kernel warp claims each 32-reference word in. Warps idle
+/// at the end of a cell until the slowest one finishes its last claim, and words differ in cost,
+/// so smaller claims shorten that wait. On a GPU running at its power limit the shorter wait
+/// only lowers the clock; with power headroom it shortens the search.
+constexpr uint32_t all_pairs_word_parts = 4U;
+
 /// @brief Exactly compares the layout pairs selected by @p reference_mask, without match counts.
 /// A null mask selects every reference.
 ///
-/// Cells, query staging, and word claiming follow @ref refine_batch_bitmap_kernel. A warp takes
-/// a claimed word's references two at a time and keeps both references' planes in registers, so
-/// each query plane group read from shared memory serves two pairs, and the two comparisons give
-/// every warp independent logic chains to interleave.
+/// Cells and query staging follow @ref refine_batch_bitmap_kernel; warps claim
+/// @ref all_pairs_word_parts parts of a 32-reference word at a time. A warp takes a claim's
+/// references two at a time and keeps both references' planes in registers, so each query plane
+/// group read from shared memory serves two pairs, and the two comparisons give every warp
+/// independent logic chains to interleave.
 template <size_t BucketCount, typename SearchResult, bool UpperTriangle, uint32_t QueryGroup>
 __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kernel(
     uint32_t const* query_planes,
@@ -2388,33 +2418,30 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     ));
     extern __shared__ uint4 all_pairs_query_planes[];
     __shared__ uint32_t next_word;
+    constexpr uint32_t part_width = warp_width / all_pairs_word_parts;
     __shared__ uint32_t claimed_cell;
 
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
-    auto const groups = (query_count + group - 1U) / group;
-    auto const reference_blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
-    auto const block_words = cuda::std::min(
-        max_block_words,
-        (words_per_query + reference_blocks_per_wave - 1U) / reference_blocks_per_wave
+    auto const cells = make_refine_cells<UpperTriangle>(
+        query_id_offset, query_count, group, words_per_query, max_block_words
     );
-    auto const reference_blocks = (words_per_query + block_words - 1U) / block_words;
-    auto const cell_count = groups * reference_blocks;
+    auto const groups = cells.groups;
 
     for (auto cell = next_cell(cell_counter, blockIdx.x - gridDim.x, claimed_cell);
-         cell < cell_count;
+         cell < cells.cell_count;
          cell = next_cell(cell_counter, cell, claimed_cell)) {
         auto const first_query = (cell % groups) * group;
         auto const group_size = cuda::std::min(group, query_count - first_query);
-        auto const first_word = (cell / groups) * block_words;
-        auto const last_word = cuda::std::min(first_word + block_words, words_per_query);
+        auto const first_word = cells.first_word + (cell / groups) * cells.block_words;
+        auto const last_word = cuda::std::min(first_word + cells.block_words, words_per_query);
         auto const* group_planes = reinterpret_cast<uint4 const*>(
             query_planes + static_cast<size_t>(first_query) * row_words
         );
 
         __syncthreads();
         if (threadIdx.x == 0U) {
-            next_word = first_word;
+            next_word = first_word * all_pairs_word_parts;
         }
         for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * (row_words / 4U);
              i += all_pairs_block_size) {
@@ -2428,15 +2455,18 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
                 word = atomicAdd(&next_word, 1U);
             }
             word = __shfl_sync(0xffffffffU, word, 0);
+            auto const part = word % all_pairs_word_parts;
+            word /= all_pairs_word_parts;
             if (word >= last_word) {
                 break;
             }
-            // Lane m holds query m's selected references in this word.
+            // Lane m holds query m's selected references in this part of the word.
             uint32_t bits = 0U;
             if (lane < group_size) {
                 auto const first_reference = word * warp_width;
                 auto const left = reference_count - first_reference;
                 bits = left >= warp_width ? ~0U : (1U << left) - 1U;
+                bits &= ((1U << part_width) - 1U) << (part * part_width);
                 if constexpr (UpperTriangle) {
                     auto const query_id = query_id_offset + first_query + lane;
                     if (first_reference <= query_id) {

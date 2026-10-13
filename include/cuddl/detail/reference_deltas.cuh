@@ -24,9 +24,11 @@ constexpr uint32_t delta_signature_buckets = 8U;
 /// @brief Highest-ID rows taken from each matching signature.
 constexpr uint32_t delta_signature_candidates = 4U;
 constexpr uint32_t delta_candidates = delta_signatures * delta_signature_candidates;
-/// @brief Warps per @ref apply_reference_deltas_kernel block and children per block cell.
+/// @brief Warps per @ref apply_reference_deltas_kernel block, and the most and fewest children
+/// one block cell takes.
 constexpr uint32_t delta_correction_warps = 24U;
 constexpr uint32_t delta_child_tile = 2048U;
+constexpr uint32_t delta_min_child_tile = 4U * delta_correction_warps;
 
 /// @brief Queries one correction cell stages bucket-major: 64 KiB of scores for every bucket
 /// count. Lane l serves query l % group and every (32 / group)-th change from l / group.
@@ -463,7 +465,14 @@ __global__ __launch_bounds__(delta_correction_warps * 32U, 1) void apply_referen
     auto const member = lane % group;
     auto const slice = lane / group;
     auto const query_groups = (query_count + group - 1U) / group;
-    auto const child_tiles = (deltas.child_count + delta_child_tile - 1U) / delta_child_tile;
+    // Few query groups shrink the child tiles until every block gets about two cells.
+    auto const tiles_wanted = (2U * gridDim.x + query_groups) / cuda::std::max(1U, query_groups);
+    auto const child_tile = cuda::std::clamp(
+        (deltas.child_count + tiles_wanted - 1U) / tiles_wanted,
+        uint32_t{delta_min_child_tile},
+        uint32_t{delta_child_tile}
+    );
+    auto const child_tiles = (deltas.child_count + child_tile - 1U) / child_tile;
     auto const* const row = reinterpret_cast<char const*>(staged) + member * sizeof(uint16_t);
     auto* const buffer =
         reinterpret_cast<uint2*>(staged + BucketCount * group) + warp * delta_change_limit;
@@ -478,8 +487,8 @@ __global__ __launch_bounds__(delta_correction_warps * 32U, 1) void apply_referen
         // Adjacent child tiles reuse a query group's base-result region.
         auto const first_member = (cell / child_tiles) * group;
         auto const members = cuda::std::min(group, query_count - first_member);
-        auto const begin_child = (cell % child_tiles) * delta_child_tile;
-        auto const end_child = cuda::std::min(deltas.child_count, begin_child + delta_child_tile);
+        auto const begin_child = (cell % child_tiles) * child_tile;
+        auto const end_child = cuda::std::min(deltas.child_count, begin_child + child_tile);
         if constexpr (UpperTriangle) {
             // Children ascend, so a tile whose last child precedes the group has no pairs.
             if (deltas.children[end_child - 1U].x <= query_id_offset + first_member) {
