@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
+#include <cctype>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdio>
@@ -194,6 +196,45 @@ struct sequence_build_options {
     std::optional<size_t> staging_bytes{};
     std::optional<std::reference_wrapper<device_blacklist const>> blacklist = std::nullopt;
 };
+
+/**
+ * @brief The FASTA/FASTQ files under @p directory, searched recursively and sorted by path,
+ * which is the order that numbers reference IDs.
+ *
+ * Recognised extensions are .fa, .fna, .fasta, .ffn, .frn, .fq and .fastq, in any case,
+ * optionally followed by .gz, .bgz or .bgzf. Entries are filtered by the type the directory
+ * reports and symlinks are kept without being followed, so listing a directory of symlinked
+ * genomes costs no per-file metadata lookup.
+ */
+[[nodiscard]] inline Result<std::vector<std::filesystem::path>> genome_paths(
+    std::filesystem::path const& directory
+) try {
+    std::vector<std::filesystem::path> paths;
+    for (auto const& entry : std::filesystem::recursive_directory_iterator(
+             directory, std::filesystem::directory_options::skip_permission_denied
+         )) {
+        if (!entry.is_symlink() && !entry.is_regular_file()) continue;
+        auto name = entry.path().filename().string();
+        std::ranges::transform(name, name.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        auto extension = std::filesystem::path(name).extension().string();
+        if (extension == ".gz" || extension == ".bgz" || extension == ".bgzf") {
+            extension = std::filesystem::path(name).stem().extension().string();
+        }
+        if (extension == ".fa" || extension == ".fna" || extension == ".fasta" ||
+            extension == ".ffn" || extension == ".frn" || extension == ".fq" ||
+            extension == ".fastq") {
+            paths.push_back(entry.path());
+        }
+    }
+    std::ranges::sort(paths);
+    return paths;
+} catch (std::filesystem::filesystem_error const& error) {
+    return Err(Error::resource(error.what()));
+}
+
+namespace detail { struct reference_file_assembly; }  // namespace detail
 
 /**
  * @brief Host-owned reference sketches and labels, ready for binary storage or GPU upload.
@@ -580,6 +621,7 @@ class reference_database_file {
 
    private:
     friend class reference_index_file;
+    friend struct detail::reference_file_assembly;
     reference_database_file() = default;
 
     /// @brief Staging sink that copies each group's device scores into this file's host rows.

@@ -17,10 +17,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -29,6 +32,7 @@
 
 #include <cuddl/detail/hash.cuh>
 #include <cuddl/detail/kernels.cuh>
+#include <cuddl/detail/pinned_pool.cuh>
 #include <cuddl/detail/reference_deltas.cuh>
 #include <cuddl/detail/register.cuh>
 #include <cuddl/device_span.cuh>
@@ -39,6 +43,14 @@ namespace cuddl {
 
 template <uint32_t K, size_t BucketCount, typename Layout = default_register_layout>
 class reference_index;
+
+namespace detail {
+/// @brief Makes @p stream's device current for the enclosing scope and restores the previous
+/// context on exit. Every public function that takes a stream opens one, so its kernel
+/// launches, CUB calls and function attributes target the stream's device, never the calling
+/// thread's current device. CCCL provides this only as an internal type.
+using device_scope = ::cuda::__ensure_current_context;
+}  // namespace detail
 
 /// @brief Dense offsets favor query latency; sparse sorted keys reduce index memory and build time.
 /// Automatic picks whichever needs fewer device bytes for the database's reference count.
@@ -264,18 +276,38 @@ struct batch_result_tile {
 /**
  * @brief Host copy of a @ref batch_result_tile holding only the passing results, packed in
  * query-major, reference order, in pinned memory; @ref tile views it.
+ *
+ * Downloading tile after tile into one object reuses its pinned buffers, which only grow when a
+ * tile needs more. That keeps pinned allocation, and the pool growth behind it, out of every tile
+ * after the first.
  */
 class host_batch_results {
    public:
+    /// @brief Empty results to @ref download into, with pinned buffers for @p stream's device.
+    explicit host_batch_results(cuda::stream_ref stream)
+        : host_batch_results(
+              stream, detail::device_pinned_pool(stream.device(), detail::pinned_placement::device_node)
+          ) {}
+
+    /// @brief Empty results to @ref download into, with pinned buffers taken from @p pool.
+    host_batch_results(cuda::stream_ref stream, cuda::pinned_memory_pool_ref pool)
+        : pool_(pool),
+          results_(stream, pool, 0, cuda::no_init),
+          match_counts_(stream, pool, 0, cuda::no_init),
+          pass_bits_(stream, pool, 0, cuda::no_init),
+          word_offsets_(stream, pool, 0, cuda::no_init) {}
+
     host_batch_results(host_batch_results const&) = delete;
     host_batch_results& operator=(host_batch_results const&) = delete;
 
     __host__ host_batch_results(host_batch_results&& other) noexcept
-        : results_(std::move(other.results_)),
+        : pool_(other.pool_),
+          results_(std::move(other.results_)),
           match_counts_(std::move(other.match_counts_)),
           pass_bits_(std::move(other.pass_bits_)),
           word_offsets_(std::move(other.word_offsets_)),
           count_(std::exchange(other.count_, 0U)),
+          has_match_counts_(other.has_match_counts_),
           layout_(other.layout_) {}
 
     __host__ ~host_batch_results() {}
@@ -295,9 +327,7 @@ class host_batch_results {
     /// match counts were requested.
     // A span into a temporary copy would dangle, so rvalues are rejected.
     [[nodiscard]] std::span<uint32_t const> passing_match_counts() const& noexcept {
-        return {
-            match_counts_.data(), match_counts_.size() == 0U ? 0U : static_cast<size_t>(count_)
-        };
+        return {match_counts_.data(), has_match_counts_ ? static_cast<size_t>(count_) : 0U};
     }
     void passing_match_counts() const&& = delete;
 
@@ -305,7 +335,7 @@ class host_batch_results {
     [[nodiscard]] batch_result_tile tile() const& noexcept {
         auto view = layout_;
         view.results = results_.data();
-        view.match_counts = match_counts_.size() == 0U ? nullptr : match_counts_.data();
+        view.match_counts = has_match_counts_ ? match_counts_.data() : nullptr;
         view.pass_bits = layout_.pass_bits == nullptr ? nullptr : pass_bits_.data();
         view.word_offsets = layout_.pass_bits == nullptr ? nullptr : word_offsets_.data();
         return view;
@@ -316,70 +346,74 @@ class host_batch_results {
     template <typename T>
     using pinned_buffer = cuda::buffer<T, cuda::mr::host_accessible, cuda::mr::device_accessible>;
 
-    explicit host_batch_results(cuda::stream_ref stream)
-        : results_(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init),
-          match_counts_(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init),
-          pass_bits_(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init),
-          word_offsets_(stream, cuda::pinned_default_memory_pool(), 0, cuda::no_init) {}
+    /// @brief Grows @p buffer to at least @p count elements, discarding its contents.
+    template <typename T>
+    void reserve(pinned_buffer<T>& buffer, size_t count, cuda::stream_ref stream) {
+        if (buffer.size() < count) buffer = pinned_buffer<T>(stream, pool_, count, cuda::no_init);
+    }
 
-    friend Result<host_batch_results> download(batch_result_tile const&, cuda::stream_ref);
+    friend Result<void> download(batch_result_tile const&, cuda::stream_ref, host_batch_results&);
 
+    cuda::pinned_memory_pool_ref pool_;
     pinned_buffer<packed_pairwise_counts> results_;
     pinned_buffer<uint32_t> match_counts_;
     pinned_buffer<uint32_t> pass_bits_;
     pinned_buffer<uint32_t> word_offsets_;
     uint64_t count_{};
+    bool has_match_counts_{};
     batch_result_tile layout_{};
 };
 
 /**
- * @brief Copies a device tile's passing results to pinned host memory, synchronizing @p stream.
+ * @brief Copies a device tile's passing results into @p host's pinned buffers, growing them only
+ * when needed, and synchronizes @p stream.
  *
  * Exhaustive tiles are copied as they are, since every slot passes in order. Threshold tiles are
  * packed on the device: a scan of the pass-bit words gives each word's first packed position, and
  * a gather writes the passing records straight into the host buffer.
  */
-[[nodiscard]] inline Result<host_batch_results>
-download(batch_result_tile const& tile, cuda::stream_ref stream) {
-    host_batch_results host(stream);
+[[nodiscard]] inline Result<void>
+download(batch_result_tile const& tile, cuda::stream_ref stream, host_batch_results& host) {
+    detail::device_scope const scope{stream};
     host.layout_ = tile;
     host.layout_.word_offsets = nullptr;
-    auto const memory = cuda::pinned_default_memory_pool();
-    using pinned_results = host_batch_results::pinned_buffer<packed_pairwise_counts>;
-    using pinned_words = host_batch_results::pinned_buffer<uint32_t>;
+    host.has_match_counts_ = tile.match_counts != nullptr;
     if (tile.pass_bits == nullptr) {
         auto const slots = static_cast<size_t>(tile.slot_count());
         host.count_ = slots;
-        host.results_ = pinned_results(stream, memory, slots, cuda::no_init);
+        host.reserve(host.results_, slots, stream);
         if (slots != 0U) {
             CUDDL_CUDA_TRY(
                 cuda::copy_bytes(
-                    stream, cuda::std::span{tile.results, slots}, cuda::std::span{host.results_}
+                    stream,
+                    cuda::std::span{tile.results, slots},
+                    cuda::std::span{host.results_.data(), slots}
                 )
             );
         }
-        if (tile.match_counts != nullptr) {
-            host.match_counts_ = pinned_words(stream, memory, slots, cuda::no_init);
+        if (host.has_match_counts_) {
+            host.reserve(host.match_counts_, slots, stream);
             if (slots != 0U) {
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
                         cuda::std::span{tile.match_counts, slots},
-                        cuda::std::span{host.match_counts_}
+                        cuda::std::span{host.match_counts_.data(), slots}
                     )
                 );
             }
         }
         CUDDL_CUDA_TRY(stream.sync());
-        return host;
+        return Ok();
     }
 
     auto const words = static_cast<size_t>(tile.query_count) * tile.words_per_query();
-    host.pass_bits_ = pinned_words(stream, memory, words, cuda::no_init);
-    host.word_offsets_ = pinned_words(stream, memory, words, cuda::no_init);
+    host.reserve(host.pass_bits_, words, stream);
+    host.reserve(host.word_offsets_, words, stream);
     if (words == 0U) {
+        host.count_ = 0U;
         CUDDL_CUDA_TRY(stream.sync());
-        return host;
+        return Ok();
     }
     auto const popcounts = cuda::make_transform_iterator(tile.pass_bits, detail::word_popcount{});
     size_t scan_bytes = 0;
@@ -408,20 +442,20 @@ download(batch_result_tile const& tile, cuda::stream_ref stream) {
     );
     CUDDL_CUDA_TRY(
         cuda::copy_bytes(
-            stream, cuda::std::span{tile.pass_bits, words}, cuda::std::span{host.pass_bits_}
+            stream,
+            cuda::std::span{tile.pass_bits, words},
+            cuda::std::span{host.pass_bits_.data(), words}
         )
     );
     CUDDL_CUDA_TRY(stream.sync());
     host.count_ = static_cast<uint64_t>(host.word_offsets_.data()[words - 1U]) +
                   static_cast<uint64_t>(cuda::std::popcount(host.pass_bits_.data()[words - 1U]));
     auto const count = static_cast<size_t>(host.count_);
-    host.results_ = pinned_results(stream, memory, count, cuda::no_init);
-    if (tile.match_counts != nullptr) {
-        host.match_counts_ = pinned_words(stream, memory, count, cuda::no_init);
-    }
+    host.reserve(host.results_, count, stream);
+    if (host.has_match_counts_) host.reserve(host.match_counts_, count, stream);
     if (count == 0U) {
         CUDDL_CUDA_TRY(stream.sync());
-        return host;
+        return Ok();
     }
     // Passing records are gathered into bounded device staging, so each chunk crosses the bus as
     // one bulk copy rather than as scattered small writes.
@@ -489,7 +523,16 @@ download(batch_result_tile const& tile, cuda::stream_ref stream) {
         first_word = last_word;
     }
     CUDDL_CUDA_TRY(stream.sync());
-    return host;
+    return Ok();
+}
+
+/// @brief Copies a device tile's passing results to new pinned host memory; see the overload
+/// that downloads into reusable @ref host_batch_results.
+[[nodiscard]] inline Result<host_batch_results>
+download(batch_result_tile const& tile, cuda::stream_ref stream) {
+    host_batch_results host(stream);
+    CUDDL_TRY(download(tile, stream, host));
+    return Result<host_batch_results>::ok(std::move(host));
 }
 
 namespace detail {
@@ -519,9 +562,11 @@ struct visit_chunk {
 template <typename F>
 [[nodiscard]] Result<void>
 for_each_passing(batch_result_tile const& tile, cuda::stream_ref stream, F&& f) {
+    detail::device_scope const scope{stream};
     using pinned_counts = cuda::
         buffer<packed_pairwise_counts, cuda::mr::host_accessible, cuda::mr::device_accessible>;
-    auto const memory = cuda::pinned_default_memory_pool();
+    auto const memory =
+        detail::device_pinned_pool(stream.device(), detail::pinned_placement::device_node);
     constexpr auto chunk_records = detail::visit_chunk_records;
     auto const threshold = tile.pass_bits != nullptr;
     auto const words = static_cast<size_t>(tile.query_count) * tile.words_per_query();
@@ -733,6 +778,18 @@ struct search_options {
     uint32_t minimum_matches = 5;
 };
 
+/**
+ * @brief Part @ref index of @ref count disjoint parts of an all-to-all search.
+ *
+ * Running every part, for example one per process, covers each pair exactly once. Parts take
+ * query tiles in alternating order (0, 1, ..., count - 1, count - 1, ..., 0, ...), so the
+ * shrinking tiles of the upper triangle spread evenly across parts.
+ */
+struct all_to_all_shard {
+    uint32_t index = 0U;
+    uint32_t count = 1U;
+};
+
 namespace detail {
 
 struct sparse_index_key {
@@ -861,12 +918,21 @@ constexpr uint32_t batch_query_tile_count = 128U;
 /// @brief Query rows one all-to-all tile compares: about 2^25 pairs, and at least
 /// @ref batch_query_tile_count. Enough query groups to fill the GPU for each launch, while result
 /// storage holds two tiles so one is searched as the other is consumed.
-[[nodiscard]] constexpr uint32_t all_to_all_tile_queries(uint32_t reference_count) noexcept {
+///
+/// Split into @p parts shards, tiles shrink until each part gets about four, so the alternating
+/// assignment evens out the triangle. They shrink only when the whole search already spans
+/// several tiles: its two-slot result storage then holds the smaller tiles too.
+[[nodiscard]] constexpr uint32_t
+all_to_all_tile_queries(uint32_t reference_count, uint32_t parts = 1U) noexcept {
     constexpr uint32_t pair_budget = 1U << 25U;
+    constexpr uint64_t tiles_per_part = 4U;
     auto const limit = reference_count == 0U
                            ? batch_query_tile_count
                            : std::max(batch_query_tile_count, pair_budget / reference_count);
-    return batch_query_tile_size(reference_count, reference_count, limit);
+    auto const whole = batch_query_tile_size(reference_count, reference_count, limit);
+    if (parts < 2U || whole == 0U || whole >= reference_count) return whole;
+    auto const per_part = static_cast<uint32_t>(reference_count / (parts * tiles_per_part));
+    return std::min(whole, std::max(batch_query_tile_count, per_part));
 }
 
 /// @brief Query rows one external batch tile may hold on @p device.
@@ -887,6 +953,118 @@ external_batch_query_limit(uint32_t reference_count, cuda::device_ref device) {
 }
 
 }  // namespace detail
+
+/**
+ * @brief Thread-safe source of the all-to-all tiles one process searches.
+ *
+ * Tiles hold `detail::all_to_all_tile_queries(reference_count, shard.count * searchers)` query
+ * rows, so each of the `shard.count * searchers` searches gets about four. The process keeps the
+ * tiles @p shard owns, and concurrent searches, typically one per device, @ref claim them one at
+ * a time, largest first. A device that finishes early simply claims more, so devices of
+ * different speeds share the work without a fixed split.
+ *
+ * With @p next_tile, processes share the tiles instead of keeping those @p shard assigns:
+ * @p next_tile returns the next unclaimed tile number of the whole search, counting from 0
+ * across every process, and must not throw. A faster process then claims more tiles, as a
+ * faster device does within one process. `shard.count` still sizes the tiles; pass the number
+ * of processes. See shared_tile_counter in distributed.cuh for a counter shared over MPI.
+ */
+class all_to_all_tile_queue {
+   public:
+    struct tile {
+        uint32_t first_query_id{};
+        uint32_t query_count{};
+    };
+
+    [[nodiscard]] static Result<all_to_all_tile_queue> make(
+        uint32_t reference_count,
+        all_to_all_shard shard = {},
+        uint32_t searchers = 1U,
+        std::function<uint64_t()> next_tile = {}
+    ) {
+        if (shard.count == 0U || shard.index >= shard.count) {
+            return Err(Error::invalid_argument("all-to-all shard index must be below its count"));
+        }
+        if (searchers == 0U || shard.count > std::numeric_limits<uint32_t>::max() / searchers) {
+            return Err(Error::invalid_argument("all-to-all searcher count is out of range"));
+        }
+        all_to_all_tile_queue queue;
+        queue.reference_count_ = reference_count;
+        queue.tile_queries_ =
+            detail::all_to_all_tile_queries(reference_count, shard.count * searchers);
+        auto const count = queue.tile_queries_ == 0U
+                               ? 0U
+                               : (reference_count + queue.tile_queries_ - 1U) / queue.tile_queries_;
+        for (uint32_t t = 0U; t < count; ++t) {
+            auto const lane = t % shard.count;
+            auto const owner = (t / shard.count) % 2U == 0U ? lane : shard.count - 1U - lane;
+            if (next_tile || owner == shard.index) queue.tiles_.push_back(t);
+        }
+        queue.next_tile_ = std::move(next_tile);
+        return Result<all_to_all_tile_queue>::ok(std::move(queue));
+    }
+
+    all_to_all_tile_queue(all_to_all_tile_queue&& other) noexcept
+        : tiles_(std::move(other.tiles_)),
+          next_(other.next_.load()),
+          next_tile_(std::move(other.next_tile_)),
+          cancelled_(other.cancelled_.load()),
+          tile_queries_(other.tile_queries_),
+          reference_count_(other.reference_count_) {}
+
+    /// @brief The next unclaimed tile, or nothing once all are claimed or after @ref cancel.
+    [[nodiscard]] std::optional<tile> claim() noexcept {
+        if (cancelled_.load(std::memory_order_relaxed)) return std::nullopt;
+        auto const i = next_tile_ ? next_tile_() : next_.fetch_add(1U, std::memory_order_relaxed);
+        if (i >= tiles_.size()) return std::nullopt;
+        auto const first = tiles_[i] * tile_queries_;
+        return tile{first, std::min(tile_queries_, reference_count_ - first)};
+    }
+
+    /// @brief Makes every later @ref claim of this queue return nothing, for example after a
+    /// device failed. Other processes sharing the tiles keep claiming.
+    void cancel() noexcept {
+        cancelled_.store(true);
+    }
+
+    /// @brief Whether processes share the tiles through a `next_tile` counter.
+    [[nodiscard]] bool shared() const noexcept {
+        return static_cast<bool>(next_tile_);
+    }
+
+    /// @brief Query rows per tile (the last tile may hold fewer).
+    [[nodiscard]] uint32_t tile_queries() const noexcept {
+        return tile_queries_;
+    }
+
+    /// @brief Tiles this process owns, or every tile of the search when they are shared.
+    [[nodiscard]] size_t size() const noexcept {
+        return tiles_.size();
+    }
+
+    /// @brief Reference count the tiles cover.
+    [[nodiscard]] uint32_t reference_count() const noexcept {
+        return reference_count_;
+    }
+
+    /// @brief Position, in claim order, of the tile starting at @p first_query_id.
+    [[nodiscard]] size_t position(uint32_t first_query_id) const noexcept {
+        return static_cast<size_t>(
+            std::lower_bound(tiles_.begin(), tiles_.end(), first_query_id / tile_queries_) -
+            tiles_.begin()
+        );
+    }
+
+   private:
+    all_to_all_tile_queue() = default;
+
+    std::vector<uint32_t> tiles_;
+    std::atomic<size_t> next_{0U};
+    std::function<uint64_t()> next_tile_;
+    std::atomic<bool> cancelled_{false};
+    uint32_t tile_queries_{};
+    uint32_t reference_count_{};
+};
 
 namespace detail {
 
@@ -1105,6 +1283,7 @@ class reference_database_view {
         device_span<result_type> results,
         cuda::stream_ref stream
     ) const {
+        device_scope const scope{stream};
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (!rows_match_metadata(expected_scores)) {
             return Err(Error::invalid_argument("database extent does not match its metadata"));
@@ -1160,6 +1339,7 @@ class reference_database_view {
         search_options options,
         cuda::stream_ref stream
     ) const {
+        device_scope const scope{stream};
         auto const expected_scores = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (!rows_match_metadata(expected_scores)) {
             return Err(Error::invalid_argument("database extent does not match its metadata"));
@@ -1339,6 +1519,7 @@ class reference_database_view {
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream
     ) const {
+        device_scope const scope{stream};
         auto const query_count =
             CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
         auto const requirements = CUDDL_TRY(batch_search_requirements(query_count, stream));
@@ -1349,8 +1530,12 @@ class reference_database_view {
         auto const tile_size = storage_queries < 2U ? storage_queries : storage_queries / 2U;
         auto const tiles = tile_size == 0U ? 0U : (query_count + tile_size - 1U) / tile_size;
         auto const slot = static_cast<size_t>(tile_size) * metadata_.reference_count;
+        uint32_t next_tile = 0U;
         return pipeline_tiles(
-            tiles,
+            [&]() -> std::optional<uint32_t> {
+                if (next_tile >= tiles) return std::nullopt;
+                return next_tile++;
+            },
             slot,
             results,
             result_match_counts,
@@ -1395,6 +1580,7 @@ class reference_database_view {
         search_options options,
         cuda::stream_ref stream
     ) const {
+        device_scope const scope{stream};
         auto const query_count =
             CUDDL_TRY(validate_batch_queries(queries, query_compatibility, query_id_offset));
         auto const requirements = CUDDL_TRY(indexed_batch_search_requirements(query_count, stream));
@@ -1427,7 +1613,7 @@ class reference_database_view {
      *
      * @p on_tile receives each tile's @ref batch_result_tile. Before returning, it must consume
      * the tile synchronously or enqueue dependent work on @p stream because the supplied storage
-     * is reused by the next tile.
+     * is reused by the next tile. @p shard restricts the search to one part of the pairs.
      */
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
@@ -1435,27 +1621,52 @@ class reference_database_view {
         device_span<batch_result_type> results,
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        all_to_all_shard shard = {}
     ) const {
+        auto tiles = CUDDL_TRY(all_to_all_tile_queue::make(metadata_.reference_count, shard));
+        return search_all_to_all_async(
+            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, tiles
+        );
+    }
+
+    /// @brief Exhaustive all-to-all search of the tiles claimed from @p tiles, which other
+    /// searches, for example on other devices' replicas, may claim from concurrently.
+    template <typename OnTile>
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream,
+        all_to_all_tile_queue& tiles
+    ) const {
+        device_scope const scope{stream};
         CUDDL_TRY(validate_stored_rows());
+        CUDDL_TRY(validate_tile_queue(tiles));
         auto const requirements = CUDDL_TRY(all_to_all_search_requirements());
         CUDDL_TRY(validate_batch_outputs(requirements, results, result_match_counts));
-        auto const tile_size = detail::all_to_all_tile_queries(metadata_.reference_count);
+        std::vector<all_to_all_tile_queue::tile> claimed;
         return pipeline_tiles(
-            all_to_all_tile_count(),
+            [&]() -> std::optional<uint32_t> {
+                auto const tile = tiles.claim();
+                if (!tile) return std::nullopt;
+                claimed.push_back(*tile);
+                return static_cast<uint32_t>(claimed.size() - 1U);
+            },
             CUDDL_TRY(all_to_all_slot_pairs()),
             results,
             result_match_counts,
-            [&](uint32_t tile,
+            [&](uint32_t index,
                 device_span<batch_result_type> slot_results,
                 device_span<uint32_t> slot_matches,
                 cuda::stream_ref work) {
-                auto const first_query_id = tile * tile_size;
+                auto const tile = claimed[index];
                 return launch_batch_exhaustive<true>(
                     {},
-                    first_query_id,
-                    std::min(tile_size, metadata_.reference_count - first_query_id),
-                    first_query_id,
+                    tile.first_query_id,
+                    tile.query_count,
+                    tile.first_query_id,
                     workspace,
                     slot_results,
                     slot_matches,
@@ -1473,7 +1684,7 @@ class reference_database_view {
      * @p on_tile receives each tile's @ref batch_result_tile, holding exactly the pairs with at
      * least `options.minimum_matches` index matches. Before returning, it must consume the tile
      * synchronously or enqueue dependent work on @p stream because the supplied storage is
-     * reused by the next tile.
+     * reused by the next tile. @p shard restricts the search to one part of the pairs.
      */
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_indexed_async(
@@ -1482,25 +1693,54 @@ class reference_database_view {
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
         search_options options,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        all_to_all_shard shard = {}
     ) const {
+        auto tiles = CUDDL_TRY(all_to_all_tile_queue::make(metadata_.reference_count, shard));
+        return search_all_to_all_indexed_async(
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            options,
+            stream,
+            tiles
+        );
+    }
+
+    /// @brief Indexed all-to-all search of the tiles claimed from @p tiles, which other searches
+    /// may claim from concurrently.
+    template <typename OnTile>
+    [[nodiscard]] Result<void> search_all_to_all_indexed_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts,
+        search_options options,
+        cuda::stream_ref stream,
+        all_to_all_tile_queue& tiles
+    ) const {
+        device_scope const scope{stream};
         CUDDL_TRY(validate_stored_rows());
+        CUDDL_TRY(validate_tile_queue(tiles));
         auto const requirements = CUDDL_TRY(indexed_all_to_all_search_requirements());
         CUDDL_TRY(validate_indexed_batch_inputs(
             requirements, workspace, results, result_match_counts, options
         ));
-        auto const tile_size = detail::all_to_all_tile_queries(metadata_.reference_count);
-        for (uint32_t first_query_id = 0U;
-             tile_size != 0U && first_query_id < metadata_.reference_count;
-             first_query_id += tile_size) {
-            auto const query_count =
-                std::min(tile_size, metadata_.reference_count - first_query_id);
+        // Every tile reuses the same storage, so the next tile is claimed once the previous
+        // tile's consumers are done; tiles claimed from a shared queue then go to whichever
+        // device frees up first.
+        std::optional<cuda::event> consumed;
+        while (true) {
+            if (consumed) CUDDL_CUDA_TRY(consumed->sync());
+            auto const tile = tiles.claim();
+            if (!tile) break;
             on_tile(CUDDL_TRY(
                 launch_batch_indexed<true>(
                     nullptr,
-                    first_query_id,
-                    query_count,
-                    first_query_id,
+                    tile->first_query_id,
+                    tile->query_count,
+                    tile->first_query_id,
                     workspace,
                     results,
                     result_match_counts,
@@ -1508,6 +1748,8 @@ class reference_database_view {
                     stream
                 )
             ));
+            if (!consumed) consumed.emplace(CUDDL_CUDA_TRY(cuda::event(stream.device())));
+            CUDDL_CUDA_TRY(consumed->record(stream));
         }
         return Ok();
     }
@@ -1523,6 +1765,14 @@ class reference_database_view {
         return tile_size == 0U ? 0U : (metadata_.reference_count + tile_size - 1U) / tile_size;
     }
 
+    /// @brief Rejects a queue made for a different reference count; its tiles would not fit.
+    [[nodiscard]] Result<void> validate_tile_queue(all_to_all_tile_queue const& tiles) const {
+        if (tiles.reference_count() != metadata_.reference_count) {
+            return Err(Error::invalid_argument("tile queue was made for another reference count"));
+        }
+        return Ok();
+    }
+
     /// @brief Results in the largest (first) all-to-all tile.
     [[nodiscard]] Result<uint32_t> all_to_all_slot_pairs() const {
         return all_to_all_pair_count(
@@ -1531,17 +1781,22 @@ class reference_database_view {
     }
 
     /**
-     * @brief Searches @p tiles tiles on an internal stream, one tile ahead of @p on_tile.
+     * @brief Searches the tiles @p next hands out on an internal stream, one tile ahead of
+     * @p on_tile.
      *
-     * Tile n uses result slot `n % 2` of @p slot results each. Tile n + 1 is enqueued, after
-     * everything the caller has queued on @p stream so far (tile n - 1's consumers, which share
-     * its slot), before @p on_tile receives tile n, so the search of one tile overlaps the
-     * consumption of the previous one. @p stream waits for each tile's search before its
-     * callback and for the last search before returning.
+     * @p next returns tile numbers 0, 1, 2, ... until it returns nothing. It is asked for tile
+     * n + 2, which takes tile n's slot, only once tile n's consumers on @p stream are done,
+     * while tile n + 1 keeps the device busy. A search therefore holds at most two tiles, and
+     * tiles claimed from a shared queue go to whichever device frees up first. Tile n uses
+     * result slot `n % 2` of @p slot results each. Tile n + 1 is enqueued, after everything the
+     * caller has queued on @p stream so far (tile n - 1's consumers, which share its slot),
+     * before @p on_tile receives tile n, so the search of one tile overlaps the consumption of
+     * the previous one. @p stream waits for each tile's search before its callback and for the
+     * last search before returning.
      */
-    template <typename Launch, typename OnTile>
+    template <typename Next, typename Launch, typename OnTile>
     [[nodiscard]] Result<void> pipeline_tiles(
-        uint32_t tiles,
+        Next&& next,
         size_t slot,
         device_span<batch_result_type> results,
         device_span<uint32_t> match_counts,
@@ -1557,10 +1812,12 @@ class reference_database_view {
                                      : device_span<uint32_t>{match_counts.data() + offset, slot}
             };
         };
-        if (tiles == 0U) return Ok();
-        if (tiles == 1U) {
-            auto const [slot_results, slot_matches] = slot_of(0U);
-            on_tile(CUDDL_TRY(launch(0U, slot_results, slot_matches, stream)));
+        auto const first = next();
+        if (!first) return Ok();
+        auto ahead = next();
+        if (!ahead) {
+            auto const [slot_results, slot_matches] = slot_of(*first);
+            on_tile(CUDDL_TRY(launch(*first, slot_results, slot_matches, stream)));
             return Ok();
         }
         auto work = CUDDL_CUDA_TRY(cuda::stream(stream.device()));
@@ -1577,13 +1834,20 @@ class reference_database_view {
             CUDDL_CUDA_TRY(searched[tile % 2U].record(work));
             return Ok();
         };
-        CUDDL_TRY(enqueue(0U));
-        for (uint32_t tile = 0; tile < tiles; ++tile) {
-            if (tile + 1U < tiles) CUDDL_TRY(enqueue(tile + 1U));
+        auto consumed = CUDDL_CUDA_TRY(cuda::event(stream.device()));
+        CUDDL_TRY(enqueue(*first));
+        for (auto tile = *first;; ++tile) {
+            bool const more = ahead.has_value();
+            if (more) CUDDL_TRY(enqueue(*ahead));
             CUDDL_CUDA_TRY(stream.wait(searched[tile % 2U]));
             on_tile(pending[tile % 2U]);
+            if (!more) return Ok();
+            // Tile n + 2 takes this tile's slot, so it is claimed once this tile's consumers are
+            // done, while tile n + 1 keeps the device busy.
+            CUDDL_CUDA_TRY(consumed.record(stream));
+            CUDDL_CUDA_TRY(consumed.sync());
+            ahead = next();
         }
-        return Ok();
     }
 
     [[nodiscard]] Result<cuddl::batch_search_requirements>
@@ -2340,6 +2604,13 @@ class reference_database_view {
         };
 
         if (compares_planes()) {
+            if constexpr (AllToAll) {
+                // The filter and refinement kernels skip words wholly below the triangle, so
+                // those words must already read as no pair.
+                CUDDL_CUDA_TRY(
+                    cudaMemsetAsync(candidate_bits, 0, word_count * sizeof(uint32_t), stream.get())
+                );
+            }
             // A low-plane bound selects candidates; the refinement counts their matches exactly
             // and keeps, in the same bitmap, those meeting the threshold.
             if constexpr (detail::match_filter_supported<BucketCount>) {
@@ -2642,6 +2913,7 @@ class reference_database {
 
     reference_database(reference_database&& other) noexcept
         : planes_(std::move(other.planes_)),
+          device_(other.device_),
           metadata_(std::exchange(other.metadata_, {})),
           names_(std::move(other.names_)),
           identity_(std::move(other.identity_)),
@@ -2650,6 +2922,7 @@ class reference_database {
     reference_database& operator=(reference_database&& other) noexcept {
         if (this != &other) {
             planes_ = std::move(other.planes_);
+            device_ = other.device_;
             metadata_ = std::exchange(other.metadata_, {});
             names_ = std::move(other.names_);
             identity_ = std::move(other.identity_);
@@ -2668,6 +2941,7 @@ class reference_database {
         score_compatibility compatibility,
         cuda::stream_ref stream
     ) {
+        detail::device_scope const scope{stream};
         auto const reference_count = CUDDL_TRY(validate_rows(rows, compatibility));
         auto database = CUDDL_CUDA_TRY(reference_database(stream));
         database.metadata_ = {.compatibility = compatibility, .reference_count = reference_count};
@@ -2696,6 +2970,7 @@ class reference_database {
     /// @brief Writes the reference scores, row-major in reference-ID order, to @p scores.
     [[nodiscard]] Result<void>
     copy_scores_async(device_span<score_type> scores, cuda::stream_ref stream) const {
+        detail::device_scope const scope{stream};
         auto const count = static_cast<size_t>(metadata_.reference_count) * BucketCount;
         if (scores.size() < count) {
             return Err(Error::resource("score destination is too small"));
@@ -2729,6 +3004,11 @@ class reference_database {
     /// @brief Reference count.
     [[nodiscard]] uint32_t reference_count() const noexcept {
         return metadata_.reference_count;
+    }
+
+    /// @brief Device holding the rows: the device of the stream that built them.
+    [[nodiscard]] cuda::device_ref device() const noexcept {
+        return device_;
     }
 
     /// @brief Bytes one compact row store needs for @p reference_count references.
@@ -2808,10 +3088,27 @@ class reference_database {
         device_span<batch_result_type> results,
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        all_to_all_shard shard = {}
     ) const {
         return view().search_all_to_all_async(
-            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream
+            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, shard
+        );
+    }
+
+    /// @brief Exhaustive search of the tiles claimed from @p tiles; see
+    /// @ref all_to_all_tile_queue.
+    template <typename OnTile>
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts,
+        cuda::stream_ref stream,
+        all_to_all_tile_queue& tiles
+    ) const {
+        return view().search_all_to_all_async(
+            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, tiles
         );
     }
 
@@ -2890,11 +3187,43 @@ class reference_database {
         device_span<uint32_t> result_match_counts,
         search_options options,
         cuda::stream_ref stream,
-        reference_index<K, BucketCount, Layout> const* index = nullptr
+        reference_index<K, BucketCount, Layout> const* index = nullptr,
+        all_to_all_shard shard = {}
     ) const {
         auto search_view = CUDDL_TRY(view(index));
         return search_view.search_all_to_all_indexed_async(
-            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, options, stream
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            options,
+            stream,
+            shard
+        );
+    }
+
+    /// @brief Indexed or threshold search of the tiles claimed from @p tiles; see
+    /// @ref all_to_all_tile_queue.
+    template <typename OnTile>
+    [[nodiscard]] Result<void> search_all_to_all_async(
+        device_span<uint8_t> workspace,
+        device_span<batch_result_type> results,
+        OnTile&& on_tile,
+        device_span<uint32_t> result_match_counts,
+        search_options options,
+        cuda::stream_ref stream,
+        reference_index<K, BucketCount, Layout> const* index,
+        all_to_all_tile_queue& tiles
+    ) const {
+        auto search_view = CUDDL_TRY(view(index));
+        return search_view.search_all_to_all_indexed_async(
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            options,
+            stream,
+            tiles
         );
     }
 
@@ -2950,7 +3279,8 @@ class reference_database {
     }
 
     explicit reference_database(cuda::stream_ref stream)
-        : planes_(stream, cuda::device_default_memory_pool(stream.device())) {}
+        : planes_(stream, cuda::device_default_memory_pool(stream.device())),
+          device_(stream.device()) {}
 
     [[nodiscard]] static Result<uint32_t>
     validate_rows(device_span<score_type const> rows, score_compatibility compatibility) {
@@ -2971,6 +3301,7 @@ class reference_database {
     }
 
     cuda::device_buffer<uint32_t> planes_;
+    cuda::device_ref device_{0};
     reference_database_metadata metadata_{};
     std::vector<std::string> names_;
     // A shared identity prevents accepting an index for a different or recycled row allocation.

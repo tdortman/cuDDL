@@ -120,7 +120,7 @@ class CuddlDecompression(StrEnum):
     """Where cuDDL decompresses gzip input."""
 
     AUTOMATIC = "automatic"
-    COHERENT = "coherent"
+    HYBRID = "hybrid"
     CPU = "cpu"
     GPU = "gpu"
 
@@ -485,7 +485,6 @@ def read_sketchlib_dists(
     return rows, count
 
 
-
 def discover(directory: Path) -> list[Path]:
     exts = (".fa", ".fna", ".fasta", ".ffn", ".frn")
     files = {
@@ -833,9 +832,9 @@ def main(
         CuddlDecompression,
         typer.Option(
             help="Where every cuDDL stage decompresses gzip input: 'automatic' picks for the "
-            "device and loader count, 'cpu' uses the loaders, 'gpu' uses nvCOMP and falls back "
-            "to the CPU for formats it cannot read, 'coherent' inflates on the loaders and "
-            "normalises FASTA on a device that reads pageable host memory."
+            "loader count, 'cpu' uses the loaders, 'gpu' uses nvCOMP and falls back "
+            "to the CPU for formats it cannot read, 'hybrid' inflates on the loaders and "
+            "normalises FASTA on the device."
         ),
     ] = CuddlDecompression.AUTOMATIC,
 ) -> None:
@@ -2430,9 +2429,7 @@ def main(
                 ss_query_list.write_text("".join(f"{p}\n" for p in query_list))
                 ss_compare += ["--queries", str(ss_query_list)]
             ss_compare_resident: list[dict] = []
-            marks = wall_of(
-                ss_compare, samples, warmups, resident=ss_compare_resident
-            )
+            marks = wall_of(ss_compare, samples, warmups, resident=ss_compare_resident)
             record_native_resident("simdsketch", "compare", ss_compare_resident)
             evaluated = count_pairs(references, query_list, topology)
             stride = (
@@ -2509,7 +2506,9 @@ def main(
                 skl_dists, skl_names, sketch_k["sketchlib"], stride
             )
             if counted != evaluated:
-                raise ValueError(f"sketchlib wrote {counted} pairs, expected {evaluated}")
+                raise ValueError(
+                    f"sketchlib wrote {counted} pairs, expected {evaluated}"
+                )
             record_compare(
                 "sketchlib", "one-perm-minhash", marks, rows, evaluated=evaluated
             )
@@ -2808,7 +2807,10 @@ def main(
                 resident=skl_search_resident,
             )
             record_native_resident("sketchlib", "search", skl_search_resident)
-            search_cases["sketchlib"] = {"index": "native-inverted", "index_supported": True}
+            search_cases["sketchlib"] = {
+                "index": "native-inverted",
+                "index_supported": True,
+            }
             if not performance_only:
                 with skl_search.open() as handle:
                     if topology == "batch":
@@ -2825,7 +2827,9 @@ def main(
                                 ] = float(count)
                     else:
                         for line in handle:
-                            query, reference, distance = line.rstrip("\n").split("\t")[:3]
+                            query, reference, distance = line.rstrip("\n").split("\t")[
+                                :3
+                            ]
                             search_scores[
                                 (
                                     "sketchlib",

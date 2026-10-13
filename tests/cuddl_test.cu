@@ -1545,6 +1545,189 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchesOfNearDuplicateRowsMatchScalarOr
     expect_near_duplicate_exhaustive_searches<8192>(stream_, 300U);
 }
 
+// Shards of an all-to-all search must split its tiles among themselves, alternating owners, and
+// together reproduce the unsharded results exactly.
+TEST_F(ReferenceDatabaseTest, AllToAllShardsPartitionTheUnshardedSearch) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    // Four tiles of about 2^25 pairs unsharded; three shards split it into 12 tiles of 875 rows.
+    constexpr uint32_t reference_count = 10500U;
+    auto const whole_tile = cuddl::detail::all_to_all_tile_queries(reference_count);
+    ASSERT_EQ((reference_count + whole_tile - 1U) / whole_tile, 4U);
+    constexpr uint32_t tile_queries = 875U;
+    ASSERT_EQ(cuddl::detail::all_to_all_tile_queries(reference_count, 3U), tile_queries);
+    std::mt19937 random(0xa11U);
+    std::vector<uint16_t> rows(size_t{reference_count} * b_default);
+    // A small score range makes equal, lower and higher buckets all common.
+    std::ranges::generate(rows, [&] { return static_cast<uint16_t>(random() % 8U); });
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto const database = CUDDL_UNWRAP(
+        database_type::build_async(
+            device_rows, cuddl::score_compatibility::current<k_default, b_default>(), stream
+        )
+    );
+    auto const requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements());
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, uint8_t{}
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuddl::packed_pairwise_counts{}
+    );
+    struct searched {
+        std::vector<uint32_t> first_queries;
+        uint64_t pairs = 0U;
+        uint64_t fingerprint = 0U;
+    };
+    auto run = [&](cuddl::all_to_all_shard shard) {
+        searched out;
+        CUDDL_UNWRAP(database.search_all_to_all_async(
+            workspace,
+            results,
+            [&](cuddl::batch_result_tile const& tile) {
+                out.first_queries.push_back(tile.first_query_id);
+                auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+                host.tile().for_each_passing([&](cuddl::batch_search_result const& r) {
+                    auto const& c = r.counts;
+                    auto h = (uint64_t{r.query_id} << 32U | r.reference_id) * 0x9e3779b97f4a7c15ULL;
+                    h ^= cuddl::packed_pairwise_counts::pack(c.lower, c.equal, c.higher).bits;
+                    h *= 0xbf58476d1ce4e5b9ULL;
+                    out.pairs += 1U;
+                    out.fingerprint += h ^ (h >> 31U);
+                });
+            },
+            {},
+            stream,
+            shard
+        ));
+        stream.sync();
+        return out;
+    };
+    auto const whole = run({});
+    EXPECT_EQ(whole.pairs, uint64_t{reference_count} * (reference_count - 1U) / 2U);
+    // Tiles go to shards 0, 1, 2, 2, 1, 0, 0, 1, 2, 2, 1, 0 as the order turns back each round.
+    std::array<std::vector<uint32_t>, 3> owned;
+    for (uint32_t tile : {0U, 5U, 6U, 11U}) owned[0].push_back(tile * tile_queries);
+    for (uint32_t tile : {1U, 4U, 7U, 10U}) owned[1].push_back(tile * tile_queries);
+    for (uint32_t tile : {2U, 3U, 8U, 9U}) owned[2].push_back(tile * tile_queries);
+    uint64_t pairs = 0U;
+    uint64_t fingerprint = 0U;
+    for (uint32_t index = 0U; index < 3U; ++index) {
+        auto const part = run({.index = index, .count = 3U});
+        EXPECT_EQ(part.first_queries, owned[index]) << "shard " << index;
+        pairs += part.pairs;
+        fingerprint += part.fingerprint;
+    }
+    EXPECT_EQ(pairs, whole.pairs);
+    EXPECT_EQ(fingerprint, whole.fingerprint);
+
+    auto const rejected = database.search_all_to_all_async(
+        workspace,
+        results,
+        [](cuddl::batch_result_tile const&) {},
+        {},
+        stream,
+        cuddl::all_to_all_shard{.index = 3U, .count = 3U}
+    );
+    EXPECT_FALSE(rejected);
+}
+
+// Replicas claiming tiles concurrently must together report every pair exactly once with the
+// single database's counts; ordered delivery must arrive in query order; a callback exception
+// must stop the search and reach the caller. Two replicas share the one test GPU.
+TEST_F(ReferenceDatabaseTest, ReplicatedAllToAllMatchesSingleDatabase) {
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using group_type = cuddl::replicated_database<k_default, b_default>;
+    constexpr uint32_t reference_count = 10500U;
+    std::mt19937 random(0xbeefU);
+    std::vector<uint16_t> rows(size_t{reference_count} * b_default);
+    std::ranges::generate(rows, [&] { return static_cast<uint16_t>(random() % 8U); });
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    // Each replica's building stream must outlive the group.
+    std::array<cuda::stream, 2> streams{
+        cuda::stream{cuda::devices[0]}, cuda::stream{cuda::devices[0]}
+    };
+    std::vector<database_type> replicas;
+    for (auto& s : streams) {
+        auto device_rows = cuda::make_device_buffer<uint16_t>(s, s.device(), rows);
+        replicas.push_back(CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, s)));
+        s.sync();
+    }
+    auto group = CUDDL_UNWRAP(group_type::adopt(std::move(replicas)));
+    ASSERT_EQ(group.size(), 2U);
+
+    auto const key = [](cuddl::batch_search_result const& r) {
+        auto const& c = r.counts;
+        auto h = (uint64_t{r.query_id} << 32U | r.reference_id) * 0x9e3779b97f4a7c15ULL;
+        h ^= cuddl::packed_pairwise_counts::pack(c.lower, c.equal, c.higher).bits;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        return h ^ (h >> 31U);
+    };
+    // Expected sums from the single-database search of replica 0's rows.
+    uint64_t expected_pairs = 0U, expected_fingerprint = 0U;
+    {
+        auto const stream = cuda::stream_ref{stream_};
+        auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+        auto const single =
+            CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+        auto const requirements = CUDDL_UNWRAP(single.all_to_all_search_requirements());
+        auto workspace = cuda::make_device_buffer<uint8_t>(
+            stream, stream.device(), requirements.workspace_bytes, uint8_t{}
+        );
+        auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+            stream,
+            stream.device(),
+            requirements.maximum_pair_count,
+            cuddl::packed_pairwise_counts{}
+        );
+        CUDDL_UNWRAP(single.search_all_to_all_async(
+            workspace,
+            results,
+            [&](cuddl::batch_result_tile const& tile) {
+                auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+                host.tile().for_each_passing([&](auto const& r) {
+                    ++expected_pairs;
+                    expected_fingerprint += key(r);
+                });
+            },
+            {},
+            stream
+        ));
+        stream.sync();
+    }
+    EXPECT_EQ(expected_pairs, uint64_t{reference_count} * (reference_count - 1U) / 2U);
+
+    for (bool in_order : {false, true}) {
+        SCOPED_TRACE(in_order);
+        std::array<uint64_t, 2> pairs{}, fingerprint{}, tiles{};
+        std::vector<uint32_t> first_queries;
+        CUDDL_UNWRAP(group.search_all_to_all(
+            [&](cuddl::replica_tile const& tile) {
+                auto const i = tile.replica;
+                ++tiles[i];
+                if (in_order) first_queries.push_back(tile.tile.first_query_id);
+                CUDDL_UNWRAP(tile.download())->tile().for_each_passing([&](auto const& r) {
+                    ++pairs[i];
+                    fingerprint[i] += key(r);
+                });
+            },
+            {.in_query_order = in_order}
+        ));
+        EXPECT_EQ(pairs[0] + pairs[1], expected_pairs);
+        EXPECT_EQ(fingerprint[0] + fingerprint[1], expected_fingerprint);
+        EXPECT_GT(tiles[0] + tiles[1], 2U);
+        if (in_order) EXPECT_TRUE(std::ranges::is_sorted(first_queries));
+    }
+
+    struct stop_here {};
+    EXPECT_THROW(
+        (void)group.search_all_to_all([](cuddl::replica_tile const&) { throw stop_here{}; }),
+        stop_here
+    );
+    EXPECT_FALSE(group.search_all_to_all(
+        [](cuddl::replica_tile const&) {}, {.shard = {.index = 2U, .count = 2U}}
+    ));
+}
+
 TEST_F(ReferenceDatabaseTest, UnfilteredHostVisitPreservesChunkBoundaries) {
     auto const stream = cuda::stream_ref{stream_};
     constexpr uint32_t references = 4097U;
@@ -1809,6 +1992,75 @@ TEST_F(ReferenceDatabaseTest, IndexedAllToAllPlaneFallbackMatchesOracleAcrossQue
         EXPECT_EQ(actual.results, expected);
         EXPECT_EQ(actual.match_counts, expected_matches);
     }
+}
+
+// A threshold all-to-all tile starting at query q never compares the reference words below q / 32.
+// Its pass bitmap must still report no pair there, even when the workspace held set bits before.
+// Rows come in groups of four that share every indexed bucket except one emptied bucket per row;
+// all rows share buckets 0..47, so other pairs have at most 48 index matches and the plane filter
+// runs (high pair fraction). Exactly the pairs within a group meet the threshold of 100.
+TEST_F(ReferenceDatabaseTest, IndexedAllToAllLaterTilesReportOnlyTheirTriangle) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    constexpr uint32_t references = 6000U;
+    constexpr uint32_t group_size = 4U;
+    constexpr uint32_t minimum = 100U;
+    constexpr uint32_t shared = 48U;
+    ASSERT_LT(cuddl::detail::all_to_all_tile_queries(references), references);
+    auto compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    compatibility.indexed_bucket_count = b_default / 2U;
+    compatibility.key_mask = 0x7fffU;
+    std::vector<uint16_t> rows(static_cast<size_t>(references) * b_default);
+    for (uint32_t reference = 0U; reference < references; ++reference) {
+        auto const group = reference / group_size;
+        auto const member = reference % group_size;
+        for (uint32_t bucket = 0U; bucket < b_default; ++bucket) {
+            if (bucket >= shared && bucket % 50U == member) continue;
+            auto const score = bucket < shared ? 7U : 1U + group + 1600U * (bucket % 16U);
+            rows[static_cast<size_t>(reference) * b_default + bucket] =
+                static_cast<uint16_t>(score);
+        }
+    }
+    std::vector<cuddl::batch_search_result> expected;
+    std::vector<uint32_t> expected_matches;
+    for (uint32_t query_id = 0U; query_id < references; ++query_id) {
+        auto const query = std::span<uint16_t const>{rows}.subspan(
+            static_cast<size_t>(query_id) * b_default, b_default
+        );
+        auto const group_end = (query_id / group_size + 1U) * group_size;
+        for (uint32_t reference = query_id + 1U; reference < group_end; ++reference) {
+            uint32_t count = 0U;
+            for (size_t bucket = 0U; bucket < compatibility.indexed_bucket_count; ++bucket) {
+                auto const score = rows[static_cast<size_t>(reference) * b_default + bucket];
+                count += query[bucket] != 0U && query[bucket] == score;
+            }
+            ASSERT_GE(count, minimum);
+            expected.push_back({query_id, reference, score_row_oracle(query, rows, reference)});
+            expected_matches.push_back(count);
+        }
+    }
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto index =
+        CUDDL_UNWRAP(index_type::build_async(database, stream, cuddl::index_storage::dense));
+    ASSERT_GT(index.pair_fraction(), cuddl::detail::index_pair_fraction_limit);
+    auto requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(&index));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, uint8_t{0xffU}
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    auto matches = cuda::make_device_buffer<uint32_t>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    tile_collector actual{stream};
+    CUDDL_UNWRAP(database.search_all_to_all_async(
+        workspace, results, actual, matches, {.minimum_matches = minimum}, stream, &index
+    ));
+    EXPECT_EQ(actual.results, expected);
+    EXPECT_EQ(actual.match_counts, expected_matches);
 }
 
 TEST_F(ReferenceDatabaseTest, BatchSearchMatchesRepeatedSingleQueries) {
@@ -4642,7 +4894,7 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
          {cuddl::decompression_backend::automatic,
           cuddl::decompression_backend::cpu,
           cuddl::decompression_backend::gpu,
-          cuddl::decompression_backend::coherent}) {
+          cuddl::decompression_backend::hybrid}) {
         SCOPED_TRACE(static_cast<int>(backend));
         for (auto transfer :
              {cuddl::transfer_mode::automatic,
@@ -4657,9 +4909,8 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
                 cuddl::reference_database_file::build<25, buckets>(paths, stream, options);
             bool const unavailable =
                 (!CUDDL_HAS_NVCOMP && (backend == cuddl::decompression_backend::gpu ||
-                                       backend == cuddl::decompression_backend::coherent)) ||
-                (!coherent && (backend == cuddl::decompression_backend::coherent ||
-                               transfer == cuddl::transfer_mode::in_place));
+                                       backend == cuddl::decompression_backend::hybrid)) ||
+                (!coherent && transfer == cuddl::transfer_mode::in_place);
             if (unavailable) {
                 EXPECT_FALSE(built);
                 continue;

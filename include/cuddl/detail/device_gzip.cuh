@@ -39,6 +39,7 @@
     #include <arm_neon.h>
 #endif
 
+#include <cuddl/detail/pinned_pool.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
 
@@ -602,20 +603,6 @@ class device_fasta_pipeline {
                                                               stream.get()
                                                           );
         if (selected != cudaSuccess) throw std::runtime_error(cudaGetErrorString(selected));
-#if CUDART_VERSION < 13030
-        if (compressed_capacity_ == 0) {
-            auto const copied = cub::DeviceCopy::Batched(
-                nullptr,
-                copy_temp_bytes_,
-                static_cast<char**>(nullptr),
-                static_cast<char**>(nullptr),
-                static_cast<uint64_t*>(nullptr),
-                static_cast<int64_t>(max_files),
-                stream
-            );
-            if (copied != cudaSuccess) throw std::runtime_error(cudaGetErrorString(copied));
-        }
-#endif
         auto const device = stream.device();
         auto const streaming_window =
             compressed_capacity_ == 0
@@ -634,7 +621,8 @@ class device_fasta_pipeline {
             lane.released.emplace(stream);
             if (compressed_capacity_ != 0) {
                 lane.pinned.emplace(
-                    s, cuda::pinned_default_memory_pool(), compressed_capacity_, cuda::no_init
+                    s, device_pinned_pool(device, pinned_placement::host), compressed_capacity_,
+                    cuda::no_init
                 );
                 lane.payload.emplace(
                     cuda::make_device_buffer<char>(
@@ -643,7 +631,8 @@ class device_fasta_pipeline {
                 );
             }
             lane.host.emplace(
-                s, cuda::pinned_default_memory_pool(), host_table_bytes(), cuda::no_init
+                s, device_pinned_pool(device, pinned_placement::host), host_table_bytes(),
+                cuda::no_init
             );
             // Sixteen bytes of tail padding let the header scan read whole words.
             lane.slots.emplace(
@@ -670,12 +659,7 @@ class device_fasta_pipeline {
                 cuda::make_device_buffer<char>(
                     s,
                     device,
-                    std::max(
-                        {nvcomp_temp_bytes_,
-                         select_temp_bytes_,
-                         copy_temp_bytes_,
-                         count_temp_bytes_}
-                    ) + 1,
+                    std::max({nvcomp_temp_bytes_, select_temp_bytes_, count_temp_bytes_}) + 1,
                     cuda::no_init
                 )
             );
@@ -1009,7 +993,7 @@ class device_fasta_pipeline {
             device_table.header_count
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
-#if CUDART_VERSION >= 13030
+        static_assert(CUDART_VERSION >= 13030, "cuDDL needs CUDA 13.3 or newer");
         cudaMemcpyAttributes attributes{};
         attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
         attributes.srcLocHint = {cudaMemLocationTypeHost, 0};
@@ -1025,20 +1009,6 @@ class device_fasta_pipeline {
             1,
             s.get()
         ));
-#else
-        auto temporary_bytes = copy_temp_bytes_;
-        CUDDL_CUDA_TRY(
-            cub::DeviceCopy::Batched(
-                lane.temp->data(),
-                temporary_bytes,
-                device_table.compressed_ptrs,
-                device_table.output_ptrs,
-                device_table.compressed_bytes,
-                count,
-                s
-            )
-        );
-#endif
         CUDDL_CUDA_TRY(lane.uploaded->record(s));
         return normalise(lane, bytes);
     }
@@ -1182,8 +1152,7 @@ class device_fasta_pipeline {
     size_t workers_;
     worker_pool readers_{workers_};
     size_t compressed_capacity_ = 0, slot_capacity_ = 0;
-    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, copy_temp_bytes_ = 0,
-           count_temp_bytes_ = 0;
+    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, count_temp_bytes_ = 0;
     uint32_t header_capacity_ = 0;
     std::array<lane_state, lane_count> lanes_;
 };

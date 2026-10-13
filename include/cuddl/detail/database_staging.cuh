@@ -34,6 +34,7 @@
 #endif
 #include <cuddl/detail/fastx_sequence_file.hpp>
 #include <cuddl/detail/kernels.cuh>
+#include <cuddl/detail/pinned_pool.cuh>
 #include <cuddl/detail/sequence_encode.cuh>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
@@ -43,8 +44,8 @@ namespace cuddl::detail {
 /// @brief Where inputs are decompressed; sketch construction always runs on the GPU.
 enum class decompression_backend : uint8_t {
     automatic,
-    /// CPU inflation, followed by GPU FASTA normalisation through coherent host memory.
-    coherent,
+    /// CPU inflation, followed by GPU FASTA normalisation of the inflated bytes.
+    hybrid,
     /// CPU inflation and normalisation
     cpu,
     /// nvCOMP for eligible gzip inputs; unsupported formats use host loaders.
@@ -837,16 +838,29 @@ template <size_t BucketCount>
 }
 
 // Reusable sequence storage handed to loader threads. A lease returns to the pool when the
-// parsed file holding it dies, which is after the caller enqueued every copy that reads it.
-// Releasing records that point on the stream; the next loader to take the slot waits for it
-// there, so a buffer is never rewritten under a DMA and the build never has to drain.
+// parsed file holding it dies. Copies are complete by then: the stager drops a held file only
+// after its copy event, and the device normaliser's lanes after their batch finished. Kernels
+// that read a buffer in place may still be queued, so then releasing records that point on the
+// stream, and the next loader to take the slot waits for it there.
 class sequence_buffer_pool {
     struct slot;
 
    public:
     /// @p limit bounds one buffer; larger genomes stay on the loader's own growing buffer.
-    sequence_buffer_pool(cuda::stream_ref stream, size_t buffers, size_t limit, bool page_locked)
-        : stream_(stream), limit_(limit), page_locked_(page_locked) {
+    /// @p in_place says kernels read leased buffers themselves. Otherwise only copies read
+    /// them, and every consumer drops a lease once its copies have completed, so a slot is
+    /// reusable as soon as it is released.
+    sequence_buffer_pool(
+        cuda::stream_ref stream, size_t buffers, size_t limit, bool page_locked, bool in_place
+    )
+        : stream_(stream),
+          limit_(limit),
+          pinned_pool_(
+              page_locked
+                  ? std::optional{device_pinned_pool(stream.device(), pinned_placement::host)}
+                  : std::nullopt
+          ),
+          in_place_(in_place) {
         slots_.reserve(buffers);
     }
 
@@ -866,33 +880,37 @@ class sequence_buffer_pool {
         slot* owner = nullptr;
         {
             std::lock_guard lock(mutex_);
-            owner = claim(bytes);
+            owner = claim();
             if (owner == nullptr) return {};
         }
         // Wait on the loader thread rather than the build loop: the slot is already reserved,
         // so this blocks only the genome that needs it. A failing wait throws out of the loader,
         // which reports it through the pool's error slot like any other load failure.
-        owner->consumed.sync();
+        if (in_place_) owner->consumed.sync();
         if (owner->size < bytes) {
             auto grown = size_t{1} << 16;
             while (grown < bytes) {
                 grown *= 2;
             }
-            owner->resize(stream_, grown, page_locked_);
+            owner->resize(stream_, grown, pinned_pool_);
         }
         return lease(owner);
     }
 
    private:
     /// @brief Reserves the oldest released slot, or returns null when the pool is full.
-    [[nodiscard]] slot* claim(size_t bytes) {
+    ///
+    /// A new slot holds no buffer yet; its loader allocates outside the lock. Page-locking
+    /// serialises across processes (27 ms per allocation with 8 ranks per node), and inside the
+    /// lock it stalled every loader and every lease release behind it.
+    [[nodiscard]] slot* claim() {
         if (free_head_ != nullptr) {
             auto* owner = free_head_;
             free_head_ = owner->next_free;
             return owner;
         }
         if (slots_.size() >= capacity_) return nullptr;
-        slots_.push_back(std::make_unique<slot>(stream_, bytes, page_locked_));
+        slots_.push_back(std::make_unique<slot>(stream_));
         return slots_.back().get();
     }
 
@@ -905,13 +923,15 @@ class sequence_buffer_pool {
         cuda::event consumed;
         slot* next_free = nullptr;
 
-        slot(cuda::stream_ref stream, size_t bytes, bool page_locked) : consumed(stream) {
-            resize(stream, bytes, page_locked);
-        }
+        explicit slot(cuda::stream_ref stream) : consumed(stream) {}
 
-        void resize(cuda::stream_ref stream, size_t bytes, bool page_locked) {
-            if (page_locked) {
-                pinned.emplace(stream, cuda::pinned_default_memory_pool(), bytes, cuda::no_init);
+        void resize(
+            cuda::stream_ref stream,
+            size_t bytes,
+            std::optional<cuda::pinned_memory_pool_ref> const& pinned_pool
+        ) {
+            if (pinned_pool) {
+                pinned.emplace(stream, *pinned_pool, bytes, cuda::no_init);
             } else {
                 heap = std::make_unique_for_overwrite<char[]>(bytes);
             }
@@ -928,8 +948,8 @@ class sequence_buffer_pool {
         return {owner->data(), owner->size, std::shared_ptr<void>(owner, [pool, owner](void*) {
                     std::lock_guard lock(pool->mutex_);
                     // Record before publishing the slot: a loader that takes it must see the
-                    // event of every copy the previous lease fed.
-                    owner->consumed.record(pool->stream_);
+                    // event of every kernel the previous lease fed.
+                    if (pool->in_place_) owner->consumed.record(pool->stream_);
                     owner->next_free = nullptr;
                     if (pool->free_head_ == nullptr) {
                         pool->free_head_ = owner;
@@ -942,7 +962,8 @@ class sequence_buffer_pool {
 
     cuda::stream_ref stream_;
     size_t limit_;
-    bool page_locked_;
+    std::optional<cuda::pinned_memory_pool_ref> pinned_pool_;
+    bool in_place_;
     size_t capacity_{1};
     std::vector<std::unique_ptr<slot>> slots_;
     slot* free_head_ = nullptr;
@@ -967,14 +988,16 @@ class path_loaders {
     /// @param paths Genome files in reference-ID order.
     /// @param parser_workers Loader ceiling; the build clamps it to inputs and hardware.
     /// @param page_locked gives the loaders page-locked buffers to decompress into.
+    /// @param in_place says the stager's kernels read the loaders' buffers themselves.
     path_loaders(
         cuda::stream_ref stream,
         std::span<std::filesystem::path const> paths,
         unsigned parser_workers,
-        bool page_locked
+        bool page_locked,
+        bool in_place
     )
         : workers_(worker_count(paths.size(), parser_workers)),
-          buffers_(stream, workers_, size_t{32} << 20, page_locked),
+          buffers_(stream, workers_, size_t{32} << 20, page_locked, in_place),
           page_locked_(page_locked) {
         // One buffer per in-flight file plus the stager's hold ring, plus headroom: a worker
         // asks for its next file while every loaded file still holds a lease. A pool smaller
@@ -1111,7 +1134,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     auto const page_locked = pages_locked(transfer, stream.device());
     auto const window = workers * 8;
     auto const batch_limit = std::min(workers * 4, device_fasta_pipeline::max_files);
-    sequence_buffer_pool buffers(stream, workers, size_t{32} << 20, page_locked);
+    sequence_buffer_pool buffers(stream, workers, size_t{32} << 20, page_locked, in_place);
     buffers.set_capacity(
         window + batch_limit * device_fasta_pipeline::lane_count + stager_hold_slots + 2
     );
@@ -1270,7 +1293,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         probes[id] = probe_gzip_file(paths[id]);
     });
     std::optional<device_fasta_pipeline> inflater;
-    sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked);
+    sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked, in_place);
     host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
     auto const fits = [&](gzip_file_probe const& probe) {
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
@@ -1450,7 +1473,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     }
 #if !CUDDL_HAS_NVCOMP
     if (decompression == decompression_backend::gpu ||
-        decompression == decompression_backend::coherent) {
+        decompression == decompression_backend::hybrid) {
         return Err(
             Error::invalid_argument("requested decompression backend requires nvCOMP support")
         );
@@ -1464,21 +1487,20 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             )
         );
     }
-    bool const coherent = device_reads_pageable_memory(stream.device());
-    if (decompression == decompression_backend::coherent && !coherent) {
-        return Err(
-            Error::invalid_argument("coherent decompression needs coherent pageable host memory")
-        );
-    }
     if (paths.empty()) return Ok();
+    // Which backend is fastest depends on the GPU and the cores per GPU. With 100,000 genomes,
+    // 8 ranks of 16 loaders on an A40 node sketched in 13.4 s with hybrid, 15.1-15.6 s with cpu
+    // and 16-25 s with gpu; 3,000 genomes on an RTX 5070 Ti with 24 loaders took 2.5-2.8 s with
+    // gpu and 3.0-3.4 s with hybrid. A coherent GPU reads the loaders' buffers in place.
     if (decompression == decompression_backend::automatic) {
+        bool const coherent = device_reads_pageable_memory(stream.device());
         decompression = !coherent ? decompression_backend::gpu
                         : path_loaders::worker_count(paths.size(), parser_workers) > 1
-                            ? decompression_backend::coherent
+                            ? decompression_backend::hybrid
                             : decompression_backend::cpu;
     }
 #if CUDDL_HAS_NVCOMP
-    if (decompression == decompression_backend::coherent) {
+    if (decompression == decompression_backend::hybrid) {
         return stage_paths_normalising<K, BucketCount, Layout>(
             paths,
             stream,
@@ -1505,7 +1527,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 #endif
     auto const in_place = stages_in_place(transfer, stream.device());
     auto const page_locked = pages_locked(transfer, stream.device());
-    path_loaders loaders(stream, paths, parser_workers, page_locked);
+    path_loaders loaders(stream, paths, parser_workers, page_locked, in_place);
     // The corpus size only bounds a default arena, and only below its ceiling, so probing stops
     // there: a corpus of any size then costs at most a few dozen file opens here.
     uint64_t staged_ceiling = 0;

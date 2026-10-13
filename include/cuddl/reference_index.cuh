@@ -68,6 +68,7 @@ class reference_index {
         cuda::stream_ref stream,
         index_storage storage = index_storage::automatic
     ) {
+        detail::device_scope const scope{stream};
         auto index = CUDDL_TRY(build_index<score_type>(database, stream, storage));
         CUDDL_TRY(index.measure_pair_fraction(database, stream));
         CUDDL_TRY(index.build_posting_bitmaps(database, stream));

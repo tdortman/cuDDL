@@ -64,7 +64,7 @@ int main(int argc, char** argv) try {
                     {"automatic", cuddl::decompression_backend::automatic},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
-                    {"coherent", cuddl::decompression_backend::coherent}
+                    {"hybrid", cuddl::decompression_backend::hybrid}
                 }
             )
         )

@@ -1,7 +1,6 @@
 #include <CLI/CLI.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -48,7 +47,7 @@ int main(int argc, char** argv) {
             CLI::CheckedTransformer(
                 std::map<std::string, cuddl::decompression_backend>{
                     {"automatic", cuddl::decompression_backend::automatic},
-                    {"coherent", cuddl::decompression_backend::coherent},
+                    {"hybrid", cuddl::decompression_backend::hybrid},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
                 }
@@ -58,36 +57,20 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     try {
-        std::vector<std::filesystem::path> paths;
-        for (auto const& entry : std::filesystem::recursive_directory_iterator(
-                 folder, std::filesystem::directory_options::skip_permission_denied
-             )) {
-            if (!entry.is_regular_file()) continue;
-            if (!blacklist_path.empty() &&
-                std::filesystem::equivalent(entry.path(), blacklist_path))
-                continue;
-            auto filename = entry.path().filename().string();
-            std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
+        auto paths = CUDDL_UNWRAP(cuddl::genome_paths(folder));
+        if (!blacklist_path.empty()) {
+            std::erase_if(paths, [&](auto const& path) {
+                return std::filesystem::equivalent(path, blacklist_path);
             });
-            auto extension = std::filesystem::path(filename).extension().string();
-            if (extension == ".gz" || extension == ".bgz" || extension == ".bgzf") {
-                extension = std::filesystem::path(filename).stem().extension().string();
-            }
-            if (extension == ".fa" || extension == ".fna" || extension == ".fasta" ||
-                extension == ".ffn" || extension == ".frn" || extension == ".fq" ||
-                extension == ".fastq") {
-                if (std::filesystem::exists(output) &&
-                    std::filesystem::equivalent(entry.path(), output)) {
-                    throw std::invalid_argument("output must not overwrite an input genome");
-                }
-                paths.push_back(entry.path());
-            }
+        }
+        if (std::filesystem::exists(output) && std::ranges::any_of(paths, [&](auto const& path) {
+                return std::filesystem::equivalent(path, output);
+            })) {
+            throw std::invalid_argument("output must not overwrite an input genome");
         }
         if (paths.empty()) {
             throw std::invalid_argument("folder contains no supported FASTA/FASTQ files");
         }
-        std::sort(paths.begin(), paths.end());
         cuda::stream stream{cuda::devices[0]};
         std::optional<cuddl::device_blacklist> blacklist;
         if (!blacklist_path.empty()) {

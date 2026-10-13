@@ -2038,7 +2038,7 @@ int main(int argc, char** argv) try {
             CLI::CheckedTransformer(
                 std::map<std::string, cuddl::decompression_backend>{
                     {"automatic", cuddl::decompression_backend::automatic},
-                    {"coherent", cuddl::decompression_backend::coherent},
+                    {"hybrid", cuddl::decompression_backend::hybrid},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
                 }

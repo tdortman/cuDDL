@@ -2,6 +2,7 @@
 
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
+#include <cuddl/replicated_database.cuh>
 
 #include <algorithm>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -27,13 +29,51 @@ constexpr size_t query_batch_size = 4096;
 using database_type = cuddl::reference_database<cli::kmer_length, cli::buckets, cli::layout>;
 using index_type = cuddl::reference_index<cli::kmer_length, cli::buckets, cli::layout>;
 using query_type = cuddl::query_sketch_batch<cli::kmer_length, cli::buckets, cli::layout>;
+using replicated_type = cuddl::replicated_database<cli::kmer_length, cli::buckets, cli::layout>;
+
+/// Writes result rows as TSV on standard output, or as binary records to a file.
+class result_writer {
+   public:
+    explicit result_writer(std::filesystem::path const& output) {
+        if (output.empty()) {
+            std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
+            return;
+        }
+        binary_.open(output, std::ios::binary | std::ios::trunc);
+        if (!binary_) throw std::runtime_error("cannot open " + output.string());
+    }
+
+    void write(std::span<cuddl::batch_search_result const> rows) {
+        if (binary_.is_open()) {
+            binary_.write(
+                reinterpret_cast<char const*>(rows.data()),
+                static_cast<std::streamsize>(rows.size() * sizeof(cuddl::batch_search_result))
+            );
+            return;
+        }
+        for (auto const& result : rows) {
+            auto const& counts = result.counts;
+            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
+                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
+                      << '\n';
+        }
+    }
+
+    void finish() {
+        if (binary_.is_open() ? !binary_.flush() : !std::cout) {
+            throw std::runtime_error("cannot write search results");
+        }
+    }
+
+   private:
+    std::ofstream binary_;
+};
 
 void search(
     database_type const& database,
     index_type const* index,
     std::vector<std::filesystem::path> const& paths,
-    std::filesystem::path const& output,
-    bool all_to_all,
+    result_writer& writer,
     uint32_t minimum_matches,
     unsigned workers,
     cuddl::decompression_backend decompression,
@@ -42,10 +82,7 @@ void search(
 ) {
     auto const batch_capacity = std::min(query_batch_size, paths.size());
     auto const requirements = CUDDL_UNWRAP(
-        all_to_all ? database.all_to_all_search_requirements(index)
-                   : database.batch_search_requirements(
-                         static_cast<uint32_t>(batch_capacity), stream, index
-                     )
+        database.batch_search_requirements(static_cast<uint32_t>(batch_capacity), stream, index)
     );
     auto workspace = cuda::make_device_buffer<uint8_t>(
         stream, stream.device(), requirements.workspace_bytes, cuda::no_init
@@ -53,38 +90,30 @@ void search(
     auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
         stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
-    std::ofstream binary;
-    if (output.empty()) {
-        std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
-    } else {
-        binary.open(output, std::ios::binary | std::ios::trunc);
-        if (!binary) throw std::runtime_error("cannot open " + output.string());
-    }
-    // Each tile's results are written before the next tile reuses the storage.
+    // Each tile's results are written before the next tile reuses the storage; the pinned host
+    // copy is reused too.
+    cuddl::host_batch_results host(stream);
     auto write_tile = [&](cuddl::batch_result_tile const& tile) {
-        auto const tile_copy = CUDDL_UNWRAP(cuddl::download(tile, stream));
-        auto const passing = tile_copy.passing();
-        if (binary.is_open()) {
-            binary.write(
-                reinterpret_cast<char const*>(passing.data()),
-                static_cast<std::streamsize>(passing.size() * sizeof(cuddl::batch_search_result))
-            );
-            return;
-        }
-        for (auto const& result : passing) {
-            auto const& counts = result.counts;
-            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
-                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
-                      << '\n';
-        }
+        CUDDL_UNWRAP(cuddl::download(tile, stream, host));
+        writer.write(host.passing());
     };
     // Without an index or a threshold every pair is reported, so the dedicated exhaustive
     // kernels run instead of counting matches only to discard nothing.
     bool const exhaustive = index == nullptr && minimum_matches == 0;
-    if (all_to_all) {
-        // Database rows are the queries; only pairs with query_id < reference_id are searched.
+    for (size_t first = 0; first < paths.size(); first += query_batch_size) {
+        auto batch_size = std::min(query_batch_size, paths.size() - first);
+        auto queries = CUDDL_UNWRAP(
+            query_type::sketch(
+                std::span{paths.data() + first, batch_size},
+                stream,
+                {.parser_workers = workers, .decompression = decompression, .blacklist = blacklist}
+            )
+        );
         if (exhaustive) {
-            CUDDL_UNWRAP(database.search_all_to_all_async(
+            CUDDL_UNWRAP(database.search_batch_async(
+                queries.scores(),
+                queries.compatibility(),
+                static_cast<uint32_t>(first),
                 {workspace.data(), workspace.size()},
                 {results.data(), results.size()},
                 write_tile,
@@ -92,7 +121,10 @@ void search(
                 stream
             ));
         } else {
-            CUDDL_UNWRAP(database.search_all_to_all_async(
+            CUDDL_UNWRAP(database.search_batch_async(
+                queries.scores(),
+                queries.compatibility(),
+                static_cast<uint32_t>(first),
                 {workspace.data(), workspace.size()},
                 {results.data(), results.size()},
                 write_tile,
@@ -102,48 +134,34 @@ void search(
                 index
             ));
         }
+    }
+    writer.finish();
+}
+
+/// Searches every unique database-row pair (query_id < reference_id) on @p devices, each holding
+/// a replica. Tiles are written in query order, so the output does not depend on the devices.
+void search_all_to_all(
+    cuddl::reference_database_file const& file,
+    std::filesystem::path const& index_path,
+    result_writer& writer,
+    uint32_t minimum_matches,
+    std::span<cuda::device_ref const> devices
+) {
+    auto group = CUDDL_UNWRAP(replicated_type::upload(file, devices));
+    if (!index_path.empty()) CUDDL_UNWRAP(group.load_index(index_path));
+    auto const write_tile = [&](cuddl::replica_tile const& tile) {
+        writer.write(CUDDL_UNWRAP(tile.download())->passing());
+    };
+    auto const split = cuddl::replica_search{.in_query_order = true};
+    // Without an index or a threshold every pair is reported, so the exhaustive search runs.
+    if (index_path.empty() && minimum_matches == 0) {
+        CUDDL_UNWRAP(group.search_all_to_all(write_tile, split));
     } else {
-        for (size_t first = 0; first < paths.size(); first += query_batch_size) {
-            auto batch_size = std::min(query_batch_size, paths.size() - first);
-            auto queries = CUDDL_UNWRAP(
-                query_type::sketch(
-                    std::span{paths.data() + first, batch_size},
-                    stream,
-                    {.parser_workers = workers,
-                     .decompression = decompression,
-                     .blacklist = blacklist}
-                )
-            );
-            if (exhaustive) {
-                CUDDL_UNWRAP(database.search_batch_async(
-                    queries.scores(),
-                    queries.compatibility(),
-                    static_cast<uint32_t>(first),
-                    {workspace.data(), workspace.size()},
-                    {results.data(), results.size()},
-                    write_tile,
-                    {},
-                    stream
-                ));
-            } else {
-                CUDDL_UNWRAP(database.search_batch_async(
-                    queries.scores(),
-                    queries.compatibility(),
-                    static_cast<uint32_t>(first),
-                    {workspace.data(), workspace.size()},
-                    {results.data(), results.size()},
-                    write_tile,
-                    {},
-                    {.minimum_matches = minimum_matches},
-                    stream,
-                    index
-                ));
-            }
-        }
+        CUDDL_UNWRAP(
+            group.search_all_to_all(write_tile, {.minimum_matches = minimum_matches}, split)
+        );
     }
-    if (binary.is_open() ? !binary.flush() : !std::cout) {
-        throw std::runtime_error("cannot write search results");
-    }
+    writer.finish();
 }
 
 }  // namespace
@@ -191,13 +209,25 @@ int main(int argc, char** argv) {
             )
             ->check(CLI::ExistingFile);
     bool all_to_all = false;
+    auto* all_to_all_flag =
+        query
+            ->add_flag(
+                "--all-to-all",
+                all_to_all,
+                "Search database rows against each other, each unordered pair once, instead of "
+                "--query"
+            )
+            ->excludes(query_option);
+    std::vector<int> device_ids{0};
     query
-        ->add_flag(
-            "--all-to-all",
-            all_to_all,
-            "Search database rows against each other, each unordered pair once, instead of --query"
+        ->add_option(
+            "--devices",
+            device_ids,
+            "GPU ordinals sharing an --all-to-all search, each holding a replica"
         )
-        ->excludes(query_option);
+        ->needs(all_to_all_flag)
+        ->check(CLI::NonNegativeNumber)
+        ->default_str("0");
     query
         ->add_option(
             "--minimum-matches",
@@ -222,7 +252,7 @@ int main(int argc, char** argv) {
                     {"automatic", cuddl::decompression_backend::automatic},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
-                    {"coherent", cuddl::decompression_backend::coherent}
+                    {"hybrid", cuddl::decompression_backend::hybrid}
                 }
             )
         )
@@ -245,6 +275,21 @@ int main(int argc, char** argv) {
         if (minimum_matches > compatibility.indexed_bucket_count) {
             throw std::invalid_argument("minimum matches exceeds indexed bucket count");
         }
+        if (*query && all_to_all) {
+            std::vector<cuda::device_ref> devices;
+            for (auto const id : device_ids) {
+                if (id >= static_cast<int>(cuda::devices.size())) {
+                    throw std::invalid_argument(
+                        "--devices names GPU " + std::to_string(id) + " but only " +
+                        std::to_string(cuda::devices.size()) + " are visible"
+                    );
+                }
+                devices.push_back(cuda::devices[id]);
+            }
+            result_writer writer(output);
+            search_all_to_all(file, index_path, writer, minimum_matches, devices);
+            return 0;
+        }
         cuda::stream stream{cuda::devices[0]};
         auto database =
             CUDDL_UNWRAP((file.upload<cli::kmer_length, cli::buckets, cli::layout>(stream)));
@@ -263,15 +308,15 @@ int main(int argc, char** argv) {
             );
         }
         std::optional<cuddl::device_blacklist> blacklist;
-        if (!all_to_all && !file.blacklist().keys().empty()) {
+        if (!file.blacklist().keys().empty()) {
             blacklist.emplace(file.blacklist(), cli::buckets, stream);
         }
+        result_writer writer(output);
         search(
             database,
             index ? &*index : nullptr,
             queries,
-            output,
-            all_to_all,
+            writer,
             minimum_matches,
             workers,
             decompression,

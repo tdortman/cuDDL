@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuddl/detail/pinned_pool.cuh>
 #include <cuddl/detail/sketch_view.cuh>
 #include <cuddl/error.hpp>
 #include <cuddl/hybrid_cardinality.cuh>
@@ -80,7 +81,12 @@ class sketch {
                   register_type{0}
               )
           ),
-          mapped_scratch_(stream, cuda::pinned_default_memory_pool(), 1, cuda::no_init) {
+          mapped_scratch_(
+              stream,
+              detail::device_pinned_pool(stream.device(), detail::pinned_placement::device_node),
+              1,
+              cuda::no_init
+          ) {
         if (blacklist_) {
             if (!*blacklist_) throw std::invalid_argument("blacklist owner must not be null");
             CUDDL_UNWRAP((*blacklist_)->validate(K, BucketCount, stream));

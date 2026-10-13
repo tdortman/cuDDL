@@ -82,6 +82,7 @@ class reference_index_file {
         cuda::stream_ref stream
     ) try {
         return [&]() -> Result<void> {
+            detail::device_scope const scope{stream};
             CUDDL_TRY(source.view(&index));
             auto database = CUDDL_TRY(snapshot(source, stream));
             auto storage = index.storage();
@@ -145,6 +146,7 @@ class reference_index_file {
         reference_database<K, BucketCount, Layout> const& database,
         cuda::stream_ref stream
     ) {
+        detail::device_scope const scope{stream};
         auto source = CUDDL_TRY(snapshot(database, stream));
         auto decoded = CUDDL_TRY(read(path, std::move(source)));
         auto index = CUDDL_CUDA_TRY((reference_index<K, BucketCount, Layout>(database, stream)));

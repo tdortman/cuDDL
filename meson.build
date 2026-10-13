@@ -37,8 +37,13 @@ cccl_dep = subproject(
 ).get_variable('cccl_dep')
 libdeflate_dep = subproject('libdeflate').get_variable('libdeflate_dep')
 
-# nvCOMP is optional; sketch construction still requires CUDA.
 cuda_compiler = meson.get_compiler('cuda')
+# Batched host-to-device copies (cudaMemcpyBatchAsync with access-order hints) need 13.3.
+if not cuda_compiler.version().version_compare('>= 13.3')
+    error('cuDDL needs CUDA 13.3 or newer, found ' + cuda_compiler.version())
+endif
+
+# nvCOMP is optional; sketch construction still requires CUDA.
 nvcomp_dep = cuda_compiler.find_library('nvcomp', required: get_option('nvcomp'))
 nvcomp_enabled = nvcomp_dep.found() and cuda_compiler.compiles(
     '''#include <nvcomp/gzip.h>
