@@ -1450,6 +1450,8 @@ def main(
                         if link.is_symlink() or link.exists():
                             link.unlink()
                         link.symlink_to(path.resolve())
+                        # hypergen names genomes by the staged path; rows join on the real one.
+                        staged_to_real[str(link)] = str(path)
                 sketch_cmds = [
                     [
                         str(hypergen),
