@@ -5,7 +5,7 @@
 # ///
 """Strong and weak scaling of cuddl-distributed-all-to-all-benchmark across nodes.
 
-Takes the reports of logs/sketch-scaling.sh. Strong-scaling runs are those with
+Takes the reports of scripts/sketch-scaling.sh. Strong-scaling runs are those with
 the most genomes; weak-scaling runs keep genomes per node equal to the
 smallest 1-node run. Reports whose name ends in -r0 are skipped: a first run
 reads from Lustre only what earlier runs left uncached, so it measures neither
@@ -15,7 +15,7 @@ runs differ slightly in bytes per node; ideal times and efficiency therefore
 use compressed input bytes per second per node, relative to the fewest nodes.
 Writes stacked phase wall times per node count, with the ideal sketch time as
 a dashed tick on each bar, and the sketch efficiency, and prints a table.
-SimdSketch reports of logs/simdsketch-nodes.sh among the inputs add a hatched
+SimdSketch reports of scripts/simdsketch-nodes.sh among the inputs add a hatched
 SimdSketch bar next to each cuDDL bar (sketch, gather, compare and write) and
 their rows in the table.
 """
@@ -173,7 +173,7 @@ def main(
     reports: Annotated[
         list[Path],
         typer.Argument(
-            exists=True, dir_okay=False, help="Reports of logs/sketch-scaling.sh"
+            exists=True, dir_okay=False, help="Reports of scripts/sketch-scaling.sh"
         ),
     ],
     output_dir: Annotated[
