@@ -175,6 +175,47 @@ index abf850a..ac71063 100644
  }
  
  /// Create separate .sketch files (legacy format)
+diff --git a/src/triangle.rs b/src/triangle.rs
+index 75137c4..91e7fd7 100644
+--- a/src/triangle.rs
++++ b/src/triangle.rs
+@@ -2,6 +2,7 @@ use crate::chain;
+ use crate::file_io;
+ use crate::params::*;
+ use crate::regression;
++use crate::resident;
+ use crate::screen;
+ use crate::types::*;
+ use fxhash::FxHashMap;
+@@ -68,10 +69,12 @@ pub fn triangle(command_params: CommandParams, mut sketch_params: SketchParams)
+         }
+     }
+ 
++    let resident = resident::ResidentClock::new();
+     (0..ref_sketches.len() - 1)
+         .collect::<Vec<usize>>()
+         .into_par_iter()
+         .for_each(|i| {
++            let interval = resident.enter();
+             let ref_sketch_i = &ref_sketches[i];
+             let screened_refs = screen::screen_refs(
+                 screen_val,
+@@ -103,6 +106,7 @@ pub fn triangle(command_params: CommandParams, mut sketch_params: SketchParams)
+                     }
+                 }
+             });
++            drop(interval);
+ 
+             let c;
+             {
+@@ -140,6 +144,7 @@ pub fn triangle(command_params: CommandParams, mut sketch_params: SketchParams)
+             //
+         });
+     let anis = anis.into_inner().unwrap();
++    resident::emit("sketches", resident.elapsed_ms());
+ 
+     if command_params.sparse {
+         file_io::write_sparse_matrix(
 --- /dev/null
 +++ b/src/resident.rs
 @@ -0,0 +1,94 @@

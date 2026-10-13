@@ -24,6 +24,22 @@ index 0285c3d..f515fe4 100644
                  OMP_PFOR_DYN
                  for(size_t i = 0; i < nrow; ++i) {
                      for(size_t j = 0; j < nq; ++j)
+@@ -279,6 +282,7 @@
+                     if(verbosity >= Verbosity::DEBUG && (start_index < ns)) {
+                         std::fprintf(stderr, "UT comparing %zd against %zd through %zd\n", i, start_index, ns - 1);
+                     }
++                    cuddl_resident_compare_interval resident;
+                     OMP_PFOR_DYN
+                     for(size_t start = start_index;start < ns; ++start) {
+                         datp[start] = compare(opts, result, i, start);
+@@ -302,6 +306,7 @@
+                     auto dat = std::make_unique<float[]>(nwritten);
+                     DBG_ONLY(std::fill_n(dat.get(), nwritten, EMPTY);)
+                     std::atomic<size_t> totalused(0);
++                    cuddl_resident_compare_interval resident;
+                     OMP_PFOR_DYN
+                     for(size_t fs = firstrow; fs < erow; ++fs) {
+                         auto myoff = fs - firstrow;
 diff --git a/src/resident.h b/src/resident.h
 new file mode 100644
 --- /dev/null
