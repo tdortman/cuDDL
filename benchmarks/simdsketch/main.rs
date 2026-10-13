@@ -53,13 +53,20 @@ enum Command {
         /// File with one FASTX path per line.
         inputs: PathBuf,
     },
-    /// Compare FASTX queries, or every reference pair, against a sketch file.
+    /// Compare FASTX queries, or every reference pair, against sketch files.
     Compare {
-        #[arg(long)]
-        references: PathBuf,
+        /// Sketch files, concatenated in order into one reference list.
+        #[arg(long, num_args = 1.., required = true)]
+        references: Vec<PathBuf>,
         /// File with one query FASTX path per line; omit for all reference pairs.
         #[arg(long)]
         queries: Option<PathBuf>,
+        /// Without queries: compare only reference rows r with r % shards == shard, so
+        /// several nodes split the pairs nearly evenly. Rows go to the output in order.
+        #[arg(long, default_value_t = 0)]
+        shard: usize,
+        #[arg(long, default_value_t = 1)]
+        shards: usize,
         #[arg(long)]
         output: PathBuf,
     },
@@ -164,9 +171,28 @@ fn sketch(k: usize, s: usize, b: usize, cap: u64, inputs: &Path, output: &Path) 
     emit_resident("sequence_ascii", resident)
 }
 
-fn compare(cap: u64, references: &Path, queries: Option<&Path>, output: &Path) -> Result<()> {
-    let refs: Vec<Sketch> =
-        bincode::decode_from_std_read(&mut BufReader::new(File::open(references)?), BINCODE)?;
+fn compare(
+    cap: u64,
+    references: &[PathBuf],
+    queries: Option<&Path>,
+    shard: usize,
+    shards: usize,
+    output: &Path,
+) -> Result<()> {
+    if shards == 0 || shard >= shards {
+        return Err("--shard must be below --shards".into());
+    }
+    if queries.is_some() && shards > 1 {
+        return Err("--shards applies to all reference pairs only".into());
+    }
+    let mut refs: Vec<Sketch> = Vec::new();
+    for path in references {
+        let part: Vec<Sketch> = bincode::decode_from_std_read(
+            &mut BufReader::new(File::open(path).map_err(|e| format!("{}: {e}", path.display()))?),
+            BINCODE,
+        )?;
+        refs.extend(part);
+    }
     let n = refs.len();
     let mut similarities;
     let tick;
@@ -190,16 +216,17 @@ fn compare(cap: u64, references: &Path, queries: Option<&Path>, output: &Path) -
                 }
             });
     } else {
-        similarities = vec![0f32; n * n.saturating_sub(1) / 2];
-        let mut rows = Vec::with_capacity(n);
+        let mine: Vec<usize> = (shard..n).step_by(shards).collect();
+        similarities = vec![0f32; mine.iter().map(|&i| n - 1 - i).sum()];
+        let mut rows = Vec::with_capacity(mine.len());
         let mut rest = similarities.as_mut_slice();
-        for i in 0..n {
+        for &i in &mine {
             let (row, tail) = rest.split_at_mut(n - 1 - i);
-            rows.push(row);
+            rows.push((i, row));
             rest = tail;
         }
         tick = Instant::now();
-        rows.into_par_iter().enumerate().for_each(|(i, row)| {
+        rows.into_par_iter().for_each(|(i, row)| {
             for (out, reference) in row.iter_mut().zip(&refs[i + 1..]) {
                 *out = refs[i].jaccard_similarity(reference);
             }
@@ -232,11 +259,15 @@ fn main() -> Result<()> {
         Command::Compare {
             references,
             queries,
+            shard,
+            shards,
             output,
         } => compare(
             args.resident_bytes,
             &references,
             queries.as_deref(),
+            shard,
+            shards,
             &output,
         ),
     }

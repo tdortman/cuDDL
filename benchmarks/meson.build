@@ -59,7 +59,7 @@ simdsketch_bin = custom_target(
         'export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"; '
         + '"$1" build --release --locked --offline --manifest-path "$2" --target-dir "$3" '
         + '>"$4.log" 2>&1 || { cat "$4.log"; exit 1; }; '
-        + 'cp "$3/release/simdsketch-benchmark" "$4"',
+        + 'cp "$3/release/simdsketch-benchmark" "$4.tmp" && mv -f "$4.tmp" "$4"',
         '_',
         find_program('cargo'),
         meson.current_source_dir() / 'simdsketch' / 'Cargo.toml',
