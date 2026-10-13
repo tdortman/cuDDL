@@ -69,6 +69,21 @@ struct packed_pairwise_counts {
     friend bool operator==(packed_pairwise_counts const&, packed_pairwise_counts const&) = default;
 };
 
+/**
+ * @brief Weighted k-mer identity of a pair, `equal / max(equal + min(lower, higher), 6)`, as
+ * sketch::wkid computes it, or 0 when no bucket is comparable.
+ *
+ * The divisor's floor of six suppresses similarity from sparse random collisions.
+ */
+[[nodiscard]] __host__ __device__ constexpr float weighted_kmer_identity(
+    pairwise_counts const& counts
+) noexcept {
+    auto const divisor =
+        counts.equal + (counts.lower < counts.higher ? counts.lower : counts.higher);
+    if (divisor == 0U) return 0.0F;
+    return static_cast<float>(counts.equal) / static_cast<float>(divisor < 6U ? 6U : divisor);
+}
+
 /// @brief Pairwise counts with an optional compile-time cardinality field.
 struct pairwise_summary {
     pairwise_counts counts{};

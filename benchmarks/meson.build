@@ -163,6 +163,37 @@ executable(
     install: false,
 )
 
+# Both define main; nvbench_main stays for its driver and NVML link dependencies.
+multi_gpu_deps = [cuddl_distributed_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep]
+# Exhaustive all-to-all with one MPI rank per GPU, on one node or many: MPI broadcasts the
+# database rows, every rank searches the tiles it claims, and each rank count is verified, then
+# timed.
+executable(
+    'cuddl-multi-gpu-all-to-all-benchmark',
+    'cuddl_multi_gpu_all_to_all_benchmark.cu',
+    dependencies: multi_gpu_deps,
+    cuda_args: cuda_args,
+    install: false,
+)
+# Compressed FASTA to filtered all-to-all results through include/cuddl/distributed.cuh.
+executable(
+    'cuddl-distributed-all-to-all-benchmark',
+    'cuddl_distributed_all_to_all_benchmark.cu',
+    dependencies: multi_gpu_deps,
+    cuda_args: cuda_args,
+    install: false,
+)
+# Integer-ALU rate one GPU sustains under its power limit: the numerator of a pairs/s ceiling
+# for the exhaustive search that accounts for the power limit. Defines main; nvbench_main stays
+# for NVML.
+executable(
+    'alu-power-ceiling',
+    'alu_power_ceiling.cu',
+    dependencies: [cuddl_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 # Provides its own main (strips --summary-json, runs nvbench, then writes shared JSON).
 # nvbench_main stays linked: its static archive member is skipped when main is already
 # defined, while its cuda driver/nvml/cupti link dependencies are still required.
