@@ -1,0 +1,6 @@
+option(
+    'driver_library_dir',
+    type: 'string',
+    value: '',
+    description: 'Directory holding the real libcuda.so; empty lets CMake search',
+)

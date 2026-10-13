@@ -23,7 +23,18 @@ cuda_args = [
     '--generate-line-info',
 ] + cuda_arch_args
 
-cccl_dep = subproject('cccl').get_variable('cccl_dep')
+# CMake's CUDAToolkit falls back to the toolkit's stub libcuda/libnvidia-ml when the toolkit has
+# no real driver, and Meson then records the stub directory as an RPATH that shadows the driver
+# at run time. driver_library_dir names the real driver libraries instead.
+driver_library_dir = get_option('driver_library_dir')
+cuda_driver_cmake_defines = driver_library_dir == '' ? {} : {
+    'CUDA_cuda_driver_LIBRARY': driver_library_dir / 'libcuda.so',
+    'CUDA_nvml_LIBRARY': driver_library_dir / 'libnvidia-ml.so',
+}
+cccl_dep = subproject(
+    'cccl',
+    default_options: {'driver_library_dir': driver_library_dir},
+).get_variable('cccl_dep')
 libdeflate_dep = subproject('libdeflate').get_variable('libdeflate_dep')
 
 # nvCOMP is optional; sketch construction still requires CUDA.
@@ -91,6 +102,14 @@ if build_benchmarks
         # Same vendored source, exposed for the nvbench shim below.
         'NVBENCH_JSON_INCLUDE': meson.project_source_root() / 'subprojects/nlohmann_json-3.12.0/include',
     })
+    # nvbench loads rapids-cmake through FetchContent before project(), so neither
+    # CPM_SOURCE_CACHE nor toolchain variables reach it; only a cache define does.
+    if get_option('rapids_cmake_source') != ''
+        nvbench_opts.add_cmake_defines({
+            'FETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE': get_option('rapids_cmake_source'),
+        })
+    endif
+    nvbench_opts.add_cmake_defines(cuda_driver_cmake_defines)
     # nvbench is imported as a CMake subproject; its `nvbench` and `nvbench.main` targets are
     # exposed through Meson's cmake module. NVML and CUPTI are provided by the dev shell's
     # CUDA toolkit. C++20 is forced: building at nvbench's default C++17 trips a GCC 15.3

@@ -6,6 +6,20 @@ option(
 )
 
 option(
+    'rapids_cmake_source',
+    type: 'string',
+    value: '',
+    description: 'Pre-fetched rapids-cmake source for nvbench on hosts without internet access; empty downloads it',
+)
+
+option(
+    'driver_library_dir',
+    type: 'string',
+    value: '',
+    description: 'Directory holding the real libcuda.so and libnvidia-ml.so, for toolkits that only ship stubs; empty lets CMake search',
+)
+
+option(
     'benchmarks',
     type: 'feature',
     value: 'auto',
