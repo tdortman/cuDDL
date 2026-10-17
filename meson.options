@@ -2,7 +2,14 @@ option(
     'nvcomp',
     type: 'feature',
     value: 'auto',
-    description: 'Enable nvCOMP GPU and coherent hybrid decompression backends',
+    description: 'Enable the nvCOMP gpu and hybrid decompression backends',
+)
+
+option(
+    'ablations',
+    type: 'boolean',
+    value: false,
+    description: 'Compile in the CUDDL_ABLATE switches that turn optimisations off, for ablation studies; off, they cost nothing',
 )
 
 option(

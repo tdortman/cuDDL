@@ -58,7 +58,10 @@ endif
 cuddl_dep = declare_dependency(
     include_directories: include_directories('include'),
     dependencies: [cccl_dep, libdeflate_dep] + (nvcomp_enabled ? [nvcomp_dep] : []),
-    compile_args: ['-DCUDDL_HAS_NVCOMP=' + (nvcomp_enabled ? '1' : '0')],
+    compile_args: [
+        '-DCUDDL_HAS_NVCOMP=' + (nvcomp_enabled ? '1' : '0'),
+        '-DCUDDL_ABLATIONS=' + (get_option('ablations') ? '1' : '0'),
+    ],
 )
 
 # MPI is optional; only include/cuddl/distributed.cuh needs it.
