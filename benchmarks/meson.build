@@ -50,6 +50,43 @@ if build_x86_tools
     dashing2_bin = subproject('dashing2').get_variable('dashing2_bin')
 endif
 
+# pp-sketchlib, driven through its own C++ classes: CPU sketching and GPU distances. Its
+# databases are HDF5 files, so the harness builds only where HDF5's C++ library is found,
+# through pkg-config or, as with EasyBuild modules that ship no .pc files, h5c++.
+hdf5_dep = dependency('hdf5', language: 'cpp', required: false)
+if hdf5_dep.found()
+    pp_sketchlib = subproject('pp-sketchlib')
+    # Its k-means random-match code includes a C source.
+    add_languages('c', native: false)
+    executable(
+        'ppsketchlib-micro',
+        'ppsketchlib_micro.cpp',
+        pp_sketchlib.get_variable('pp_sketchlib_sources'),
+        include_directories: pp_sketchlib.get_variable('pp_sketchlib_include'),
+        # Upstream builds optimised, without assertions, and with relocatable device code.
+        c_args: ['-O3', '-DNDEBUG'],
+        cpp_args: pp_sketchlib.get_variable('pp_sketchlib_args') + [
+            '-O3',
+            '-DNDEBUG',
+            '-U_GLIBCXX_ASSERTIONS',
+            '-std=c++17',
+        ],
+        cuda_args: pp_sketchlib.get_variable('pp_sketchlib_args') + cuda_arch_args + [
+            '-O3',
+            '-DNDEBUG',
+            '-U_GLIBCXX_ASSERTIONS',
+            '-std=c++17',
+            '--expt-relaxed-constexpr',
+            '-rdc=true',
+        ],
+        # nvcc links the CUDA runtime and the device code, for the architectures it was compiled
+        # for; the C++ sources find the CUDA headers as cuDDL's do.
+        link_args: ['-rdc=true'] + cuda_arch_args,
+        dependencies: [hdf5_dep, dependency('eigen3'), dependency('zlib'), dependency('openmp')],
+        install: false,
+    )
+endif
+
 # SimdSketch has no C ABI; this cargo crate drives its Rust library. Its SIMD paths are chosen
 # at compile time, so it builds for the host CPU like RabbitSketch.
 simdsketch_bin = custom_target(

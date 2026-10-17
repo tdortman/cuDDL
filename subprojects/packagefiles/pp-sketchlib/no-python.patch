@@ -1,0 +1,59 @@
+diff --git a/src/api.cpp b/src/api.cpp
+index 4323ef1..4f13443 100644
+--- a/src/api.cpp
++++ b/src/api.cpp
+@@ -11,7 +11,12 @@
+ 
+ #include <H5Cpp.h>
+ #include <omp.h>
++#ifdef PYTHON_EXT
+ #include <pybind11/pybind11.h>
++namespace py = pybind11;
++#else
++#include "no_python.hpp"
++#endif
+ 
+ #include "api.hpp"
+ #include "database/database.hpp"
+@@ -21,7 +26,6 @@
+ #include "sketch/bitfuncs.hpp"
+ 
+ using namespace Eigen;
+-namespace py = pybind11;
+ 
+ namespace {
+ const float unfit_core_acc_distance = 1.0f;
+diff --git a/src/gpu/dist.cu b/src/gpu/dist.cu
+index ff3fa66..69c8b98 100644
+--- a/src/gpu/dist.cu
++++ b/src/gpu/dist.cu
+@@ -20,8 +20,12 @@
+ #include <unistd.h>
+ #include <vector>
+ 
++#ifdef PYTHON_EXT
+ #include <pybind11/pybind11.h>
+ namespace py = pybind11;
++#else
++#include "../no_python.hpp"
++#endif
+ 
+ // memcpy_async
+ #include <cub/cub.cuh>
+diff --git a/src/gpu/sketch.cu b/src/gpu/sketch.cu
+index d14475c..05232ab 100644
+--- a/src/gpu/sketch.cu
++++ b/src/gpu/sketch.cu
+@@ -8,8 +8,12 @@
+ 
+ #include <stdint.h>
+ 
++#ifdef PYTHON_EXT
+ #include <pybind11/pybind11.h>
+ namespace py = pybind11;
++#else
++#include "../no_python.hpp"
++#endif
+ 
+ // memcpy_async
+ #include <cooperative_groups.h>

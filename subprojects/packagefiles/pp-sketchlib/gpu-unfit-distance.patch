@@ -1,0 +1,17 @@
+diff --git a/src/gpu/dist.cu b/src/gpu/dist.cu
+index ff3fa66..4ac81b3 100644
+--- a/src/gpu/dist.cu
++++ b/src/gpu/dist.cu
+@@ -93,8 +93,10 @@ __device__ void simple_linear_regression(float dists[],
+                                          const float ysquaresum, const int n,
+                                          const int dist_col) {
+   if (n < 2) {
+-    dists[0] = 0.0f;
+-    dists[1] = 0.0f;
++    // Too few k-mer lengths to fit, which the CPU path reports as distance 1
++    // (unfit_core_acc_distance in api.cpp).
++    dists[0] = 1.0f;
++    dists[1] = 1.0f;
+   } else {
+     // CUDA fast-math intrinsics on floats, which give comparable accuracy
+     // Speed gain is fairly minimal, as most time spent on Jaccard distance

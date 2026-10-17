@@ -38,20 +38,27 @@ Every wall is a whole process, timed from spawn to exit, one operation per proce
   (RabbitSketch, Dashing2) construct it inside the timed interval, RabbitSketch
   from its loaded sketch file. sketchlib.rust times building its inverted index from FASTA
   apart from querying it; BBTools rebuilds its in-memory CSR index from its sketch file and
-  times the build apart from the ranked search. SimdSketch and HyperGen have no search mode,
-  so their SEARCH is the exhaustive COMPARE.
+  times the build apart from the ranked search. SimdSketch, HyperGen and pp-sketchlib have no
+  search mode, so their SEARCH is the exhaustive COMPARE.
+
+pp-sketchlib runs through a harness of its own classes (benchmarks/ppsketchlib_micro.cpp):
+SKETCH is its CPU sketching of assemblies at k = 15, 19, 23, 27 and 31 with 2048 bins each,
+writing its HDF5 database and random match chances; COMPARE loads that database and fits core
+and accessory distances on the GPU, its only GPU comparison, and reports the Jaccard index at
+k = 25 the fit predicts.
 
 Every CPU tool is timed at each thread count in --threads and reports its fastest, with the
 count in `case.threads`. CPU lanes run with OpenMP threads bound to cores and, on hosts with
 several NUMA nodes, confined to one node when their threads fit its physical cores.
-`case.timing_scope` names what a wall covers: `process` is a timed child process,
-`process_jvm` adds JVM start-up and the BBTools driver, and `in_process` is the tool's own
-timer around the operation (RabbitSketch, cub-exact, and cuDDL's reference build).
+`case.timing_scope` names what a wall covers: `process` is a timed child process, and
+`process_jvm` adds JVM start-up and the BBTools driver.
 
 With --performance-only, cuDDL also skips internal validation and auxiliary
 benchmark suites. Every result is downloaded through a reusable host tile;
 per-genome statistics and per-pair JSON rows are not generated.
-Resident processing timings are recorded alongside wall timings in the same run.
+Resident processing timings come from each tool's own timer: inside the timed processes where
+the tool reports them, otherwise from its benchmark harness run at the same settings (cuDDL
+compare and search, RabbitSketch, cub-exact).
 They exclude parsing and transfers. RabbitSketch native indexed search retains
 its coupled text formatting, writing to /dev/null for the resident interval.
 
@@ -65,8 +72,9 @@ every ANI tool here targets. Fixed-size sketches use 2048 entries (cuDDL buckets
 5-bit exponent and 11-bit mantissa, Dashing2 registers, RabbitSketch slots,
 SimdSketch buckets keeping the 8 low hash bits its author recommends, sketchlib.rust
 one-permutation bins, BBTools DynamicDemiLog buckets with the same exponent as cuDDL,
-hypergen dimensions); skani keeps its own sampling and k. Entries differ in width
-and information per tool, so tools are compared in error-versus-time space.
+hypergen dimensions, pp-sketchlib bins at each of its k-mer lengths); skani keeps its own
+sampling and k. Entries differ in width and information per tool, so tools are compared in
+error-versus-time space.
 
 Caps are automatic unless passed explicitly: thread counts default to half the physical
 cores, all physical cores, and all logical CPUs, max-kmers derives from free VRAM, the
@@ -105,7 +113,8 @@ from hypergen_pipeline import dataset_entries, summarize
 ROOT = Path(__file__).resolve().parent.parent
 APP = typer.Typer()
 DEFAULT_TOOLS = (
-    "cuddl,rabbitsketch,simdsketch,sketchlib,bbtools,hypergen,skani,dashing2,cub-exact"
+    "cuddl,rabbitsketch,simdsketch,sketchlib,pp-sketchlib,bbtools,hypergen,skani,dashing2,"
+    "cub-exact"
 )
 TOOLS = tuple(DEFAULT_TOOLS.split(","))
 
@@ -806,7 +815,7 @@ def main(
         str,
         typer.Option(
             help="Comma-separated tools to measure: cuddl, rabbitsketch, simdsketch, "
-            "sketchlib, bbtools, hypergen, skani, dashing2, cub-exact."
+            "sketchlib, pp-sketchlib, bbtools, hypergen, skani, dashing2, cub-exact."
         ),
     ] = DEFAULT_TOOLS,
     performance_only: Annotated[
@@ -1044,6 +1053,7 @@ def main(
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
     simdsketch = build / "benchmarks/simdsketch-benchmark"
     sketchlib = build / "subprojects/sketchlib/sketchlib"
+    ppsketchlib = build / "benchmarks/ppsketchlib-micro"
     bbtools_jar = ROOT / "subprojects/bbmap/bbtools.jar"
     # Forwarded to every cub lane that evaluates pairs, so a large corpus can be told to keep
     # less resident than the default share of host memory.
@@ -1074,6 +1084,8 @@ def main(
         required.append(simdsketch)
     if "sketchlib" in selected:
         required.append(sketchlib)
+    if "pp-sketchlib" in selected:
+        required.append(ppsketchlib)
     if "bbtools" in selected:
         required.append(bbtools_jar)
         for program in ("java", "javac"):
@@ -1154,6 +1166,8 @@ def main(
         "rabbitsketch": 25,
         "simdsketch": 25,
         "sketchlib": 25,
+        # The Jaccard index pp-sketchlib reports is its fit's prediction at k = 25.
+        "pp-sketchlib": 25,
         "bbtools": 25,
         "hypergen": 25,
         "dashing2": 25,
@@ -1973,6 +1987,56 @@ def main(
                     quiet=True,
                 )
 
+        if "pp-sketchlib" in selected:
+            # pp-sketchlib's own sketching and database classes, through a harness like
+            # BBTools'. Same reference-only reuse rule as SimdSketch.
+            pp_sketch_list = work / "pp-sketch.txt"
+            pp_sketch_list.write_text("".join(f"{p}\n" for p in sketch_file_args))
+            pp_sketch = work / "pp-sketch"
+            pp_resident: list[dict] = []
+            marks = sweep(
+                "pp-sketchlib",
+                "sketch",
+                lambda count: [
+                    str(ppsketchlib),
+                    "sketch",
+                    str(pp_sketch_list),
+                    str(pp_sketch),
+                    str(count),
+                ],
+                resident=pp_resident,
+            )
+            record_native_resident("pp-sketchlib", "sketch", pp_resident)
+            sketch_times["pp-sketchlib"] = marks
+            sketch_bytes["pp-sketchlib"] = pp_sketch.with_suffix(".h5").stat().st_size
+            record_sketch(
+                "pp-sketchlib",
+                "core-accessory",
+                marks,
+                {"sketch_bytes": sketch_bytes["pp-sketchlib"]},
+            )
+            pp_references = pp_sketch
+            if sketch_file_args != [str(p) for p in references]:
+                pp_reference_list = work / "pp-references.txt"
+                pp_reference_list.write_text("".join(f"{p}\n" for p in references))
+                pp_references = work / "pp-references"
+                run(
+                    [
+                        str(ppsketchlib),
+                        "sketch",
+                        str(pp_reference_list),
+                        str(pp_references),
+                        str(max_threads),
+                    ],
+                    quiet=True,
+                )
+            # Batch queries are sketched inside each COMPARE wall, then compared.
+            pp_queries = "-"
+            pp_query_list = work / "pp-queries.txt"
+            if topology == "batch":
+                pp_query_list.write_text("".join(f"{p}\n" for p in query_list))
+                pp_queries = str(work / "pp-queries")
+
         if "bbtools" in selected:
             # BBTools' own DDLWriter, comparison, and index classes, driven by a small harness
             # so file lists and the all-to-all triangle need no shell argument or mode BBTools
@@ -2788,6 +2852,62 @@ def main(
             )
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
+        if "pp-sketchlib" in selected:
+            pp_pairs = work / "pp-pairs.f32"
+            pp_compare_resident: list[dict] = []
+            marks = sweep(
+                "pp-sketchlib",
+                "compare",
+                lambda count: [
+                    *(
+                        [
+                            [
+                                str(ppsketchlib),
+                                "sketch",
+                                str(pp_query_list),
+                                pp_queries,
+                                str(count),
+                            ]
+                        ]
+                        if topology == "batch"
+                        else []
+                    ),
+                    [
+                        str(ppsketchlib),
+                        "compare",
+                        str(pp_references),
+                        pp_queries,
+                        str(pp_pairs),
+                        str(count),
+                    ],
+                ],
+                resident=pp_compare_resident,
+                resident_skip=1 if topology == "batch" else 0,
+            )
+            record_native_resident("pp-sketchlib", "compare", pp_compare_resident)
+            evaluated = count_pairs(references, query_list, topology)
+            stride = (
+                max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
+            )
+            rows = [
+                {
+                    "query": str(query),
+                    "reference": str(reference),
+                    "jaccard": jaccard,
+                    "ani": mash_ani(jaccard, sketch_k["pp-sketchlib"]),
+                }
+                for query, reference, jaccard in read_f32_pairs(
+                    pp_pairs,
+                    references,
+                    query_list if topology == "batch" else [],
+                    stride,
+                )
+            ]
+            record_compare(
+                "pp-sketchlib", "core-accessory", marks, rows, evaluated=evaluated
+            )
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
+
         if "bbtools" in selected:
             # DDL reports ANI and WKID, not Jaccard, like cuDDL.
             bb_pairs = work / "bb-pairs.f32"
@@ -3294,6 +3414,7 @@ def main(
         for tool, score_key in (
             ("hypergen", "ani"),
             ("simdsketch", "jaccard"),
+            ("pp-sketchlib", "jaccard"),
             ("cub-exact", "jaccard"),
         ):
             if tool in selected:
@@ -3308,7 +3429,11 @@ def main(
             if "hypergen" in selected
             else []
         )
-        for tool, score_key in (("simdsketch", "jaccard"), ("cub-exact", "jaccard")):
+        for tool, score_key in (
+            ("simdsketch", "jaccard"),
+            ("pp-sketchlib", "jaccard"),
+            ("cub-exact", "jaccard"),
+        ):
             if tool in selected:
                 search_query_ms[tool] = [
                     m["timings"]["wall"]["median_ms"]
@@ -3320,6 +3445,7 @@ def main(
         for tool, score_key in (
             ("hypergen", "ani"),
             ("simdsketch", "jaccard"),
+            ("pp-sketchlib", "jaccard"),
             ("cub-exact", "jaccard"),
         ):
             if tool in selected:
@@ -3395,13 +3521,14 @@ def main(
             "rabbitsketch": "FastKMV",
             "simdsketch": "bucket-b8",
             "sketchlib": "one-perm-minhash",
+            "pp-sketchlib": "core-accessory",
             "bbtools": "ddl",
             "cub-exact": "gpu-exact",
         }
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {"hypergen", "simdsketch", "cub-exact"}:
+                if tool in {"hypergen", "simdsketch", "pp-sketchlib", "cub-exact"}:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]

@@ -96,6 +96,9 @@
 
             # Ranks of the multi-GPU (and multi-node) all-to-all benchmark.
             pkgs.mpi
+
+            # pp-sketchlib's databases (benchmarks/ppsketchlib_micro.cpp).
+            pkgs.hdf5-cpp
           ];
 
           nativeBuildInputs = with pkgs; [
