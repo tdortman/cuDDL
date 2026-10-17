@@ -1702,6 +1702,12 @@ static __global__ __launch_bounds__(block_size) void candidate_bits_from_counts_
 /// Leaves register space for query-plane loads alongside cached reference planes.
 constexpr uint32_t bitmap_refine_block_size = 768U;
 
+/// @brief Cells per @ref refine_batch_bitmap_kernel block that a tile of bitmap-selected pairs
+/// is split into when it allows. Selected pairs cluster around near-duplicate genomes, so cells
+/// differ in work by 20 times or more; with one cell per block the densest cell sets the
+/// kernel's time.
+constexpr uint32_t bitmap_refine_waves = 8U;
+
 /// @brief Shared bytes @ref refine_batch_bitmap_kernel may stage query planes in; one block
 /// per SM fits on every supported architecture.
 constexpr size_t bitmap_refine_shared_bytes = 96U * 1024U;
@@ -1756,25 +1762,27 @@ struct refine_cells {
     uint32_t cell_count;
 };
 
-/// @brief Splits a tile into @ref refine_cells, filling the grid for small batches without
-/// spilling whole query groups into a second wave. Every query of an upper-triangle tile follows
-/// @p query_id_offset, so words wholly before it hold no pairs and get no cells; otherwise those
-/// empty cells would take most of the split for tiles far down the triangle.
+/// @brief Splits a tile into @ref refine_cells, about @p waves cells per block when the tile
+/// allows, so that blocks claiming cells dynamically even out cells of uneven work. Every query
+/// of an upper-triangle tile follows @p query_id_offset, so words wholly before it hold no pairs
+/// and get no cells; otherwise those empty cells would take most of the split for tiles far down
+/// the triangle.
 template <bool UpperTriangle>
 __device__ __forceinline__ refine_cells make_refine_cells(
     uint32_t query_id_offset,
     uint32_t query_count,
     uint32_t group,
     uint32_t words_per_query,
-    uint32_t max_block_words
+    uint32_t max_block_words,
+    uint32_t waves
 ) {
     auto const groups = (query_count + group - 1U) / group;
     auto const first_word =
         UpperTriangle ? cuda::std::min(query_id_offset / 32U, words_per_query) : 0U;
     auto const words = words_per_query - first_word;
-    auto const blocks_per_wave = cuda::std::max(1U, gridDim.x / groups);
+    auto const blocks_per_group = cuda::std::max(1U, waves * gridDim.x / groups);
     auto const block_words = cuda::std::max(
-        1U, cuda::std::min(max_block_words, (words + blocks_per_wave - 1U) / blocks_per_wave)
+        1U, cuda::std::min(max_block_words, (words + blocks_per_group - 1U) / blocks_per_group)
     );
     return {groups, first_word, block_words, groups * ((words + block_words - 1U) / block_words)};
 }
@@ -1922,7 +1930,12 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
     auto const cells = make_refine_cells<UpperTriangle>(
-        query_id_offset, query_count, group, words_per_query, max_block_words
+        query_id_offset,
+        query_count,
+        group,
+        words_per_query,
+        max_block_words,
+        Candidates == refine_candidates::bitmap ? bitmap_refine_waves : 1U
     );
     auto const groups = cells.groups;
     auto const indexed_groups = indexed_bucket_count / warp_width;
@@ -2190,7 +2203,7 @@ __global__ __launch_bounds__(match_filter_block_size, 1) void match_filter_kerne
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
     auto const cells = make_refine_cells<UpperTriangle>(
-        query_id_offset, query_count, group, words_per_query, max_block_words
+        query_id_offset, query_count, group, words_per_query, max_block_words, 1U
     );
     auto const groups = cells.groups;
     auto const indexed_groups = indexed_bucket_count / warp_width;
@@ -2381,7 +2394,7 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const words_per_query = candidate_bit_words(reference_count);
     auto const cells = make_refine_cells<UpperTriangle>(
-        query_id_offset, query_count, group, words_per_query, max_block_words
+        query_id_offset, query_count, group, words_per_query, max_block_words, 1U
     );
     auto const groups = cells.groups;
 

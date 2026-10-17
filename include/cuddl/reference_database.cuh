@@ -2364,16 +2364,14 @@ class reference_database_view {
         auto kernel = select_kernel.template operator()<detail::bitmap_refine_group<BucketCount>>();
         auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
         if constexpr (detail::bitmap_refine_staged<BucketCount>) {
-            constexpr uint32_t hopper_group = static_cast<uint32_t>(
-                cuda::std::min<size_t>(32U, (128U * 1024U) / (BucketCount * sizeof(uint16_t)))
-            );
-            constexpr auto hopper_bytes = hopper_group * BucketCount * sizeof(uint16_t);
-            if (stream.device().attribute(cuda::device_attributes::compute_capability_major) == 9 &&
-                static_cast<size_t>(stream.device().attribute(
-                    cuda::device_attributes::max_shared_memory_per_block_optin
-                )) >= hopper_bytes + sizeof(uint32_t)) {
+            // On Hopper the densest query groups, not L2 row reads, set the kernel's time: the
+            // 115,223-genome threshold search took 416 ms on a GH200 with groups of 8 queries,
+            // 438 ms with 24 and 445 ms with 32. An RTX 5070 Ti is fastest with 24.
+            constexpr uint32_t hopper_group =
+                cuda::std::min(8U, detail::bitmap_refine_group<BucketCount>);
+            if (stream.device().attribute(cuda::device_attributes::compute_capability_major) == 9) {
                 kernel = select_kernel.template operator()<hopper_group>();
-                shared_bytes = hopper_bytes;
+                shared_bytes = hopper_group * BucketCount * sizeof(uint16_t);
             }
         }
         CUDDL_CUDA_TRY(cudaFuncSetAttribute(
