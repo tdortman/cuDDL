@@ -24,8 +24,16 @@ if want compile; then
     "-Dcuda_args=-gencode=arch=compute_$cc,code=sm_$cc"
 fi
 
-[ -d $mgpu/genomes-1k-sample ] ||
-  uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k 1000 $mgpu/genomes-1k-sample
+for size in 1k 25k; do
+  [ -d $mgpu/genomes-$size-sample ] ||
+    uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k $((${size%k} * 1000)) \
+      $mgpu/genomes-$size-sample
+done
+if [ ! -e $mgpu/refseq211-100k.cuddl ]; then
+  build/ablation/main-build/examples/cuddl-build-reference-db $mgpu/genomes-100k -o "$S/db.cuddl" \
+    --workers "$SLURM_CPUS_ON_NODE"
+  cp "$S/db.cuddl" $mgpu/refseq211-100k.cuddl
+fi
 srun -N "$nodes" --ntasks="$nodes" mkdir -p "$S/out" "$S/sweep"
 srun -N "$nodes" --ntasks="$nodes" cp "$mgpu/refseq211-100k.cuddl" "$S/db.cuddl"
 export UCX_RCACHE_ENABLE=n
