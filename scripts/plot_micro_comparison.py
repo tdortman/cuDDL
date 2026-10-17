@@ -5,8 +5,9 @@
 # ///
 """Figures for micro-benchmark comparisons (operation=micro).
 
-Fourteen single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
-COMPARE node energy per pair and the same above the node's idle power (CPU and GPU stacked),
+Sixteen single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+SKETCH node energy per genome, COMPARE node energy per pair, and both above the node's idle
+power (CPU and GPU stacked),
 resident processing time for each of those operations,
 Jaccard MAE vs exact, ANI MAE vs ANIm, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
@@ -83,6 +84,8 @@ def read_micro(path: Path) -> list[dict]:
                 "resident_device": case.get("resident_device"),
                 "resident_reuses_compare": case.get("resident_reuses_compare", False),
                 "metrics": m.get("metrics", {}),
+                # Genomes sketched or pairs compared, which energy rates divide by.
+                "units": case.get("genomes") or case.get("pairs"),
             }
         )
     if not rows:
@@ -209,13 +212,13 @@ def main(
                 resident=True,
             )
 
-        # Energy over the same wall as the COMPARE rate; lanes without CPU counters have none.
+        # Energy over the same wall as the time panels; lanes without CPU counters have none.
         # Above idle subtracts the node's power at rest, so a tool that leaves most cores idle
         # is not billed for them, and neither is a CPU tool for the GPUs it never counted.
-        def energy_panel(prefix: str, title: str, stem: str) -> None:
+        def energy_panel(rows: list[dict], unit: str, prefix: str, title: str, stem: str) -> None:
             metered = sorted(
-                (r for r in compare if f"{prefix}_per_pair_j" in r["metrics"]),
-                key=lambda r: r["metrics"][f"{prefix}_per_pair_j"],
+                (r for r in rows if f"{prefix}_per_{unit}_j" in r["metrics"]),
+                key=lambda r: r["metrics"][f"{prefix}_per_{unit}_j"],
             )
             fig, ax = plt.subplots(figsize=(width, 4))
             if not metered:
@@ -223,16 +226,16 @@ def main(
                 ax.set_axis_off()
                 save_both(fig, stem)
                 return
-            pairs = [max(r["metrics"]["pairs"], 1) for r in metered]
+            units = [max(r["units"] or 1, 1) for r in metered]
             # Above idle, a CPU tool's GPUs never ran and a GPU run's idle sockets can dip a
             # share just below zero; neither is energy the run spent.
             cpu = [
-                max(r["metrics"][f"{prefix}_cpu_j"], 0.0) / p * 1e6
-                for r, p in zip(metered, pairs)
+                max(r["metrics"][f"{prefix}_cpu_j"], 0.0) / n * 1e6
+                for r, n in zip(metered, units)
             ]
             gpu = [
-                max(r["metrics"].get(f"{prefix}_gpu_j", 0.0), 0.0) / p * 1e6
-                for r, p in zip(metered, pairs)
+                max(r["metrics"].get(f"{prefix}_gpu_j", 0.0), 0.0) / n * 1e6
+                for r, n in zip(metered, units)
             ]
             names = [label(r) for r in metered]
             ax.bar(names, cpu, label="CPU packages (RAPL)")
@@ -245,18 +248,27 @@ def main(
             ax.margins(y=0.15)
             # The smallest bar would otherwise sit below the axis.
             ax.set_ylim(bottom=min((c + g for c, g in zip(cpu, gpu) if c + g > 0), default=1e-3) / 3)
-            ax.set_ylabel("Energy per pair (µJ), log scale")
+            ax.set_ylabel(f"Energy per {unit} (µJ), log scale")
             ax.set_title(title)
             ax.tick_params(axis="x", labelrotation=20)
             ax.legend(fontsize=8)
             save_both(fig, stem, list(zip(bars, texts)))
 
-        energy_panel("energy", "COMPARE node energy per pair", "micro_energy_compare")
-        energy_panel(
-            "energy_dynamic",
-            "COMPARE energy per pair above idle",
-            "micro_energy_dynamic_compare",
-        )
+        for rows, unit, operation in ((sketch, "genome", "sketch"), (compare, "pair", "compare")):
+            energy_panel(
+                rows,
+                unit,
+                "energy",
+                f"{operation.upper()} node energy per {unit}",
+                f"micro_energy_{operation}",
+            )
+            energy_panel(
+                rows,
+                unit,
+                "energy_dynamic",
+                f"{operation.upper()} energy per {unit} above idle",
+                f"micro_energy_dynamic_{operation}",
+            )
 
         def scatter_panel(metric: str, title: str, ylabel: str, stem: str) -> None:
             fig, ax = plt.subplots(figsize=(5.5, 4.5))

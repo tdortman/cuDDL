@@ -375,6 +375,31 @@ def above_idle(energy: dict, seconds: float) -> dict:
     return energy
 
 
+def energy_metrics(marks: list[float], unit: str, count: int) -> dict:
+    """Median node energy of @p marks' reps, total and above idle, with the node's idle power
+    and the energy per @p unit over @p count of them; empty where the counters are unreadable
+    (scripts/energy_meter.py) or @p marks carries no energy.
+
+    Without the CPUs' share the node energy would be understated, so there is no rate then.
+    """
+    metrics: dict = {}
+    for source in ("cpu_j", "gpu_j", "dynamic_cpu_j", "dynamic_gpu_j"):
+        joules = [
+            e[source] for e in getattr(marks, "energy", []) if e.get(source) is not None
+        ]
+        if joules:
+            metrics[f"energy_{source}"] = statistics.median(joules)
+    for source in ("cpu_w", "gpu_w"):
+        if IDLE.get(source) is not None:
+            metrics[f"idle_{source}"] = IDLE[source]
+    for prefix in ("energy", "energy_dynamic"):
+        if f"{prefix}_cpu_j" in metrics:
+            metrics[f"{prefix}_per_{unit}_j"] = (
+                metrics[f"{prefix}_cpu_j"] + metrics.get(f"{prefix}_gpu_j", 0.0)
+            ) / max(count, 1)
+    return metrics
+
+
 def wall_of(
     command: list[str] | list[list[str]],
     samples: int,
@@ -1539,6 +1564,8 @@ def main(
                     "metrics": {
                         "per_genome_ms": statistics.median(marks)
                         / len(sketch_file_args),
+                        # Node energy of each timed rep over the same wall.
+                        **energy_metrics(marks, "genome", len(sketch_file_args)),
                         **(extra or {}),
                     },
                 }
@@ -2276,26 +2303,8 @@ def main(
                 "report_row_stride": stride,
                 "per_pair_ms": statistics.median(marks) / max(pairs, 1),
             }
-            # Node energy of each timed rep, over the same CLI wall the rate uses, and the same
-            # above the node's idle power; only on hosts whose counters are readable
-            # (scripts/energy_meter.py).
-            for source in ("cpu_j", "gpu_j", "dynamic_cpu_j", "dynamic_gpu_j"):
-                joules = [
-                    e[source]
-                    for e in getattr(marks, "energy", [])
-                    if e.get(source) is not None
-                ]
-                if joules:
-                    metrics[f"energy_{source}"] = statistics.median(joules)
-            for source in ("cpu_w", "gpu_w"):
-                if IDLE.get(source) is not None:
-                    metrics[f"idle_{source}"] = IDLE[source]
-            # Without the CPUs' share the node energy would be understated, so no rate.
-            for prefix in ("energy", "energy_dynamic"):
-                if f"{prefix}_cpu_j" in metrics:
-                    metrics[f"{prefix}_per_pair_j"] = (
-                        metrics[f"{prefix}_cpu_j"] + metrics.get(f"{prefix}_gpu_j", 0.0)
-                    ) / max(pairs, 1)
+            # Node energy of each timed rep, over the same CLI wall the rate uses.
+            metrics |= energy_metrics(marks, "pair", pairs)
             if jaccard_errors:
                 metrics["jaccard_mae_vs_exact"] = sum(jaccard_errors) / len(
                     jaccard_errors
