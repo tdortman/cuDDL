@@ -5,7 +5,7 @@
 # ///
 """Strong and weak scaling of cuddl-distributed-all-to-all-benchmark across nodes.
 
-Takes the reports of scripts/sketch-scaling.sh. Strong-scaling runs are those with
+Takes the reports of scripts/sketch_scaling.py. Strong-scaling runs are those with
 the most genomes; weak-scaling runs keep genomes per node equal to the
 smallest 1-node run. Reports whose name ends in -r0 are skipped: a first run
 reads from Lustre only what earlier runs left uncached, so it measures neither
@@ -15,7 +15,7 @@ runs differ slightly in bytes per node; ideal times and efficiency therefore
 use compressed input bytes per second per node, relative to the fewest nodes.
 Writes stacked phase wall times per node count, with the ideal sketch time as
 a dashed tick on each bar, and the sketch efficiency, and prints a table.
-SimdSketch reports of scripts/simdsketch-nodes.sh among the inputs add a hatched
+SimdSketch reports of scripts/simdsketch_nodes.py among the inputs add a hatched
 SimdSketch bar next to each cuDDL bar (sketch, gather, compare and write) and
 their rows in the table.
 """
@@ -87,7 +87,8 @@ def phase_panel(
         heights = np.array(
             [
                 statistics.median(
-                    max(rank_seconds(rank, phase) for rank in r["ranks_detail"]) for r in runs
+                    max(rank_seconds(rank, phase) for rank in r["ranks_detail"])
+                    for r in runs
                 )
                 for runs in points.values()
             ]
@@ -173,7 +174,7 @@ def main(
     reports: Annotated[
         list[Path],
         typer.Argument(
-            exists=True, dir_okay=False, help="Reports of scripts/sketch-scaling.sh"
+            exists=True, dir_okay=False, help="Reports of scripts/sketch_scaling.py"
         ),
     ],
     output_dir: Annotated[
@@ -190,7 +191,9 @@ def main(
     simdsketch = [r for r in loaded if r.get("tool") == "simdsketch"]
     thresholds = {r["minimum_matches"] for r in runs}
     if len(thresholds) > 1:
-        raise typer.BadParameter(f"reports mix minimum-match thresholds {sorted(thresholds)}")
+        raise typer.BadParameter(
+            f"reports mix minimum-match thresholds {sorted(thresholds)}"
+        )
     minimum = thresholds.pop()
     output = "every pair" if minimum == 0 else f"at least {minimum} matches"
     most = max(r["genomes"] for r in runs)
@@ -222,7 +225,14 @@ def main(
             if strong
             else f"{per_node // 1000}k genomes per node"
         )
-        phase_panel(ax, points, baseline[name], strong, f"{name}, {genomes}, {output}", node_axis)
+        phase_panel(
+            ax,
+            points,
+            baseline[name],
+            strong,
+            f"{name}, {genomes}, {output}",
+            node_axis,
+        )
     pu.add_top_legend(fig, axes, ncol=4)
     pu.save_figure(fig, output_dir / "sketch_scaling_phases.pdf")
 

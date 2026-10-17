@@ -6,7 +6,7 @@
 """Side-by-side cost of measured CPU (SimdSketch) and GPU (cuDDL) all-to-all runs.
 
 Pairs every cuddl-distributed-all-to-all-benchmark report with the
-`scripts/cpu-baseline.sh` measurement of the same genome count and prints their
+`scripts/cpu_baseline.py` measurement of the same genome count and prints their
 measured wall times, node-hours and output bytes. Nothing is fitted or scaled:
 a report without a CPU measurement of its genome count is an error. cuDDL's
 sketch phase includes reading and decompressing the genomes, like SimdSketch's.
@@ -21,7 +21,8 @@ import typer
 
 def main(
     cpu: Annotated[
-        Path, typer.Argument(exists=True, help="JSON lines from scripts/cpu-baseline.sh")
+        Path,
+        typer.Argument(exists=True, help="JSON lines from scripts/cpu_baseline.py"),
     ],
     gpu_reports: Annotated[
         list[Path],
