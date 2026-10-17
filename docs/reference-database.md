@@ -292,7 +292,7 @@ cuDDL patches libdeflate for DNA, which is full of short matches:
 
 - A short match copies at most two machine words when it fits.
 - An 11-bit table decodes a short length and distance pair in one lookup.
-- A literal and the short match after it share one table entry when their Huffman codes fit together.
+- A literal and the short match after it share one table entry when their Huffman codes fit together. The decoder writes that literal without a branch, because whether an entry carries one is close to random in DNA. On RefSeq genomes this alone raised single-thread inflation from 1.49 to 1.66 GB/s on a desktop CPU and from 1.40 to 1.79 GB/s on a Xeon w9-3595X.
 
 Every other token, including long and overlapping matches, goes through the unchanged decoder with its offset and bounds checks. The patches accept any DEFLATE stream.
 

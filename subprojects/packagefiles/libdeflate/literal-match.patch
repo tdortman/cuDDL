@@ -31,14 +31,18 @@
  
 --- a/lib/decompress_template.h
 +++ b/lib/decompress_template.h
-@@ -443,7 +443,10 @@
+@@ -443,7 +443,14 @@
  		if (entry & HUFFDEC_PAIR) {
  			unsigned extra = (entry >> 8) & 0xf;
  			length = (entry >> 16) & 0x1ff;
 -			offset = (entry >> 32) +
-+			if (entry & HUFFDEC_LITERAL_PAIR) {
-+				*out_next++ = entry >> 48;
-+			}
++			/*
++			 * Write the fused literal without a branch: an entry
++			 * without one writes a zero byte that the match copy,
++			 * starting at the same position, overwrites.
++			 */
++			*out_next = (u8)(entry >> 48);
++			out_next += (entry & HUFFDEC_LITERAL_PAIR) != 0;
 +			offset = (u16)(entry >> 32) +
  				 ((saved_bitbuf >> ((u8)entry - extra)) & BITMASK(extra));
  			if (unlikely((u8)bitsleft < LITLEN_TABLEBITS))
