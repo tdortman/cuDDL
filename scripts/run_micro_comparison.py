@@ -1316,15 +1316,6 @@ def main(
             # Measured that way the rate was 8.5 ms a pair where the pair phase is 0.17 ms, which
             # inflated every estimate and shrank the oracle cap to match.
             probe2 = jsonlib_probe.loads((work / "probe2.json").read_text())
-            # Genomes whose sorted k-mer arrays fit cub-exact's device stash. A pair outside it
-            # rebuilds a side per pair, a cost of how the run is sized, not of the method.
-            nonlocal cub_device_genomes
-            distinct = [g["distinct"] for g in probe2.get("genomes", []) if g["distinct"]]
-            if distinct and "device_stash_mb" in probe2["case"]:
-                cub_device_genomes = int(
-                    probe2["case"]["device_stash_mb"] * (1 << 20) * 0.9
-                    // (8 * statistics.mean(distinct))
-                )
             phases = probe2["phases_ms"]
             if probe_eval2 > 0 and "compare" in phases:
                 return phases["compare"]["median_ms"] / probe_eval2
@@ -1344,7 +1335,6 @@ def main(
         slowest = "unprobed"
         probe_per_pair_ms = 0.0
         rate_note = "unprobed"
-        cub_device_genomes: int | None = None
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
                 _spread_pick(references, sizes, _PROBE_GENOMES)
@@ -1380,8 +1370,6 @@ def main(
                         keep = len(references)
                         if capacity < orig_pairs:
                             keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
-                        if cub_device_genomes is not None:
-                            keep = min(keep, max(2, cub_device_genomes))
                         if keep < len(references):
                             references = _spread_pick(references, sizes, keep)
                             subset_note = "budget subset"

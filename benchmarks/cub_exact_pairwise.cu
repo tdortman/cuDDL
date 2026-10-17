@@ -525,13 +525,18 @@ int run_main(
         max_pairs && total_pairs > max_pairs ? (total_pairs + max_pairs - 1) / max_pairs : 1;
     auto pair_at = [&](size_t ordinal) {
         if (all_to_all) {
-            // Triangular index: ordinal -> (q, r) with q < r.
-            size_t q = 0, lo = 0;
-            while (lo + (genomes - 1 - q) <= ordinal) {
-                lo += genomes - 1 - q;
-                ++q;
-            }
-            return std::pair{q, q + 1 + (ordinal - lo)};
+            // Triangular index: ordinal -> (q, r) with q < r. Row q starts at q (2N - q - 1) / 2,
+            // so q solves a quadratic; the loops correct the floating-point estimate.
+            auto const row_start = [&](size_t row) {
+                return row * (2 * genomes - row - 1) / 2;
+            };
+            auto const n = static_cast<double>(genomes);
+            auto q = static_cast<size_t>(std::max(
+                0.0, (2 * n - 1 - std::sqrt((2 * n - 1) * (2 * n - 1) - 8.0 * ordinal)) / 2
+            ));
+            while (q > 0 && row_start(q) > ordinal) --q;
+            while (row_start(q + 1) <= ordinal) ++q;
+            return std::pair{q, q + 1 + (ordinal - row_start(q))};
         }
         return std::pair{query_base + ordinal / reference_count, ordinal % reference_count};
     };
@@ -544,6 +549,12 @@ int run_main(
             evaluated.push_back(total_pairs - 1);
         }
     }
+    std::vector<uint32_t> pair_a(evaluated.size()), pair_r(evaluated.size());
+    for (size_t i = 0; i < evaluated.size(); ++i) {
+        auto const [a, r] = pair_at(evaluated[i]);
+        pair_a[i] = static_cast<uint32_t>(a);
+        pair_r[i] = static_cast<uint32_t>(r);
+    }
     // The query side is touched by every reference and the reference side by every query, so
     // whichever of them stays resident decides how often the other is parsed. Queries come first
     // because a batch run reuses each of them across the whole reference set.
@@ -553,27 +564,12 @@ int run_main(
     auto const stash_order = [&](size_t pass, size_t g) {
         return pass == 0 ? query_side(g) : !query_side(g);
     };
-    // Pairs are processed reference-major: one group per reference, every query against it. With
-    // the queries resident that is one parse per reference instead of one per pair.
-    struct scheduled_pair {
-        size_t ordinal;
-        size_t evaluated_index;
-    };
-    std::vector<scheduled_pair> schedule;
-    schedule.reserve(evaluated.size());
-    for (size_t i = 0; i < evaluated.size(); ++i) {
-        schedule.push_back({evaluated[i], i});
-    }
-    std::stable_sort(schedule.begin(), schedule.end(), [&](auto const& left, auto const& right) {
-        return pair_at(left.ordinal).second < pair_at(right.ordinal).second;
-    });
     // Genomes touched by evaluated pairs keep their packed arrays across the
     // pair loop; the rest stream through for distinct counts only.
     std::vector<char> needed(genomes, 0);
-    for (size_t ordinal : evaluated) {
-        auto const [qa, rb] = pair_at(ordinal);
-        needed[qa] = 1;
-        needed[rb] = 1;
+    for (size_t i = 0; i < evaluated.size(); ++i) {
+        needed[pair_a[i]] = 1;
+        needed[pair_r[i]] = 1;
     }
     // Retaining a genome's k-mers is what makes a pair cheap, but every genome touched by an
     // evaluated pair would be kept: over a full corpus that is terabytes, which is how a run
@@ -594,7 +590,7 @@ int run_main(
     size_t sorted_bytes = 0;
     if (device_stash_bytes >= sizeof(uint64_t)) sorted_store.reset(device_stash_bytes);
     size_t stashed_bytes = 0;
-    size_t reparsed_genomes = 0;
+    size_t reparsed_genomes = 0, rebuilt_genomes = 0, compare_blocks = 0;
 
     device_buffer unique_regions, run_counts_dev, pair_counts, num_runs_dev, temp, staged_bases,
         staged_chunks, window_keys, window_flags, chunk_valid, compacted_keys;
@@ -863,9 +859,8 @@ int run_main(
             /*whole_genomes=*/true
         );
         // Pair buffers sized from the largest evaluated pair actually measured.
-        for (size_t ordinal : evaluated) {
-            auto const [qa, rb] = pair_at(ordinal);
-            max_pair = std::max(max_pair, kmers_of[qa] + kmers_of[rb]);
+        for (size_t i = 0; i < evaluated.size(); ++i) {
+            max_pair = std::max(max_pair, kmers_of[pair_a[i]] + kmers_of[pair_r[i]]);
         }
         // A rebuilt side sorts one genome and run-length encodes it, so what it needs is sized by
         // the largest genome rather than by the largest pair.
@@ -973,67 +968,92 @@ int run_main(
             job_rows.clear();
         };
         emitted = json::array();
-        // Sorted, deduplicated k-mers for the two sides of the current pair. A side the sketch
-        // pass packed for the device already has them; anything else is uploaded and reduced once
-        // per group, which the reference-major schedule makes one pass per genome.
-        struct sorted_side {
-            device_buffer keys;
-            device_buffer unique;
-            size_t genome = std::numeric_limits<size_t>::max();
-        };
-        sorted_side side_a, side_r;
-        auto sorted_for = [&](sorted_side& state, size_t g) {
-            if (sorted_count[g]) {
-                return std::pair{
-                    static_cast<uint64_t const*>(sorted_store.data) + sorted_offset[g],
-                    static_cast<size_t>(sorted_count[g])
-                };
+        // Pairs read sorted, deduplicated k-mers from the store. When the sketch pass fitted every
+        // genome a pair touches, they stay where it put them. Otherwise the store is split in two
+        // regions and genomes are taken in blocks that fit one: block I is built into the first,
+        // each block J >= I into the second, and every pair between them runs as one batch. A
+        // genome is then rebuilt about once per block rather than once per pair, so the merges
+        // rather than the rebuilds set the time.
+        bool all_stored = true;
+        for (size_t g = 0; g < genomes; ++g) {
+            if (needed[g] && distinct[g] && !sorted_count[g]) all_stored = false;
+        }
+        size_t const region_words = sorted_store.bytes / 2 / sizeof(uint64_t);
+        std::vector<uint32_t> block_of(genomes, 0);
+        std::vector<std::vector<size_t>> blocks(1);
+        size_t block_words = 0;
+        for (size_t g = 0; g < genomes; ++g) {
+            if (!needed[g]) continue;
+            if (!all_stored) {
+                if (distinct[g] > region_words) {
+                    throw std::runtime_error(
+                        "a genome's sorted k-mers exceed half the device store, raise "
+                        "--device-stash-mb: " +
+                        names[g]
+                    );
+                }
+                if (block_words + distinct[g] > region_words) {
+                    blocks.emplace_back();
+                    block_words = 0;
+                }
+                block_words += distinct[g];
             }
-            if (state.genome != g) {
-                // Pending jobs point at this scratch, so they are counted before it is filled
-                // with another genome. Deferring the flush to the next iteration in the caller
-                // is too late: the rebuild below overwrites or frees what they read.
-                flush_jobs();
-                // A held sequence is re-extracted on the device; anything outside the budget is
-                // packed again here, which costs a parse but keeps memory bounded.
-                std::vector<uint64_t> parsed;
+            block_of[g] = static_cast<uint32_t>(blocks.size() - 1);
+            blocks.back().push_back(g);
+        }
+        compare_blocks = blocks.size();
+        // Pairs grouped by their unordered block pair, each group in evaluation order.
+        auto const bucket_of = [&](size_t i) {
+            auto lo = block_of[pair_a[i]], hi = block_of[pair_r[i]];
+            if (lo > hi) std::swap(lo, hi);
+            return static_cast<size_t>(lo) * blocks.size() + hi;
+        };
+        std::vector<size_t> bucket_start(blocks.size() * blocks.size() + 1, 0);
+        for (size_t i = 0; i < evaluated.size(); ++i) ++bucket_start[bucket_of(i) + 1];
+        for (size_t b = 1; b < bucket_start.size(); ++b) bucket_start[b] += bucket_start[b - 1];
+        std::vector<size_t> order(evaluated.size());
+        {
+            auto next = bucket_start;
+            for (size_t i = 0; i < evaluated.size(); ++i) order[next[bucket_of(i)]++] = i;
+        }
+        auto* const store = static_cast<uint64_t*>(sorted_store.data);
+        std::vector<uint64_t const*> sorted_at(genomes, nullptr);
+        if (all_stored) {
+            for (size_t g = 0; g < genomes; ++g) sorted_at[g] = store + sorted_offset[g];
+        }
+        device_buffer rebuild_keys;
+        // Sorts and deduplicates a block's genomes into a region, from their held sequence or,
+        // outside the host budget, a fresh parse.
+        auto build_block = [&](size_t block, size_t region) {
+            // Pending jobs read the region this overwrites.
+            flush_jobs();
+            auto* out = store + region * region_words;
+            for (size_t const g : blocks[block]) {
+                sorted_at[g] = out;
+                if (!distinct[g]) continue;
                 uint64_t* keys = nullptr;
                 size_t count = 0;
                 if (resident[g]) {
                     // The emitter fills a slot per window, broken ones included, so the array is
-                    // sized by the genome's windows and the compaction is what leaves the
-                    // valid ones behind.
+                    // sized by the genome's windows and the compaction leaves the valid ones.
                     size_t windows = 0;
                     for (auto const& piece : stashed[g].pieces) windows += piece.windows;
                     stage_and_compact(stashed[g].bases, stashed[g].pieces, windows, nullptr);
-                    count = kmers_of[g];
                     keys = static_cast<uint64_t*>(compacted_keys.data);
+                    count = kmers_of[g];
                 } else {
-                    parsed = parse_one(g);
+                    auto const parsed = parse_one(g);
                     ++reparsed_genomes;
                     count = parsed.size();
-                    if (count) {
-                        if (state.keys.bytes < count * sizeof(uint64_t)) {
-                            state.keys.reset(count * sizeof(uint64_t));
-                        }
-                        CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                            state.keys.data,
-                            parsed.data(),
-                            count * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice,
-                            stream
-                        ));
-                        keys = static_cast<uint64_t*>(state.keys.data);
-                    }
-                }
-                if (state.unique.bytes < count * sizeof(uint64_t)) {
-                    state.unique.reset(count * sizeof(uint64_t));
-                }
-                if (!count) {
-                    state.genome = g;
-                    return std::pair{
-                        static_cast<uint64_t const*>(state.unique.data), static_cast<size_t>(0)
-                    };
+                    rebuild_keys.reset(count * sizeof(uint64_t));
+                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                        rebuild_keys.data,
+                        parsed.data(),
+                        count * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice,
+                        stream
+                    ));
+                    keys = static_cast<uint64_t*>(rebuild_keys.data);
                 }
                 CUDDL_CUDA_CALL(
                     cub::DeviceRadixSort::SortKeys(
@@ -1045,51 +1065,50 @@ int run_main(
                         temp.data,
                         temp.bytes,
                         keys,
-                        static_cast<uint64_t*>(state.unique.data),
+                        out,
                         static_cast<int*>(pair_counts.data),
                         static_cast<int*>(num_runs_dev.data),
                         count,
                         stream
                     )
                 );
-                state.genome = g;
+                out += distinct[g];
+                ++rebuilt_genomes;
             }
-            return std::pair{
-                static_cast<uint64_t const*>(state.unique.data), static_cast<size_t>(distinct[g])
-            };
         };
-        for (auto const& scheduled : schedule) {
-            auto const [a, r] = pair_at(scheduled.ordinal);
-            // Both sides are sorted and deduplicated, so a pair is one linear pass over them and
-            // the union follows from distinct[a] + distinct[r] - shared. An empty side shares
-            // nothing, which the kernel handles without reading anything.
-            uint64_t const* left = nullptr;
-            uint64_t const* right = nullptr;
-            size_t left_len = 0, right_len = 0;
-            if (distinct[a] && distinct[r]) {
-                auto const packed_left = sorted_for(side_a, a);
-                auto const packed_right = sorted_for(side_r, r);
-                left = packed_left.first;
-                left_len = packed_left.second;
-                right = packed_right.first;
-                right_len = packed_right.second;
+        for (size_t lo = 0; lo < blocks.size(); ++lo) {
+            bool built = all_stored;
+            for (size_t hi = lo; hi < blocks.size(); ++hi) {
+                auto const first = bucket_start[lo * blocks.size() + hi];
+                auto const last = bucket_start[lo * blocks.size() + hi + 1];
+                if (first == last) continue;
+                if (!built) {
+                    build_block(lo, 0);
+                    built = true;
+                }
+                if (!all_stored && hi != lo) build_block(hi, 1);
+                for (auto k = first; k < last; ++k) {
+                    auto const i = order[k];
+                    auto const a = pair_a[i], r = pair_r[i];
+                    // Both sides are sorted and deduplicated, so a pair is one linear pass over
+                    // them and the union follows from distinct[a] + distinct[r] - shared. An
+                    // empty side shares nothing, which the kernel handles without reading.
+                    bool const both = distinct[a] && distinct[r];
+                    jobs.push_back({
+                        both ? sorted_at[a] : nullptr,
+                        static_cast<uint32_t>(both ? distinct[a] : 0),
+                        both ? sorted_at[r] : nullptr,
+                        static_cast<uint32_t>(both ? distinct[r] : 0),
+                    });
+                    job_rows.push_back({
+                        a,
+                        r,
+                        static_cast<char>(i % emit_stride == 0 || i + 1 == evaluated.size()),
+                    });
+                }
+                flush_jobs();
             }
-            jobs.push_back({
-                left,
-                static_cast<uint32_t>(left_len),
-                right,
-                static_cast<uint32_t>(right_len),
-            });
-            job_rows.push_back({
-                a,
-                r,
-                static_cast<char>(
-                    scheduled.evaluated_index % emit_stride == 0 ||
-                    scheduled.evaluated_index + 1 == evaluated.size()
-                ),
-            });
         }
-        flush_jobs();
         auto const done = clock_type::now();
         if (rep >= 0) {
             using ms = std::chrono::duration<double, std::milli>;
@@ -1145,6 +1164,8 @@ int run_main(
           {"stashed_genomes", static_cast<size_t>(std::count(resident.begin(), resident.end(), 1))},
           {"stashed_mb", stashed_bytes >> 20},
           {"reparsed_genomes", reparsed_genomes},
+          {"compare_blocks", compare_blocks},
+          {"rebuilt_genomes", rebuilt_genomes},
           {"pair_stride", pair_stride},
           {"pairs_emitted", emitted.size()}}},
         {"genomes", genome_rows},
