@@ -6,18 +6,21 @@
 """Micro-benchmarks over shared fused operations (SKETCH, COMPARE, SEARCH).
 
 Each tool runs its native fused path and reports wall time plus native
-outputs; accuracy joins against exact oracles afterwards unless --performance-only is set:
+outputs; accuracy joins against exact oracles afterwards unless --performance-only is set.
+Every wall is a whole process, timed from spawn to exit, one operation per process:
 
 - SKETCH: FASTA files to queryable sketch state. CLI tools time their
-  sketch command; cuDDL times reference-database build; RabbitSketch
-  times sketching plus writing its sketch file; SimdSketch times its library-driven
-  sketch command, which writes one sketch file; cub-exact times its device sketch phase.
+  sketch command; cuDDL times its reference-database builder CLI; RabbitSketch's
+  benchmark sketches and writes its sketch file; SimdSketch times its library-driven
+  sketch command, which writes one sketch file; cub-exact sketches on the device with
+  `--sketch-only`.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
   cuDDL's wall is its search CLI without an index (load the reference database,
   sketch FASTX queries, compare, download results to the host and discard them);
   RabbitSketch's wall loads its reference sketch file and sketches FASTX
   queries; SimdSketch's wall loads its reference sketch file, sketches batch FASTX
-  queries, and writes one binary similarity per pair; cub-exact times its device phase, and the
+  queries, and writes one binary similarity per pair; cub-exact keeps no sketch file, so its
+  process parses and sketches every genome before it compares; the
   CLI tools their native compare commands. Batch queries are sketched from FASTX
   inside the wall: skani sketches them and runs dist against reference sketches saved
   beforehand; Dashing2 loads cached reference sketches and evicts query cache entries before
@@ -73,13 +76,14 @@ from host RAM. Large corpora evaluate a size-spread genome subset that
 fits the budget; every lane runs the same files.
 """
 
-import array
 import gzip
 import json
 import math
+import mmap
 import os
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -93,6 +97,7 @@ from typing import Annotated
 
 import typer
 from benchmark_schema import make_result, write_result
+from energy_meter import EnergyMeter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hypergen_pipeline import dataset_entries, summarize
@@ -117,15 +122,6 @@ class HypergenDevice(StrEnum):
 
     CPU = "cpu"
     GPU = "gpu"
-
-
-class CuddlTransfer(StrEnum):
-    """How the cuDDL reference build gets bytes to the device."""
-
-    AUTOMATIC = "automatic"
-    PINNED = "pinned"
-    STAGED = "staged"
-    IN_PLACE = "in-place"
 
 
 class CuddlDecompression(StrEnum):
@@ -347,6 +343,29 @@ def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
     return stdout
 
 
+class Marks(list[float]):
+    """Wall milliseconds per rep, with the node energy of each rep (EnergyMeter.joules)."""
+
+    energy: list[dict]
+
+
+METER = EnergyMeter()
+# Node power at rest, from EnergyMeter.idle_watts before any tool runs; empty when not measured.
+IDLE: dict = {}
+
+
+def above_idle(energy: dict, seconds: float) -> dict:
+    """@p energy with what each source drew above the node's idle power over @p seconds.
+
+    Energy above idle bills a tool only for what it draws: total node energy also bills idle
+    sockets to a tool that leaves most cores unused, and the CPU tools run with no GPU counted.
+    """
+    for source in ("cpu", "gpu"):
+        if energy[f"{source}_j"] is not None and IDLE.get(f"{source}_w") is not None:
+            energy[f"dynamic_{source}_j"] = energy[f"{source}_j"] - IDLE[f"{source}_w"] * seconds
+    return energy
+
+
 def wall_of(
     command: list[str] | list[list[str]],
     samples: int,
@@ -355,18 +374,20 @@ def wall_of(
     prepare: Callable[[], None] | None = None,
     resident_skip: int = 0,
     log_tail: bool = False,
-) -> list[float]:
+) -> Marks:
     """Times @p command, a command or a group run back to back, per rep.
 
     @p prepare runs untimed before each rep. Resident timings sum over the group, except its
     first @p resident_skip commands, which count toward wall time only.
     """
     groups = command if command and isinstance(command[0], list) else [command]
-    marks: list[float] = []
+    marks = Marks()
+    marks.energy = []
     for rep in range(warmups + samples):
         if prepare is not None:
             prepare()
         resident_parts = [] if resident is not None else None
+        counters = METER.read()
         tick = time.perf_counter()
         for index, item in enumerate(groups):
             run(
@@ -378,6 +399,7 @@ def wall_of(
         done = time.perf_counter()
         if rep >= warmups:
             marks.append((done - tick) * 1000)
+            marks.energy.append(above_idle(METER.joules(counters, METER.read()), done - tick))
             if resident is not None:
                 first = resident_parts[0]
                 if any(
@@ -532,26 +554,28 @@ def read_f32_pairs(
     @p queries, or the strict upper triangle of @p references, row by row, when @p queries is
     empty. Returns (query, reference, value) for the sampled pairs.
     """
-    values = array.array("f")
-    values.frombytes(path.read_bytes())
-    if sys.byteorder != "little":
-        values.byteswap()
     n = len(references)
     expected = len(queries) * n if queries else n * (n - 1) // 2
-    if len(values) != expected:
-        raise ValueError(f"{path}: {len(values)} similarities, expected {expected}")
-    positions = list(range(0, len(values), stride))
-    if values and positions[-1] != len(values) - 1:
-        positions.append(len(values) - 1)
+    count = path.stat().st_size // 4
+    if count != expected:
+        raise ValueError(f"{path}: {count} similarities, expected {expected}")
+    positions = list(range(0, count, stride))
+    if count and positions[-1] != count - 1:
+        positions.append(count - 1)
+    # 100,000 genomes write 20 GB; read only the sampled values.
+    values = []
+    if count:
+        with path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
+            values = [struct.unpack_from("<f", view, 4 * p)[0] for p in positions]
     if queries:
-        return [(queries[p // n], references[p % n], values[p]) for p in positions]
+        return [(queries[p // n], references[p % n], v) for p, v in zip(positions, values)]
     pairs = []
     i, start = 0, 0
-    for p in positions:
+    for p, v in zip(positions, values):
         while p >= start + n - 1 - i:
             start += n - 1 - i
             i += 1
-        pairs.append((references[i], references[i + 1 + p - start], values[p]))
+        pairs.append((references[i], references[i + 1 + p - start], v))
     return pairs
 
 
@@ -923,15 +947,6 @@ def main(
             "pair.",
         ),
     ] = None,
-    cuddl_transfer: Annotated[
-        CuddlTransfer,
-        typer.Option(
-            help="How the cuDDL reference build gets bytes to the device: 'automatic' asks the "
-            "device, 'pinned' transfers page-locked memory, 'staged' copies each genome through "
-            "a heap buffer, 'in-place' lets the kernels read that heap buffer, which only a "
-            "device that reads pageable host memory can do."
-        ),
-    ] = CuddlTransfer.AUTOMATIC,
     cuddl_decompression: Annotated[
         CuddlDecompression,
         typer.Option(
@@ -941,8 +956,19 @@ def main(
             "normalises FASTA on the device."
         ),
     ] = CuddlDecompression.AUTOMATIC,
+    idle_seconds: Annotated[
+        float,
+        typer.Option(
+            min=0,
+            help="Seconds to measure node power at rest before any tool runs, for energy above "
+            "idle. 0 skips it. Needs an otherwise idle node.",
+        ),
+    ] = 30.0,
 ) -> None:
     """Time SKETCH, COMPARE, and SEARCH for each tool and score against oracles."""
+    if idle_seconds > 0:
+        IDLE.update(METER.idle_watts(idle_seconds))
+        typer.echo(f"idle power: {IDLE}")
     if performance_only:
         ani_truth = False
     layout = cpu_layout()
@@ -1013,7 +1039,6 @@ def main(
     skani = build / "subprojects/skani/skani"
     dashing2 = build / "subprojects/dashing2/dashing2"
     cub = build / "benchmarks/cub-exact-pairwise"
-    refbuild = build / "benchmarks/cuddl-reference-build-benchmark"
     cuddl_cli = build / "examples/cuddl-reference-index"
     cuddl_dbbuild = build / "examples/cuddl-build-reference-db"
     rabbit = build / "benchmarks/rabbitsketch-pipeline-benchmark"
@@ -1042,7 +1067,7 @@ def main(
     if "cub-exact" in selected:
         required.append(cub)
     if "cuddl" in selected:
-        required += [refbuild, cuddl_cli, cuddl_dbbuild]
+        required += [cuddl_cli, cuddl_dbbuild]
     if "rabbitsketch" in selected:
         required.append(rabbit)
     if "simdsketch" in selected:
@@ -1249,9 +1274,17 @@ def main(
             # the pairs, and cub-exact sorts and deduplicates each genome before any pair runs.
             # Measured that way the rate was 8.5 ms a pair where the pair phase is 0.17 ms, which
             # inflated every estimate and shrank the oracle cap to match.
-            phases = jsonlib_probe.loads((work / "probe2.json").read_text())[
-                "phases_ms"
-            ]
+            probe2 = jsonlib_probe.loads((work / "probe2.json").read_text())
+            # Genomes whose sorted k-mer arrays fit cub-exact's device stash. A pair outside it
+            # rebuilds a side per pair, a cost of how the run is sized, not of the method.
+            nonlocal cub_device_genomes
+            distinct = [g["distinct"] for g in probe2.get("genomes", []) if g["distinct"]]
+            if distinct and "device_stash_mb" in probe2["case"]:
+                cub_device_genomes = int(
+                    probe2["case"]["device_stash_mb"] * (1 << 20) * 0.9
+                    // (8 * statistics.mean(distinct))
+                )
+            phases = probe2["phases_ms"]
             if probe_eval2 > 0 and "compare" in phases:
                 return phases["compare"]["median_ms"] / probe_eval2
             probe_per_pair_ms = 0.0
@@ -1270,6 +1303,7 @@ def main(
         slowest = "unprobed"
         probe_per_pair_ms = 0.0
         rate_note = "unprobed"
+        cub_device_genomes: int | None = None
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
                 _spread_pick(references, sizes, _PROBE_GENOMES)
@@ -1300,16 +1334,22 @@ def main(
                 )
                 # An explicit query count is a decision, not a request to be second-guessed: the
                 # pairs it implies are reported below instead of being trimmed away silently.
-                if capacity < orig_pairs and query_count is None:
+                if query_count is None:
                     if topology == "all-to-all":
-                        keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
-                        references = _spread_pick(references, sizes, keep)
-                    else:
+                        keep = len(references)
+                        if capacity < orig_pairs:
+                            keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
+                        if cub_device_genomes is not None:
+                            keep = min(keep, max(2, cub_device_genomes))
+                        if keep < len(references):
+                            references = _spread_pick(references, sizes, keep)
+                            subset_note = "budget subset"
+                    elif capacity < orig_pairs:
                         keep = max(
                             1, min(len(query_list), capacity // max(1, len(references)))
                         )
                         query_list = _spread_pick(query_list, sizes, keep)
-                    subset_note = "budget subset"
+                        subset_note = "budget subset"
                 capacity_pairs = max(1, capacity)
             else:
                 capacity_pairs = None
@@ -1659,47 +1699,35 @@ def main(
 
         if "cuddl" in selected:
             db_out = work / "ref.cuddl"
-            # Full-corpus sketch-all runs pass paths by config file;
-            # argv cannot hold a hundred thousand genomes.
-            ref_cmd = [str(refbuild)]
-            if sketch_all:
-                import json as jsonlib_ref
-
-                ref_cfg = work / "refbuild.toml"
-                ref_cfg.write_text(
-                    "reference = "
-                    + jsonlib_ref.dumps([str(p) for p in sketch_file_args])
-                    + "\n"
-                )
-                ref_cmd += ["--config", str(ref_cfg)]
-            else:
-                ref_cmd += ["--reference", *file_args]
-            stdout = run_timed(
-                f"cuddl sketch: reference database for {len(sketch_file_args)} genomes "
-                f"({max(samples, 2)} samples, {cuddl_workers} loaders)",
-                ref_cmd
-                + [
-                    "--database",
+            sketched = [Path(p) for p in (sketch_file_args if sketch_all else file_args)]
+            # The builder takes a folder and sorts its paths, so zero-padded symlinks pin the order.
+            farm = work / "cuddl-sketch-refs"
+            farm.mkdir()
+            width = len(str(len(sketched)))
+            for i, path in enumerate(sketched):
+                (farm / f"{i:0{width}d}-{path.name}").symlink_to(path.resolve())
+            typer.echo(
+                f"  cuddl sketch: reference database for {len(sketched)} genomes "
+                f"({samples} samples, {cuddl_workers} loaders)"
+            )
+            cuddl_resident: list[dict] = []
+            marks = wall_of(
+                [
+                    str(cuddl_dbbuild),
+                    str(farm),
+                    "--output",
                     str(db_out),
-                    "--samples",
-                    str(max(samples, 2)),
-                    # The benchmark defaults to one loader, which gunzips and
-                    # parses every genome on the calling thread.
                     "--workers",
                     str(cuddl_workers),
-                    "--transfer",
-                    cuddl_transfer,
                     "--decompression",
                     cuddl_decompression,
                 ],
-                capture=True,
+                samples,
+                warmups,
+                resident=cuddl_resident,
+                log_tail=True,
             )
-            import json as jsonlib2
-
-            payload = jsonlib2.loads(stdout[stdout.index("{") :])
-            resident_timings[("cuddl", "sketch")] = payload["resident"]
-            native_timings[("cuddl", "sketch")] = {"wall": payload["wall"]}
-            marks = [payload["wall"]["median_ms"]]
+            record_native_resident("cuddl", "sketch", cuddl_resident)
             sketch_times["cuddl"] = marks
             sketch_bytes["cuddl"] = db_out.stat().st_size
             record_sketch(
@@ -1745,9 +1773,8 @@ def main(
             typer.echo(
                 f"  rabbitsketch: sequence ingest, {staged_bytes >> 30} GiB of input"
             )
-            # One process times every operation, so each thread count is one run and each
-            # operation takes the run where it was fastest.
-            rabbit_runs: list[tuple[int, dict, dict]] = []
+            # One process per thread count supplies resident timings and match rows.
+            rabbit_runs: dict[int, tuple[dict, dict]] = {}
             for count in thread_counts:
                 rep = work / f"rabbit-{count}.json"
                 run(
@@ -1786,28 +1813,46 @@ def main(
                     for m in payload["measurements"]
                     if m["case"].get("measurement") == "pipeline"
                 )
-                rabbit_runs.append((count, payload, pipe))
-            rabbit_timed: dict[str, dict] = {}
-            for operation, timing in (
-                ("sketch", "sketch_file_wall"),
-                ("compare", "query_fastx_compare"),
-                ("search", "query_fastx_search"),
-            ):
-                count, _, pipe = min(
-                    rabbit_runs,
-                    key=lambda entry: entry[2]["timings"][timing]["median_ms"],
+                rabbit_runs[count] = (payload, pipe)
+
+            # Walls run one operation per process, like every other tool's; compare and search
+            # read back the sketch file the sketch operation writes.
+            def rabbit_operation(operation: str) -> Callable[[int], list[str]]:
+                return lambda count: [
+                    str(rabbit),
+                    "--operation",
+                    operation,
+                    "--threads",
+                    str(count),
+                    "--topology",
+                    topology,
+                    "--k",
+                    "25",
+                    "--sketch-size",
+                    "2048",
+                    "--config",
+                    str(cfg),
+                    "--sketch-file",
+                    str(work / "rabbit.kmv"),
+                ]
+
+            rabbit_marks = {
+                operation: sweep(
+                    "rabbitsketch", operation, rabbit_operation(operation), log_tail=True
                 )
-                rabbit_timed[operation] = pipe
-                chosen_threads[("rabbitsketch", operation)] = count
-            sketched = rabbit_timed["sketch"]["timings"]["sketch_file_wall"]
-            native_timings[("rabbitsketch", "sketch")] = {"wall": sketched}
+                for operation in ("sketch", "compare", "search")
+            }
+            rabbit_timed = {
+                operation: rabbit_runs[chosen_threads[("rabbitsketch", operation)]][1]
+                for operation in rabbit_marks
+            }
             resident_timings[("rabbitsketch", "sketch")] = rabbit_timed["sketch"][
                 "timings"
             ]["resident_sketch"]
             resident_timings[("rabbitsketch", "compare")] = rabbit_timed["compare"][
                 "timings"
             ]["resident_compare"]
-            marks = [sketched["median_ms"]]
+            marks = rabbit_marks["sketch"]
             sketch_times["rabbitsketch"] = marks
             sketch_bytes["rabbitsketch"] = (work / "rabbit.kmv").stat().st_size
             record_sketch(
@@ -1817,7 +1862,7 @@ def main(
                 {"sketch_bytes": sketch_bytes["rabbitsketch"]},
             )
             # Match rows are the same at every thread count; take the last run's.
-            _, rabbit_report, rabbit_rows = rabbit_runs[-1]
+            rabbit_report, rabbit_rows = rabbit_runs[thread_counts[-1]]
 
         if "simdsketch" in selected:
             # The timed sketch covers the same files as the other CLI lanes. COMPARE needs a
@@ -2035,6 +2080,18 @@ def main(
                     ],
                 )
                 sketch_payload = jsonlib4.loads((work / "cub-sketch.json").read_text())
+            cub_args = [
+                *cub_stash,
+                *cub_inputs(
+                    work, "compare", references, query_list if topology == "batch" else []
+                ),
+                "--max-kmers",
+                str(max_kmers),
+                "--max-pairs",
+                str(all_pairs),
+                "--match-rows",
+                str(match_rows),
+            ]
             cub_cmd = [
                 str(cub),
                 "--topology",
@@ -2043,18 +2100,7 @@ def main(
                 str(samples),
                 "--warmups",
                 str(warmups),
-            ]
-            cub_cmd += cub_stash
-            cub_cmd += cub_inputs(
-                work, "compare", references, query_list if topology == "batch" else []
-            )
-            cub_cmd += [
-                "--max-kmers",
-                str(max_kmers),
-                "--max-pairs",
-                str(all_pairs),
-                "--match-rows",
-                str(match_rows),
+                *cub_args,
                 "--output",
                 str(cub_rep),
             ]
@@ -2066,17 +2112,56 @@ def main(
             payload = jsonlib4.loads(cub_rep.read_text())
             if sketch_all:
                 payload = sketch_payload
-            sketch_times["cub-exact"] = [payload["phases_ms"]["sketch"]["median_ms"]]
-            native_timings[("cub-exact", "sketch")] = {
-                "wall": payload["phases_ms"]["sketch"]
-            }
+            # Walls are whole processes run once each. cub-exact keeps no sketch file, so its
+            # compare process parses and sketches every genome before it compares any pair.
+            single = ["--samples", "1", "--warmups", "0"]
+            cub_sketch_marks = wall_of(
+                [
+                    str(cub),
+                    "--topology",
+                    topology,
+                    *single,
+                    *cub_stash,
+                    *cub_inputs(
+                        work,
+                        "sketch",
+                        sketch_references if sketch_all else references,
+                        (sketch_queries if sketch_all else query_list)
+                        if topology == "batch"
+                        else [],
+                    ),
+                    "--max-kmers",
+                    str(max_kmers),
+                    "--sketch-only",
+                    "--output",
+                    str(work / "cub-sketch-wall.json"),
+                ],
+                samples,
+                warmups,
+                log_tail=True,
+            )
+            cub_compare_marks = wall_of(
+                [
+                    str(cub),
+                    "--topology",
+                    topology,
+                    *single,
+                    *cub_args,
+                    "--output",
+                    str(work / "cub-wall.json"),
+                ],
+                samples,
+                warmups,
+                log_tail=True,
+            )
+            sketch_times["cub-exact"] = cub_sketch_marks
             resident_timings[("cub-exact", "sketch")] = payload["phases_ms"][
                 "resident_sketch"
             ]
             record_sketch(
                 "cub-exact",
                 "gpu-exact",
-                [payload["phases_ms"]["sketch"]["median_ms"]],
+                cub_sketch_marks,
                 {
                     f"device_{key}_bytes": value
                     for key, value in payload["phases_ms"]
@@ -2086,7 +2171,6 @@ def main(
             )
             cub_compare = jsonlib4.loads(cub_rep.read_text())
             cub_phases = cub_compare["phases_ms"]
-            native_timings[("cub-exact", "compare")] = {"wall": cub_phases["compare"]}
             resident_timings[("cub-exact", "compare")] = cub_phases["resident_compare"]
 
         # COMPARE op per tool; errors join cub-exact Jaccard and ANIm.
@@ -2128,6 +2212,26 @@ def main(
                 "report_row_stride": stride,
                 "per_pair_ms": statistics.median(marks) / max(pairs, 1),
             }
+            # Node energy of each timed rep, over the same CLI wall the rate uses, and the same
+            # above the node's idle power; only on hosts whose counters are readable
+            # (scripts/energy_meter.py).
+            for source in ("cpu_j", "gpu_j", "dynamic_cpu_j", "dynamic_gpu_j"):
+                joules = [
+                    e[source]
+                    for e in getattr(marks, "energy", [])
+                    if e.get(source) is not None
+                ]
+                if joules:
+                    metrics[f"energy_{source}"] = statistics.median(joules)
+            for source in ("cpu_w", "gpu_w"):
+                if IDLE.get(source) is not None:
+                    metrics[f"idle_{source}"] = IDLE[source]
+            # Without the CPUs' share the node energy would be understated, so no rate.
+            for prefix in ("energy", "energy_dynamic"):
+                if f"{prefix}_cpu_j" in metrics:
+                    metrics[f"{prefix}_per_pair_j"] = (
+                        metrics[f"{prefix}_cpu_j"] + metrics.get(f"{prefix}_gpu_j", 0.0)
+                    ) / max(pairs, 1)
             if jaccard_errors:
                 metrics["jaccard_mae_vs_exact"] = sum(jaccard_errors) / len(
                     jaccard_errors
@@ -2563,13 +2667,11 @@ def main(
                     )
             phases = retrieval_phases(rabbit_rows, _RABBITS_RESULT_PHASES[topology])
             # Wall loads reference sketches from the file and sketches batch queries from FASTX.
-            fastx_compare = rabbit_timed["compare"]["timings"]["query_fastx_compare"]
-            native_timings[("rabbitsketch", "compare")] = {"wall": fastx_compare}
             evaluated = rabbit_rows["metrics"].get("match_rows_total")
             record_compare(
                 "rabbitsketch",
                 "FastKMV",
-                [fastx_compare["median_ms"]] * max(samples, 1),
+                rabbit_marks["compare"],
                 rows,
                 evaluated=evaluated,
             )
@@ -2742,7 +2844,7 @@ def main(
             record_compare(
                 "cub-exact",
                 "gpu-exact",
-                [cub_phases["compare"]["median_ms"]],
+                cub_compare_marks,
                 rows,
                 evaluated=cub_compare["case"]["pairs_evaluated"],
             )
@@ -3158,25 +3260,16 @@ def main(
         if "rabbitsketch" in selected:
             timings = rabbit_timed["search"]["timings"]
             index = rabbit_timed["search"]["case"]["search_index"]
-            index_timing = (
-                timings["search_index_build"]
-                if index != "none"
-                else timings["sketch_file_wall"]
-            )
-            # No index file format: the query wall loads the sketch file and constructs the index.
-            query_timing = timings["query_fastx_search"]
-            search_index_ms["rabbitsketch"] = [index_timing["median_ms"]]
-            search_query_ms["rabbitsketch"] = [query_timing["median_ms"]]
-            native_timings[("rabbitsketch", "search")] = {
-                "index_build": index_timing,
-                "query": query_timing,
-            }
+            # No index file format: the index build is the sketch process, and the query process
+            # loads the sketch file and constructs the index.
+            search_index_ms["rabbitsketch"] = rabbit_marks["sketch"]
+            search_query_ms["rabbitsketch"] = rabbit_marks["search"]
             resident_timings[("rabbitsketch", "search")] = timings["resident_search"]
             search_cases["rabbitsketch"] = {
                 "index": index,
                 "index_supported": index != "none",
                 "resident_output": rabbit_rows["case"]["search_resident_output"],
-                "index_build_includes_sketching": index == "none",
+                "index_build_includes_sketching": True,
             }
             if index == "none":
                 search_cases["rabbitsketch"]["index_unavailable_reason"] = (
@@ -3369,12 +3462,7 @@ def main(
                     (tool, "search-index")
                 ]
         measurement["case"]["timing_scope"] = (
-            "in_process"
-            if tool in {"rabbitsketch", "cub-exact"}
-            or (tool, operation) == ("cuddl", "sketch")
-            else "process_jvm"
-            if tool == "bbtools"
-            else "process"
+            "process_jvm" if tool == "bbtools" else "process"
         )
 
     datasets = dataset_entries("reference", references, 8)

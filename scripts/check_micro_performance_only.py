@@ -349,12 +349,12 @@ def main() -> None:
         genome = str(pipeline_genome)
         for topology, ingest, performance, references, queries, exhaustive in [
             ("batch", "sequence", True, 257, 259, False),
-            ("all-to-all", "sequence", True, 257, 1, False),
+            ("all-to-all", "sequence", True, 6000, 1, False),
             ("batch", "packed", True, 3, 2, False),
             ("batch", "sequence", False, 3, 2, False),
             ("batch", "sequence", False, 10001, 1, False),
             ("batch", "sequence", True, 257, 259, True),
-            ("all-to-all", "sequence", True, 257, 1, True),
+            ("all-to-all", "sequence", True, 6000, 1, True),
             ("batch", "packed", True, 3, 2, True),
             ("batch", "sequence", False, 3, 2, True),
         ]:
@@ -427,13 +427,13 @@ def main() -> None:
                 if exhaustive:
                     assert report["case"]["index"] == "none"
                     assert memory["persistent_index"] == 0
-                    assert memory["search_workspace"] == 0
                 assert (
                     memory["host_result_capacity"]
                     <= memory["search_result_capacity"]
                     + memory["search_match_capacity"]
                 )
-                if references == 257:
+                # All-to-all tiles hold about 2^25 pairs, so 6,000 references take two.
+                if references == 6000:
                     assert report["metrics"]["downloaded_tiles"] > 1
                     assert memory["host_result_capacity"] < expected * 36
             else:

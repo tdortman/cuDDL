@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -99,17 +101,33 @@ int main(int argc, char** argv) {
                 stream
             );
         }
+        cuddl::reference_build_statistics statistics;
+        // The micro comparison names a file here to read the build's GPU time, as it does with
+        // every other tool it times as a whole process.
+        char const* const resident_path = std::getenv("CUDDL_RESIDENT_TIMINGS");
+        statistics.measure_resident = resident_path != nullptr && *resident_path != '\0';
         auto file = CUDDL_UNWRAP(
             (cuddl::reference_database_file::build<cli::kmer_length, cli::buckets, cli::layout>(
                 paths,
                 stream,
-                {.parser_workers = workers,
+                {.statistics = &statistics,
+                 .parser_workers = workers,
                  .decompression = decompression,
                  .blacklist = blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt}
             ))
         );
         CUDDL_UNWRAP(file.save(output));
+        if (statistics.measure_resident) {
+            std::ofstream timings(resident_path);
+            timings << R"({"resident_ms":)" << statistics.resident_compute_ms
+                    << R"(,"source":"cuda_events","device":"cuda","input":"sequence_ascii"})";
+            if (!timings) throw std::runtime_error("cannot write resident timings");
+        }
         std::cout << "Saved " << paths.size() << " reference sketches to " << output << '\n';
+        if (statistics.device_files != 0) {
+            std::cout << statistics.device_files
+                      << " of them loaded by the GPU without a host loader\n";
+        }
     } catch (std::exception const& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;

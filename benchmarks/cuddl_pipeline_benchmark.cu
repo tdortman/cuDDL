@@ -879,8 +879,25 @@ json resident_timings(
         auto const reference_words = opts.references.size() * buckets;
         refs.bind_store({store.data(), reference_words});
         queries.bind_store({store.data() + reference_words, store.size() - reference_words});
-        refs.clear(setup);
-        queries.clear(setup);
+        // The search buffers are sized from the setup database's index, so that database holds
+        // the sketches the timed construction reproduces; the timed reset clears them first.
+        // The plan probe has no sketches and builds from cleared rows.
+        if (expected_references) {
+            cuda::copy_bytes(
+                setup, *expected_references->store, cuda::std::span{store.data(), reference_words}
+            );
+        } else {
+            refs.clear(setup);
+        }
+        if (!all && expected_queries && expected_queries->store) {
+            cuda::copy_bytes(
+                setup,
+                *expected_queries->store,
+                cuda::std::span{store.data() + reference_words, store.size() - reference_words}
+            );
+        } else {
+            queries.clear(setup);
+        }
     } else {
         refs.add(setup);
         queries.add(setup);

@@ -38,6 +38,7 @@ using json = nlohmann::json;
 struct options {
     std::vector<std::string> references, queries;
     std::string output, sketch_file, name = "RabbitSketch CPU pipeline", topology = "batch";
+    std::string operation;
     std::string ingest = "packed";
     int k = 25, sketch_size = 4096, samples = 20, warmups = 3;
     bool performance_only = false;
@@ -927,6 +928,89 @@ json resident_timings(options const& opts) {
     return timings;
 }
 
+struct native_index {
+    std::vector<std::vector<uint64_t>> keys;
+    std::vector<int> sizes;
+    std::vector<std::string> labels;
+    std::optional<Sketch::InvertedIndex<uint64_t>> index;
+};
+
+native_index index_keys(collection const& sketches) {
+    native_index n{
+        std::vector<std::vector<uint64_t>>(sketches.size()),
+        std::vector<int>(sketches.size()),
+        std::vector<std::string>(sketches.size()),
+        std::nullopt
+    };
+    parallel_for(sketches.size(), [&](size_t i) {
+        auto const& sketch = sketches[i].sketch.fastKMV();
+        n.keys[i].assign(sketch.getRegisters(), sketch.getRegisters() + sketch.size());
+        n.sizes[i] = static_cast<int>(sketch.size());
+        n.labels[i] = std::to_string(i);
+    });
+    return n;
+}
+
+void build_index(native_index& n, options const& opts) {
+    std::vector<phmap::flat_hash_map<uint64_t, std::vector<uint32_t>>> parts(opts.threads);
+    parallel_for(n.keys.size(), [&](size_t i) {
+        auto& part = parts[omp_get_thread_num()];
+        for (auto key : n.keys[i]) {
+            part[key].push_back(static_cast<uint32_t>(i));
+        }
+    });
+    n.index = Sketch::buildCSRIndex<uint64_t>(parts, opts.threads);
+}
+
+void indexed_search(native_index const& n, std::string const& destination, options const& opts) {
+    Sketch::computeDistances<uint64_t>(
+        *n.index,
+        n.keys,
+        n.sizes,
+        n.labels,
+        static_cast<int>(n.keys.size()),
+        0,
+        1.0,
+        [&](int common, int left, int right) {
+            auto const denominator = std::min(left + right - common, opts.sketch_size);
+            return denominator > 0 ? double(common) / denominator : 0.0;
+        },
+        [](int) { return 1; },
+        destination,
+        opts.threads
+    );
+}
+
+/// @brief Runs one operation once, for a wall timed around the whole process.
+///
+/// sketch writes `--sketch-file`; compare and search read it back, as their walls in @ref run do.
+void run_operation(options const& opts) {
+    auto const cfg = config(opts);
+    auto const all = opts.topology == "all-to-all";
+    if (opts.operation == "sketch") {
+        save_sketches(
+            opts.sketch_file, build_files(opts.references, cfg), build_files(opts.queries, cfg)
+        );
+        return;
+    }
+    auto refs = load_references(opts.sketch_file, opts, cfg);
+    if (opts.operation == "search" && all) {
+        // No index file format exists, so the search builds the index from the loaded sketches.
+        auto index = index_keys(refs);
+        build_index(index, opts);
+        auto close_output = [](FILE* file) {
+            std::fclose(file);
+        };
+        std::unique_ptr<FILE, decltype(close_output)> output(std::tmpfile(), close_output);
+        if (!output) throw std::runtime_error("cannot create native search output file");
+        indexed_search(index, "/proc/self/fd/" + std::to_string(fileno(output.get())), opts);
+        return;
+    }
+    auto hits = all ? search(refs, refs, true, opts.match_rows)
+                    : search(refs, build_files(opts.queries, cfg), false, opts.match_rows);
+    consumed_size = hits.matches.size();
+}
+
 json run(options const& opts) {
     auto const cfg = config(opts);
     auto const all = opts.topology == "all-to-all";
@@ -1044,73 +1128,25 @@ json run(options const& opts) {
         if (refs.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
             throw std::runtime_error("native RabbitSketch index requires at most INT_MAX genomes");
         }
-        struct native_index {
-            std::vector<std::vector<uint64_t>> keys;
-            std::vector<int> sizes;
-            std::vector<std::string> labels;
-            std::optional<Sketch::InvertedIndex<uint64_t>> index;
-        };
-        auto index_keys = [&](collection const& sketches) {
-            native_index n{
-                std::vector<std::vector<uint64_t>>(sketches.size()),
-                std::vector<int>(sketches.size()),
-                std::vector<std::string>(sketches.size()),
-                std::nullopt
-            };
-            parallel_for(sketches.size(), [&](size_t i) {
-                auto const& sketch = sketches[i].sketch.fastKMV();
-                n.keys[i].assign(sketch.getRegisters(), sketch.getRegisters() + sketch.size());
-                n.sizes[i] = static_cast<int>(sketch.size());
-                n.labels[i] = std::to_string(i);
-            });
-            return n;
-        };
-        auto build_index = [&](native_index& n) {
-            std::vector<phmap::flat_hash_map<uint64_t, std::vector<uint32_t>>> parts(opts.threads);
-            parallel_for(n.keys.size(), [&](size_t i) {
-                auto& part = parts[omp_get_thread_num()];
-                for (auto key : n.keys[i]) {
-                    part[key].push_back(static_cast<uint32_t>(i));
-                }
-            });
-            n.index = Sketch::buildCSRIndex<uint64_t>(parts, opts.threads);
-        };
-        auto indexed_search = [&](native_index const& n, std::string const& destination) {
-            Sketch::computeDistances<uint64_t>(
-                *n.index,
-                n.keys,
-                n.sizes,
-                n.labels,
-                static_cast<int>(n.keys.size()),
-                0,
-                1.0,
-                [&](int common, int left, int right) {
-                    auto const denominator = std::min(left + right - common, opts.sketch_size);
-                    return denominator > 0 ? double(common) / denominator : 0.0;
-                },
-                [](int) { return 1; },
-                destination,
-                opts.threads
-            );
-        };
         auto resident = index_keys(refs);
         timings["search_index_build"] =
-            measure(opts, [&] { build_index(resident); }, [&] { resident.index.reset(); });
-        timings["resident_search"] = measure(opts, [&] { indexed_search(resident, "/dev/null"); });
+            measure(opts, [&] { build_index(resident, opts); }, [&] { resident.index.reset(); });
+        timings["resident_search"] =
+            measure(opts, [&] { indexed_search(resident, "/dev/null", opts); });
         auto close_output = [](FILE* file) {
             std::fclose(file);
         };
         std::unique_ptr<FILE, decltype(close_output)> output(std::tmpfile(), close_output);
         if (!output) throw std::runtime_error("cannot create native search output file");
         auto const path = "/proc/self/fd/" + std::to_string(fileno(output.get()));
-        timings["search_query_wall"] = measure(opts, [&] { indexed_search(resident, path); });
+        timings["search_query_wall"] = measure(opts, [&] { indexed_search(resident, path, opts); });
 
         // No index file format exists, so the search wall loads the saved sketches and also
         // constructs the index.
         timings["query_fastx_search"] = measure(opts, [&] {
             auto fresh = index_keys(load_references(sketch_path, opts, cfg));
-            build_index(fresh);
-            indexed_search(fresh, path);
+            build_index(fresh, opts);
+            indexed_search(fresh, path, opts);
         });
 
         if (!opts.performance_only) {
@@ -1277,6 +1313,13 @@ int main(int argc, char** argv) try {
         "Sketch file written by the SKETCH wall and read by COMPARE/SEARCH walls; a temporary "
         "file removed at exit if omitted"
     );
+    app.add_option(
+           "--operation",
+           opts.operation,
+           "Run one operation once and exit, for timing the whole process: sketch writes "
+           "--sketch-file, compare and search read it"
+    )
+        ->check(CLI::IsMember({"sketch", "compare", "search"}));
     app.add_option("--name", opts.name);
     app.set_config("--config", "", "Read benchmark options from a configuration file");
     CLI11_PARSE(app, argc, argv);
@@ -1300,6 +1343,13 @@ int main(int argc, char** argv) try {
                 }
             }
         }
+    }
+    if (!opts.operation.empty()) {
+        if (opts.sketch_file.empty()) {
+            throw std::runtime_error("--operation needs --sketch-file");
+        }
+        run_operation(opts);
+        return 0;
     }
     auto report = run(opts).dump(2) + '\n';
     if (opts.output.empty()) {

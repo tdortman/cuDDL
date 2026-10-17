@@ -5,15 +5,16 @@
 # ///
 """Figures for micro-benchmark comparisons (operation=micro).
 
-Twelve single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+Fourteen single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+COMPARE node energy per pair and the same above the node's idle power (CPU and GPU stacked),
 resident processing time for each of those operations,
 Jaccard MAE vs exact, ANI MAE vs ANIm, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
 for a panel are absent from it, which is itself information. Exact-zero
 errors plot at the floor with an "exact" tag.
 Timing bars use log axes and label median milliseconds above min/max error bars.
-Wall labels carry each tool's fastest thread count and name walls that are not a timed
-child process: an in-process timer, or a JVM start-up included.
+Wall labels carry each tool's fastest thread count, and note BBTools walls, which include JVM
+start-up.
 Resident-only bars show measured CPU, GPU, or hybrid processing.
 Missing resident measurements are omitted, never inferred from wall time.
 """
@@ -89,7 +90,7 @@ def read_micro(path: Path) -> list[dict]:
     return rows
 
 
-SCOPE_NOTES = {"in_process": "in-process timer", "process_jvm": "incl. JVM start"}
+SCOPE_NOTES = {"process_jvm": "incl. JVM start"}
 
 
 def label(row: dict, wall: bool = True) -> str:
@@ -207,6 +208,55 @@ def main(
                 f"micro_time_{operation}_resident",
                 resident=True,
             )
+
+        # Energy over the same wall as the COMPARE rate; lanes without CPU counters have none.
+        # Above idle subtracts the node's power at rest, so a tool that leaves most cores idle
+        # is not billed for them, and neither is a CPU tool for the GPUs it never counted.
+        def energy_panel(prefix: str, title: str, stem: str) -> None:
+            metered = sorted(
+                (r for r in compare if f"{prefix}_per_pair_j" in r["metrics"]),
+                key=lambda r: r["metrics"][f"{prefix}_per_pair_j"],
+            )
+            fig, ax = plt.subplots(figsize=(width, 4))
+            if not metered:
+                ax.set_title(f"{title} (not recorded)")
+                ax.set_axis_off()
+                save_both(fig, stem)
+                return
+            pairs = [max(r["metrics"]["pairs"], 1) for r in metered]
+            # Above idle, a CPU tool's GPUs never ran and a GPU run's idle sockets can dip a
+            # share just below zero; neither is energy the run spent.
+            cpu = [
+                max(r["metrics"][f"{prefix}_cpu_j"], 0.0) / p * 1e6
+                for r, p in zip(metered, pairs)
+            ]
+            gpu = [
+                max(r["metrics"].get(f"{prefix}_gpu_j", 0.0), 0.0) / p * 1e6
+                for r, p in zip(metered, pairs)
+            ]
+            names = [label(r) for r in metered]
+            ax.bar(names, cpu, label="CPU packages (RAPL)")
+            bars = ax.bar(names, gpu, bottom=cpu, label="GPUs (NVML)")
+            texts = ax.bar_label(
+                bars, labels=[f"{c + g:.3g}" for c, g in zip(cpu, gpu)],
+                padding=3, fontsize=pu.BAR_FONT_SIZE,
+            )
+            ax.set_yscale("log")
+            ax.margins(y=0.15)
+            # The smallest bar would otherwise sit below the axis.
+            ax.set_ylim(bottom=min((c + g for c, g in zip(cpu, gpu) if c + g > 0), default=1e-3) / 3)
+            ax.set_ylabel("Energy per pair (µJ), log scale")
+            ax.set_title(title)
+            ax.tick_params(axis="x", labelrotation=20)
+            ax.legend(fontsize=8)
+            save_both(fig, stem, list(zip(bars, texts)))
+
+        energy_panel("energy", "COMPARE node energy per pair", "micro_energy_compare")
+        energy_panel(
+            "energy_dynamic",
+            "COMPARE energy per pair above idle",
+            "micro_energy_dynamic_compare",
+        )
 
         def scatter_panel(metric: str, title: str, ylabel: str, stem: str) -> None:
             fig, ax = plt.subplots(figsize=(5.5, 4.5))

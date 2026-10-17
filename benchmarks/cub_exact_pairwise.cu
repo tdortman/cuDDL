@@ -4,9 +4,10 @@
 // evaluated pairs keep their packed arrays; the rest stream through for distinct counts only, so
 // host memory stays bounded by the evaluated set. Sketching queues a batch of genomes' sorts and
 // encodes behind each other and reads the whole batch's run counts back at once, so no genome
-// waits on a host round trip. Per evaluated pair: one block counts the shared k-mers of two
-// sorted, deduplicated arrays, so shared = |A| + |B| - union. The only downloads are the
-// per-batch counts and one integer per pair batch; pair metrics are host math.
+// waits on a host round trip. Per evaluated pair: blocks take equal tiles of the merge of two
+// sorted, deduplicated arrays and count the shared k-mers, so shared = |A| + |B| - union. The
+// only downloads are the per-batch counts and one integer per pair batch; pair metrics are host
+// math.
 //
 // --max-pairs stride-samples the evaluated pair space (first and last pair
 // always measured) and --match-rows stride-samples the emitted rows the same
@@ -17,6 +18,7 @@
 // sorting and dedup on staged bytes; phases_ms.resident_compare sums the pair kernels only.
 // Compare rebuilds stay untimed, and transfers and host parsing stay in the wall phases.
 // Allocation and temp-storage sizing stay outside timing; the report carries
+#include <cuda_pipeline.h>
 #include <vector_types.h>
 #include <cuddl/cuda_error.hpp>
 #include <cuddl/error.hpp>
@@ -269,118 +271,205 @@ struct pair_job {
     uint32_t b_len;
 };
 
-/// @brief Four keys of the sixteen-byte-aligned block that holds index @p pos.
-///
-/// An eight-byte key still costs a whole sector, so a four-key register block taken with one
-/// aligned vector load is what keeps the walk off the load-request limit. @p keys is the start of
-/// the array, @p pos the index to cover, and [@p lo, @p hi) the range the caller owns: a block
-/// that reaches outside it, or past the end of the array, falls back to a scalar window. Keys
-/// past the end repeat the last one, so the compare chain reads nothing it should not.
-struct key_block {
-    uint64_t keys[4];
-    size_t base;
-    size_t count;
-};
+/// Threads per merge block, merged keys each thread walks, and so the merged keys per tile.
+constexpr uint32_t merge_threads = 256;
+constexpr uint32_t merge_items = 16;
+constexpr uint32_t merge_tile = merge_threads * merge_items;
+/// Consecutive tiles a block walks: one job lookup for them all, and each tile's end in A is the
+/// next one's start.
+constexpr uint32_t merge_chunk = 8;
+/// Above every 25-mer, so no key equals it: what a side reads once it has no keys left.
+constexpr uint64_t no_key = ~uint64_t{0};
 
-__device__ __forceinline__ key_block
-load_block(uint64_t const* keys, size_t pos, size_t lo, size_t hi) {
-    auto const pad = ((16 - (reinterpret_cast<uintptr_t>(keys) & 15)) & 15) / sizeof(uint64_t);
-    key_block block;
-    if (pos >= pad) {
-        auto const aligned = pad + ((pos - pad) / 4) * 4;
-        if (aligned >= lo && aligned + 4 <= hi) {
-            auto const value = *reinterpret_cast<ulonglong4 const*>(keys + aligned);
-            block.keys[0] = value.x;
-            block.keys[1] = value.y;
-            block.keys[2] = value.z;
-            block.keys[3] = value.w;
-            block.base = aligned;
-            block.count = 4;
-            return block;
-        }
+/// @brief A keys among the first @p diagonal keys of the merge of sorted @p a and @p b, which
+/// takes A first on ties, so an equal pair always sits as A then B; called by a whole warp.
+///
+/// Key i is in the first @p diagonal while a[i] <= b[diagonal - 1 - i], which holds up to the
+/// split and fails after it. Every lane probes one point of the remaining range at once, so the
+/// range shrinks 32-fold per round of dependent loads instead of halving; more probes per round
+/// would cost more random sector reads than the rounds they save.
+__device__ __forceinline__ uint64_t warp_merge_split(
+    uint64_t const* a,
+    uint64_t a_len,
+    uint64_t const* b,
+    uint64_t b_len,
+    uint64_t diagonal
+) {
+    auto const lane = threadIdx.x % 32;
+    auto lo = diagonal > b_len ? diagonal - b_len : 0;
+    auto hi = min(diagonal, a_len);
+    while (lo < hi) {
+        auto const step = (hi - lo + 31) / 32;
+        auto const probe = lo + lane * step;
+        bool const below = probe < hi && a[probe] <= b[diagonal - 1 - probe];
+        auto const held = static_cast<uint64_t>(__popc(__ballot_sync(~0U, below)));
+        // The split lies after the last probe that held and at or before the first that failed.
+        auto const next_hi = min(hi, lo + held * step);
+        lo = held != 0 ? lo + (held - 1) * step + 1 : lo;
+        hi = next_hi;
     }
-    block.base = pos;
-    block.count = min(static_cast<size_t>(4), hi - pos);
-    _Pragma("unroll")
-    for (size_t i = 0; i < 4; ++i) {
-        block.keys[i] = i < block.count ? keys[pos + i] : keys[hi - 1];
-    }
-    return block;
+    return lo;
 }
 
-/// @brief Counts the k-mers two sorted, deduplicated sets share, one block per pair.
+static_assert(merge_chunk == merge_threads / 32, "one warp finds each tile's end");
+
+/// @brief Counts the k-mers two sorted, deduplicated sets share, merge_chunk tiles of their merges
+/// per block.
 ///
-/// Both sides arrive sorted and deduplicated, so the intersection is one linear pass over them:
-/// each thread takes a slice of one side and the range of the other covering it, found by two
-/// binary searches, and the two walk together. Each side is taken four keys at a time, so a
-/// thread has eight loads in flight instead of a chain of two, and an aligned four-key load costs
-/// one request where four scalar loads cost four. Nothing is written but one integer per pair, and
-/// a whole batch of pairs goes in one launch.
-__global__ void exact_intersection_kernel(pair_job const* jobs, uint32_t* counts) {
-    auto const job = jobs[blockIdx.x];
-    if (job.a_len == 0 || job.b_len == 0) {
-        if (threadIdx.x == 0) counts[blockIdx.x] = 0;
-        return;
-    }
-    auto const bound = [&](uint64_t value, bool upper) {
-        uint32_t lo = 0, hi = job.b_len;
-        while (lo < hi) {
-            auto const mid = lo + (hi - lo) / 2;
-            if (job.b[mid] < value || (upper && job.b[mid] == value)) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    };
-    auto const per = (static_cast<size_t>(job.a_len) + blockDim.x - 1) / blockDim.x;
-    auto const a_begin =
-        min(static_cast<size_t>(threadIdx.x) * per, static_cast<size_t>(job.a_len));
-    auto const a_end = min(a_begin + per, static_cast<size_t>(job.a_len));
-    size_t matches = 0;
-    if (a_begin < a_end) {
-        size_t mine = a_begin;
-        size_t theirs = bound(job.a[a_begin], false);
-        auto const theirs_begin = theirs;
-        auto const theirs_end = bound(job.a[a_end - 1], true);
-        while (mine < a_end && theirs < theirs_end) {
-            auto const a_block = load_block(job.a, mine, a_begin, a_end);
-            auto const b_block = load_block(job.b, theirs, theirs_begin, theirs_end);
-            // Both tiles sit in registers, so every key pair is one static comparison with no load
-            // in the chain and no branch to diverge on. A tile may start before the walk position
-            // when the walk is not block-aligned, and the keys it holds back are already counted,
-            // so only the ones the walk has not passed are compared.
-            _Pragma("unroll")
-            for (size_t i = 0; i < 4; ++i) {
-                _Pragma("unroll")
-                for (size_t j = 0; j < 4; ++j) {
-                    bool const live = i < a_block.count && j < b_block.count &&
-                                      a_block.base + i >= mine && b_block.base + j >= theirs;
-                    matches += static_cast<size_t>(live && a_block.keys[i] == b_block.keys[j]);
-                }
-            }
-            // A tile's keys are all accounted for once the walk passes them, and a key is only
-            // passed when the other side can no longer produce one that equals it. The step stops
-            // at the end of the window: an aligned window can end before the walk's own block does,
-            // and stepping past it would pass keys no window ever held.
-            auto const a_step = min(a_block.base + a_block.count - mine, static_cast<size_t>(4));
-            auto const b_step = min(b_block.base + b_block.count - theirs, static_cast<size_t>(4));
-            // A short window repeats its last key, so index 3 is that key either way.
-            if (a_block.keys[3] < b_block.keys[3]) {
-                mine += a_step;
-            } else if (b_block.keys[3] < a_block.keys[3]) {
-                theirs += b_step;
-            } else {
-                mine += a_step;
-                theirs += b_step;
-            }
-        }
-    }
-    using reduce_type = cub::BlockReduce<size_t, 256>;
+/// Pair p's merge, |A| + |B| keys long, is cut into tiles of merge_tile keys, tiles
+/// @p tile_first[p] onward. A block takes merge_chunk consecutive tiles, and its warps first find
+/// where each of them ends in A, all at once by merge-path searches: a tile starts where the one
+/// before it ended, or at 0 for a new pair, and the last tile of a pair ends at |A|. Each tile is
+/// then staged in shared memory with coalesced copies, and every thread merges merge_items of its
+/// merged order, so work is the same for every thread whatever the keys. The merge takes A first
+/// on ties, so a shared k-mer is an A key directly followed by its equal B key: it counts when the
+/// A key is taken while the B head equals it. The B key after a tile is staged too, for a pair
+/// the tile boundary splits.
+__global__ __launch_bounds__(merge_threads) void merge_intersection_kernel(
+    pair_job const* jobs,
+    uint64_t const* tile_first,
+    uint32_t job_count,
+    uint64_t first_block,
+    uint32_t* counts
+) {
+    // Logical key x is slot x + x / 8: A keys from 0, B keys from na, the B key after the tile at
+    // n. Threads start their merges about eight keys apart, which without the pad word every
+    // eight keys lands a warp on the same banks.
+    __shared__ uint64_t keys[merge_tile + merge_tile / 8 + 1];
+    // Where the block's first tile starts in A, then where each tile ends.
+    __shared__ uint64_t bounds[merge_chunk + 1];
+    using reduce_type = cub::BlockReduce<uint32_t, merge_threads>;
     __shared__ typename reduce_type::TempStorage storage;
-    auto const total = reduce_type(storage).Sum(matches);
-    if (threadIdx.x == 0) counts[blockIdx.x] = static_cast<uint32_t>(total);
+    auto const at = [&](uint32_t x) -> uint64_t& {
+        return keys[x + (x >> 3)];
+    };
+    auto const first = (first_block + blockIdx.x) * merge_chunk;
+    auto const last = min(first + merge_chunk, tile_first[job_count]);
+    if (first >= last) return;
+    // The last job whose tiles start at or before the first; jobs without tiles share its start.
+    uint32_t start_job = 0;
+    for (uint32_t hi = job_count - 1; start_job < hi;) {
+        auto const mid = start_job + (hi - start_job + 1) / 2;
+        if (tile_first[mid] <= first) {
+            start_job = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // Tile `tile`'s job, found by walking on from @p job, and its merged keys [d0, d1).
+    auto const place = [&](uint64_t tile, uint32_t& job, uint64_t& d0, uint64_t& d1) {
+        while (tile >= tile_first[job + 1]) ++job;
+        d0 = (tile - tile_first[job]) * merge_tile;
+        d1 = min(d0 + merge_tile, uint64_t{jobs[job].a_len} + jobs[job].b_len);
+    };
+    {
+        auto const warp = threadIdx.x / 32;
+        auto const tile = first + warp;
+        if (tile < last) {
+            auto job = start_job;
+            uint64_t d0 = 0, d1 = 0;
+            place(tile, job, d0, d1);
+            auto const& pair = jobs[job];
+            auto const end = d1 == uint64_t{pair.a_len} + pair.b_len
+                                 ? uint64_t{pair.a_len}
+                                 : warp_merge_split(pair.a, pair.a_len, pair.b, pair.b_len, d1);
+            if (threadIdx.x % 32 == 0) bounds[warp + 1] = end;
+            if (warp == 0) {
+                auto const begin =
+                    d0 == 0 ? 0 : warp_merge_split(pair.a, pair.a_len, pair.b, pair.b_len, d0);
+                if (threadIdx.x == 0) bounds[0] = begin;
+            }
+        }
+    }
+    __syncthreads();
+    uint32_t matches = 0;
+    auto job_index = start_job;
+    auto counting = start_job;
+    for (auto tile = first; tile < last; ++tile) {
+        uint64_t d0 = 0, d1 = 0;
+        place(tile, job_index, d0, d1);
+        if (job_index != counting) {
+            auto const sum = reduce_type(storage).Sum(matches);
+            if (threadIdx.x == 0 && sum != 0) atomicAdd(counts + counting, sum);
+            matches = 0;
+            counting = job_index;
+        }
+        auto const& job = jobs[job_index];
+        auto const a0 = d0 == 0 ? 0 : bounds[tile - first];
+        auto const na = static_cast<uint32_t>(bounds[tile - first + 1] - a0);
+        auto const n = static_cast<uint32_t>(d1 - d0);
+        auto const nb = n - na;
+        auto const b0 = d0 - a0;
+        // Every copy in flight at once, straight into shared memory. Key e = threadIdx.x + 256k
+        // has slot threadIdx.x + threadIdx.x / 8 + 288k, so the unrolled copies differ only by
+        // constants.
+        auto const* const from_a = job.a + a0;
+        auto const* const from_b = job.b + b0;
+        auto* const slot = keys + threadIdx.x + (threadIdx.x >> 3);
+        _Pragma("unroll")
+        for (uint32_t k = 0; k < merge_items; ++k) {
+            auto const e = threadIdx.x + k * merge_threads;
+            if (e < n) {
+                __pipeline_memcpy_async(
+                    slot + k * (merge_threads + merge_threads / 8),
+                    e < na ? from_a + e : from_b + (e - na),
+                    sizeof(uint64_t)
+                );
+            }
+        }
+        if (threadIdx.x == 0) {
+            if (b0 + nb < job.b_len) {
+                __pipeline_memcpy_async(&at(n), from_b + nb, sizeof(uint64_t));
+            } else {
+                at(n) = no_key;
+            }
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        auto const begin = min(threadIdx.x * merge_items, n);
+        auto const end = min(begin + merge_items, n);
+        uint32_t i = begin > nb ? begin - nb : 0;
+        for (uint32_t high = min(begin, na); i < high;) {
+            auto const mid = i + (high - i) / 2;
+            if (at(mid) <= at(na + begin - 1 - mid)) {
+                i = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        auto j = begin - i;
+        // Both heads stay in registers; a step reads only the next key of the side it took, from
+        // a slot that always exists: slot na holds a B key or the key after the tile, and an A
+        // side that has run out reads it and drops it. The B head is at most the key after the
+        // tile, which no step within it takes.
+        auto head_a = i < na ? at(min(i, na)) : no_key;
+        auto head_b = at(na + j);
+        auto const advance = [&] {
+            bool const take_a = head_a <= head_b;
+            matches += take_a && head_a == head_b;
+            i += take_a;
+            j += !take_a;
+            auto const read = at(take_a ? min(i, na) : na + j);
+            auto const following = take_a && i >= na ? no_key : read;
+            head_a = take_a ? following : head_a;
+            head_b = take_a ? head_b : following;
+        };
+        if (n == merge_tile) {
+            // Every tile but a pair's last is full, and then every thread takes all its steps.
+            _Pragma("unroll")
+            for (uint32_t step = 0; step < merge_items; ++step) advance();
+        } else {
+            _Pragma("unroll")
+            for (uint32_t step = 0; step < merge_items; ++step) {
+                if (begin + step < end) advance();
+            }
+        }
+        // The next tile overwrites the keys.
+        __syncthreads();
+    }
+    auto const sum = reduce_type(storage).Sum(matches);
+    if (threadIdx.x == 0 && sum != 0) atomicAdd(counts + counting, sum);
 }
 
 int run_main(
@@ -795,12 +884,22 @@ int run_main(
         };
         std::vector<pair_job> jobs;
         std::vector<job_row> job_rows;
-        device_buffer jobs_dev, counts_dev;
+        device_buffer jobs_dev, counts_dev, tile_first_dev;
         std::vector<uint32_t> intersections;
+        // First merge tile of each job, then the total: a job's tiles cover its merged keys.
+        std::vector<uint64_t> tile_first;
         auto flush_jobs = [&]() {
             if (jobs.empty()) return;
+            tile_first.assign(1, 0);
+            for (auto const& job : jobs) {
+                auto const merged = uint64_t{job.a_len} + job.b_len;
+                auto const tiles =
+                    job.a_len && job.b_len ? (merged + merge_tile - 1) / merge_tile : 0;
+                tile_first.push_back(tile_first.back() + tiles);
+            }
             jobs_dev.reset(jobs.size() * sizeof(pair_job));
             counts_dev.reset(jobs.size() * sizeof(uint32_t));
+            tile_first_dev.reset(tile_first.size() * sizeof(uint64_t));
             CUDDL_CUDA_CALL(cudaMemcpyAsync(
                 jobs_dev.data,
                 jobs.data(),
@@ -808,11 +907,32 @@ int run_main(
                 cudaMemcpyHostToDevice,
                 stream
             ));
-            auto const kernel_span = compare_device.begin();
-            exact_intersection_kernel<<<static_cast<uint32_t>(jobs.size()), 256, 0, stream>>>(
-                static_cast<pair_job const*>(jobs_dev.data), static_cast<uint32_t*>(counts_dev.data)
+            CUDDL_CUDA_CALL(cudaMemcpyAsync(
+                tile_first_dev.data,
+                tile_first.data(),
+                tile_first.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice,
+                stream
+            ));
+            CUDDL_CUDA_CALL(
+                cudaMemsetAsync(counts_dev.data, 0, jobs.size() * sizeof(uint32_t), stream)
             );
-            CUDDL_CUDA_CALL(cudaGetLastError());
+            auto const kernel_span = compare_device.begin();
+            // One block per merge_chunk tiles, in launches within the grid's x limit.
+            auto const total_blocks = (tile_first.back() + merge_chunk - 1) / merge_chunk;
+            constexpr uint64_t max_blocks = uint64_t{1} << 30;
+            for (uint64_t first = 0; first < total_blocks; first += max_blocks) {
+                auto const blocks =
+                    static_cast<uint32_t>(std::min(max_blocks, total_blocks - first));
+                merge_intersection_kernel<<<blocks, merge_threads, 0, stream>>>(
+                    static_cast<pair_job const*>(jobs_dev.data),
+                    static_cast<uint64_t const*>(tile_first_dev.data),
+                    static_cast<uint32_t>(jobs.size()),
+                    first,
+                    static_cast<uint32_t*>(counts_dev.data)
+                );
+                CUDDL_CUDA_CALL(cudaGetLastError());
+            }
             compare_device.end(kernel_span);
             intersections.resize(jobs.size());
             CUDDL_CUDA_CALL(cudaMemcpyAsync(
@@ -1021,6 +1141,7 @@ int run_main(
           {"pairs_evaluated", evaluated.size()},
           {"parse_workers", parse_workers},
           {"stash_mb_allowed", stash_bytes >> 20},
+          {"device_stash_mb", device_stash_bytes >> 20},
           {"stashed_genomes", static_cast<size_t>(std::count(resident.begin(), resident.end(), 1))},
           {"stashed_mb", stashed_bytes >> 20},
           {"reparsed_genomes", reparsed_genomes},
