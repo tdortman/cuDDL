@@ -2062,6 +2062,54 @@ TEST_F(ReferenceDatabaseTest, IndexedAllToAllPlaneFallbackMatchesOracleAcrossQue
     }
 }
 
+// Frequent keys become posting bitmaps once a database has 8192 references; the tiled count
+// then starts from their bit-sliced sums. A quarter of every row's buckets hold one of two
+// common keys, so bitmaps supply most matches and the threshold falls inside their spread.
+// The indexed all-to-all search must equal the exhaustive one.
+TEST_F(ReferenceDatabaseTest, BitmapSeededAllToAllMatchesExhaustive) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    constexpr uint32_t references = 9000U;
+    constexpr uint32_t minimum = 80U;
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    std::mt19937 random(references);
+    std::vector<uint16_t> rows(static_cast<size_t>(references) * b_default);
+    for (auto& score : rows) {
+        score =
+            static_cast<uint16_t>(random() % 4U == 0U ? 1U + random() % 2U : 3U + random() % 256U);
+    }
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto search = [&](index_type const* index) {
+        auto requirements = CUDDL_UNWRAP(database.all_to_all_search_requirements(index));
+        auto workspace = cuda::make_device_buffer<uint8_t>(
+            stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+        );
+        auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+            stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+        );
+        auto matches = cuda::make_device_buffer<uint32_t>(
+            stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+        );
+        tile_collector tiles{stream};
+        CUDDL_UNWRAP(database.search_all_to_all_async(
+            workspace, results, tiles, matches, {.minimum_matches = minimum}, stream, index
+        ));
+        return std::pair{tiles.results, tiles.match_counts};
+    };
+    auto [expected, expected_matches] = search(nullptr);
+    ASSERT_FALSE(expected.empty());
+    ASSERT_LT(expected.size(), size_t{references} * (references - 1U) / 20U);
+    for (auto storage : {cuddl::index_storage::dense, cuddl::index_storage::sparse}) {
+        SCOPED_TRACE(static_cast<int>(storage));
+        auto index = CUDDL_UNWRAP(index_type::build_async(database, stream, storage));
+        auto [actual, actual_matches] = search(&index);
+        EXPECT_EQ(actual, expected);
+        EXPECT_EQ(actual_matches, expected_matches);
+    }
+}
+
 // A threshold all-to-all tile starting at query q never compares the reference words below q / 32.
 // Its pass bitmap must still report no pair there, even when the workspace held set bits before.
 // Rows come in groups of four that share every indexed bucket except one emptied bucket per row;

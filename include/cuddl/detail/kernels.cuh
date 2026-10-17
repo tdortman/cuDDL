@@ -882,98 +882,64 @@ __global__ void hybrid_posting_ranges_kernel(
     }
 }
 
-constexpr uint32_t bitmap_count_words_per_query = 64U;
-
-/// @brief Records threshold crossings while accumulating long posting lists in bit-sliced counters.
-/// Each block handles adjacent queries over a shared reference interval for bitmap cache reuse.
-/// Independent bitmap loads overlap in batches. All-to-all searches exclude the diagonal and
-/// lower triangle from @p passes. The short-list stage consumes @p planes.
-/// Once a reference passes, its count is unused and may wrap; the short-list stage seeds it
-/// with @p minimum_matches instead.
+/// @brief Sums one query's posting bitmaps over one word of references in bit-sliced counters.
+///
+/// Independent bitmap loads overlap in batches. Returns @p passed with every reference whose
+/// count reaches @p minimum_matches added; summing stops once all 32 have passed, so a passed
+/// reference's count is unused and may wrap.
 template <uint32_t CounterBits>
-__global__ void count_posting_bitmaps_kernel(
+__device__ uint32_t sum_posting_bitmaps(
     uint32_t const* bitmaps,
     uint32_t const* starts,
-    uint32_t const* counts,
-    uint32_t query_count,
-    uint32_t reference_count,
-    uint32_t indexed_buckets,
+    uint32_t count,
+    uint32_t word,
     uint32_t minimum_matches,
-    uint32_t query_id_offset,
-    bool all_to_all,
-    uint32_t* planes,
-    uint32_t* passes
+    uint32_t passed,
+    uint32_t (&counters)[CounterBits]
 ) {
-    auto const words = candidate_bit_words(reference_count);
-    auto const queries_per_block = blockDim.x / bitmap_count_words_per_query;
-    auto const query_tiles = (query_count + queries_per_block - 1U) / queries_per_block;
-    auto const word_tiles =
-        (words + bitmap_count_words_per_query - 1U) / bitmap_count_words_per_query;
-    for (size_t tile = blockIdx.x; tile < static_cast<size_t>(query_tiles) * word_tiles;
-         tile += gridDim.x) {
-        auto const query =
-            tile % query_tiles * queries_per_block + threadIdx.x / bitmap_count_words_per_query;
-        auto const word = tile / query_tiles * bitmap_count_words_per_query +
-                          threadIdx.x % bitmap_count_words_per_query;
-        if (query >= query_count || word >= words) continue;
-        uint32_t excluded = 0U;
-        if (all_to_all && word * 32U <= query_id_offset + query) {
-            auto const skipped = query_id_offset + query - word * 32U + 1U;
-            excluded = skipped >= 32U ? ~0U : (1U << skipped) - 1U;
-        }
-        uint32_t counters[CounterBits]{};
-        uint32_t passed = minimum_matches == 0U ? ~0U : excluded;
-        auto const count = counts[query];
-        constexpr uint32_t batch = 8U;
-        for (uint32_t i = 0U; i < count && passed != ~0U; i += batch) {
-            // Keep independent bitmap reads in flight before consuming their values.
-            uint32_t loaded[batch]{};
-            _Pragma("unroll")
-            for (uint32_t j = 0U; j < batch; ++j) {
-                if (i + j < count) {
-                    loaded[j] = bitmaps[starts[query * indexed_buckets + i + j] + word];
-                }
-            }
-            // Reduce eight bitmaps to four input count planes.
-            auto const sum0 = loaded[0] ^ loaded[1] ^ loaded[2];
-            auto const carry0 = (loaded[0] & loaded[1]) | ((loaded[0] | loaded[1]) & loaded[2]);
-            auto const sum1 = loaded[3] ^ loaded[4] ^ loaded[5];
-            auto const carry1 = (loaded[3] & loaded[4]) | ((loaded[3] | loaded[4]) & loaded[5]);
-            auto const ones0 = sum0 ^ sum1 ^ loaded[6];
-            auto const carry2 = (sum0 & sum1) | ((sum0 | sum1) & loaded[6]);
-            auto const twos0 = carry0 ^ carry1 ^ carry2;
-            auto const fours0 = (carry0 & carry1) | ((carry0 | carry1) & carry2);
-            auto const carry3 = ones0 & loaded[7];
-            auto const carry4 = twos0 & carry3;
-            uint32_t const additions[]{
-                ones0 ^ loaded[7], twos0 ^ carry3, fours0 ^ carry4, fours0 & carry4
-            };
-            uint32_t carry = 0U;
-            uint32_t at_least = ~0U;
-            _Pragma("unroll")
-            for (uint32_t bit = 0U; bit < CounterBits; ++bit) {
-                auto const extra = bit < 4U ? additions[bit] : 0U;
-                auto const previous = counters[bit];
-                counters[bit] = previous ^ carry ^ extra;
-                carry = (previous & carry) | ((previous | carry) & extra);
-                auto const key = 0U - ((minimum_matches >> bit) & 1U);
-                at_least = (counters[bit] & ~key) | ((counters[bit] | ~key) & at_least);
-            }
-            // Overflow is above every threshold representable by these counter planes.
-            passed |= at_least | carry;
-            _Pragma("unroll")
-            for (uint32_t bit = CounterBits; bit < 4U; ++bit) {
-                passed |= additions[bit];
+    constexpr uint32_t batch = 8U;
+    for (uint32_t i = 0U; i < count && passed != ~0U; i += batch) {
+        // Keep independent bitmap reads in flight before consuming their values.
+        uint32_t loaded[batch]{};
+        _Pragma("unroll")
+        for (uint32_t j = 0U; j < batch; ++j) {
+            if (i + j < count) {
+                loaded[j] = bitmaps[starts[i + j] + word];
             }
         }
+        // Reduce eight bitmaps to four input count planes.
+        auto const sum0 = loaded[0] ^ loaded[1] ^ loaded[2];
+        auto const carry0 = (loaded[0] & loaded[1]) | ((loaded[0] | loaded[1]) & loaded[2]);
+        auto const sum1 = loaded[3] ^ loaded[4] ^ loaded[5];
+        auto const carry1 = (loaded[3] & loaded[4]) | ((loaded[3] | loaded[4]) & loaded[5]);
+        auto const ones0 = sum0 ^ sum1 ^ loaded[6];
+        auto const carry2 = (sum0 & sum1) | ((sum0 | sum1) & loaded[6]);
+        auto const twos0 = carry0 ^ carry1 ^ carry2;
+        auto const fours0 = (carry0 & carry1) | ((carry0 | carry1) & carry2);
+        auto const carry3 = ones0 & loaded[7];
+        auto const carry4 = twos0 & carry3;
+        uint32_t const additions[]{
+            ones0 ^ loaded[7], twos0 ^ carry3, fours0 ^ carry4, fours0 & carry4
+        };
+        uint32_t carry = 0U;
+        uint32_t at_least = ~0U;
         _Pragma("unroll")
         for (uint32_t bit = 0U; bit < CounterBits; ++bit) {
-            planes[(query * CounterBits + bit) * words + word] = counters[bit];
+            auto const extra = bit < 4U ? additions[bit] : 0U;
+            auto const previous = counters[bit];
+            counters[bit] = previous ^ carry ^ extra;
+            carry = (previous & carry) | ((previous | carry) & extra);
+            auto const key = 0U - ((minimum_matches >> bit) & 1U);
+            at_least = (counters[bit] & ~key) | ((counters[bit] | ~key) & at_least);
         }
-        auto const valid = reference_count - word * 32U;
-        passes[query * words + word] =
-            passed & ~excluded & (valid >= 32U ? ~0U : (1U << valid) - 1U);
+        // Overflow is above every threshold representable by these counter planes.
+        passed |= at_least | carry;
+        _Pragma("unroll")
+        for (uint32_t bit = CounterBits; bit < 4U; ++bit) {
+            passed |= additions[bit];
+        }
     }
+    return passed;
 }
 
 /// @brief Counts index matches for one query against one reference tile in shared memory.
@@ -983,13 +949,16 @@ __global__ void count_posting_bitmaps_kernel(
 /// share its posting-range lookups through the caches. Postings ascend by reference within each
 /// key, so each posting list is narrowed to the tile with two binary searches. The flush writes
 /// every pair of the tile, so @p match_counts needs no zeroing.
-/// Seeded counting starts with saturated bitmap counts and adds the remaining posting lists.
+/// With nonzero @p CounterBits, each lane first sums the query's posting bitmaps over one word of
+/// the tile in that many bit-sliced counters, seeding references that already reach
+/// @p minimum_matches with exactly that count; the posting lists then add the rest.
 ///
 /// Launched with @ref index_tile_block_size threads: the shared counters, not the thread count,
 /// bound how many blocks fit on an SM, so larger blocks keep more warps resident to hide the
-/// posting loads' latency.
-template <size_t BucketCount, bool Seeded, typename QueryRow>
-__global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_kernel(
+/// posting loads' latency. Capping registers at 48 leaves a quarter of the SM's registers to
+/// kernels of neighbouring tiles; a GH200 searched 115,223 genomes 12% faster than with 60.
+template <size_t BucketCount, uint32_t CounterBits, typename QueryRow>
+__global__ __maxnreg__(48) void count_batch_index_tile_kernel(
     QueryRow const* queries,
     size_t query_row_offset,
     uint32_t const* offsets,
@@ -1005,8 +974,9 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
     uint32_t query_id_offset,
     bool all_to_all,
     uint32_t* candidate_bits,
-    uint32_t const* initial_count_planes,
-    uint32_t initial_count_bits
+    uint32_t const* bitmaps,
+    uint32_t const* bitmap_starts,
+    uint32_t const* bitmap_counts
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t warps_per_block = index_tile_block_size / warp_width;
@@ -1042,38 +1012,61 @@ __global__ __launch_bounds__(index_tile_block_size) void count_batch_index_tile_
     __shared__ uint32_t long_count;
     auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
     auto const warp = static_cast<uint32_t>(threadIdx.x) / warp_width;
-    for (auto base = warp * warp_width; base < (width + 1U) / 2U; base += blockDim.x) {
-        auto const i = base + lane;
-        uint32_t packed = 0U;
-        if constexpr (Seeded) {
-            auto const words = candidate_bit_words(reference_count);
-            auto const word = (low + 2U * base) / warp_width + lane / 16U;
+    if constexpr (CounterBits != 0U) {
+        // Each lane sums one word's bitmaps; half warps then expand two words at a time, so the
+        // counter stores stay free of bank conflicts.
+        auto const tile_words = (width + warp_width - 1U) / warp_width;
+        auto const count = bitmap_counts[query_index];
+        auto const* starts =
+            bitmap_starts + static_cast<size_t>(query_index) * indexed_bucket_count;
+        for (auto base = warp * warp_width; base < tile_words; base += blockDim.x) {
+            auto const word = low / warp_width + base + lane;
+            uint32_t counters[CounterBits]{};
+            uint32_t passed = ~0U;
+            if (base + lane < tile_words) {
+                // References on or below the diagonal count as passed so that summing can stop
+                // early; the flush excludes them.
+                uint32_t excluded = 0U;
+                if (all_to_all && word * warp_width <= query_id_offset + query_index) {
+                    auto const skipped = query_id_offset + query_index - word * warp_width + 1U;
+                    excluded = skipped >= warp_width ? ~0U : (1U << skipped) - 1U;
+                }
+                passed = sum_posting_bitmaps(
+                    bitmaps,
+                    starts,
+                    count,
+                    word,
+                    minimum_matches,
+                    minimum_matches == 0U ? ~0U : excluded,
+                    counters
+                );
+            }
             auto const shift = (lane % 16U) * 2U;
-            // Each half warp loads the planes of one word concurrently, then broadcasts them.
-            uint32_t seed = 0U;
-            if (lane % 16U < initial_count_bits && word < words) {
-                seed = initial_count_planes
-                    [(static_cast<size_t>(query_index) * initial_count_bits + lane % 16U) * words +
-                     word];
-            }
-            for (uint32_t plane = 0U; plane < initial_count_bits; ++plane) {
-                auto const bits =
-                    (__shfl_sync(0xffffffffU, seed, plane + (lane / 16U) * 16U) >> shift) & 3U;
-                packed |= ((bits & 1U) | ((bits & 2U) << 15U)) << plane;
-            }
-            auto const passed =
-                word < words
-                    ? candidate_bits[static_cast<size_t>(query_index) * words + word] >> shift
-                    : 0U;
-            if (passed & 1U) {
-                packed = (packed & 0xffff0000U) | minimum_matches;
-            }
-            if (passed & 2U) {
-                packed = (packed & 0xffffU) | (minimum_matches << 16U);
+            for (uint32_t pair = 0U; pair < warp_width / 2U; ++pair) {
+                auto const source = 2U * pair + lane / 16U;
+                uint32_t packed = 0U;
+                _Pragma("unroll")
+                for (uint32_t plane = 0U; plane < CounterBits; ++plane) {
+                    auto const bits =
+                        (__shfl_sync(0xffffffffU, counters[plane], source) >> shift) & 3U;
+                    packed |= ((bits & 1U) | ((bits & 2U) << 15U)) << plane;
+                }
+                auto const pass = __shfl_sync(0xffffffffU, passed, source) >> shift;
+                if (pass & 1U) {
+                    packed = (packed & 0xffff0000U) | minimum_matches;
+                }
+                if (pass & 2U) {
+                    packed = (packed & 0xffffU) | (minimum_matches << 16U);
+                }
+                auto const slot = (base + source) * 16U + lane % 16U;
+                if (slot < (width + 1U) / 2U) {
+                    packed_counts[slot] = packed;
+                }
             }
         }
-        if (i < (width + 1U) / 2U) {
-            packed_counts[i] = packed;
+    } else {
+        for (auto i = threadIdx.x; i < (width + 1U) / 2U; i += blockDim.x) {
+            packed_counts[i] = 0U;
         }
     }
     if (threadIdx.x == 0U) {

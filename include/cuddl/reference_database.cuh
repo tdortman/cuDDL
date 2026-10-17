@@ -2744,11 +2744,13 @@ class reference_database_view {
                 CUDDL_CUDA_TRY(cudaGetLastError());
             }
             auto const hybrid = !bitmap_cells_.empty();
+            uint32_t* starts = nullptr;
+            uint32_t* counts = nullptr;
             if (hybrid) {
                 ranges = static_cast<uint2*>(temporary_workspace);
                 auto const range_count = static_cast<size_t>(query_count) * indexed_bucket_count;
-                auto* starts = reinterpret_cast<uint32_t*>(ranges + range_count);
-                auto* counts = starts + range_count;
+                starts = reinterpret_cast<uint32_t*>(ranges + range_count);
+                counts = starts + range_count;
                 detail::hybrid_posting_ranges_kernel<BucketCount>
                     <<<query_count, detail::block_size, 0, stream.get()>>>(
                         query_scores,
@@ -2764,93 +2766,16 @@ class reference_database_view {
                     );
                 CUDDL_CUDA_TRY(cudaGetLastError());
                 counter_bits = std::max<uint32_t>(1U, std::bit_width(options.minimum_matches));
-                auto const count_bitmaps = [&]<uint32_t Bits>() -> Result<void> {
-                    auto const words = detail::candidate_bit_words(reference_count);
-                    constexpr auto words_per_query = detail::bitmap_count_words_per_query;
-                    constexpr auto queries_per_block = detail::block_size / words_per_query;
-                    auto const query_tiles =
-                        (query_count + queries_per_block - 1U) / queries_per_block;
-                    auto const blocks = static_cast<uint32_t>(std::min<size_t>(
-                        static_cast<size_t>(query_tiles) *
-                            ((words + words_per_query - 1U) / words_per_query),
-                        65535U
-                    ));
-                    detail::count_posting_bitmaps_kernel<Bits>
-                        <<<blocks, detail::block_size, 0, stream.get()>>>(
-                            posting_bitmaps_.data(),
-                            starts,
-                            counts,
-                            query_count,
-                            reference_count,
-                            indexed_bucket_count,
-                            options.minimum_matches,
-                            query_id_offset,
-                            AllToAll,
-                            match_counts,
-                            candidate_bits
-                        );
-                    return cuda_try(cudaGetLastError());
-                };
-                switch (counter_bits) {
-                    case 1:
-                        CUDDL_TRY((count_bitmaps.template operator()<1>()));
-                        break;
-                    case 2:
-                        CUDDL_TRY((count_bitmaps.template operator()<2>()));
-                        break;
-                    case 3:
-                        CUDDL_TRY((count_bitmaps.template operator()<3>()));
-                        break;
-                    case 4:
-                        CUDDL_TRY((count_bitmaps.template operator()<4>()));
-                        break;
-                    case 5:
-                        CUDDL_TRY((count_bitmaps.template operator()<5>()));
-                        break;
-                    case 6:
-                        CUDDL_TRY((count_bitmaps.template operator()<6>()));
-                        break;
-                    case 7:
-                        CUDDL_TRY((count_bitmaps.template operator()<7>()));
-                        break;
-                    case 8:
-                        CUDDL_TRY((count_bitmaps.template operator()<8>()));
-                        break;
-                    case 9:
-                        CUDDL_TRY((count_bitmaps.template operator()<9>()));
-                        break;
-                    case 10:
-                        CUDDL_TRY((count_bitmaps.template operator()<10>()));
-                        break;
-                    case 11:
-                        CUDDL_TRY((count_bitmaps.template operator()<11>()));
-                        break;
-                    case 12:
-                        CUDDL_TRY((count_bitmaps.template operator()<12>()));
-                        break;
-                    case 13:
-                        CUDDL_TRY((count_bitmaps.template operator()<13>()));
-                        break;
-                    case 14:
-                        CUDDL_TRY((count_bitmaps.template operator()<14>()));
-                        break;
-                    case 15:
-                        CUDDL_TRY((count_bitmaps.template operator()<15>()));
-                        break;
-                    case 16:
-                        CUDDL_TRY((count_bitmaps.template operator()<16>()));
-                        break;
-                }
             }
-            auto const count_postings = [&]<bool Seeded>() -> Result<void> {
+            auto const count_postings = [&]<uint32_t Bits>() -> Result<void> {
                 CUDDL_CUDA_TRY(cudaFuncSetAttribute(
                     reinterpret_cast<void const*>(
-                        detail::count_batch_index_tile_kernel<BucketCount, Seeded, uint16_t>
+                        detail::count_batch_index_tile_kernel<BucketCount, Bits, uint16_t>
                     ),
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     static_cast<int>(tile / 2U * sizeof(uint32_t))
                 ));
-                detail::count_batch_index_tile_kernel<BucketCount, Seeded>
+                detail::count_batch_index_tile_kernel<BucketCount, Bits>
                     <<<query_count * tiles,
                        detail::index_tile_block_size,
                        tile / 2U * sizeof(uint32_t),
@@ -2870,15 +2795,64 @@ class reference_database_view {
                         query_id_offset,
                         AllToAll,
                         candidate_bits,
-                        Seeded ? match_counts : nullptr,
-                        counter_bits
+                        hybrid ? posting_bitmaps_.data() : nullptr,
+                        starts,
+                        counts
                     );
                 return cuda_try(cudaGetLastError());
             };
-            if (hybrid) {
-                CUDDL_TRY((count_postings.template operator()<true>()));
-            } else {
-                CUDDL_TRY((count_postings.template operator()<false>()));
+            switch (counter_bits) {
+                case 0:
+                    CUDDL_TRY((count_postings.template operator()<0>()));
+                    break;
+                case 1:
+                    CUDDL_TRY((count_postings.template operator()<1>()));
+                    break;
+                case 2:
+                    CUDDL_TRY((count_postings.template operator()<2>()));
+                    break;
+                case 3:
+                    CUDDL_TRY((count_postings.template operator()<3>()));
+                    break;
+                case 4:
+                    CUDDL_TRY((count_postings.template operator()<4>()));
+                    break;
+                case 5:
+                    CUDDL_TRY((count_postings.template operator()<5>()));
+                    break;
+                case 6:
+                    CUDDL_TRY((count_postings.template operator()<6>()));
+                    break;
+                case 7:
+                    CUDDL_TRY((count_postings.template operator()<7>()));
+                    break;
+                case 8:
+                    CUDDL_TRY((count_postings.template operator()<8>()));
+                    break;
+                case 9:
+                    CUDDL_TRY((count_postings.template operator()<9>()));
+                    break;
+                case 10:
+                    CUDDL_TRY((count_postings.template operator()<10>()));
+                    break;
+                case 11:
+                    CUDDL_TRY((count_postings.template operator()<11>()));
+                    break;
+                case 12:
+                    CUDDL_TRY((count_postings.template operator()<12>()));
+                    break;
+                case 13:
+                    CUDDL_TRY((count_postings.template operator()<13>()));
+                    break;
+                case 14:
+                    CUDDL_TRY((count_postings.template operator()<14>()));
+                    break;
+                case 15:
+                    CUDDL_TRY((count_postings.template operator()<15>()));
+                    break;
+                case 16:
+                    CUDDL_TRY((count_postings.template operator()<16>()));
+                    break;
             }
         } else {
             CUDDL_CUDA_TRY(
