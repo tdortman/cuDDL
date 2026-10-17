@@ -1,0 +1,14 @@
+diff --git a/nvbench/json_printer.cu b/nvbench/json_printer.cu
+--- a/nvbench/json_printer.cu
++++ b/nvbench/json_printer.cu
+@@ -540,7 +540,9 @@ void json_printer::do_print_benchmark_results(const benchmark_vector &benches)
+         st["skip_time"]                = exec_state.get_skip_time();
+         st["timeout"]                  = exec_state.get_timeout();
+ 
+-        st["device"]            = exec_state.get_device()->get_id();
++        // CPU-only states run without a device.
++        const auto &device      = exec_state.get_device();
++        st["device"]            = device ? nlohmann::json(device->get_id()) : nlohmann::json();
+         st["type_config_index"] = exec_state.get_type_config_index();
+ 
+         // TODO I'd like to replace this with:
