@@ -4,6 +4,7 @@ import json
 import math
 import os
 import platform
+import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -79,14 +80,25 @@ def benchmark_system() -> dict[str, Any]:
     host = platform.uname()
     cpu = platform.processor()
     if not cpu:
+        # ARM kernels list no "model name" in /proc/cpuinfo, only implementer and part codes;
+        # lscpu decodes those into a name such as Neoverse-V2.
         try:
             cpu = next(
                 line.partition(":")[2].strip()
                 for line in Path("/proc/cpuinfo").read_text().splitlines()
                 if line.partition(":")[0].strip() == "model name"
             )
-        except (OSError, StopIteration) as error:
-            raise RuntimeError("cannot determine CPU model") from error
+        except (OSError, StopIteration):
+            try:
+                cpu = next(
+                    line.partition(":")[2].strip()
+                    for line in subprocess.run(
+                        ["lscpu"], check=True, capture_output=True, text=True
+                    ).stdout.splitlines()
+                    if line.partition(":")[0].strip() == "Model name"
+                )
+            except (OSError, subprocess.CalledProcessError, StopIteration) as error:
+                raise RuntimeError("cannot determine CPU model") from error
     logical_cpu_count = os.cpu_count()
     page_size = os.sysconf("SC_PAGE_SIZE")
     physical_pages = os.sysconf("SC_PHYS_PAGES")
