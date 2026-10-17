@@ -5,9 +5,10 @@
 # ///
 """Speed-of-light throughputs from scripts/run_ncu_sol.py, one figure per corpus size.
 
-ncu_sol_<genomes>: every profiled kernel of every tool, labelled with its share of the run's GPU
-time. The left panel is SM throughput, the right one memory throughput, with the L1, L2 and DRAM
-throughputs it is the maximum of marked on the bar. All values are percentages of the peak.
+ncu_sol_<genomes>: every profiled kernel of every tool, SKETCH before COMPARE, labelled with its
+share of that operation's GPU time. The left panel is SM throughput, the right one memory
+throughput, with the L1, L2 and DRAM throughputs it is the maximum of marked on the bar. All
+values are percentages of the peak.
 """
 
 import json
@@ -33,12 +34,17 @@ def main(
     tools = list(dict.fromkeys(row["tool"] for row in rows))
     colors = {tool: plt.cm.tab10(i % 10) for i, tool in enumerate(tools)}
     for genomes in sorted({row["genomes"] for row in rows}):
+        operations = ("sketch", "compare")
         kernels = sorted(
             (row for row in rows if row["genomes"] == genomes),
-            key=lambda row: (tools.index(row["tool"]), -row["time_share"]),
+            key=lambda row: (
+                tools.index(row["tool"]), operations.index(row["operation"]), -row["time_share"]
+            ),
         )
         labels = [
-            pu.paper_text(f"{row['tool']}: {row['kernel'][:40]} ({row['time_share']:.0%})")
+            pu.paper_text(
+                f"{row['tool']} {row['operation']}: {row['kernel'][:36]} ({row['time_share']:.0%})"
+            )
             for row in kernels
         ]
         positions = range(len(kernels))[::-1]

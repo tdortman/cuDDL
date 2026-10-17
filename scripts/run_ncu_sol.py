@@ -8,17 +8,22 @@
 For every --reference-count and GPU tool, the tool's `run_micro_comparison.py --performance-only`
 lane runs twice over:
 
-1. under Nsight Systems, for every kernel's share of the run's GPU time and its launch count;
-2. once per kernel that matters (the largest ones up to --coverage of GPU time, at most
-   --max-kernels) under Nsight Compute, which records the speed-of-light throughputs below for
-   --launches launches from the middle of the run, then ends the run.
+1. under Nsight Systems, for every kernel's share of its operation's GPU time and its launch
+   count. The runner announces each lane (`<tool> sketch: ...`, `<tool> compare: ...`) as it
+   starts it; a kernel belongs to the operation announced last before it ran. Comparison lanes
+   sketch their inputs again, so COMPARE keeps only the kernels the sketch lane never runs;
+   shares of COMPARE time are shares of those kernels' time;
+2. once per kernel that matters, for SKETCH and COMPARE alike (the largest ones up to --coverage
+   of the operation's GPU time, at most --max-kernels each) under Nsight Compute, which records
+   the speed-of-light throughputs below for --launches launches from the middle of the run, then
+   ends the run.
 
-Each kernel becomes one line of OUTPUT_DIR/kernels.jsonl: its time share and the duration-weighted
-mean of each throughput, as a percentage of the unit's peak. scripts/plot_ncu_sol.py draws them.
+Each kernel becomes one line of OUTPUT_DIR/kernels.jsonl: its operation, its share of that
+operation's GPU time and the duration-weighted mean of each throughput, as a percentage of the
+unit's peak. scripts/plot_ncu_sol.py draws them.
 
 The pairs a lane compares are capped at --max-pairs, a stride over every pair, so a 100k corpus
-stays affordable: per-launch throughputs do not depend on how many pairs a run compares, but the
-time shares do, so they describe the capped run.
+stays affordable: per-launch throughputs do not depend on how many pairs a run compares.
 
     ./scripts/run_ncu_sol.py /localscratch/genomes --reference-count 1000 \\
       --reference-count 10000 --output-dir results/ncu-sol-gh200
@@ -28,9 +33,13 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -63,6 +72,10 @@ def csv_rows(text: str, first_column: str) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO("".join(lines[start:]))))
 
 
+# A lane announcement of run_micro_comparison.py, such as "  cuddl compare: 1770 pairs ...".
+LANE = re.compile(r"^\s+\S+ (sketch|compare|search)\b")
+
+
 def tool_path(name: str) -> str:
     path = shutil.which(name) or next(
         (str(p) for p in sorted(Path("/usr/local").glob(f"cuda*/bin/{name}"), reverse=True)), None
@@ -72,28 +85,56 @@ def tool_path(name: str) -> str:
     return path
 
 
-def kernel_times(nsys: str, command: list[str], scratch: Path) -> list[dict]:
-    """Kernels by GPU time, largest first, under their base names as Nsight Compute matches them."""
+def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list[dict]]:
+    """Per operation, its kernels by GPU time, largest first, under their base names as Nsight
+    Compute matches them."""
     report = scratch / "timeline"
+    # (wall-clock ns, operation) at each lane announcement, read as the runner prints it.
+    lanes: list[tuple[int, str]] = []
+    with subprocess.Popen(
+        [nsys, "profile", "--trace=cuda", "--sample=none", "--cpuctxsw=none",
+         "--force-overwrite=true", "-o", str(report), *command],
+        stdout=subprocess.PIPE, text=True, env=os.environ | {"PYTHONUNBUFFERED": "1"},
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if match := LANE.match(line):
+                lanes.append((time.time_ns(), match.group(1)))
+            sys.stdout.write(line)
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, process.args)
     subprocess.run(
-        [nsys, "profile", "--trace=cuda", "--sample=none", "--cpuctxsw=none", "--force-overwrite=true",
-         "-o", str(report), *command],
+        [nsys, "export", "--type", "sqlite", "--force-overwrite", "true", "-o",
+         str(report.with_suffix(".sqlite")), f"{report}.nsys-rep"],
         check=True,
     )
-    summary = subprocess.run(
-        [nsys, "stats", "--report", "cuda_gpu_kern_sum:base", "--format", "csv", "--output", "-",
-         "--force-export=true", f"{report}.nsys-rep"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    kernels: dict[str, dict] = {}
-    for row in csv_rows(summary, "Time (%)"):
-        entry = kernels.setdefault(row["Name"], {"kernel": row["Name"], "ns": 0.0, "launches": 0})
-        entry["ns"] += number(row["Total Time (ns)"])
-        entry["launches"] += int(number(row["Instances"]))
-    total = sum(k["ns"] for k in kernels.values())
-    ranked = sorted(kernels.values(), key=lambda k: k["ns"], reverse=True)
-    for entry in ranked:
-        entry["time_share"] = entry["ns"] / total if total else 0.0
+    with sqlite3.connect(report.with_suffix(".sqlite")) as db:
+        (session_start,) = db.execute("SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME").fetchone()
+        launches = db.execute(
+            "SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
+            "JOIN StringIds s ON s.id = k.shortName"
+        ).fetchall()
+    kernels: dict[str, dict[str, dict]] = {}
+    for start, end, name in launches:
+        at = session_start + start
+        operation = next((op for stamp, op in reversed(lanes) if stamp <= at), None)
+        if operation is None:
+            continue
+        entry = kernels.setdefault(operation, {}).setdefault(
+            name, {"kernel": name, "ns": 0, "launches": 0}
+        )
+        entry["ns"] += end - start
+        entry["launches"] += 1
+    # Comparison lanes sketch their inputs again; those kernels belong to SKETCH, which measures
+    # them already, so COMPARE keeps only the kernels the sketch lane never runs.
+    for name in kernels.get("sketch", {}):
+        kernels.get("compare", {}).pop(name, None)
+    ranked: dict[str, list[dict]] = {}
+    for operation, by_name in kernels.items():
+        total = sum(k["ns"] for k in by_name.values())
+        ranked[operation] = sorted(by_name.values(), key=lambda k: k["ns"], reverse=True)
+        for entry in ranked[operation]:
+            entry["time_share"] = entry["ns"] / total if total else 0.0
     return ranked
 
 
@@ -145,9 +186,12 @@ def main(
     ),
     max_pairs: Annotated[int, typer.Option(min=1, help="Pairs a lane compares at most")] = 10_000_000,
     coverage: Annotated[
-        float, typer.Option(min=0, max=1, help="Profile kernels up to this share of GPU time")
+        float,
+        typer.Option(min=0, max=1, help="Profile kernels up to this share of an operation's GPU time"),
     ] = 0.9,
-    max_kernels: Annotated[int, typer.Option(min=1, help="Kernels profiled per lane at most")] = 5,
+    max_kernels: Annotated[
+        int, typer.Option(min=1, help="Kernels profiled per operation at most")
+    ] = 5,
     launches: Annotated[int, typer.Option(min=1, help="Launches profiled per kernel")] = 10,
     threads: Annotated[int, typer.Option(min=1, help="Host threads per lane")] = len(
         os.sched_getaffinity(0)
@@ -167,20 +211,22 @@ def main(
             ]
             with tempfile.TemporaryDirectory(prefix="ncu-sol-") as scratch:
                 ranked = kernel_times(nsys, command, Path(scratch))
-                covered = 0.0
-                for kernel in ranked[:max_kernels]:
-                    if covered >= coverage:
-                        break
-                    covered += kernel["time_share"]
-                    profiled, means = kernel_throughputs(ncu, command, kernel, launches,
-                                                         Path(scratch))
-                    with kernels_path.open("a") as stream:
-                        stream.write(json.dumps({
-                            "tool": tool, "genomes": count, "pairs": pairs,
-                            "kernel": kernel["kernel"], "time_share": kernel["time_share"],
-                            "launches": kernel["launches"], "profiled_launches": profiled,
-                            **means,
-                        }) + "\n")
+                for operation in ("sketch", "compare"):
+                    covered = 0.0
+                    for kernel in ranked.get(operation, [])[:max_kernels]:
+                        if covered >= coverage:
+                            break
+                        covered += kernel["time_share"]
+                        profiled, means = kernel_throughputs(ncu, command, kernel, launches,
+                                                             Path(scratch))
+                        with kernels_path.open("a") as stream:
+                            stream.write(json.dumps({
+                                "tool": tool, "genomes": count, "pairs": pairs,
+                                "operation": operation, "kernel": kernel["kernel"],
+                                "time_share": kernel["time_share"],
+                                "launches": kernel["launches"], "profiled_launches": profiled,
+                                **means,
+                            }) + "\n")
 
 
 if __name__ == "__main__":
