@@ -3,10 +3,12 @@
 // ranks share; every rank uploads it, builds a replica and searches the tiles it claims from a
 // cuddl::shared_tile_counter, so faster ranks search more. One launch sweeps
 // the requested rank counts by splitting the world communicator; ranks outside a count wait.
-// With --weak, a count of P ranks searches n*sqrt(P/P_max) of the n references, evenly spaced
-// over the file, so the pairs per GPU stay about constant (weak scaling). Spacing them keeps
-// the share of near-duplicate references, which sets the cost per pair, close to the whole
-// file's; a prefix of an accession-ordered collection can hold far more near-duplicates.
+// With --weak, a count of P ranks searches n*sqrt(P/P_max) of the n references, so the pairs
+// per GPU stay about constant (weak scaling). The references are the ones whose hashed IDs come
+// first: a pseudorandom sample, each smaller count's a subset of the larger ones'. That keeps the
+// share of near-duplicate references, which sets the cost per pair, close to the whole file's.
+// Accession order clusters species, so a prefix or a fixed stride can hold far more or fewer
+// near-duplicates.
 //
 // Every rank count is verified before it is timed: each rank downloads its results and reduces
 // them to a pair count and an order-independent fingerprint, MPI sums those, and rank 0 checks
@@ -416,7 +418,8 @@ void search_threshold(
 }
 
 /// One instrumented threshold search that downloads every passing pair and writes it to
-/// @p path as raw 24-byte records, flushed to the device before the clock stops.
+/// @p path as raw 24-byte records, flushed to the device before the clock stops. The writer's
+/// thread writes while the search continues; node-local NVMe gains nothing from more files.
 json rank_output(
     group_type& group,
     tile_claims& claims,
@@ -424,10 +427,7 @@ json rank_output(
     std::filesystem::path const& path,
     MPI_Comm comm
 ) {
-    std::unique_ptr<std::FILE, int (*)(std::FILE*)> file(
-        std::fopen(path.c_str(), "wb"), std::fclose
-    );
-    if (!file) throw std::runtime_error("cannot write " + path.string());
+    parallel_writer file(path, 1);
     double download_ms = 0, write_ms = 0;
     uint64_t pairs = 0;
     auto split = claims.next();
@@ -439,18 +439,13 @@ json rank_output(
             auto const rows = CUDDL_UNWRAP(tile.download())->passing();
             auto const downloaded = wall_clock::now();
             download_ms += std::chrono::duration<double, std::milli>(downloaded - begin).count();
-            if (std::fwrite(rows.data(), sizeof(rows[0]), rows.size(), file.get()) != rows.size()) {
-                throw std::runtime_error("short write to " + path.string());
-            }
+            file.append(rows.data(), rows.size() * sizeof(rows[0]));
             write_ms += ms_since(downloaded);
             pairs += rows.size();
         }
     );
     auto const flush = wall_clock::now();
-    if (std::fflush(file.get()) != 0 || fsync(fileno(file.get())) != 0) {
-        throw std::runtime_error("cannot flush " + path.string());
-    }
-    file.reset();
+    file.finish();
     write_ms += ms_since(flush);
     json result{
         {"pairs", pairs},
@@ -484,8 +479,8 @@ int run(int argc, char** argv, ranks const& r) {
     app.add_flag(
         "--weak",
         weak,
-        "Weak scaling: P ranks search n*sqrt(P/P_max) evenly spaced references, so each GPU's "
-        "pair count stays about constant"
+        "Weak scaling: P ranks search a hashed sample of n*sqrt(P/P_max) references, so each "
+        "GPU's pair count stays about constant"
     );
     auto* write_option = app.add_option(
         "--write-dir", write_dir, "Node-local directory for the threshold sweep's result files"
@@ -550,6 +545,12 @@ int run(int argc, char** argv, ranks const& r) {
         // mpirun fills nodes slot by slot, so the first count ranks span these nodes.
         return (count + r.local_size - 1) / r.local_size;
     };
+    // Reference IDs in hash order; a weak-scaling count searches a prefix of it.
+    std::vector<uint32_t> hash_order(n);
+    std::iota(hash_order.begin(), hash_order.end(), 0U);
+    std::ranges::sort(hash_order, [](uint32_t a, uint32_t b) {
+        return std::pair{mix(a), a} < std::pair{mix(b), b};
+    });
 
     json report{
         {"database", database_path},
@@ -578,15 +579,16 @@ int run(int argc, char** argv, ranks const& r) {
                        )
                      : n;
             uint64_t const pairs = uint64_t{references} * (references - 1) / 2;
-            // References i * n / references for i < references, uploaded for this count only.
+            // The first references of hash_order, in ID order, uploaded for this count only.
             std::vector<uint16_t> sampled;
             std::optional<cuda::device_buffer<uint16_t>> sampled_rows;
             std::optional<group_type> sample;
             if (references != n) {
+                std::vector<uint32_t> ids(hash_order.begin(), hash_order.begin() + references);
+                std::ranges::sort(ids);
                 sampled.reserve(size_t{references} * buckets);
-                for (uint32_t i = 0; i < references; ++i) {
-                    auto const id = static_cast<size_t>(uint64_t{i} * n / references);
-                    auto const row = std::span{host_rows}.subspan(id * buckets, buckets);
+                for (auto const id : ids) {
+                    auto const row = std::span{host_rows}.subspan(size_t{id} * buckets, buckets);
                     sampled.insert(sampled.end(), row.begin(), row.end());
                 }
                 sampled_rows.emplace(cuda::make_device_buffer<uint16_t>(stream, device, sampled));

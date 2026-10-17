@@ -6,7 +6,10 @@
 // rank's GPU, `index` builds the index for a threshold search, and `search` is
 // cuddl::search_all_to_all across the ranks, appending this rank's tiles to `rank-<r>.bin`.
 // `download` is the part of the search spent turning finished tiles into records on the host,
-// and `write` the part spent writing and flushing the file.
+// and `write` the part spent handing records to the writer: copying them into its queue,
+// waiting while too much is queued, and flushing at the end. The writer's threads write while
+// the search continues. With `--write-streams S` above 1, stream s writes `rank-<r>.bin.<s>`,
+// and each tile goes whole to the next stream in turn.
 //
 // `--records similarity` (the default) stores each pair's weighted k-mer identity as a 4-byte
 // float. An exhaustive tile is converted on the GPU and written as its first query and query
@@ -83,6 +86,7 @@ int run(int argc, char** argv, ranks const& r) {
     uint32_t minimum_matches = 0;
     unsigned workers = default_workers(r);
     bool keep_output = false;
+    unsigned write_streams = 2;
     std::string records = "similarity";
     app.add_option("--records", records, "Result records: similarity or raw bucket counts")
         ->check(CLI::IsMember({"similarity", "counts"}));
@@ -106,6 +110,12 @@ int run(int argc, char** argv, ranks const& r) {
     app.add_option("--output-dir", output_dir, "Directory for the per-rank result files")
         ->required();
     app.add_flag("--keep-output", keep_output, "Keep the result files instead of deleting them");
+    app.add_option(
+           "--write-streams",
+           write_streams,
+           "Result files this rank writes in parallel; a shared file system needs several"
+    )
+        ->check(CLI::PositiveNumber);
     app.add_option("-o,--output", output, "JSON report destination (written by rank 0)");
     try {
         app.parse(argc, argv);
@@ -163,17 +173,15 @@ int run(int argc, char** argv, ranks const& r) {
     };
     std::vector<similarity_record> passing_similarity;
     meter.run("search", [&] {
-        std::unique_ptr<std::FILE, int (*)(std::FILE*)> file(
-            std::fopen(path.c_str(), "wb"), std::fclose
-        );
-        if (!file) throw std::runtime_error("cannot write " + path.string());
-        auto const write = [&](void const* data, size_t size, size_t count) {
+        parallel_writer file(path, write_streams);
+        auto const write = [&](std::initializer_list<std::span<char const>> chunks) {
             auto const start = wall_clock::now();
-            if (std::fwrite(data, size, count, file.get()) != count) {
-                throw std::runtime_error("short write to " + path.string());
-            }
+            file.append(chunks);
             write_ms += ms_since(start);
-            bytes_written += size * count;
+            for (auto const& chunk : chunks) bytes_written += chunk.size();
+        };
+        auto const bytes = [](auto const* data, size_t count) {
+            return std::span{reinterpret_cast<char const*>(data), count * sizeof(*data)};
         };
         auto const on_tile = [&](cuddl::replica_tile const& tile) {
             // Waiting for the tile's search first keeps that wait out of the download time.
@@ -182,7 +190,7 @@ int run(int argc, char** argv, ranks const& r) {
             if (records == "counts") {
                 auto const passing = CUDDL_UNWRAP(tile.download())->passing();
                 download_ms += ms_since(fetched);
-                write(passing.data(), sizeof(passing[0]), passing.size());
+                write({bytes(passing.data(), passing.size())});
                 pairs += passing.size();
                 return;
             }
@@ -216,8 +224,7 @@ int run(int argc, char** argv, ranks const& r) {
                 tile.stream.sync();
                 download_ms += ms_since(fetched);
                 std::array const header{t.first_query_id, t.query_count};
-                write(header.data(), sizeof(header[0]), header.size());
-                write(host_similarity.data(), sizeof(float), slots);
+                write({bytes(header.data(), header.size()), bytes(host_similarity.data(), slots)});
                 pairs += slots;
                 return;
             }
@@ -231,7 +238,7 @@ int run(int argc, char** argv, ranks const& r) {
                 );
             });
             download_ms += ms_since(fetched);
-            write(passing_similarity.data(), sizeof(similarity_record), passing_similarity.size());
+            write({bytes(passing_similarity.data(), passing_similarity.size())});
             pairs += passing_similarity.size();
         };
         if (minimum_matches == 0) {
@@ -244,13 +251,13 @@ int run(int argc, char** argv, ranks const& r) {
             );
         }
         auto const start = wall_clock::now();
-        if (std::fflush(file.get()) != 0 || fsync(fileno(file.get())) != 0) {
-            throw std::runtime_error("cannot flush " + path.string());
-        }
+        file.finish();
         write_ms += ms_since(start);
     });
     auto const wall_ms = meter.total_ms();
-    if (!keep_output) fs::remove(path);
+    if (!keep_output) {
+        for (auto const& file : result_files(path, write_streams)) fs::remove(file);
+    }
 
     char host[256] = {};
     gethostname(host, sizeof(host) - 1);
@@ -294,6 +301,7 @@ int run(int argc, char** argv, ranks const& r) {
         {"minimum_matches", minimum_matches},
         {"indexed", minimum_matches > 0},
         {"records", records},
+        {"write_streams", write_streams},
         {"pairs_total", pairs_total},
         {"bytes_written_total", bytes_total},
         {"wall_ms", wall_ms},

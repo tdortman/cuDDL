@@ -6,14 +6,16 @@
 """Fix a genome set while a download is still running.
 
 Creates OUTPUT holding absolute symlinks to COUNT completed genome files of
-GENOMES, in name order: the first COUNT, or with --spread COUNT files evenly
-spaced over all of them. Spread subsets of an accession-ordered collection keep
-its mix of species and near-duplicates; a prefix can be far more redundant.
+GENOMES: the first COUNT in name order, or with --sample the first COUNT in
+order of a hash of their names. Accession order clusters species, so a prefix
+or a fixed stride can be far more or less redundant than the whole collection;
+a hashed sample keeps its mix, and a smaller sample is a subset of a larger one.
 aria2 keeps a NAME.aria2 control file beside each unfinished download, so those
 files are skipped. Snapshots are meant to stay unchanged, so an existing OUTPUT
 is an error.
 """
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Annotated
@@ -29,8 +31,9 @@ def main(
     ],
     count: Annotated[int, typer.Argument(min=1, help="Genomes to link")],
     output: Annotated[Path, typer.Argument(help="Snapshot directory to create")],
-    spread: Annotated[
-        bool, typer.Option(help="Take evenly spaced genomes instead of the first ones")
+    sample: Annotated[
+        bool,
+        typer.Option(help="Take the genomes whose hashed names come first"),
     ] = False,
 ) -> None:
     if output.exists():
@@ -47,8 +50,8 @@ def main(
     staging = output.with_name(output.name + ".partial")
     staging.mkdir(parents=True)
     chosen = (
-        [complete[i * len(complete) // count] for i in range(count)]
-        if spread
+        sorted(complete, key=lambda n: hashlib.blake2b(n.encode()).digest())[:count]
+        if sample
         else complete[:count]
     )
     for name in chosen:
