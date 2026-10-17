@@ -105,7 +105,7 @@ from typing import Annotated
 
 import typer
 from benchmark_schema import make_result, write_result
-from energy_meter import EnergyMeter
+from energy_meter import EnergyMeter, EnergySampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hypergen_pipeline import dataset_entries, summarize
@@ -353,7 +353,7 @@ def run_timed(label: str, cmd: list[str], capture: bool = False) -> str:
 
 
 class Marks(list[float]):
-    """Wall milliseconds per rep, with the node energy of each rep (EnergyMeter.joules)."""
+    """Wall milliseconds per rep, with the node energy of each rep (EnergySampler.joules)."""
 
     energy: list[dict]
 
@@ -421,19 +421,22 @@ def wall_of(
         if prepare is not None:
             prepare()
         resident_parts = [] if resident is not None else None
-        counters = METER.read()
-        tick = time.perf_counter()
-        for index, item in enumerate(groups):
-            run(
-                item,
-                quiet=True,
-                log_tail=log_tail,
-                resident=resident_parts if index >= resident_skip else None,
-            )
-        done = time.perf_counter()
+        # Sampled throughout, since one rep can outlast a RAPL counter's wrap.
+        with EnergySampler(METER, period=1.0) as sampler:
+            start = time.time()
+            tick = time.perf_counter()
+            for index, item in enumerate(groups):
+                run(
+                    item,
+                    quiet=True,
+                    log_tail=log_tail,
+                    resident=resident_parts if index >= resident_skip else None,
+                )
+            done = time.perf_counter()
+            end = time.time()
         if rep >= warmups:
             marks.append((done - tick) * 1000)
-            marks.energy.append(above_idle(METER.joules(counters, METER.read()), done - tick))
+            marks.energy.append(above_idle(sampler.joules(start, end), done - tick))
             if resident is not None:
                 first = resident_parts[0]
                 if any(
