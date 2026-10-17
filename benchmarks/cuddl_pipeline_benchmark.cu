@@ -2041,6 +2041,7 @@ int main(int argc, char** argv) try {
                     {"hybrid", cuddl::decompression_backend::hybrid},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
+                    {"gpu-cores", cuddl::decompression_backend::gpu_cores},
                 }
             )
         )

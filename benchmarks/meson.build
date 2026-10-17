@@ -156,6 +156,15 @@ executable(
     install: false,
 )
 
+# Inflation alone: nvCOMP on the SMs against the hardware decompression engine.
+executable(
+    'cuddl-inflate-benchmark',
+    'cuddl_inflate_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 # Measures launch overhead and bounded-output indexed selection on resident inputs.
 executable(
     'cuddl-search-overhead-benchmark',

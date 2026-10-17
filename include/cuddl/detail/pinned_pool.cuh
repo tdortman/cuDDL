@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -56,9 +57,33 @@ device_pinned_pool(cuda::device_ref device, pinned_placement placement) {
             {cudaMemLocationTypeDevice, device.get()}, cudaMemAccessFlagsProtReadWrite
         };
         CUDDL_CUDA_CALL(cudaMemPoolSetAccess(created, &access, 1));
+        // Pinning is the expensive part of an allocation: with the default threshold of zero,
+        // every synchronisation returns freed pages to the OS and the next allocation pins them
+        // again, which cost sketch loaders more time than inflating their files.
+        auto keep = std::numeric_limits<uint64_t>::max();
+        CUDDL_CUDA_CALL(cudaMemPoolSetAttribute(created, cudaMemPoolAttrReleaseThreshold, &keep));
         pool = created;
     }
     return cuda::pinned_memory_pool_ref(pool);
 }
+
+/// @brief Returns the free pages of a @ref device_pinned_pool to the OS when it leaves scope.
+///
+/// The pool keeps freed pages so work that allocates and frees pinned buffers repeatedly pins
+/// them once; a guard around that work keeps the process from holding them afterwards. A trim
+/// that fails only leaves the pages pinned, so its status is not reported.
+class pinned_pool_trim {
+   public:
+    pinned_pool_trim(cuda::device_ref device, pinned_placement placement)
+        : pool_(device_pinned_pool(device, placement)) {}
+    pinned_pool_trim(pinned_pool_trim const&) = delete;
+    pinned_pool_trim& operator=(pinned_pool_trim const&) = delete;
+    ~pinned_pool_trim() {
+        (void)cudaMemPoolTrimTo(pool_.get(), 0);
+    }
+
+   private:
+    cuda::pinned_memory_pool_ref pool_;
+};
 
 }  // namespace cuddl::detail

@@ -28,7 +28,7 @@ Each input file represents one genome, including all of its sequence records. Re
 ### Requirements
 
 - Linux and an NVIDIA GPU with a compatible driver.
-- CUDA 13.3 or newer and a host compiler with C++20 support. The supplied Nix environment uses CUDA 13.4.
+- CUDA 13.0 or newer and a host compiler with C++20 support. The supplied Nix environment uses CUDA 13.4.
 - Optional nvCOMP 5, used to inflate gzip genomes on the GPU.
 - Meson 1.3 or newer, Ninja, and Git.
 
@@ -83,7 +83,7 @@ Pass `--blacklist blacklist.fa.gz` to exclude literal k-mers during construction
 
 The builder reads FASTA and FASTQ files with the extensions `.fa`, `.fna`, `.fasta`, `.ffn`, `.frn`, `.fq`, and `.fastq`, in any letter case. Gzip and BGZF files add `.gz`, `.bgz`, or `.bgzf`, as in `genome.fna.gz`.
 
-By default, a discrete GPU inflates gzip FASTA files with nvCOMP and checks each file's length and CRC32 against its gzip trailer. Coherent-memory GPUs such as GH200 inflate on CPU workers instead. Everything else goes to the host loader: FASTQ, BGZF, multi-member gzip, and any file the GPU cannot verify.
+By default, a discrete GPU inflates gzip and BGZF FASTA files with nvCOMP, or with the hardware decompression engine on Blackwell data-center GPUs, and checks each file's length and CRC32 against its gzip trailers. Coherent-memory GPUs such as GH200 inflate on CPU workers instead. Everything else goes to the host loader: FASTQ, multi-member gzip that is not BGZF, and any file the GPU cannot verify.
 
 The host loader checks the gzip structure and the uncompressed length, but not the CRC32. If you need that guarantee, verify the input files before you build. Saved databases and indexes carry their own checksum, which cuDDL checks on every load.
 
@@ -92,7 +92,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 | Option            | Accepted values                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
-| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `hybrid`. `cpu` inflates and parses every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `hybrid` inflates on the host loaders and strips FASTA headers and line breaks on the GPU. `gpu` and `hybrid` need nvCOMP. `automatic` picks `gpu` on discrete GPUs; with few cores per GPU, `hybrid` can be faster. |
+| `--decompression` | `automatic` (default), `cpu`, `gpu`, or `hybrid`. `cpu` inflates and parses every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `hybrid` inflates on the host loaders and strips FASTA headers and line breaks on the GPU. `gpu` and `hybrid` need nvCOMP. On discrete GPUs, `automatic` picks `cpu` with 48 or more loaders and `gpu` with fewer; with few cores per GPU, `hybrid` can be faster. |
 
 ### 2. Search without an index
 

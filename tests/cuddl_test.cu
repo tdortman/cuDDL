@@ -5018,6 +5018,79 @@ TEST(ReferenceDatabaseFileTest, PlainFastaSkipsPageableStaging) {
     }
 }
 
+/// Writes @p content as BGZF: one gzip member per @p block bytes, each of stored DEFLATE with its
+/// size in a BC subfield, then the empty end-of-file block.
+std::string write_tmp_bgzf(std::string const& content, size_t block) {
+    static int counter = 0;
+    auto const path = std::string("/tmp/cuddl_bgzf_test_") + std::to_string(++counter) + ".fa.gz";
+    std::string bytes;
+    auto const put16 = [&](uint32_t value) {
+        bytes.push_back(static_cast<char>(value & 0xffU));
+        bytes.push_back(static_cast<char>(value >> 8U));
+    };
+    auto const put32 = [&](uint32_t value) {
+        put16(value & 0xffffU);
+        put16(value >> 16U);
+    };
+    for (size_t offset = 0; offset < content.size(); offset += block) {
+        auto const size = static_cast<uint32_t>(std::min(block, content.size() - offset));
+        bytes.append("\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00", 16);
+        put16(18 + 5 + size + 8 - 1);  // BSIZE: the whole block, minus one
+        bytes.push_back('\x01');       // final stored block
+        put16(size);
+        put16(~size & 0xffffU);
+        bytes.append(content, offset, size);
+        put32(libdeflate_crc32(0, content.data() + offset, size));
+        put32(size);
+    }
+    bytes.append(
+        "\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00\x1b\x00\x03\x00"
+        "\x00\x00\x00\x00\x00\x00\x00\x00",
+        28
+    );
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+    return path;
+}
+
+TEST(ReferenceDatabaseFileTest, BgzfInflatesOnTheGpu) {
+    // BGZF files reach the GPU block by block, with the blocks' CRC32s combined for the check
+    // that accepts each genome. A wrong combination or block walk hands every file back to the
+    // host loader, which would still build the right rows, so the device count must be checked.
+    if (!CUDDL_HAS_NVCOMP) GTEST_SKIP() << "the gpu backend needs nvCOMP";
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    std::vector<std::filesystem::path> bgzf, gzip;
+    for (uint64_t id = 0; id < 12; ++id) {
+        std::string genome = ">genome " + std::to_string(id) + "\n";
+        for (uint64_t i = 0; i < 150000 + id * 9973; ++i) {
+            genome.push_back("ACGT"[cuddl::detail::splitmix64(id << 32 | i) & 3U]);
+            if (i % 80 == 79) genome.push_back('\n');
+        }
+        genome.push_back('\n');
+        bgzf.push_back(write_tmp_bgzf(genome, 65280));
+        gzip.push_back(write_tmp_gzip(genome));
+    }
+    auto const reference = cuddl::reference_database_file::build<25, buckets>(
+        gzip, stream, {.decompression = cuddl::decompression_backend::cpu}
+    );
+    ASSERT_TRUE(reference) << reference.error().message();
+    for (auto backend : {cuddl::decompression_backend::cpu, cuddl::decompression_backend::gpu}) {
+        SCOPED_TRACE(static_cast<int>(backend));
+        cuddl::reference_build_statistics statistics;
+        // One host loader leaves most files to the device.
+        auto const built = cuddl::reference_database_file::build<25, buckets>(
+            bgzf, stream, {.statistics = &statistics, .parser_workers = 1, .decompression = backend}
+        );
+        ASSERT_TRUE(built) << built.error().message();
+        EXPECT_TRUE(std::ranges::equal(reference->rows(), built->rows()));
+        if (backend == cuddl::decompression_backend::gpu) EXPECT_GT(statistics.device_files, 0u);
+    }
+    for (size_t index = 0; index < bgzf.size(); ++index) {
+        std::filesystem::remove(bgzf[index]);
+        std::filesystem::remove(gzip[index]);
+    }
+}
+
 TEST(FastaTest, EmptyFileParsesToEmptyResult) {
     auto const path = write_tmp_fasta("");
     auto const res = cuddl::parse_fasta_file(path, 3);

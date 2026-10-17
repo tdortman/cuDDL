@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuddl/detail/ablation.hpp>
 #include <cuddl/detail/dna.hpp>
 #include <cuddl/error.hpp>
 
@@ -1536,6 +1538,68 @@ inline Result<std::unique_ptr<fastx_sequence_file>> finish_fastx_sequence_file(
     return result;
 }
 
+/// @brief Inflates gzip @p input in this thread's reusable heap buffer and, for FASTA, packs it
+/// there and moves only the packed words into a buffer from @p source.
+///
+/// The words are what crosses the bus, a quarter of the bases, so only they need page-locked
+/// memory. Pinning the whole inflated genome made pinning, which the driver runs one call at a
+/// time, what a fresh process with many loaders waited on. FASTQ is copied whole instead, and
+/// its bytes are returned for the parser; packed FASTA returns nothing.
+[[nodiscard]] inline Result<std::optional<std::string_view>> inflate_and_pack(
+    fastx_sequence_file& result,
+    std::string_view input,
+    std::string const& path,
+    decompression_source source,
+    uint32_t k
+) {
+    thread_local std::unique_ptr<char[]> scratch;
+    thread_local size_t capacity = 0;
+    // A single-member file's ISIZE is its inflated length. ISIZE sizes nothing for a BGZF stream,
+    // which ends in an empty EOF block that reads back as zero, so a hint below the compressed
+    // size falls back to an over-estimate; a short buffer doubles and inflates again.
+    auto const hint = gzip_size_hint(input);
+    size_t wanted = hint >= input.size() ? hint : input.size() * 8;
+    size_t produced = 0;
+    while (true) {
+        if (capacity < wanted) {
+            capacity = std::bit_ceil(wanted);
+            scratch = std::make_unique_for_overwrite<char[]>(capacity);
+        }
+        bool insufficient = false;
+        produced = CUDDL_TRY(
+            gunzip_members_direct(input, {scratch.get(), capacity, {}}, insufficient, path)
+        );
+        if (!insufficient) break;
+        wanted = capacity * 2;
+    }
+    std::string_view const data{scratch.get(), produced};
+    auto const first = data.find_first_not_of("\r\n");
+    bool const fastq = first != std::string_view::npos && data[first] == '@';
+    if (!fastq) CUDDL_TRY(pack_fasta_chunks(result, data, scratch.get(), k, path));
+    uint64_t bytes = produced;
+    if (!fastq) {
+        uint64_t words = 0;
+        for (auto const& record : result.packed) {
+            words = std::max(words, record.word + (record.bases + 15) / 16);
+        }
+        bytes = words * sizeof(uint32_t);
+    }
+    auto target = source.request(bytes);
+    char* out = target.data;
+    if (out == nullptr) {
+        result.decompressed.resize(bytes);
+        out = result.decompressed.data();
+    } else {
+        result.decompressed_target = out;
+        result.decompressed_size = bytes;
+        result.storage_owner = std::move(target.owner);
+    }
+    std::memcpy(out, scratch.get(), bytes);
+    if (fastq) return std::optional{std::string_view{out, bytes}};
+    result.words = reinterpret_cast<uint32_t const*>(out);
+    return std::optional<std::string_view>{};
+}
+
 inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
     std::unique_ptr<fastx_mapped_file> file,
     std::string const& path,
@@ -1549,11 +1613,20 @@ inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
     auto& decompressed = result->decompressed;
     if (data.size() >= 2 && static_cast<unsigned char>(data[0]) == 0x1f &&
         static_cast<unsigned char>(data[1]) == 0x8b) {
-        // ISIZE is one member's length, so it sizes nothing for a BGZF stream: those end in an
-        // empty EOF block, which reads back as zero, and a concatenated stream advertises only its
-        // last member. Ask for the same over-estimate the heap path assumes, then grow the request
-        // on a short target, which keeps a multi-member file off the heap path.
-        auto request = std::max(gzip_size_hint(data), data.size() * 8);
+        if (pack_k >= 16 && !defer_fasta && source.acquire != nullptr) {
+            auto const fastq = CUDDL_TRY(inflate_and_pack(*result, data, path, source, pack_k));
+            if (!fastq) return result;
+            return finish_fastx_sequence_file(std::move(result), *fastq, path, false, pack_k);
+        }
+        // A single-member file's ISIZE is its inflated length. Asking for that rather than an
+        // over-estimate keeps loader buffers small, which matters most when they are
+        // page-locked, since the driver pins one allocation at a time. ISIZE sizes
+        // nothing for a BGZF stream, which ends in an empty EOF block that reads back as zero, so
+        // a hint below the compressed size falls back to the over-estimate the heap path assumes.
+        // A concatenated stream advertises only its last member; a short target grows the
+        // request, which keeps a multi-member file off the heap path.
+        auto const hint = gzip_size_hint(data);
+        auto request = hint >= data.size() ? hint : data.size() * 8;
         auto target = source.request(request);
         bool insufficient = false;
         bool inflated = false;
@@ -1579,6 +1652,17 @@ inline Result<std::unique_ptr<fastx_sequence_file>> decode_fastx_sequence_file(
             auto inflated = gunzip_members_into(data, decompressed, path);
             if (!inflated) return Err(inflated.error());
             data = decompressed;
+        }
+    } else if (source.acquire != nullptr && !defer_fasta) {
+        // Plain bytes go to the caller's buffer, as inflated bytes do: the parser compacts them
+        // in place and the stager reads them without another copy.
+        auto target = source.request(data.size());
+        if (target.data != nullptr) {
+            std::memcpy(target.data, data.data(), data.size());
+            result->decompressed_target = target.data;
+            result->decompressed_size = data.size();
+            result->storage_owner = std::move(target.owner);
+            data = std::string_view{target.data, data.size()};
         }
     }
     return finish_fastx_sequence_file(std::move(result), data, path, defer_fasta, pack_k);
@@ -1628,11 +1712,20 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
 }
 
+/// Reads a parallel file system needs in flight to give one node its bandwidth: on MOGON's
+/// Lustre, 16 threads read 2.9 GB/s of ~1 MB files and 64 threads 6.7 GB/s.
+inline constexpr size_t parallel_read_depth = 64;
+
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
-// per genome costs tens of microseconds and dominates at high file counts. Workers pull
-// ids in order with a bounded number of outstanding loads. Consumers may collect by ID
+// per genome costs tens of microseconds and dominates at high file counts. Readers pull
+// ids in order with a bounded number of outstanding files. Consumers may collect by ID
 // or by completion, retaining each input's ID. Loader exceptions are
 // rethrown by take, matching std::async propagation into the build error handlers.
+//
+// Readers read whole files ahead of the loaders, which only decode. A parallel file system
+// gives its bandwidth only to many reads in flight, and a loader that read its own files left
+// storage idle while it inflated: on MOGON's Lustre, 16 loaders sketched 4,000 genomes no node
+// had cached in 10.3-11.6 s reading their own files, and in 4.0-4.5 s with readers.
 class fastx_load_pool {
    public:
     /// @param paths Files the pool loads in order.
@@ -1663,12 +1756,17 @@ class fastx_load_pool {
           results_(paths.size()),
           errors_(paths.size()),
           ready_(completion_order ? window_ : 0),
-          retired_(defer_fasta ? window_ : 0),
-          mapped_(defer_fasta ? window_ : 0) {
+          retired_(defer_fasta ? window_ : 0) {
         threads_.reserve(workers_);
-        if (defer_fasta_) {
-            retirer_ = std::thread([this] { retire_files(); });
-            mapper_ = std::thread([this] { map_files(); });
+        if (defer_fasta_) retirer_ = std::thread([this] { retire_files(); });
+        // A reader spends most of its time waiting on storage, so there are as many as the reads
+        // a parallel file system needs in flight, however few the loaders.
+        auto const readers =
+            ablated("read-depth") ? workers_
+                                  : std::min(window_, std::max(workers_, parallel_read_depth));
+        readers_.reserve(readers);
+        for (size_t i = 0; i < readers; ++i) {
+            readers_.emplace_back([this] { read_files(); });
         }
         for (size_t i = 0; i < workers_; ++i) threads_.emplace_back([this] { work(); });
     }
@@ -1679,7 +1777,7 @@ class fastx_load_pool {
         }
         assign_.notify_all();
         mapped_ready_.notify_all();
-        if (mapper_.joinable()) mapper_.join();
+        for (auto& thread : readers_) thread.join();
         for (auto& thread : threads_) thread.join();
         // Loaders may be waiting for retirement space, so stop the reaper only after joining them.
         if (retirer_.joinable()) {
@@ -1745,42 +1843,44 @@ class fastx_load_pool {
     size_t cap(size_t limit) {
         {
             std::lock_guard lock(mutex_);
-            limit_ = std::clamp(limit, next_, limit_);
+            limit_ = std::clamp(limit, claimed_end_, limit_);
             limit = limit_;
         }
         assign_.notify_all();
         filled_.notify_all();
+        mapped_ready_.notify_all();
         return limit;
     }
 
    private:
+    /// A file a reader has read, or the error that stopped it.
     struct mapped_input {
+        size_t id = 0;
         std::optional<Result<std::unique_ptr<fastx_mapped_file>>> file;
         std::exception_ptr error;
     };
 
-    void map_files() {
+    void read_files() {
         while (true) {
             size_t id;
             {
                 std::unique_lock lock(mutex_);
                 assign_.wait(lock, [&] {
-                    return stop_ || mapped_next_ >= paths_.size() ||
-                           mapped_next_ - taken_ < window_;
+                    return stop_ || mapped_next_ >= limit_ || mapped_next_ - taken_ < window_;
                 });
-                if (stop_ || mapped_next_ >= paths_.size()) return;
-                id = mapped_next_;
+                if (stop_ || mapped_next_ >= limit_) return;
+                id = mapped_next_++;
             }
             mapped_input input;
+            input.id = id;
             try {
-                input.file = fastx_mapped_file::load(paths_[id].string());
+                input.file = fastx_mapped_file::load(paths_[id].string(), true);
             } catch (...) {
                 input.error = std::current_exception();
             }
             {
                 std::lock_guard lock(mutex_);
-                mapped_[id % mapped_.size()] = std::move(input);
-                ++mapped_next_;
+                mapped_.push_back(std::move(input));
             }
             mapped_ready_.notify_one();
         }
@@ -1816,33 +1916,33 @@ class fastx_load_pool {
             mapped_input input;
             {
                 std::unique_lock lock(mutex_);
-                // The mapper owns the prefetch window; decoders wait for published mappings.
-                if (defer_fasta_) {
-                    mapped_ready_.wait(lock, [&] {
-                        return stop_ || next_ >= paths_.size() || next_ < mapped_next_;
-                    });
-                } else {
-                    assign_.wait(lock, [&] {
-                        return stop_ || next_ >= limit_ || next_ - taken_ < window_;
-                    });
-                }
-                if (stop_ || next_ >= limit_) return;
-                id = next_++;
-                if (defer_fasta_) input = std::move(mapped_[id % mapped_.size()]);
+                // Readers own the window; loaders take files as they are read, so one slow read
+                // holds up only itself. Files read past a cap belong to another consumer.
+                mapped_ready_.wait(lock, [&] {
+                    return stop_ || claimed_ >= limit_ || !mapped_.empty();
+                });
+                if (stop_ || claimed_ >= limit_) return;
+                input = std::move(mapped_.front());
+                mapped_.pop_front();
+                id = input.id;
+                if (id >= limit_) continue;
+                ++claimed_;
+                claimed_end_ = std::max(claimed_end_, id + 1);
+                // Another file may have been read with no loader woken for it.
+                if (!mapped_.empty()) mapped_ready_.notify_one();
             }
             try {
                 auto const path = paths_[id].string();
                 auto loaded = [&]() -> Result<std::unique_ptr<fastx_sequence_file>> {
-                    // Loaders free their files on the consumer, so they read rather than map.
-                    if (!defer_fasta_)
-                        return load_fastx_sequence_file(path, source_, false, true, pack_k_);
                     if (input.error) std::rethrow_exception(input.error);
                     if (!*input.file)
                         return Err(Error::invalid_argument("cannot open FASTX file: " + path));
-                    return decode_fastx_sequence_file(std::move(**input.file), path, source_, true);
+                    return decode_fastx_sequence_file(
+                        std::move(**input.file), path, source_, defer_fasta_, pack_k_
+                    );
                 }();
                 if (pack_k_ != 0 && loaded) pack_fastx_sequence_file(**loaded, pack_k_);
-                // Inflated or copied bytes no longer reference the file mapping.
+                // Inflated or copied bytes no longer reference the file's bytes.
                 if (defer_fasta_ && loaded && (*loaded)->file &&
                     ((*loaded)->decompressed_target != nullptr ||
                      !(*loaded)->decompressed.empty())) {
@@ -1875,16 +1975,17 @@ class fastx_load_pool {
     std::vector<std::exception_ptr> errors_;
     std::vector<size_t> ready_;
     std::vector<std::unique_ptr<fastx_mapped_file>> retired_;
-    std::vector<mapped_input> mapped_;
+    std::deque<mapped_input> mapped_;
     std::vector<std::thread> threads_;
     std::thread retirer_;
-    std::thread mapper_;
+    std::vector<std::thread> readers_;
     std::mutex mutex_;
     std::mutex retired_mutex_;
     std::condition_variable assign_, filled_;
     std::condition_variable retired_ready_, retired_space_;
     std::condition_variable mapped_ready_;
-    size_t next_ = 0, taken_ = 0, limit_ = paths_.size();
+    // Files loaders took, and one past the highest id among them.
+    size_t claimed_ = 0, claimed_end_ = 0, taken_ = 0, limit_ = paths_.size();
     size_t ready_head_ = 0, ready_count_ = 0;
     size_t retired_head_ = 0, retired_count_ = 0;
     size_t mapped_next_ = 0;
@@ -1912,6 +2013,9 @@ struct reference_build_statistics {
     size_t staging_bytes = 0;
     size_t batches = 0;
     size_t transfers = 0;  // runs copied in one piece, plus records split across pieces
+    // Files the gpu backend took without a host loader: inflated by nvCOMP or the
+    // decompression engine, or plain FASTA read straight into the GPU's buffers.
+    size_t device_files = 0;
     /// Measure GPU row reset and sketch construction, excluding input transfers and readback.
     bool measure_resident = false;
     double resident_compute_ms = 0;

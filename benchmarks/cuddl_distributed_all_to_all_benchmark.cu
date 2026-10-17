@@ -98,6 +98,7 @@ int run(int argc, char** argv, ranks const& r) {
         {"hybrid", cuddl::decompression_backend::hybrid},
         {"cpu", cuddl::decompression_backend::cpu},
         {"gpu", cuddl::decompression_backend::gpu},
+        {"gpu-cores", cuddl::decompression_backend::gpu_cores},
     };
     std::string decompression_name = "automatic";
     app.add_option("--decompression", decompression_name, "Decompression backend")

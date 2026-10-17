@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
+#include <nvcomp/deflate.h>
 #include <nvcomp/gzip.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -39,7 +43,9 @@
     #include <arm_neon.h>
 #endif
 
+#include <cuddl/detail/fastx_sequence_file.hpp>
 #include <cuddl/detail/pinned_pool.cuh>
+#include <cuddl/detail/worker_pool.hpp>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
 
@@ -49,10 +55,14 @@ namespace cuddl::detail {
 /// without inflating it.
 struct gzip_file_probe {
     uint64_t compressed = 0;  // file size
-    uint32_t isize = 0;  // trailer ISIZE: the last member's length modulo 2^32; a plain file's size
-    uint32_t crc = 0;    // trailer CRC32 of the last member
-    bool device = false;  // a single-member candidate the device may inflate, or plain FASTA
-    bool plain = false;   // uncompressed FASTA, which the device normalises as read
+    // Inflated size and CRC32 of the whole file. For one member, its trailer's ISIZE and CRC32;
+    // for BGZF, the sum and combination over its blocks. A plain file's size, without a CRC.
+    uint32_t isize = 0;
+    uint32_t crc = 0;
+    uint32_t members = 0;  // gzip members the device inflates: 1, or BGZF's non-empty blocks
+    bool device = false;   // a candidate the device may inflate, or plain FASTA
+    bool plain = false;    // uncompressed FASTA, which the device normalises as read
+    bool bgzf = false;     // blocked gzip, with each block's size in its header
 
     /// @brief Bytes the file takes in a lane's page-locked buffer. A plain file lies there as it
     /// will in its slot, guard byte included.
@@ -61,21 +71,76 @@ struct gzip_file_probe {
     }
 };
 
-/// @brief Reads the header and trailer of @p path.
+/// @brief A BGZF block's total size from its 18-byte @p header, or 0 if it is not one: a gzip
+/// header with only FEXTRA set, holding just the BC subfield.
+[[nodiscard]] inline uint32_t bgzf_block_size(unsigned char const* header) noexcept {
+    unsigned char const expected[16] = {0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0, 6, 0, 'B', 'C', 2, 0};
+    for (size_t i = 0; i < sizeof(expected); ++i) {
+        // Bytes 4-9 are MTIME, XFL and OS, which may hold anything.
+        if ((i < 4 || i > 9) && header[i] != expected[i]) return 0;
+    }
+    return (uint32_t{header[16]} | uint32_t{header[17]} << 8U) + 1U;
+}
+
+/// @brief CRC32 of A followed by B, from CRC32(A), CRC32(B) and B's length, as zlib's
+/// crc32_combine: CRC32(A) times x^(8 * length) modulo the reflected polynomial, plus CRC32(B).
+[[nodiscard]] inline uint32_t crc32_combine(uint32_t a, uint32_t b, uint64_t length) noexcept {
+    constexpr uint32_t polynomial = 0xedb88320U;
+    auto const multiply = [](uint32_t x, uint32_t y) {
+        uint32_t product = 0;
+        for (uint32_t bit = 1U << 31U; bit != 0; bit >>= 1U) {
+            if ((x & bit) != 0) product ^= y;
+            y = (y & 1U) != 0 ? (y >> 1U) ^ polynomial : y >> 1U;
+        }
+        return product;
+    };
+    // power = x^(2^k) for bit k of 8 * length; x^1 is 1 << 30 in reflected order.
+    uint32_t shift = 1U << 31U, power = 1U << 30U;
+    for (uint64_t bits = length * 8; bits != 0; bits >>= 1U) {
+        if ((bits & 1U) != 0) shift = multiply(power, shift);
+        power = multiply(power, power);
+    }
+    return multiply(shift, a) ^ b;
+}
+
+/// @brief Calls @p block(deflate_at, deflate_bytes, inflated) for each non-empty block of the
+/// BGZF file in @p bytes. @return The non-empty blocks and their inflated total, or nullopt
+/// unless whole blocks tile all @p size bytes.
+template <typename Block>
+[[nodiscard]] std::optional<std::pair<uint32_t, uint64_t>>
+walk_bgzf(unsigned char const* bytes, uint64_t size, Block&& block) {
+    uint64_t at = 0, total = 0;
+    uint32_t count = 0;
+    while (at < size) {
+        auto const block_size = size - at >= 18 ? bgzf_block_size(bytes + at) : 0;
+        if (block_size < 26 || block_size > size - at) return std::nullopt;
+        uint32_t inflated = 0;
+        std::memcpy(&inflated, bytes + at + block_size - 4, 4);
+        if (inflated != 0) {
+            block(at + 18, uint64_t{block_size} - 26, inflated);
+            total += inflated;
+            ++count;
+        }
+        at += block_size;
+    }
+    return std::pair{count, total};
+}
+
+/// @brief Reads the header and trailer of @p path, and of every block of a BGZF file.
 ///
-/// A candidate is a gzip file without FEXTRA (so never BGZF) whose trailer names a non-empty
-/// member, or an uncompressed file that opens with a FASTA header, either one with a name that
-/// does not mark it FASTQ. Additional member signatures are checked after reading the compressed
-/// bytes, before accepting the device output.
+/// A candidate is a gzip file without FEXTRA whose trailer names a non-empty member, a BGZF file
+/// with a non-empty block, or an uncompressed file that opens with a FASTA header, any of them
+/// with a name that does not mark it FASTQ. For gzip without FEXTRA, additional member signatures
+/// are checked after reading the compressed bytes, before accepting the device output.
 [[nodiscard]] inline gzip_file_probe probe_gzip_file(std::filesystem::path const& path) {
     gzip_file_probe probe;
     int const fd = ::open(path.c_str(), O_RDONLY);
     if (fd == -1) return probe;
     struct stat status{};
-    unsigned char header[4] = {};
-    unsigned char trailer[8] = {};
+    unsigned char header[18] = {};
+    unsigned char trailer[8 + 18] = {};  // a member's trailer, and the next BGZF header
     if (::fstat(fd, &status) == 0 && status.st_size >= 4 &&
-        ::pread(fd, header, sizeof(header), 0) == sizeof(header)) {
+        ::pread(fd, header, sizeof(header), 0) >= 4) {
         auto const size = static_cast<uint64_t>(status.st_size);
         probe.compressed = size;
         auto name = path.filename().string();
@@ -89,12 +154,42 @@ struct gzip_file_probe {
             probe.plain = size < std::numeric_limits<uint32_t>::max();
             probe.isize = static_cast<uint32_t>(probe.plain ? size : 0);
             probe.device = probe.plain && !fastq;
-        } else if (
-            status.st_size >= 18 &&
-            ::pread(fd, trailer, sizeof(trailer), status.st_size - 8) == sizeof(trailer)
-        ) {
+        } else if (size >= 26 && bgzf_block_size(header) != 0) {
+            // One read per block: its trailer, and the header of the block after it.
+            uint64_t at = 0, total = 0;
+            uint32_t crc = 0, block_size = bgzf_block_size(header);
+            bool tiled = false;
+            while (block_size >= 26 && block_size <= size - at) {
+                auto const next = at + block_size;
+                auto const wanted = next == size ? 8 : std::min<uint64_t>(26, size - next + 8);
+                if (::pread(fd, trailer, wanted, static_cast<off_t>(next - 8)) !=
+                    static_cast<ssize_t>(wanted)) {
+                    break;
+                }
+                uint32_t block_crc = 0, inflated = 0;
+                std::memcpy(&block_crc, trailer, 4);
+                std::memcpy(&inflated, trailer + 4, 4);
+                if (inflated != 0) {
+                    crc = crc32_combine(crc, block_crc, inflated);
+                    total += inflated;
+                    ++probe.members;
+                }
+                if (next == size) {
+                    tiled = true;
+                    break;
+                }
+                block_size = wanted == 26 ? bgzf_block_size(trailer + 8) : 0;
+                at = next;
+            }
+            probe.bgzf = true;
+            probe.crc = crc;
+            probe.isize = static_cast<uint32_t>(total);
+            probe.device =
+                tiled && total != 0 && total < std::numeric_limits<uint32_t>::max() && !fastq;
+        } else if (size >= 18 && ::pread(fd, trailer, 8, static_cast<off_t>(size - 8)) == 8) {
             std::memcpy(&probe.crc, trailer, 4);
             std::memcpy(&probe.isize, trailer + 4, 4);
+            probe.members = 1;
             probe.device = header[0] == 0x1f && header[1] == 0x8b && header[2] == 8 &&
                            (header[3] & 0xe4U) == 0 && probe.isize != 0 && !fastq;
         }
@@ -140,7 +235,8 @@ __attribute__((target("avx512f,avx512bw"))) inline bool
 has_gzip_signature_avx512(char const* data, size_t size) {
     size_t at = 0;
     for (; at + 67 <= size; at += 64) {
-        auto const first = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(data + at), _mm512_set1_epi8(0x1f));
+        auto const first =
+            _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(data + at), _mm512_set1_epi8(0x1f));
         if (first == 0) continue;
         auto const second = _mm512_cmpeq_epi8_mask(
             _mm512_loadu_si512(data + at + 1), _mm512_set1_epi8(static_cast<char>(0x8b))
@@ -218,79 +314,6 @@ inline bool has_gzip_signature_neon(char const* data, size_t size) {
 }
 
 static bool (*const has_gzip_signature)(char const*, size_t) = resolve_gzip_signature_scanner();
-
-/// @brief Fixed threads that run indexed work with the caller, for work repeated per batch.
-///
-/// Spawning and joining threads for every batch cost the thread submitting batches more time
-/// than the reads it spread over them.
-class worker_pool {
-   public:
-    explicit worker_pool(size_t workers) {
-        auto const helpers = workers > 0 ? workers - 1 : 0;
-        threads_.reserve(helpers);
-        for (size_t thread = 0; thread < helpers; ++thread) {
-            threads_.emplace_back([this] { serve(); });
-        }
-    }
-    worker_pool(worker_pool const&) = delete;
-    worker_pool& operator=(worker_pool const&) = delete;
-    ~worker_pool() {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-        }
-        start_.notify_all();
-        for (auto& thread : threads_) thread.join();
-    }
-
-    /// @brief Runs @p work(index) for every index below @p count; one call at a time.
-    template <typename Work>
-    void for_each(size_t count, Work&& work) {
-        if (count == 0) return;
-        auto run = [&](size_t index) { work(index); };
-        {
-            std::lock_guard lock(mutex_);
-            job_ = run;
-            count_ = count;
-            next_ = 0;
-            active_ = threads_.size();
-            ++generation_;
-        }
-        start_.notify_all();
-        drain();
-        std::unique_lock lock(mutex_);
-        done_.wait(lock, [&] { return active_ == 0; });
-        job_ = nullptr;
-    }
-
-   private:
-    void drain() {
-        for (size_t index = next_++; index < count_; index = next_++) job_(index);
-    }
-
-    void serve() {
-        size_t seen = 0;
-        while (true) {
-            {
-                std::unique_lock lock(mutex_);
-                start_.wait(lock, [&] { return stop_ || generation_ != seen; });
-                if (stop_) return;
-                seen = generation_;
-            }
-            drain();
-            std::lock_guard lock(mutex_);
-            if (--active_ == 0) done_.notify_one();
-        }
-    }
-
-    std::vector<std::thread> threads_;
-    std::mutex mutex_;
-    std::condition_variable start_, done_;
-    std::function<void(size_t)> job_;
-    std::atomic<size_t> next_{0};
-    size_t count_ = 0, active_ = 0, generation_ = 0;
-    bool stop_ = false;
-};
 
 namespace device_gzip {
 
@@ -504,6 +527,74 @@ static __global__ void slot_finish_kernel(
     for (auto at = begin + threadIdx.x; at < head; at += block_size) buffer[at] = '\n';
 }
 
+/// @brief Largest output, in bytes, that @p device's hardware decompression engine (Blackwell
+/// B200, B300, GB200, GB300) inflates in one operation, or 0 for a device without one. nvCOMP
+/// sends a whole batch to the SMs once any output buffer in it exceeds this.
+inline size_t hardware_inflate_limit(int device) {
+    void* address = nullptr;
+    cudaDriverEntryPointQueryResult found{};
+    if (cudaGetDriverEntryPointByVersion(
+            "cuDeviceGetAttribute", &address, 12000U, cudaEnableDefault, &found
+        ) != cudaSuccess ||
+        found != cudaDriverEntryPointSuccess) {
+        return 0;
+    }
+    int limit = 0;
+    auto const attribute = reinterpret_cast<decltype(&cuDeviceGetAttribute)>(address);
+    auto const status =
+        attribute(&limit, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH, device);
+    return status == CUDA_SUCCESS && limit > 0 ? static_cast<size_t>(limit) : 0;
+}
+
+/// @brief Device memory @p device's decompression engine can read and write. CUDA's default pool
+/// is not: nvCOMP then falls back to the SMs, which on a B300 inflated 2,000 genomes at 7.3 GB/s
+/// of gzip against 57.6 GB/s from this pool. One pool per device for the life of the process,
+/// like device_pinned_pool.
+[[nodiscard]] inline cuda::device_memory_pool_ref hardware_inflate_pool(cuda::device_ref device) {
+    static std::mutex mutex;
+    static std::vector<cudaMemPool_t> pools(cuda::devices.size());
+    std::lock_guard lock(mutex);
+    auto& pool = pools.at(static_cast<size_t>(device.get()));
+    if (pool == nullptr) {
+        cudaMemPoolProps properties{};
+        properties.allocType = cudaMemAllocationTypePinned;
+        properties.location = {cudaMemLocationTypeDevice, device.get()};
+        properties.usage = cudaMemPoolCreateUsageHwDecompress;
+        CUDDL_CUDA_CALL(cudaMemPoolCreate(&pool, &properties));
+    }
+    return cuda::device_memory_pool_ref(pool);
+}
+
+/// @brief The driver's cuMemBatchDecompressAsync, or nullptr where the driver lacks it.
+inline PFN_cuMemBatchDecompressAsync_v12060 batch_decompress_entry() {
+    void* address = nullptr;
+    cudaDriverEntryPointQueryResult found{};
+    if (cudaGetDriverEntryPointByVersion(
+            "cuMemBatchDecompressAsync", &address, 12060U, cudaEnableDefault, &found
+        ) != cudaSuccess ||
+        found != cudaDriverEntryPointSuccess) {
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_cuMemBatchDecompressAsync_v12060>(address);
+}
+
+/// @brief Where the DEFLATE stream starts in the @p size bytes of a gzip candidate (one member,
+/// no FEXTRA), or 0 if its header runs into the trailer.
+inline size_t deflate_offset(char const* bytes, size_t size) {
+    auto const flags = static_cast<unsigned char>(bytes[3]);
+    size_t at = 10;
+    // FNAME, then FCOMMENT: zero-terminated strings.
+    for (auto const flag : {8U, 16U}) {
+        if ((flags & flag) == 0) continue;
+        auto const* const end =
+            static_cast<char const*>(std::memchr(bytes + at, '\0', size - std::min(at, size)));
+        if (end == nullptr) return 0;
+        at = static_cast<size_t>(end - bytes) + 1;
+    }
+    if ((flags & 2) != 0) at += 2;  // FHCRC
+    return at + 8 < size ? at : 0;
+}
+
 }  // namespace device_gzip
 
 /// @brief One genome the device inflated: its compacted bases, resident on the device.
@@ -538,14 +629,20 @@ class device_fasta_pipeline {
    public:
     static constexpr size_t lane_count = 6;
     static constexpr size_t max_files = 4096;
+    /// Gzip members one batch inflates: one per file, or one per non-empty BGZF block. With
+    /// BGZF's 64 KiB blocks, about 4 GiB of output.
+    static constexpr size_t max_members = 65536;
 
     /// @param slot_capacity Inflated bytes one lane holds, one guard byte per file included.
     /// @param compressed_capacity Compressed bytes per lane; zero selects decoded input.
+    /// @param hardware_inflate Whether nvCOMP may use the device's decompression engine; without
+    /// it, nvCOMP inflates on the SMs from ordinary device memory.
     device_fasta_pipeline(
         cuda::stream_ref stream,
         size_t slot_capacity,
         size_t compressed_capacity,
-        size_t workers
+        size_t workers,
+        bool hardware_inflate
     )
         : workers_(std::max<size_t>(1, workers)),
           compressed_capacity_(compressed_capacity),
@@ -557,11 +654,11 @@ class device_fasta_pipeline {
                   std::numeric_limits<uint32_t>::max()
               ))
           ) {
-        auto const options = nvcompBatchedGzipDecompressDefaultOpts;
+        auto const options = nvcompBatchedDeflateDecompressDefaultOpts;
         nvcomp_temp_bytes_ = 0;
         if (compressed_capacity_ != 0 &&
-            nvcompBatchedGzipDecompressGetTempSizeAsync(
-                max_files,
+            nvcompBatchedDeflateDecompressGetTempSizeAsync(
+                max_members,
                 std::min<size_t>(slot_capacity_, std::numeric_limits<uint32_t>::max()),
                 options,
                 &nvcomp_temp_bytes_,
@@ -604,7 +701,13 @@ class device_fasta_pipeline {
                                                           );
         if (selected != cudaSuccess) throw std::runtime_error(cudaGetErrorString(selected));
         auto const device = stream.device();
-        auto const streaming_window =
+        if (hardware_inflate) {
+            batch_decompress_ = device_gzip::batch_decompress_entry();
+            if (batch_decompress_ != nullptr) {
+                hardware_limit_ = device_gzip::hardware_inflate_limit(device.get());
+            }
+        }
+        streaming_window_ =
             compressed_capacity_ == 0
                 ? std::min(
                       slot_capacity_,
@@ -619,51 +722,10 @@ class device_fasta_pipeline {
             lane.uploaded.emplace(s);
             lane.classified.emplace(s);
             lane.released.emplace(stream);
-            if (compressed_capacity_ != 0) {
-                lane.pinned.emplace(
-                    s, device_pinned_pool(device, pinned_placement::host), compressed_capacity_,
-                    cuda::no_init
-                );
-                lane.payload.emplace(
-                    cuda::make_device_buffer<char>(
-                        s, device, std::max(compressed_capacity_, slot_capacity_), cuda::no_init
-                    )
-                );
-            }
-            lane.host.emplace(
-                s, device_pinned_pool(device, pinned_placement::host), host_table_bytes(),
-                cuda::no_init
-            );
-            // Sixteen bytes of tail padding let the header scan read whole words.
-            lane.slots.emplace(
-                cuda::make_device_buffer<char>(s, device, slot_capacity_ + 16, cuda::no_init)
-            );
-            if (streaming_window != 0) {
-                cudaStreamAttrValue policy{};
-                policy.accessPolicyWindow.base_ptr = lane.slots->data();
-                policy.accessPolicyWindow.num_bytes = streaming_window;
-                policy.accessPolicyWindow.hitRatio = 0.0f;
-                policy.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
-                policy.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-                auto const status =
-                    cudaStreamSetAttribute(s.get(), cudaStreamAttributeAccessPolicyWindow, &policy);
-                if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-            }
-            lane.tables.emplace(
-                cuda::make_device_buffer<char>(s, device, host_table_bytes(), cuda::no_init)
-            );
-            lane.headers.emplace(
-                cuda::make_device_buffer<uint64_t>(s, device, header_capacity_, cuda::no_init)
-            );
-            lane.temp.emplace(
-                cuda::make_device_buffer<char>(
-                    s,
-                    device,
-                    std::max({nvcomp_temp_bytes_, select_temp_bytes_, count_temp_bytes_}) + 1,
-                    cuda::no_init
-                )
-            );
         }
+        // The other lanes allocate on first use, so the device starts on the first batch while
+        // they page-lock their compressed buffers.
+        allocate(lanes_[0]);
     }
 
     [[nodiscard]] size_t slot_capacity() const noexcept {
@@ -672,6 +734,11 @@ class device_fasta_pipeline {
 
     [[nodiscard]] size_t compressed_capacity() const noexcept {
         return compressed_capacity_;
+    }
+
+    /// @brief Largest inflated file the device's decompression engine takes; 0 without one.
+    [[nodiscard]] size_t hardware_limit() const noexcept {
+        return hardware_limit_;
     }
 
     /// @brief Device bytes a lane needs besides its slots and compressed bytes.
@@ -684,15 +751,16 @@ class device_fasta_pipeline {
         std::span<size_t const> ids,
         std::span<gzip_file_probe const> probes
     ) const noexcept {
-        size_t files = 0, compressed = 0, slots = 0;
+        size_t files = 0, compressed = 0, slots = 0, members = 0;
         while (files < ids.size() && files < max_files) {
             auto const& probe = probes[ids[files]];
             if (compressed + probe.host_bytes() > compressed_capacity_ ||
-                slots + probe.isize + 1 > slot_capacity_) {
+                slots + probe.isize + 1 > slot_capacity_ || members + probe.members > max_members) {
                 break;
             }
             compressed += probe.host_bytes();
             slots += probe.isize + 1;
+            members += probe.members;
             ++files;
         }
         return files;
@@ -711,6 +779,7 @@ class device_fasta_pipeline {
         std::span<gzip_file_probe const> probes
     ) {
         auto& lane = lanes_[lane_index];
+        CUDDL_TRY(cuda_try([&] { allocate(lane); }));
         lane.decoded = false;
         if (ids.empty()) return Err(Error::invalid_argument("an inflate batch needs a file"));
         auto const files = batch_files(ids, probes);
@@ -755,22 +824,22 @@ class device_fasta_pipeline {
             if (done != bytes) failed = true;
             // A matching trailer cannot distinguish repeated first and last members.
             // A signature inside compressed data is ambiguous too, so use the host parser.
+            // BGZF names every member in its block headers.
+            auto const& probe = probes[ids[file]];
             lane.possible_members[file] =
-                !probes[ids[file]].plain && done > 10 && has_gzip_signature(out + 10, done - 10);
+                !probe.plain && !probe.bgzf && done > 10 && has_gzip_signature(out + 10, done - 10);
         });
         if (failed) return Err(Error::invalid_argument("cannot read reference inputs"));
         lane.files.clear();
         lane.fallback.clear();
+        lane.member_first.clear();
+        engine_params_.clear();
         slot_at = 0;
+        uint32_t members = 0;
         auto const accept = [&](size_t file) {
-            auto const target = lane.files.size();
-            auto const& probe = probes[ids[file]];
-            table.compressed_ptrs[target] = lane.payload->data() + table.compressed_offsets[file];
-            table.compressed_bytes[target] = probe.compressed;
-            table.slots[target] = slot_at;
-            table.output_ptrs[target] = lane.slots->data() + slot_at + 1;
-            table.output_bytes[target] = probe.isize;
-            slot_at += probe.isize + 1;
+            table.slots[lane.files.size()] = slot_at;
+            lane.member_first.push_back(members);
+            slot_at += probes[ids[file]].isize + 1;
             lane.files.push_back(ids[file]);
         };
         for (size_t file = 0; file < files; ++file) {
@@ -778,13 +847,83 @@ class device_fasta_pipeline {
         }
         auto const plain = lane.files.size();
         for (size_t file = 0; file < files; ++file) {
-            if (probes[ids[file]].plain) continue;
-            if (lane.possible_members[file]) {
+            if (!probes[ids[file]].plain && lane.possible_members[file]) {
                 lane.fallback.push_back(ids[file]);
-            } else {
-                accept(file);
             }
         }
+        // One member: raw DEFLATE at @p deflate in the page-locked copy, which the payload buffer
+        // mirrors, inflating to @p size bytes at @p out.
+        auto const add_member = [&](unsigned char const* deflate,
+                                    uint64_t deflate_bytes,
+                                    uint32_t size,
+                                    char* out) {
+            auto* const source = lane.payload->data() +
+                                 (reinterpret_cast<char const*>(deflate) - lane.pinned->data());
+            table.member_sources[members] = source;
+            table.member_source_bytes[members] = deflate_bytes;
+            table.member_outputs[members] = out;
+            table.member_output_bytes[members] = size;
+            if (hardware_limit_ != 0 && size <= hardware_limit_) {
+                CUmemDecompressParams params{};
+                params.src = source;
+                params.srcNumBytes = deflate_bytes;
+                params.dst = out;
+                params.dstNumBytes = size;
+                // The low half of the member's 64-bit inflated size, zeroed before the batch.
+                params.dstActBytes =
+                    reinterpret_cast<cuuint32_t*>(device_tables(lane).member_inflated + members);
+                params.algo = CU_MEM_DECOMPRESS_ALGORITHM_DEFLATE;
+                engine_params_.push_back(params);
+            }
+            ++members;
+        };
+        // Gzip files whose members all fit the decompression engine come first, then those
+        // nvCOMP inflates on the SMs, so each group's members form one range. Both take raw
+        // DEFLATE: the host steps over each member's header in its copy. Without an engine, every
+        // gzip file is in the second group.
+        auto const gzip_pass = [&](bool engine) {
+            for (size_t file = 0; file < files; ++file) {
+                auto const& probe = probes[ids[file]];
+                if (probe.plain || lane.possible_members[file]) continue;
+                bool const fits =
+                    hardware_limit_ != 0 && (probe.bgzf || probe.isize <= hardware_limit_);
+                if (fits != engine) continue;
+                auto const* const bytes = reinterpret_cast<unsigned char const*>(
+                    lane.pinned->data() + table.compressed_offsets[file]
+                );
+                auto* out = lane.slots->data() + slot_at + 1;
+                if (probe.bgzf) {
+                    // The blocks must still be the ones probed, or they would overrun the slot.
+                    auto const blocks = walk_bgzf(bytes, probe.compressed, [](auto...) {});
+                    if (!blocks || blocks->first != probe.members ||
+                        blocks->second != probe.isize) {
+                        lane.fallback.push_back(ids[file]);
+                        continue;
+                    }
+                    accept(file);
+                    (void)walk_bgzf(
+                        bytes, probe.compressed, [&](uint64_t at, uint64_t length, uint32_t size) {
+                            add_member(bytes + at, length, size, out);
+                            out += size;
+                        }
+                    );
+                    continue;
+                }
+                auto const deflate_at = device_gzip::deflate_offset(
+                    reinterpret_cast<char const*>(bytes), probe.compressed
+                );
+                if (deflate_at == 0) {
+                    lane.fallback.push_back(ids[file]);
+                    continue;
+                }
+                accept(file);
+                add_member(bytes + deflate_at, probe.compressed - deflate_at - 8, probe.isize, out);
+            }
+        };
+        gzip_pass(true);
+        auto const engine_members = members;
+        gzip_pass(false);
+        lane.member_first.push_back(members);
         table.slots[lane.files.size()] = slot_at;
         lane.slot_bytes = slot_at;
         if (lane.files.empty()) return files;
@@ -830,27 +969,55 @@ class device_fasta_pipeline {
             device_table.header_count
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
-        // Table entries past the plain files belong to gzip files.
-        auto const gzip = count - static_cast<uint32_t>(plain);
-        if (gzip != 0) {
-            auto const inflated = nvcompBatchedGzipDecompressAsync(
-                reinterpret_cast<void const* const*>(device_table.compressed_ptrs + plain),
-                device_table.compressed_bytes + plain,
-                device_table.output_bytes + plain,
-                device_table.inflated_bytes + plain,
-                gzip,
+        if (engine_members != 0) {
+            // The driver takes the parameters from host memory. nvCOMP's own engine path builds
+            // them on the device and synchronises the stream to read them back, which stalls this
+            // thread and every lane it drives. The engine reports only inflated sizes, so the
+            // statuses read as success; finish still checks each size and CRC32.
+            static_assert(nvcompSuccess == 0);
+            static_assert(std::endian::native == std::endian::little);
+            CUDDL_CUDA_TRY(cudaMemsetAsync(
+                device_table.member_inflated, 0, engine_members * sizeof(uint64_t), stream
+            ));
+            CUDDL_CUDA_TRY(cudaMemsetAsync(
+                device_table.member_statuses, 0, engine_members * sizeof(nvcompStatus_t), stream
+            ));
+            size_t error_index = 0;
+            auto const submitted = batch_decompress_(
+                engine_params_.data(), engine_params_.size(), 0, &error_index, stream
+            );
+            if (submitted != CUDA_SUCCESS) {
+                return Err(
+                    Error::resource(
+                        "hardware decompression launch failed: " + std::to_string(submitted)
+                    )
+                );
+            }
+        }
+        if (engine_members != members) {
+            auto options = nvcompBatchedDeflateDecompressDefaultOpts;
+            options.backend = NVCOMP_DECOMPRESS_BACKEND_CUDA;
+            auto const first = engine_members;
+            auto const inflated = nvcompBatchedDeflateDecompressAsync(
+                reinterpret_cast<void const* const*>(device_table.member_sources + first),
+                device_table.member_source_bytes + first,
+                device_table.member_output_bytes + first,
+                device_table.member_inflated + first,
+                members - first,
                 lane.temp->data(),
                 nvcomp_temp_bytes_,
-                reinterpret_cast<void* const*>(device_table.output_ptrs + plain),
-                nvcompBatchedGzipDecompressDefaultOpts,
-                device_table.statuses + plain,
+                reinterpret_cast<void* const*>(device_table.member_outputs + first),
+                options,
+                device_table.member_statuses + first,
                 stream
             );
             if (inflated != nvcompSuccess) {
                 return Err(
-                    Error::resource("nvCOMP gzip launch failed: " + std::to_string(inflated))
+                    Error::resource("nvCOMP DEFLATE launch failed: " + std::to_string(inflated))
                 );
             }
+        }
+        if (auto const gzip = count - static_cast<uint32_t>(plain); gzip != 0) {
             device_gzip::slot_crc_kernel<<<gzip, device_gzip::block_size, 0, stream>>>(
                 lane.slots->data(), device_table.slots + plain, device_table.crcs + plain
             );
@@ -955,6 +1122,7 @@ class device_fasta_pipeline {
             return Err(Error::invalid_argument("invalid decoded FASTA batch"));
         }
         auto& lane = lanes_[lane_index];
+        CUDDL_TRY(cuda_try([&] { allocate(lane); }));
         lane.uploaded->sync();
         lane.decoded = true;
         lane.files.clear();
@@ -993,7 +1161,7 @@ class device_fasta_pipeline {
             device_table.header_count
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
-        static_assert(CUDART_VERSION >= 13030, "cuDDL needs CUDA 13.3 or newer");
+        static_assert(CUDART_VERSION >= 13000, "cuDDL needs CUDA 13.0 or newer");
         cudaMemcpyAttributes attributes{};
         attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
         attributes.srcLocHint = {cudaMemLocationTypeHost, 0};
@@ -1044,10 +1212,17 @@ class device_fasta_pipeline {
         for (size_t file = 0; file < lane.files.size(); ++file) {
             auto const id = lane.files[file];
             auto const size = table.kept[file];
-            bool const intact = lane.decoded || probes[id].plain ||
-                                (table.statuses[file] == nvcompSuccess &&
-                                 table.inflated_bytes[file] == probes[id].isize &&
-                                 table.crcs[file] == probes[id].crc);
+            bool intact = lane.decoded || probes[id].plain;
+            if (!intact) {
+                uint64_t inflated = 0;
+                bool succeeded = true;
+                for (auto m = lane.member_first[file]; m < lane.member_first[file + 1]; ++m) {
+                    succeeded = succeeded && table.member_statuses[m] == nvcompSuccess;
+                    inflated += table.member_inflated[m];
+                }
+                intact =
+                    succeeded && inflated == probes[id].isize && table.crcs[file] == probes[id].crc;
+            }
             auto const fasta =
                 table.first_char[file] != '@' && table.first_header[file] < table.slots[file + 1];
             // Each header contributes one separator, including the first header.
@@ -1076,14 +1251,18 @@ class device_fasta_pipeline {
     /// Per-batch tables. Inputs go host to device, outputs come back; one copy each way.
     struct table_view {
         uint64_t* compressed_offsets;  // host only
-        char** compressed_ptrs;
+        char** compressed_ptrs;        // decoded input only
         uint64_t* compressed_bytes;
-        uint64_t* output_bytes;
-        char** output_ptrs;
-        uint64_t* slots;  // max_files + 1
+        char** output_ptrs;  // decoded input only
+        uint64_t* slots;     // max_files + 1
+        // Gzip members, max_members each: raw DEFLATE in, inflated bytes out.
+        char const** member_sources;
+        uint64_t* member_source_bytes;
+        uint64_t* member_output_bytes;
+        char** member_outputs;
         // Outputs.
-        uint64_t* inflated_bytes;
-        nvcompStatus_t* statuses;
+        uint64_t* member_inflated;
+        nvcompStatus_t* member_statuses;
         uint32_t* crcs;
         unsigned long long* first_header;
         unsigned long long* kept;
@@ -1093,11 +1272,11 @@ class device_fasta_pipeline {
     };
 
     static constexpr size_t inputs_bytes() noexcept {
-        return 6 * max_files * 8 + 8;
+        return 5 * max_files * 8 + 8 + 4 * max_members * 8;
     }
 
     static constexpr size_t outputs_bytes() noexcept {
-        return max_files * (8 + sizeof(nvcompStatus_t) + 4 + 8 + 8 + 1) + 16;
+        return max_members * (8 + sizeof(nvcompStatus_t)) + max_files * (4 + 8 + 8 + 1) + 16;
     }
 
     static constexpr size_t host_table_bytes() noexcept {
@@ -1114,15 +1293,18 @@ class device_fasta_pipeline {
         take(view.compressed_offsets, max_files);
         take(view.compressed_ptrs, max_files);
         take(view.compressed_bytes, max_files);
-        take(view.output_bytes, max_files);
         take(view.output_ptrs, max_files);
         take(view.slots, max_files + 1);
-        take(view.inflated_bytes, max_files);
+        take(view.member_sources, max_members);
+        take(view.member_source_bytes, max_members);
+        take(view.member_output_bytes, max_members);
+        take(view.member_outputs, max_members);
+        take(view.member_inflated, max_members);
         take(view.first_header, max_files);
         take(view.kept, max_files);
         take(view.header_count, 1);
         take(view.selected, 1);
-        take(view.statuses, max_files);
+        take(view.member_statuses, max_members);
         take(view.crcs, max_files);
         take(view.first_char, max_files);
         return view;
@@ -1137,6 +1319,7 @@ class device_fasta_pipeline {
         std::optional<cuda::device_buffer<char>> payload, slots, tables, temp;
         std::optional<cuda::device_buffer<uint64_t>> headers;
         std::vector<size_t> files, fallback;
+        std::vector<uint32_t> member_first;  // each file's first member, then the member count
         std::array<bool, max_files> possible_members;
         uint64_t slot_bytes = 0;
     };
@@ -1149,9 +1332,71 @@ class device_fasta_pipeline {
         return view(lane.tables->data());
     }
 
+    /// @brief Allocates @p lane's buffers unless it has them.
+    void allocate(lane_state& lane) {
+        if (lane.slots) return;
+        auto const s = cuda::stream_ref{*lane.stream};
+        auto const device = s.device();
+        // Compressed inputs and inflated outputs: memory the decompression engine accepts on
+        // devices that have one.
+        auto const inflate_buffer = [&](size_t bytes) -> cuda::device_buffer<char> {
+            if (hardware_limit_ == 0) {
+                return cuda::make_device_buffer<char>(s, device, bytes, cuda::no_init);
+            }
+            return cuda::make_buffer<char>(
+                s, device_gzip::hardware_inflate_pool(device), bytes, cuda::no_init
+            );
+        };
+        if (compressed_capacity_ != 0) {
+            lane.pinned.emplace(
+                s,
+                device_pinned_pool(device, pinned_placement::host),
+                compressed_capacity_,
+                cuda::no_init
+            );
+            lane.payload.emplace(inflate_buffer(std::max(compressed_capacity_, slot_capacity_)));
+        }
+        lane.host.emplace(
+            s, device_pinned_pool(device, pinned_placement::host), host_table_bytes(), cuda::no_init
+        );
+        // nvCOMP's pointer, size and status arrays: the engine needs them in its memory too.
+        lane.tables.emplace(inflate_buffer(host_table_bytes()));
+        lane.headers.emplace(
+            cuda::make_device_buffer<uint64_t>(s, device, header_capacity_, cuda::no_init)
+        );
+        lane.temp.emplace(
+            cuda::make_device_buffer<char>(
+                s,
+                device,
+                std::max({nvcomp_temp_bytes_, select_temp_bytes_, count_temp_bytes_}) + 1,
+                cuda::no_init
+            )
+        );
+        // Sixteen bytes of tail padding let the header scan read whole words. Allocated last, so
+        // a lane with slots has every buffer.
+        lane.slots.emplace(inflate_buffer(slot_capacity_ + 16));
+        if (streaming_window_ != 0) {
+            cudaStreamAttrValue policy{};
+            policy.accessPolicyWindow.base_ptr = lane.slots->data();
+            policy.accessPolicyWindow.num_bytes = streaming_window_;
+            policy.accessPolicyWindow.hitRatio = 0.0f;
+            policy.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+            policy.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            auto const status =
+                cudaStreamSetAttribute(s.get(), cudaStreamAttributeAccessPolicyWindow, &policy);
+            if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        }
+    }
+
     size_t workers_;
-    worker_pool readers_{workers_};
-    size_t compressed_capacity_ = 0, slot_capacity_ = 0;
+    // Lane reads wait on storage, so they keep a parallel file system's depth in flight.
+    worker_pool readers_{
+        ablated("read-depth") ? workers_ : std::max(workers_, parallel_read_depth)
+    };
+    size_t compressed_capacity_ = 0, slot_capacity_ = 0, streaming_window_ = 0;
+    size_t hardware_limit_ = 0;  // device_gzip::hardware_inflate_limit of the stream's device
+    PFN_cuMemBatchDecompressAsync_v12060 batch_decompress_ = nullptr;
+    std::vector<CUmemDecompressParams> engine_params_;  // one batch's, reused
     size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, count_temp_bytes_ = 0;
     uint32_t header_capacity_ = 0;
     std::array<lane_state, lane_count> lanes_;

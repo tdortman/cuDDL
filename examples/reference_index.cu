@@ -252,6 +252,7 @@ int main(int argc, char** argv) {
                     {"automatic", cuddl::decompression_backend::automatic},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
+                    {"gpu-cores", cuddl::decompression_backend::gpu_cores},
                     {"hybrid", cuddl::decompression_backend::hybrid}
                 }
             )

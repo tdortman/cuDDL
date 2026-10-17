@@ -1,11 +1,13 @@
 #include <CLI/CLI.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cli_config.hpp"
@@ -50,6 +52,7 @@ int main(int argc, char** argv) {
                     {"hybrid", cuddl::decompression_backend::hybrid},
                     {"cpu", cuddl::decompression_backend::cpu},
                     {"gpu", cuddl::decompression_backend::gpu},
+                    {"gpu-cores", cuddl::decompression_backend::gpu_cores},
                 }
             )
         )
@@ -63,10 +66,22 @@ int main(int argc, char** argv) {
                 return std::filesystem::equivalent(path, blacklist_path);
             });
         }
-        if (std::filesystem::exists(output) && std::ranges::any_of(paths, [&](auto const& path) {
-                return std::filesystem::equivalent(path, output);
-            })) {
-            throw std::invalid_argument("output must not overwrite an input genome");
+        if (std::filesystem::exists(output)) {
+            // Each lookup of an input on a network file system waits for the server: 10,000
+            // genomes linked from an NFS directory took 3.7 s one at a time.
+            std::atomic<size_t> next{0};
+            std::atomic<bool> clash{false};
+            std::vector<std::jthread> threads;
+            for (size_t t = 0; t < std::min<size_t>(64, paths.size()); ++t) {
+                threads.emplace_back([&] {
+                    std::error_code error;
+                    for (auto i = next++; i < paths.size() && !clash; i = next++) {
+                        if (std::filesystem::equivalent(paths[i], output, error)) clash = true;
+                    }
+                });
+            }
+            threads.clear();
+            if (clash) throw std::invalid_argument("output must not overwrite an input genome");
         }
         if (paths.empty()) {
             throw std::invalid_argument("folder contains no supported FASTA/FASTQ files");

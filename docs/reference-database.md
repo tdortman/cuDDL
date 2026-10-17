@@ -40,6 +40,10 @@ The position of a path in the list is its zero-based reference ID. `names()` kee
 
 The optional third argument to `build` is a `path_build_options`. `parser_workers` sets how many genomes load at once. It defaults to the machine's thread count, capped by the number of inputs. Zero is an error. To load one genome at a time and keep host memory low, set `parser_workers = 1`, or pass `--workers 1` to the CLI. The saved bytes are the same for every worker count and every decompression backend.
 
+Loaders don't read their own files. Reader threads read whole files ahead of them, as many as the loaders but at least 64, because a parallel file system gives one node its bandwidth only with many reads in flight: on MOGON's Lustre, 16 threads read 2.9 GB/s of RefSeq gzip and 64 threads 6.7 GB/s. Loaders take files in the order they finish reading, so a slow read holds up only itself. The `gpu` backend reads its nvCOMP batches with the same depth. On an A100 node, 4,000 genomes that no node had cached took 10.3–11.6 s to sketch with 16 `cpu` loaders reading their own files, and 4.0–4.5 s with readers; `gpu` went from 9.8–10.5 s to 3.2–3.6 s and `hybrid` from 14.1 s to 2.1–2.2 s.
+
+Before it reads anything, the `gpu` backend probes every file's gzip header and trailer. A probe is two small reads, so it waits on latency and moves almost no data, and 256 probes run at once. On an A100 node, 20,000 uncached genomes built in 13.9–15.6 s with 16 loaders and 64 probes in flight, and in 9.6–10.5 s with 256. Raising the whole-file read depth from 64 to 128 for the nvCOMP batches alone changed nothing (14.2–14.6 s).
+
 ### Reconstruct a RabbitTClust-style bacterial dataset
 
 `scripts/reconstruct_refseq211.py` takes a directory, downloads missing NCBI current
@@ -228,12 +232,13 @@ These measurements exclude parsing, upload, and database serialization.
 
 ## Choose a decompression backend
 
-`path_build_options::decompression` picks one of four backends:
+`path_build_options::decompression` picks one of five backends:
 
-- `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP it uses `hybrid` on a coherent-memory GPU with more than one loader, `cpu` on a coherent-memory GPU with one loader, and `gpu` everywhere else. The fastest backend depends on the GPU and the cores per GPU, so measure on your system: on an RTX 5070 Ti with 24 loaders, 3,000 genomes took 2.5–2.8 s with `gpu` and 3.0–3.4 s with `hybrid`.
-- `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU. Host workers read plain files into the reusable buffers that also hold inflated files, so the transfer mode applies to both kinds alike.
+- `automatic` picks for you. Without nvCOMP it uses `cpu`. With nvCOMP, a coherent-memory GPU gets `hybrid` with more than one loader and `cpu` with one. A discrete GPU gets `cpu` with 48 or more loaders and `gpu` with fewer. The fastest backend depends on the GPU and the cores per GPU, so measure on your system. On an A100, 10,000 genomes took 2.2, 1.5, 1.3 and 1.5 s with `gpu` at 16, 32, 64 and 112 loaders, and 3.5, 1.75, 1.1 and 1.1 s with `cpu`. On an RTX 5070 Ti with a 12-core Ryzen 9 5900X, 4,000 genomes in the page cache took 1.9 s with `gpu` at 4 to 16 loaders, 2.7 s with `cpu` and 2.8 s with `hybrid` at 16.
+- `cpu` inflates and parses every file on host workers. Sketching still runs on the GPU. Host workers read plain files into the reusable buffers that also hold inflated files, so the transfer mode applies to both kinds alike. When the bases are copied to the GPU rather than read in place, the workers pack them into two bits each first, so a quarter of the bytes cross the bus. Unpacked copies held an A100 at 2.0–2.2 s for those 10,000 genomes however many loaders ran. A worker inflates and packs a gzip file in its own reusable heap buffer and copies only the packed words into page-locked memory. The driver pins one allocation at a time: with 64 loaders on an A100, a new process that pinned whole inflated genomes built those genomes in 2.3 s, against 1.7 s with only the words pinned. For the same reason the buffers for packed words are pinned all at once before the loaders start, 2 MB each, enough for a bacterial genome. With 64 loaders on a Xeon w9-3595X, 20,000 genomes took 3.3 s when each loader pinned its own first buffer and 3.0 s with the reservation.
 - `gpu` inflates eligible gzip files with nvCOMP and copies plain FASTA files to the GPU unchanged. The CPU still reads the files and hands anything the GPU can't take to the host loader.
-- `hybrid` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It moves the same bytes over the bus as `cpu`, but takes FASTA compaction, about a quarter of the host work, off the CPU. On an A40 node with 8 ranks of 16 loaders and 100,000 genomes in the page cache, `hybrid` sketched in 13.4 s, `cpu` in 15.1–15.6 s, and `gpu` in 16–25 s.
+- `gpu_cores` runs the `gpu` pipeline but makes nvCOMP inflate on the SMs even where the GPU has a hardware decompression engine. It exists to measure what the engine adds; on GPUs without one it matches `gpu`.
+- `hybrid` inflates on CPU workers and copies the raw FASTA to the GPU, which strips headers and whitespace before sketching. It takes FASTA compaction, about a quarter of the host work, off the CPU, but on a discrete GPU it moves four times the bytes `cpu` does, since `cpu` packs the bases first. On an A40 node with 8 ranks of 16 loaders and 100,000 genomes in the page cache, before `cpu` packed its bases, `hybrid` sketched in 13.4 s, `cpu` in 15.1–15.6 s, and `gpu` in 16–25 s.
 
 `reference_database_file::build`, `build_sketch_store`, and `query_sketch_batch::sketch` all take the same options:
 
@@ -244,7 +249,7 @@ auto file = CUDDL_UNWRAP((cuddl::reference_database_file::build<25, 2048>(
 )));
 ```
 
-`cuddl-build-reference-db`, `cuddl-reference-index`, and the reference-build benchmark take the same choice as `--decompression automatic|cpu|gpu|hybrid`:
+`cuddl-build-reference-db`, `cuddl-reference-index`, and the reference-build benchmark take the same choice as `--decompression automatic|cpu|gpu|gpu-cores|hybrid`:
 
 ```sh
 cuddl-build-reference-db genomes/ --workers 4 --decompression gpu
@@ -252,22 +257,36 @@ cuddl-build-reference-db genomes/ --workers 4 --decompression gpu
 
 ### Build with or without nvCOMP
 
-Meson defaults to `-Dnvcomp=auto`, which enables GPU decompression when it finds the nvCOMP library and headers. Pass `-Dnvcomp=enabled` to require nvCOMP, or `-Dnvcomp=disabled` to build without it. CUDA 13.3 or newer is required either way. Without nvCOMP, explicit `gpu` and `hybrid` requests return an error, and `automatic` falls back to `cpu`.
+Meson defaults to `-Dnvcomp=auto`, which enables GPU decompression when it finds the nvCOMP library and headers. Pass `-Dnvcomp=enabled` to require nvCOMP, or `-Dnvcomp=disabled` to build without it. CUDA 13.0 or newer is required either way. Without nvCOMP, explicit `gpu` and `hybrid` requests return an error, and `automatic` falls back to `cpu`.
 
 Consumers of `cuddl_dep` get the right macro and link flags. If you include the headers directly, they default to CPU decompression. To turn on nvCOMP, compile every translation unit with `-DCUDDL_HAS_NVCOMP=1`, add nvCOMP's include and library paths, and link `-lnvcomp`. The Nix development shell ships nvCOMP.
 
 ## How the GPU path loads files
 
-The `gpu` backend takes gzip files and plain FASTA files. A plain FASTA file is uncompressed and starts with `>`. The backend sends a file to the host loader when:
+The `gpu` backend takes gzip files, BGZF files and plain FASTA files. A plain FASTA file is uncompressed and starts with `>`. BGZF, the blocked gzip that `bgzip` writes, records each block's size in its header, so the probe walks the blocks with one read each and the GPU inflates every block on its own, into the genome's slot. The backend sends a file to the host loader when:
 
-- the file is FASTQ, BGZF, or has more than one gzip member
+- the file is FASTQ, or gzip with more than one member that is not BGZF
 - an uncompressed file starts with anything but `>`, such as a blank line
-- a gzip member signature appears inside the compressed data, since the file may then hold extra members even if its first and last trailers match
-- the inflated length or CRC32 disagrees with the gzip trailer
+- a gzip member signature appears inside the compressed data of a file that is not BGZF, since the file may then hold extra members even if its first and last trailers match
+- the inflated length or CRC32 disagrees with the gzip trailer; for BGZF, with the sum of the blocks' lengths and the combination of their CRC32s
+
+`reference_build_statistics::device_files` counts the files that took the GPU path, which `cuddl-build-reference-db` prints.
 
 Host workers load the rejected files together, one row group at a time, and each file keeps its original reference ID. Host parsing runs between GPU batch submissions, so it overlaps GPU work that is already queued.
 
-Six GPU lanes overlap file reads, inflation, and sketching. The builder splits free device memory between compressed and inflated buffers based on the input file sizes. Plain files skip nvCOMP. Each batch puts them first, so one copy moves all of them into the inflated buffer. After nvCOMP inflates a batch, CUB counts the sequence bytes each file keeps and compacts them into the buffer that held the compressed input. The memory budget covers both buffers.
+Six GPU lanes overlap file reads, inflation, and sketching. Each lane holds one batch, split between compressed and inflated buffers based on the input file sizes. A lane takes a 64th of the input but between 1 and 4 GiB. The compressed side is page-locked host memory, which takes about a second per 2.7 GB to pin: lanes sized from a B300's free memory pinned 48 GB in 17 s and split 10,000 genomes into only three batches. Only the first lane allocates before the device starts; each other lane allocates when it takes its first batch, so its pinning overlaps the batches already running. Plain files skip nvCOMP. Each batch puts them first, so one copy moves all of them into the inflated buffer. After nvCOMP inflates a batch, CUB counts the sequence bytes each file keeps and compacts them into the buffer that held the compressed input. The memory budget covers both buffers.
+
+nvCOMP takes candidates from the smallest up, and the host loaders take the rest from the largest down. Before it fills a lane, the device checks that, at the rate it has inflated so far, it would finish what it holds plus the new batch before the loaders, at their rate, finish everything else. Without that check, nvCOMP filled every free lane and took 70% of the files even with 112 loaders on an A100, which held 10,000 genomes at 1.8–1.9 s from 32 loaders up, while `cpu` took 1.3 s. With the check and 1 GiB lanes, `gpu` took 2.2 s with 16 loaders, 1.6 s with 32 and 1.44–1.5 s with 48 or more.
+
+On GPUs with a hardware decompression engine (B200, B300, GB200, GB300), the engine takes gzip files that inflate to at most its limit (4 MiB on a B300) from buffers allocated for it. cuDDL allocates the compressed, inflated and table buffers from such a pool and calls the driver's `cuMemBatchDecompressAsync` directly for those files, with each file's DEFLATE stream found by skipping its gzip header in the host copy; nvCOMP inflates the larger files on the SMs. nvCOMP's own engine path builds the request on the device and synchronises the stream to read it back, which stalled the thread that drives all six lanes for up to 117 ms per batch. Batches for the engine alternate with batches of larger files in proportion to their gzip bytes, so both run at once in different lanes. Mixing the two kinds within one batch was slower: nvCOMP inflates one file per thread block, and a batch with few large files leaves most SMs idle. On a B300, 2,000 genomes within the limit inflated at 57.6 GB/s of gzip on the engine against 7.3 GB/s on the SMs.
+
+End to end, the engine changes little, because the largest genomes bound the build. `--decompression gpu-cores` runs the same pipeline with every file on the SMs. Building the 10,000-genome snapshot on one B300 from node-local NVMe took a median 4.48 s with `gpu` and 4.84 s with `gpu-cores` with 16 loaders, but 5.37 against 4.72 s with 4 loaders, where the engine pool's slower allocation weighs more. In those builds an SM inflation kernel ran for 16.5 of the 18.4 s after the first one started, while the engine was busy for 0.52 s: only 45% of the files and 29% of the gzip bytes (on the 10,000-genome snapshot) fit the engine, and every SM batch lasts as long as its largest genome. `scripts/plot_decompression_engine.py` plots the `RESULT` lines of such a run per backend and loader count.
+
+The SM batches are what larger lanes speed up. nvCOMP gives each file one thread block, so a batch of a few hundred large genomes leaves most of a B300's SMs idle. All 115,223 genomes (142 GB of gzip), in the page cache with 16 loaders, took 24.7–24.9 s with `gpu` and 22.5–22.8 s with `gpu-cores` with fixed 1 GiB lanes, 19.2–20.1 s with 2 GiB and 16.7–17.6 s with lanes sized from the input (4 GiB here). 8 GiB lanes were no faster (18.1 s). The 10,000-genome snapshot stays at 1 GiB lanes and took 4.5–5.3 s either way. On the CPU, `cpu` and `hybrid` took 45–50 s for the whole collection with 16 loaders and 168–194 s with 4.
+
+Recompressing the input as BGZF lets every block fit the engine, but with 4 GiB lanes it no longer pays. On the same 115,223 genomes with 16 loaders, BGZF written by `bgzip` (zlib) took 14.7–17.8 s with `gpu` and 18.9–20.5 s with `gpu-cores`, against 15.3–18.4 s and 15.8–17.9 s for the gzip files as distributed. With 1 GiB lanes, BGZF took 14.4 s with `gpu` against 20.5 s for the gzip files: BGZF filled the SMs then because every block is a member of its own. BGZF compressed with libdeflate built in 16.7 s with `gpu`. The CPU paths are slower on BGZF: `cpu` took 54.0 s on zlib BGZF and 82.3 s on libdeflate BGZF against 47.1 s on gzip.
+
+`cuddl-inflate-benchmark` times inflation alone: nvCOMP on the SMs against the engine, over the same members resident in device memory, the members whose output fits the engine's limit. Pass the input directories as `-a "input=[DIR,...]"`; `scripts/plot_inflate_engine.py` plots its `--csv` output. On one B300 with the 10,000-genome snapshot, the engine inflated 211 GB/s of the gzip files of at most 4 MiB against 31 GB/s on the SMs, 169 against 27 GB/s of libdeflate-compressed BGZF and 190 against 37 GB/s of zlib-compressed BGZF: 5.1–6.8 times faster. In BGZF every genome fits, as 660,411 blocks; of the gzip files as distributed, 4,535 of 10,000 fit, 29% of the bytes.
 
 Host workers compact and pack FASTA in cache-sized blocks. Neighbouring blocks overlap by `k - 1` bases, so k-mers that cross a line break survive. Separate records and runs of ambiguous bases never join.
 
@@ -640,3 +659,14 @@ nix develop -c build/benchmarks/cuddl-reference-build-benchmark \
 `--copies` repeats the inputs to make a larger synthetic collection. Its throughput does not predict a real RefSeq build, so measure the real collection on the target machine. Compare `--workers 1` with `--workers 8` to see how loading scales.
 
 `--parse-only` times the serial CPU parser that the tests use as an oracle. The GPU builder never runs that parser. `--decompression` and `--transfer` take the same values as the build options. The JSON output records the inputs, repeat count, thread settings, samples, and median seconds.
+
+### What bounds a build
+
+The limit differs by machine, so profile before tuning:
+
+- **GH200, local NVMe:** the disk. It reads 5.1 GiB/s, and a cold build runs at about 4.9 GB/s of gzip. cuFile in compatible mode read no faster than `pread`.
+- **Desktop with an RTX 5070 Ti and 16 cores:** nvCOMP, which is busy for 97% of the loop. On the host, `perf` puts 49% of the time in the kernel copy from the page cache into pinned lanes and 10% in the gzip signature scan. Reader counts, lane counts and sizes, and `O_DIRECT` (1.9 s to 3.2 s) gained nothing.
+- **monster3, CPU only:** inflation, with `deflate_decompress_bmi2` at 65% of the profile.
+- **MOGON A100 nodes, Lustre:** the latency of opening and probing many files. Deeper probing took 20,000 uncached genomes from 13.8–18.6 s to 9.7–11.5 s with `gpu` and 16 loaders, and from 14.1–15.4 s to 9.8–10.6 s with 64. `cpu` stayed within noise. cuFile read small files as fast as POSIX with half the CPU time, but no faster.
+- **B300:** the SM batches of large gzip files, as described under the decompression engine.
+

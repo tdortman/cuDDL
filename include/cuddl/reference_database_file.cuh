@@ -181,7 +181,7 @@ struct path_build_options {
     /// memory, which is what makes Grace Hopper and Grace Blackwell coherent, stages the loader's
     /// buffers in place and copies nothing; anything else opts into or out of page-locked
     /// transfers. The `direct_bytes`, `staged_bytes` and `in_place` fields say which path a build
-    /// actually took.
+    /// actually took, and `device_files` how many files the `gpu` backend loaded on the device.
     transfer_mode transfer = transfer_mode::automatic;
     decompression_backend decompression = decompression_backend::automatic;
     /// Reusable lookup; keep alive through this synchronous build.

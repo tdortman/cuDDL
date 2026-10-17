@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -50,6 +51,9 @@ enum class decompression_backend : uint8_t {
     cpu,
     /// nvCOMP for eligible gzip inputs; unsupported formats use host loaders.
     gpu,
+    /// As gpu, with nvCOMP inflating on the SMs even where the device has a decompression
+    /// engine: the baseline that shows what the engine adds.
+    gpu_cores,
 };
 
 /// @brief How a build gets CPU-parsed sequence bytes to the device.
@@ -198,6 +202,10 @@ template <uint32_t K, size_t BucketCount>
 /// tail off that wait; at four the tail reached hundreds of milliseconds while dozens of
 /// loaders fed one consumer.
 inline constexpr size_t stager_hold_slots = 16;
+
+/// @brief Bytes reserved per loader buffer that holds packed bases: a bacterial genome's
+/// two-bit words, about 1.5 MB, fit.
+inline constexpr size_t packed_buffer_bytes = size_t{2} << 20;
 
 /// @brief Encodes genome records into register rows through a device arena.
 ///
@@ -851,7 +859,11 @@ class sequence_buffer_pool {
     /// them, and every consumer drops a lease once its copies have completed, so a slot is
     /// reusable as soon as it is released.
     sequence_buffer_pool(
-        cuda::stream_ref stream, size_t buffers, size_t limit, bool page_locked, bool in_place
+        cuda::stream_ref stream,
+        size_t buffers,
+        size_t limit,
+        bool page_locked,
+        bool in_place
     )
         : stream_(stream),
           limit_(limit),
@@ -865,8 +877,19 @@ class sequence_buffer_pool {
     }
 
     /// @brief Number of buffers the pool may grow to.
-    void set_capacity(size_t buffers) noexcept {
+    ///
+    /// With @p reserve_each, page-locks that many bytes per buffer at once and returns them to
+    /// the pool, which keeps them, so loaders take their buffers from pinned memory. Each loader
+    /// page-locking its own first buffer serialised them in the driver: with 64 loaders on a
+    /// Xeon w9-3595X, 20,000 genomes spent 9% of their host time there and took 3.3 s, against
+    /// 3.0 s with the reservation.
+    void set_capacity(size_t buffers, size_t reserve_each = 0) {
         capacity_ = std::max<size_t>(1, buffers);
+        if (pinned_pool_ && reserve_each != 0 && !ablated("pinned-reservation")) {
+            cuda::buffer<char, cuda::mr::host_accessible, cuda::mr::device_accessible> reserved(
+                stream_, *pinned_pool_, capacity_ * reserve_each, cuda::no_init
+            );
+        }
     }
 
     /// @brief Buffers allocated so far. Read once the loaders have stopped.
@@ -989,23 +1012,29 @@ class path_loaders {
     /// @param parser_workers Loader ceiling; the build clamps it to inputs and hardware.
     /// @param page_locked gives the loaders page-locked buffers to decompress into.
     /// @param in_place says the stager's kernels read the loaders' buffers themselves.
+    /// @param pack_k packs FASTA into two-bit words for k-mers this long, a quarter of the bytes
+    ///               to stage, as @ref pack_fastx_sequence_file does.
     path_loaders(
         cuda::stream_ref stream,
         std::span<std::filesystem::path const> paths,
         unsigned parser_workers,
         bool page_locked,
-        bool in_place
+        bool in_place,
+        uint32_t pack_k
     )
         : workers_(worker_count(paths.size(), parser_workers)),
           buffers_(stream, workers_, size_t{32} << 20, page_locked, in_place),
-          page_locked_(page_locked) {
+          page_locked_(page_locked),
+          pack_k_(pack_k) {
         // One buffer per in-flight file plus the stager's hold ring, plus headroom: a worker
         // asks for its next file while every loaded file still holds a lease. A pool smaller
         // than the window makes the remaining files allocate their own buffers.
         auto const window = workers_ * 4;
-        buffers_.set_capacity(window + stager_hold_slots + 2);
+        buffers_.set_capacity(
+            window + stager_hold_slots + 2, pack_k != 0 ? packed_buffer_bytes : 0
+        );
         source_ = {acquire_sequence_target, &buffers_};
-        if (workers_ > 1) pool_.emplace(paths, workers_, source_, window);
+        if (workers_ > 1) pool_.emplace(paths, workers_, source_, window, false, false, pack_k);
     }
 
     /// @brief Loaders this build runs.
@@ -1024,7 +1053,9 @@ class path_loaders {
     [[nodiscard]] Result<std::unique_ptr<fastx_sequence_file>>
     take(std::span<std::filesystem::path const> paths, size_t id) {
         if (pool_.has_value()) return pool_->take(id);
-        return load_fastx_sequence_file(paths[id].string(), source_);
+        auto loaded = load_fastx_sequence_file(paths[id].string(), source_, false, false, pack_k_);
+        if (pack_k_ != 0 && loaded) pack_fastx_sequence_file(**loaded, pack_k_);
+        return loaded;
     }
 
     /// @brief Joins the loaders. They hold leases, so pool state is only readable after this.
@@ -1044,6 +1075,7 @@ class path_loaders {
     size_t workers_ = 1;
     sequence_buffer_pool buffers_;
     bool page_locked_ = false;
+    uint32_t pack_k_ = 0;
     decompression_source source_{};
     std::optional<fastx_load_pool> pool_;
 };
@@ -1157,7 +1189,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             auto const overhead = device_fasta_pipeline::lane_overhead(wanted);
             auto const capacity = std::min(wanted, budget > overhead ? budget - overhead : 0);
             if (capacity < 2) return Err(Error::resource("no room for FASTA normalisation"));
-            CUDDL_TRY(cuda_try([&] { normaliser.emplace(stream, capacity, 0, workers); }));
+            CUDDL_TRY(cuda_try([&] { normaliser.emplace(stream, capacity, 0, workers, false); }));
         }
         fastx_load_pool pool(
             paths.subspan(base, count),
@@ -1281,6 +1313,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
     transfer_mode transfer,
+    bool hardware_inflate,
     reference_build_statistics* statistics,
     Sink&& sink,
     cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
@@ -1289,12 +1322,16 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     bool const in_place = stages_in_place(transfer, stream.device());
     bool const page_locked = pages_locked(transfer, stream.device());
     std::vector<gzip_file_probe> probes(paths.size());
-    parallel_for(paths.size(), workers, [&](size_t id) {
+    // Each probe reads a file's header and trailer, two waits on a parallel file system, and
+    // moves almost no bytes, so it keeps more in flight than whole-file reads: 20,000 genomes no
+    // A100 node had cached built in 13.9-15.6 s with 64 probes in flight and 9.6-10.5 s with 256.
+    auto const probe_depth = ablated("probe-depth") ? parallel_read_depth : 4 * parallel_read_depth;
+    parallel_for(paths.size(), std::max(workers, probe_depth), [&](size_t id) {
         probes[id] = probe_gzip_file(paths[id]);
     });
     std::optional<device_fasta_pipeline> inflater;
     sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked, in_place);
-    host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2);
+    host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2, packed_buffer_bytes);
     auto const fits = [&](gzip_file_probe const& probe) {
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
                probe.host_bytes() <= inflater->compressed_capacity();
@@ -1310,7 +1347,21 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         auto const available = CUDDL_TRY(available_device_bytes(stream));
         auto const budget = (available - available / 5) / device_fasta_pipeline::lane_count;
         auto const overhead = device_fasta_pipeline::lane_overhead(budget);
-        auto const usable = budget > overhead ? budget - overhead : 0;
+        // A lane holds one batch, not a share of the device: its compressed bytes are page-locked
+        // host memory, which pins at about 2.7 GB/s on one thread. Sized from a B300's 275 GB,
+        // six lanes pinned 48 GB in 17 s, and 10,000 genomes made only three batches. Smaller
+        // lanes also let the host loaders take a fairer share: on an A100, 10,000 genomes took
+        // 1.79 s with 2 GiB lanes and 1.53 s with 1 GiB at 112 loaders, and 2.12-2.17 s with
+        // either at 16; 512 MiB lanes took 2.48 s at 16. Large inputs need larger batches,
+        // though: nvCOMP inflates one file per thread block, so a batch fills the SMs only with
+        // enough files. On a B300 with 16 loaders, all 115,223 genomes built in 24.7-24.9 s with
+        // 1 GiB lanes and 16.7-17.6 s with 4 GiB, so a lane takes a 64th of the input. Their BGZF
+        // copy took 16.6-17.8 s with 1 GiB and 14.7-17.2 s with 4 GiB.
+        auto const lane_bytes =
+            ablated("input-lanes")
+                ? size_t{1} << 30
+                : std::clamp((slots + compressed) / 64, size_t{1} << 30, size_t{4} << 30);
+        auto const usable = std::min(budget > overhead ? budget - overhead : 0, lane_bytes);
         auto const compressed_capacity =
             slots + compressed == 0
                 ? size_t{0}
@@ -1325,7 +1376,9 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             budget > compressed_capacity + overhead ? budget - compressed_capacity - overhead : 0
         );
         return cuda_try([&] {
-            inflater.emplace(stream, std::min(room, slots), compressed_capacity, workers);
+            inflater.emplace(
+                stream, std::min(room, slots), compressed_capacity, workers, hardware_inflate
+            );
         });
     };
     CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
@@ -1349,10 +1402,49 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             std::ranges::stable_sort(device_ids, {}, [&](size_t id) {
                 return probes[id].compressed;
             });
+            // With a decompression engine, whole batches for the engine alternate with whole
+            // batches of larger files in proportion to their gzip bytes, so the engine and the
+            // SMs inflate at the same time in different lanes. Smallest first overall would run
+            // every engine batch before any SM batch; mixing within a batch leaves too few large
+            // files per launch to fill the SMs, since nvCOMP inflates one file per thread block.
+            if (auto const limit = inflater->hardware_limit(); limit != 0) {
+                auto const larger = std::ranges::stable_partition(device_ids, [&](size_t id) {
+                    return probes[id].bgzf || probes[id].isize <= limit;
+                });
+                std::vector<size_t> const engine(device_ids.begin(), larger.begin());
+                std::vector<size_t> const cores(larger.begin(), larger.end());
+                auto const bytes = [&](std::span<size_t const> ids) {
+                    long double total = 0;
+                    for (auto id : ids) total += static_cast<long double>(probes[id].compressed);
+                    return total;
+                };
+                auto const engine_total = bytes(engine), cores_total = bytes(cores);
+                long double engine_taken = 0, cores_taken = 0;
+                std::span<size_t const> engine_left{engine}, cores_left{cores};
+                device_ids.clear();
+                while (!engine_left.empty() || !cores_left.empty()) {
+                    bool const take_engine = cores_left.empty() || (!engine_left.empty() &&
+                                                                    engine_taken * cores_total <=
+                                                                        cores_taken * engine_total);
+                    auto& left = take_engine ? engine_left : cores_left;
+                    auto const batch =
+                        left.first(std::max<size_t>(1, inflater->batch_files(left, probes)));
+                    device_ids.insert(device_ids.end(), batch.begin(), batch.end());
+                    (take_engine ? engine_taken : cores_taken) += bytes(batch);
+                    left = left.subspan(batch.size());
+                }
+            }
             order.insert(order.end(), device_ids.rbegin(), device_ids.rend());
             std::vector<std::filesystem::path> host_paths;
             host_paths.reserve(order.size());
             for (auto id : order) host_paths.push_back(paths[id]);
+            // Gzip bytes of the first n files of `order`, to tell how much the host has left.
+            std::vector<uint64_t> order_bytes(order.size() + 1);
+            for (size_t index = 0; index < order.size(); ++index) {
+                order_bytes[index + 1] = order_bytes[index] + probes[order[index]].compressed;
+            }
+            auto const started = std::chrono::steady_clock::now();
+            std::atomic<uint64_t> host_done{0};
             fastx_load_pool host_pool(
                 host_paths,
                 std::min(workers, host_paths.size()),
@@ -1374,6 +1466,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                     auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
                     auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
                     auto const genome = order[index] - base;
+                    host_done += probes[order[index]].compressed;
                     stager.wait_hold_slot();
                     std::lock_guard lock(staging);
                     if (sequence->words != nullptr) {
@@ -1397,21 +1490,56 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             } stop{host_pool};
             std::vector<inflated_genome> genomes;
             std::array<bool, device_fasta_pipeline::lane_count> busy{};
+            std::array<uint64_t, device_fasta_pipeline::lane_count> lane_bytes{};
             size_t next = 0, lane = 0;
+            uint64_t device_done = 0, device_queued = 0;
+            std::chrono::steady_clock::time_point device_started;
             bool device_open = !device_ids.empty();
+            // Whether the device, at the rate it has inflated so far, finishes what it holds plus
+            // @p batch before the host loaders, at theirs, finish everything else. Each lane holds
+            // hundreds of megabytes, so claiming whenever a lane was free left nvCOMP 70% of the
+            // files on an A100 with 112 loaders: 1.9 s, while the loaders alone took 1.3 s.
+            auto const device_keeps_up = [&](std::span<size_t const> batch) {
+                if (ablated("co-scheduling") || device_done == 0 || host_done == 0) return true;
+                uint64_t bytes = 0;
+                for (auto id : batch) bytes += probes[id].compressed;
+                auto const now = std::chrono::steady_clock::now();
+                auto const host_rate = static_cast<double>(host_done) /
+                                       std::chrono::duration<double>(now - started).count();
+                auto const device_rate =
+                    static_cast<double>(device_done) /
+                    std::chrono::duration<double>(now - device_started).count();
+                auto const host_left = static_cast<double>(order_bytes[order.size() - next]) -
+                                       static_cast<double>(host_done + bytes);
+                return static_cast<double>(device_queued + bytes) / device_rate <=
+                       host_left / host_rate;
+            };
             // Cycle through lanes, submitting a batch before consuming the oldest one.
             while (device_open || std::ranges::any_of(busy, [](bool value) { return value; })) {
                 if (device_open && !busy[lane]) {
                     auto const remaining = std::span{device_ids}.subspan(next);
                     auto const wanted = inflater->batch_files(remaining, probes);
-                    auto const limit = host_pool.cap(order.size() - next - wanted);
-                    auto const files = order.size() - next - limit;
-                    device_open = files == wanted && next + files < device_ids.size();
-                    if (files != 0) {
-                        next += CUDDL_TRY(
-                            inflater->submit(lane, remaining.first(files), paths, probes)
-                        );
-                        busy[lane] = true;
+                    if (device_keeps_up(remaining.first(wanted))) {
+                        auto const limit = host_pool.cap(order.size() - next - wanted);
+                        auto const files = order.size() - next - limit;
+                        device_open = files == wanted && next + files < device_ids.size();
+                        if (files != 0) {
+                            if (device_queued == 0 && device_done == 0) {
+                                device_started = std::chrono::steady_clock::now();
+                            }
+                            lane_bytes[lane] = 0;
+                            for (auto id : remaining.first(files)) {
+                                lane_bytes[lane] += probes[id].compressed;
+                            }
+                            device_queued += lane_bytes[lane];
+                            next += CUDDL_TRY(
+                                inflater->submit(lane, remaining.first(files), paths, probes)
+                            );
+                            busy[lane] = true;
+                        }
+                    } else if (std::ranges::none_of(busy, [](bool value) { return value; })) {
+                        // The loaders, which may take every file the device has not, finish first.
+                        device_open = false;
                     }
                 }
                 auto const other = (lane + 1) % busy.size();
@@ -1422,9 +1550,12 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                     for (auto const& genome : genomes) {
                         CUDDL_TRY(stager.add_resident(genome.id - base, genome.bases, genome.size));
                     }
+                    if (statistics != nullptr) statistics->device_files += genomes.size();
                     CUDDL_TRY(stager.flush());
                     CUDDL_TRY(inflater->release(other, stream));
                     busy[other] = false;
+                    device_done += lane_bytes[other];
+                    device_queued -= lane_bytes[other];
                 }
                 lane = other;
             }
@@ -1468,11 +1599,14 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     Sink&& sink,
     cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
+    // Loaders and inflation reuse pinned buffers through the build; none outlive it.
+    pinned_pool_trim const release_pinned{stream.device(), pinned_placement::host};
     if (parser_workers == 0) {
         return Err(Error::invalid_argument("a path build needs at least one loader"));
     }
 #if !CUDDL_HAS_NVCOMP
     if (decompression == decompression_backend::gpu ||
+        decompression == decompression_backend::gpu_cores ||
         decompression == decompression_backend::hybrid) {
         return Err(
             Error::invalid_argument("requested decompression backend requires nvCOMP support")
@@ -1491,13 +1625,17 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     // Which backend is fastest depends on the GPU and the cores per GPU. With 100,000 genomes,
     // 8 ranks of 16 loaders on an A40 node sketched in 13.4 s with hybrid, 15.1-15.6 s with cpu
     // and 16-25 s with gpu; 3,000 genomes on an RTX 5070 Ti with 24 loaders took 2.5-2.8 s with
-    // gpu and 3.0-3.4 s with hybrid. A coherent GPU reads the loaders' buffers in place.
+    // gpu and 3.0-3.4 s with hybrid. A coherent GPU reads the loaders' buffers in place. On an
+    // A100, 10,000 genomes took 2.2, 1.5, 1.3 and 1.5 s with gpu at 16, 32, 64 and 112 loaders,
+    // and 3.5, 1.75, 1.1 and 1.1 s with cpu.
     if (decompression == decompression_backend::automatic) {
-        bool const coherent = device_reads_pageable_memory(stream.device());
-        decompression = !coherent ? decompression_backend::gpu
-                        : path_loaders::worker_count(paths.size(), parser_workers) > 1
-                            ? decompression_backend::hybrid
-                            : decompression_backend::cpu;
+        auto const loaders = path_loaders::worker_count(paths.size(), parser_workers);
+        if (device_reads_pageable_memory(stream.device())) {
+            decompression =
+                loaders > 1 ? decompression_backend::hybrid : decompression_backend::cpu;
+        } else {
+            decompression = loaders >= 48 ? decompression_backend::cpu : decompression_backend::gpu;
+        }
     }
 #if CUDDL_HAS_NVCOMP
     if (decompression == decompression_backend::hybrid) {
@@ -1519,6 +1657,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             staging_bytes,
             parser_workers,
             transfer,
+            decompression == decompression_backend::gpu,
             statistics,
             std::forward<Sink>(sink),
             blacklist
@@ -1527,7 +1666,19 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
 #endif
     auto const in_place = stages_in_place(transfer, stream.device());
     auto const page_locked = pages_locked(transfer, stream.device());
-    path_loaders loaders(stream, paths, parser_workers, page_locked, in_place);
+    // Copied bases cross the bus, and packing them first moves a quarter of the bytes. Unpacked,
+    // an A100 took 2.0-2.2 s for 10,000 genomes from 32 to 112 loaders, held by the copies;
+    // packed, 1.8 s with 32 and 1.3 s with 64 or more. Packing costs the loaders time, so with
+    // 16 it took 3.4 s against 2.8 s. A device that reads the bases in place gains nothing from
+    // it: 16 loaders on a GH200 took 3.0 s packed against 2.7 s without.
+    path_loaders loaders(
+        stream,
+        paths,
+        parser_workers,
+        page_locked,
+        in_place,
+        in_place || ablated("base-packing") ? 0 : K
+    );
     // The corpus size only bounds a default arena, and only below its ceiling, so probing stops
     // there: a corpus of any size then costs at most a few dozen file opens here.
     uint64_t staged_ceiling = 0;
@@ -1558,6 +1709,12 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
                     page_locked ? sequence->decompressed_target : nullptr;
                 auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
                 auto const& extents = sequence->extents;
+                if (sequence->words != nullptr) {
+                    CUDDL_TRY(stager.add_packed_genome(
+                        id - base, std::move(sequence), pinned_base, pinned_size
+                    ));
+                    continue;
+                }
                 CUDDL_TRY(stager.add_genome(
                     id - base, extents, pinned_base, pinned_size, std::move(sequence)
                 ));
@@ -1588,6 +1745,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
 ) {
     if (genomes.empty()) return Ok();
+    pinned_pool_trim const release_pinned{stream.device(), pinned_placement::host};
     // The caller knows exactly what the corpus holds, so the ceiling is the sum of its bases
     // rather than an estimate read out of file headers.
     uint64_t staged_ceiling = 0;
