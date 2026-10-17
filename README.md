@@ -204,6 +204,8 @@ HyperGen runs as two tools. `hypergen-cpu` and `hypergen-gpu` sketch on that dev
 
 [`scripts/run_speed_of_light.py`](scripts/run_speed_of_light.py) measures how each tool's throughput grows with the compute it gets. GPU tools run at several CUDA MPS caps on their SMs, and CPU tools at several thread counts. [`scripts/plot_speed_of_light.py`](scripts/plot_speed_of_light.py) plots throughput against the share of SMs or cores beside the diagonal of throughput proportional to compute.
 
+[`scripts/run_ncu_sol.py`](scripts/run_ncu_sol.py) measures how close each GPU tool's kernels come to the hardware. It runs a tool's micro-comparison lane under Nsight Systems to find the kernels that take most of its GPU time. It then reruns the lane under Nsight Compute once per kernel and records SM, memory, L1, L2 and DRAM throughput as a percentage of peak over a few launches from the middle of the run. Compared pairs are capped (`--max-pairs`), so the time shares describe the capped run, while per-launch throughputs do not depend on the pair count. [`scripts/plot_ncu_sol.py`](scripts/plot_ncu_sol.py) draws one figure per corpus size.
+
 Use the supplied development shell for the benchmark toolchain. RabbitSketch and Dashing2 builds are x86-only and are skipped on ARM hosts. Compare runs with their dataset, hardware, sketch settings, and timing scope attached, rather than treating one speedup as universal.
 
 ## License
