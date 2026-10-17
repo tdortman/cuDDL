@@ -83,7 +83,7 @@ Caps are automatic unless passed explicitly: thread counts default to half the p
 cores, all physical cores, and all logical CPUs, max-kmers derives from free VRAM, the
 evaluated pair set derives from a short cub probe against a per-invocation time budget,
 stored rows derive from a pairs-output size target, and skani's reference block derives
-from host RAM. Large corpora evaluate a size-spread genome subset that
+from host RAM. Large corpora evaluate a hashed genome sample that
 fits the budget; every lane runs the same files.
 """
 
@@ -773,15 +773,13 @@ def _exact_gz_bases(path: Path) -> int:
     return count
 
 
-def _spread_pick(paths: list[Path], sizes: dict[Path, int], count: int) -> list[Path]:
-    # Stride over size order with both endpoints kept: min and max sizes
-    # bound the per-pair cost range instead of clustering at one end.
-    ordered = sorted(paths, key=lambda p: sizes.get(p, 0))
-    count = max(1, min(count, len(ordered)))
-    if count == 1:
-        return [ordered[len(ordered) // 2]]
-    last = len(ordered) - 1
-    return sorted({ordered[round(i * last / (count - 1))] for i in range(count)})
+def _hash_pick(paths: list[Path], count: int) -> list[Path]:
+    # The genomes whose hashed file names come first, as scripts/snapshot_genomes.py takes
+    # them: accession order clusters species, so a prefix or a stride would be far more or less
+    # redundant than the corpus, while the hash keeps its mix, picks the same genomes on every
+    # host, and makes a smaller pick a subset of a larger one.
+    ranked = sorted(paths, key=lambda p: hashlib.blake2b(p.name.encode()).digest())
+    return sorted(ranked[: max(1, count)])
 
 
 @APP.command()
@@ -801,7 +799,7 @@ def main(
             "--query",
             exists=True,
             help="Files or directories to use as the query set. Without it, queries are a "
-            "size-spread slice of the references.",
+            "hashed sample of the references.",
         ),
     ] = None,
     query_fraction: Annotated[
@@ -809,7 +807,7 @@ def main(
         typer.Option(
             min=0,
             max=1,
-            help="Share of the references to use as queries, taken spread over genome size. "
+            help="Share of the references to use as queries, a hashed sample of them. "
             "Batch topology only, and excludes --query-count.",
         ),
     ] = None,
@@ -817,7 +815,7 @@ def main(
         int | None,
         typer.Option(
             min=1,
-            help="Number of references to use as queries, taken spread over genome size. Batch "
+            help="Number of references to use as queries, a hashed sample of them. Batch "
             "topology only, and excludes --query-fraction.",
         ),
     ] = None,
@@ -948,7 +946,7 @@ def main(
         typer.Option(
             min=1,
             help="Wall time the slowest lane may spend per sample. A corpus that would exceed "
-            "it is cut down to a size-spread subset.",
+            "it is cut down to a hashed sample.",
         ),
     ] = 600,
     sketch_all: Annotated[
@@ -1022,19 +1020,14 @@ def main(
         )
     references = discover(genomes)
     if reference_count is not None:
-        # The genomes whose hashed file names come first, as scripts/snapshot_genomes.py
-        # --sample takes them: accession order clusters species, so a prefix would be far more
-        # or less redundant than the corpus, while the hash keeps its mix, picks the same
-        # genomes on every host, and makes a smaller sample a subset of a larger one. Taking
-        # fewer than asked for would silently compare different corpora, so it is an error
-        # rather than a clamp.
+        # Taking fewer than asked for would silently compare different corpora, so it is an
+        # error rather than a clamp.
         if reference_count > len(references):
             raise typer.BadParameter(
                 f"--reference-count {reference_count} exceeds the {len(references)} "
                 "genomes found"
             )
-        sample = sorted(references, key=lambda p: hashlib.blake2b(p.name.encode()).digest())
-        references = sorted(sample[:reference_count])
+        references = _hash_pick(references, reference_count)
     query_list = sorted(
         {
             q
@@ -1212,14 +1205,14 @@ def main(
             p: _est_genome_bases(p) for p in dict.fromkeys([*references, *query_list])
         }
         if query_fraction is not None or query_count is not None:
-            # Batch queries are a size-spread slice of the discovered files.
+            # Batch queries are a hashed sample of the discovered files.
             count = (
                 query_count
                 if query_count is not None
                 else max(1, round(query_fraction * len(references)))
             )
             count = max(1, min(count, len(references)))
-            query_list = _spread_pick(references, sizes, count)
+            query_list = _hash_pick(references, count)
         typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
         auto_flags = {
             "threads": threads_auto,
@@ -1262,7 +1255,7 @@ def main(
         sketch_queries = list(query_list)
 
         def cub_probe_rate(probe_refs, probe_queries) -> float:
-            # Probe only estimates per-pair cost. A size-spread handful keeps
+            # Probe only estimates per-pair cost. A hashed handful keeps
             # argv bounded on huge corpora instead of passing every file.
             probe_cmd = [
                 str(cub),
@@ -1337,12 +1330,12 @@ def main(
         rate_note = "unprobed"
         if max_pairs is None and orig_pairs > _PROBE_MIN_PAIRS:
             probe_refs = (
-                _spread_pick(references, sizes, _PROBE_GENOMES)
+                _hash_pick(references, _PROBE_GENOMES)
                 if len(references) > _PROBE_GENOMES
                 else references
             )
             probe_queries = (
-                _spread_pick(query_list, sizes, _PROBE_GENOMES)
+                _hash_pick(query_list, _PROBE_GENOMES)
                 if topology == "batch" and len(query_list) > _PROBE_GENOMES
                 else query_list
             )
@@ -1371,13 +1364,13 @@ def main(
                         if capacity < orig_pairs:
                             keep = max(2, int((1 + math.sqrt(1 + 8 * capacity)) // 2))
                         if keep < len(references):
-                            references = _spread_pick(references, sizes, keep)
+                            references = _hash_pick(references, keep)
                             subset_note = "budget subset"
                     elif capacity < orig_pairs:
                         keep = max(
                             1, min(len(query_list), capacity // max(1, len(references)))
                         )
-                        query_list = _spread_pick(query_list, sizes, keep)
+                        query_list = _hash_pick(query_list, keep)
                         subset_note = "budget subset"
                 capacity_pairs = max(1, capacity)
             else:

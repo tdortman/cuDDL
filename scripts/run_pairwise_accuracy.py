@@ -330,7 +330,6 @@ def write_genome_cases(
 ) -> Path:
     """Write one ordered-pair case per sampled genome pair; truth from tools."""
     import gzip
-    import random
 
     def base_count(path: str) -> int:
         opener = gzip.open if path.endswith(".gz") else open
@@ -341,7 +340,10 @@ def write_genome_cases(
                     total += len(line.strip())
         return total
 
-    sampled = sorted(random.Random(seed).sample([str(p) for p in genomes], count))
+    # The genomes whose hashed file names come first: accession order clusters species, and
+    # the hash keeps the collection's mix and picks the same genomes on every host.
+    ranked = sorted(genomes, key=lambda p: hashlib.blake2b(p.name.encode()).digest())
+    sampled = sorted(str(p) for p in ranked[:count])
     bases = {path: base_count(path) for path in sampled}
     cases_csv = directory / "cases.csv"
     with cases_csv.open("w", newline="") as destination:

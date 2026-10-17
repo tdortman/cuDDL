@@ -61,7 +61,9 @@ def sms_under(env: dict[str, str]) -> int:
 def main(
     genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Genome directory")],
     output_dir: Annotated[Path, typer.Option(help="Reports and points.jsonl land here")],
-    reference_count: Annotated[int, typer.Option(min=1, help="First N genomes, all-to-all")] = 10000,
+    reference_count: Annotated[
+        int, typer.Option(min=1, help="Hashed sample of N genomes, all-to-all")
+    ] = 10000,
     gpu_tools: Annotated[str, typer.Option(help="Tools run at each SM cap")] = (
         "cuddl,cub-exact,pp-sketchlib,hypergen-gpu"
     ),

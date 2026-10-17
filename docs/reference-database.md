@@ -93,10 +93,12 @@ historical records, the row filter, both header styles, reuse of existing metada
 and preservation of the URL list on malformed input.
 
 To benchmark while the download runs, fix a genome set first.
-`scripts/snapshot_genomes.py DIR COUNT OUT` links the first `COUNT` completed files
-of `DIR`, in name order, into a new directory `OUT`. Files that still have an aria2
-`.aria2` control file are skipped, and an existing `OUT` is an error, so the same
-snapshot gives the same database later.
+`scripts/snapshot_genomes.py DIR COUNT OUT` links the `COUNT` completed files of
+`DIR` whose hashed names come first into a new directory `OUT`. Accession order
+clusters species, so a name-order prefix would be more or less redundant than the
+collection; the hash keeps its mix, and a smaller snapshot is a subset of a larger
+one. Files that still have an aria2 `.aria2` control file are skipped, and an
+existing `OUT` is an error, so the same snapshot gives the same database later.
 
 ## Blacklist construction
 
@@ -582,7 +584,7 @@ mpirun -n 16 build/benchmarks/cuddl-distributed-all-to-all-benchmark genomes/ \
 
 Both tools inflate gzip on the CPU unless cuDDL uses nvCOMP, and inflating dominates sketching. On one A40 node (8 GPUs, 128 EPYC 7713 cores) with 100,000 genomes in the page cache, SimdSketch sketched in 27.2 s. cuDDL, with 8 ranks of 16 loaders each seeing only its own GPU, sketched in 11.8–12.3 s with `--decompression hybrid` and 14.5–15.2 s with `cpu`. On the `cpu` path cuDDL spends 66% of its host time in libdeflate and 27% compacting FASTA, while the GPU sketch kernels take 0.4 s of a 6.6 s single-rank build of 12,500 genomes; `hybrid` moves the compaction to the GPU. nvCOMP (`gpu`) inflates one gzip file per thread block and reached about 2.6 GB/s of gzip per A40, no faster than the 16 cores each rank has.
 
-`scripts/sketch_scaling.py` runs the end-to-end pipeline with one GPU per node: strong scaling with 100,000 genomes and weak scaling with 25,000 genomes per node, 4 runs per configuration. Weak runs below 100,000 genomes read `genomes-<N>k-sample`, the genomes of `genomes-100k` whose hashed names come first (`scripts/snapshot_genomes.py --sample`), so each smaller set is a subset of the larger ones. The first 25,000 accessions average 1.14 MB of gzip per genome; the 25,000, 50,000 and 75,000-genome samples average 1.23–1.24 MB, like the whole set. `scripts/plot_sketch_scaling.py` plots its reports as phase wall times per node count, strong scaling above weak scaling, and as sketch efficiency in compressed input bytes per second per node. Given the SimdSketch reports too, it draws a hatched SimdSketch bar (sketch, gather, compare and write) next to each cuDDL bar.
+`scripts/sketch_scaling.py` runs the end-to-end pipeline with one GPU per node: strong scaling with 100,000 genomes and weak scaling with 25,000 genomes per node, 4 runs per configuration. Weak runs below 100,000 genomes read `genomes-<N>k-sample`, the genomes of `genomes-100k` whose hashed names come first (`scripts/snapshot_genomes.py`), so each smaller set is a subset of the larger ones. The first 25,000 accessions average 1.14 MB of gzip per genome; the 25,000, 50,000 and 75,000-genome samples average 1.23–1.24 MB, like the whole set. `scripts/plot_sketch_scaling.py` plots its reports as phase wall times per node count, strong scaling above weak scaling, and as sketch efficiency in compressed input bytes per second per node. Given the SimdSketch reports too, it draws a hatched SimdSketch bar (sketch, gather, compare and write) next to each cuDDL bar.
 
 `scripts/all_to_all_roofline.py` reads an Nsight Compute export of one exhaustive search. It prints instructions and bytes per pair, and the issue, ALU, FMA and DRAM ceilings for a GPU.
 

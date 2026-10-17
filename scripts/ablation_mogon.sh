@@ -25,7 +25,7 @@ if want compile; then
 fi
 
 [ -d $mgpu/genomes-1k-sample ] ||
-  uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k 1000 $mgpu/genomes-1k-sample --sample
+  uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k 1000 $mgpu/genomes-1k-sample
 srun -N "$nodes" --ntasks="$nodes" mkdir -p "$S/out" "$S/sweep"
 srun -N "$nodes" --ntasks="$nodes" cp "$mgpu/refseq211-100k.cuddl" "$S/db.cuddl"
 export UCX_RCACHE_ENABLE=n

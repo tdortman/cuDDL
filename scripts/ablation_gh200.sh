@@ -22,7 +22,7 @@ scripts/ablation_builds.sh "$(nproc)" "$@"
   build/ablation/main-build/examples/cuddl-build-reference-db "$genomes" -o $scratch/db.cuddl \
     --workers $workers
 [ -d $scratch/genomes-1k ] ||
-  uv run --offline scripts/snapshot_genomes.py "$genomes" 1000 $scratch/genomes-1k --sample
+  uv run --offline scripts/snapshot_genomes.py "$genomes" 1000 $scratch/genomes-1k
 
 abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/main-build -o $out; }
 # One rank on one GPU: the tile queue, the progress thread, the registration cache and the

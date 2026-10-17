@@ -3,14 +3,15 @@
 # requires-python = ">=3.12"
 # dependencies = ["typer"]
 # ///
-"""SimdSketch all-to-all on one node: sketch the first N genomes, then compare every pair, with
-the settings the micro-comparison uses (k=25, 2048 buckets of 8 bits).
+"""SimdSketch all-to-all on one node: sketch a hashed sample of N genomes, then compare every
+pair, with the settings the micro-comparison uses (k=25, 2048 buckets of 8 bits).
 
 SimdSketch has no thresholded output; compare writes one 32-bit similarity per pair. Prints one
 JSON line per genome count. scripts/simdsketch_nodes.py runs the same comparison across several
 nodes. Inside a Slurm job, a missing SimdSketch binary is built on the node first.
 """
 
+import hashlib
 import json
 import os
 import socket
@@ -45,7 +46,11 @@ def main(
     if "SLURM_JOB_ID" in os.environ and not simdsketch.exists():
         build_simdsketch()
     scratch.mkdir(parents=True, exist_ok=True)
-    paths = genome_files(genomes)
+    # The genomes whose hashed file names come first, so each size keeps the collection's mix
+    # and is a subset of the larger ones.
+    paths = sorted(
+        genome_files(genomes), key=lambda p: hashlib.blake2b(p.name.encode()).digest()
+    )
     sketch, pairs = scratch / "sketch.sk", scratch / "pairs.f32"
     for n in sizes:
         if len(paths) < n:

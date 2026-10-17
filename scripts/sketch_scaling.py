@@ -7,7 +7,7 @@
 A40 per node.
 
 Weak runs below 100k read genomes-<N>k-sample, a hashed sample of genomes-100k
-(snapshot_genomes.py --sample), so every size has the same mix of genomes. Each configuration
+(snapshot_genomes.py), so every size has the same mix of genomes. Each configuration
 runs 4 times: run r0 reads part of its input from Lustre for the first time, r1-r3 find it in
 the page cache. After each of r1-r3, SimdSketch
 runs on the same nodes and cores: the nodes are shared with other jobs, and alternating the tools
