@@ -1,0 +1,32 @@
+diff --git a/src/gpu/dist.cu b/src/gpu/dist.cu
+index e31765d..83578b0 100644
+--- a/src/gpu/dist.cu
++++ b/src/gpu/dist.cu
+@@ -219,6 +219,14 @@ __global__ void calculate_dists(
+   float xsquaresum = 0.0f;
+   float ysquaresum = 0.0f;
+   bool stop = false;
++  // Initialised once: re-initialising it every k-mer length raced with warps still waiting on
++  // the previous phase, which then waited forever. It completes a new phase each length.
++  auto block = cooperative_groups::this_thread_block();
++  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
++  if (block.thread_rank() == 0) {
++    init(&barrier, block.size()); // Friend function initializes barrier
++  }
++  block.sync();
+   for (int kmer_idx = 0; kmer_idx < kmer_n; kmer_idx++) {
+     // Copy query sketch into __shared__ mem
+     // Uses all threads *in a single warp* to do the copy
+@@ -231,11 +239,7 @@ __global__ void calculate_dists(
+     const uint64_t *query_ptr;
+     extern __shared__ uint64_t query_shared[];
+     int query_bin_strides;
+-    auto block = cooperative_groups::this_thread_block();
+-    __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+-    if (block.thread_rank() == 0) {
+-      init(&barrier, block.size()); // Friend function initializes barrier
+-    }
++    // Every warp is done with the previous k-mer length's query before it is overwritten.
+     block.sync();
+     if (use_shared) {
+       size_t sketch_bins = query_strides.bbits * query_strides.sketchsize64;
