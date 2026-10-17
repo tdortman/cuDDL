@@ -51,41 +51,68 @@ if build_x86_tools
 endif
 
 # pp-sketchlib, driven through its own C++ classes: CPU sketching and GPU distances. Its
-# databases are HDF5 files, so the harness builds only where HDF5's C++ library is found,
-# through pkg-config or, as with EasyBuild modules that ship no .pc files, h5c++.
-hdf5_dep = dependency('hdf5', language: 'cpp', required: false)
-if hdf5_dep.found()
-    pp_sketchlib = subproject('pp-sketchlib')
-    # Its k-means random-match code includes a C source.
-    add_languages('c', native: false)
-    executable(
-        'ppsketchlib-micro',
-        'ppsketchlib_micro.cpp',
-        pp_sketchlib.get_variable('pp_sketchlib_sources'),
-        include_directories: pp_sketchlib.get_variable('pp_sketchlib_include'),
-        # Upstream builds optimised, without assertions, and with relocatable device code.
-        c_args: ['-O3', '-DNDEBUG'],
-        cpp_args: pp_sketchlib.get_variable('pp_sketchlib_args') + [
-            '-O3',
-            '-DNDEBUG',
-            '-U_GLIBCXX_ASSERTIONS',
-            '-std=c++17',
-        ],
-        cuda_args: pp_sketchlib.get_variable('pp_sketchlib_args') + cuda_arch_args + [
-            '-O3',
-            '-DNDEBUG',
-            '-U_GLIBCXX_ASSERTIONS',
-            '-std=c++17',
-            '--expt-relaxed-constexpr',
-            '-rdc=true',
-        ],
-        # nvcc links the CUDA runtime and the device code, for the architectures it was compiled
-        # for; the C++ sources find the CUDA headers as cuDDL's do.
-        link_args: ['-rdc=true'] + cuda_arch_args,
-        dependencies: [hdf5_dep, dependency('eigen3'), dependency('zlib'), dependency('openmp')],
-        install: false,
-    )
-endif
+# databases are HDF5 files; HDF5 has no WrapDB entry, so its release builds through its own
+# CMake as static C and C++ libraries. pp-sketchlib writes no compressed datasets, so no
+# filter libraries are needed.
+hdf5_opts = cmake.subproject_options()
+hdf5_opts.add_cmake_defines(
+    {
+        'BUILD_SHARED_LIBS': false,
+        'BUILD_STATIC_LIBS': true,
+        'BUILD_TESTING': false,
+        'HDF5_BUILD_CPP_LIB': true,
+        'HDF5_BUILD_HL_LIB': false,
+        'HDF5_BUILD_TOOLS': false,
+        'HDF5_BUILD_UTILS': false,
+        'HDF5_BUILD_EXAMPLES': false,
+        'HDF5_BUILD_FORTRAN': false,
+        'HDF5_BUILD_JAVA': false,
+        'HDF5_ENABLE_Z_LIB_SUPPORT': false,
+        'HDF5_ENABLE_SZIP_SUPPORT': false,
+        'CMAKE_POSITION_INDEPENDENT_CODE': true,
+    },
+)
+hdf5_opts.set_override_option('warning_level', '0')
+hdf5_opts.set_override_option('werror', 'false')
+hdf5_project = cmake.subproject('hdf5', options: hdf5_opts)
+# Meson's CMake translation drops the C++ library's header directory from its usage requirements.
+hdf5_dep = [
+    hdf5_project.dependency('hdf5_cpp-static'),
+    hdf5_project.dependency('hdf5-static'),
+    declare_dependency(
+        compile_args: ['-I' + meson.project_source_root() / 'subprojects/hdf5-1.14.6/c++/src'],
+    ),
+]
+pp_sketchlib = subproject('pp-sketchlib')
+# Its k-means random-match code includes a C source.
+add_languages('c', native: false)
+executable(
+    'ppsketchlib-micro',
+    'ppsketchlib_micro.cpp',
+    pp_sketchlib.get_variable('pp_sketchlib_sources'),
+    include_directories: pp_sketchlib.get_variable('pp_sketchlib_include'),
+    # Upstream builds optimised, without assertions, and with relocatable device code.
+    c_args: ['-O3', '-DNDEBUG'],
+    cpp_args: pp_sketchlib.get_variable('pp_sketchlib_args') + [
+        '-O3',
+        '-DNDEBUG',
+        '-U_GLIBCXX_ASSERTIONS',
+        '-std=c++17',
+    ],
+    cuda_args: pp_sketchlib.get_variable('pp_sketchlib_args') + cuda_arch_args + [
+        '-O3',
+        '-DNDEBUG',
+        '-U_GLIBCXX_ASSERTIONS',
+        '-std=c++17',
+        '--expt-relaxed-constexpr',
+        '-rdc=true',
+    ],
+    # nvcc links the CUDA runtime and the device code, for the architectures it was compiled
+    # for; the C++ sources find the CUDA headers as cuDDL's do.
+    link_args: ['-rdc=true'] + cuda_arch_args,
+    dependencies: [hdf5_dep, dependency('eigen3'), dependency('zlib'), dependency('openmp')],
+    install: false,
+)
 
 # SimdSketch has no C ABI; this cargo crate drives its Rust library. Its SIMD paths are chosen
 # at compile time, so it builds for the host CPU like RabbitSketch.

@@ -1,0 +1,5 @@
+[wrap-file]
+directory = hdf5-1.14.6
+source_url = https://github.com/HDFGroup/hdf5/releases/download/hdf5_1.14.6/hdf5-1.14.6.tar.gz
+source_filename = hdf5-1.14.6.tar.gz
+source_hash = e4defbac30f50d64e1556374aa49e574417c9e72c6b1de7a4ff88c4b1bea6e9b
