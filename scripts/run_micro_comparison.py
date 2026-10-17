@@ -47,6 +47,9 @@ writing its HDF5 database and random match chances; COMPARE loads that database 
 and accessory distances on the GPU, its only GPU comparison, and reports the Jaccard index at
 k = 25 the fit predicts.
 
+HyperGen runs as two tools: hypergen-cpu and hypergen-gpu sketch on that device, and both compare
+with HyperGen's CPU `dist`.
+
 Every CPU tool is timed at each thread count in --threads and reports its fastest, with the
 count in `case.threads`. CPU lanes run with OpenMP threads bound to cores and, on hosts with
 several NUMA nodes, confined to one node when their threads fit its physical cores.
@@ -114,8 +117,8 @@ from hypergen_pipeline import dataset_entries, summarize
 ROOT = Path(__file__).resolve().parent.parent
 APP = typer.Typer()
 DEFAULT_TOOLS = (
-    "cuddl,rabbitsketch,simdsketch,sketchlib,pp-sketchlib,bbtools,hypergen,skani,dashing2,"
-    "cub-exact"
+    "cuddl,rabbitsketch,simdsketch,sketchlib,pp-sketchlib,bbtools,hypergen-cpu,hypergen-gpu,"
+    "skani,dashing2,cub-exact"
 )
 TOOLS = tuple(DEFAULT_TOOLS.split(","))
 
@@ -125,13 +128,6 @@ class Topology(StrEnum):
 
     BATCH = "batch"
     ALL_TO_ALL = "all-to-all"
-
-
-class HypergenDevice(StrEnum):
-    """Device hypergen runs on."""
-
-    CPU = "cpu"
-    GPU = "gpu"
 
 
 class CuddlDecompression(StrEnum):
@@ -845,7 +841,8 @@ def main(
         str,
         typer.Option(
             help="Comma-separated tools to measure: cuddl, rabbitsketch, simdsketch, "
-            "sketchlib, pp-sketchlib, bbtools, hypergen, skani, dashing2, cub-exact."
+            "sketchlib, pp-sketchlib, bbtools, hypergen-cpu, hypergen-gpu, skani, dashing2, "
+            "cub-exact."
         ),
     ] = DEFAULT_TOOLS,
     performance_only: Annotated[
@@ -960,10 +957,6 @@ def main(
             help="Sketch the full discovered corpus; compare stays on subset."
         ),
     ] = True,
-    hypergen_device: Annotated[
-        HypergenDevice,
-        typer.Option(help="Device hypergen runs on."),
-    ] = HypergenDevice.CPU,
     cuddl_index: Annotated[
         CuddlIndex,
         typer.Option(help="Reference index for cuDDL SEARCH; COMPARE is exhaustive."),
@@ -1103,7 +1096,7 @@ def main(
         )
     if "skani" in selected:
         required.append(skani)
-    if "hypergen" in selected:
+    if "hypergen-cpu" in selected or "hypergen-gpu" in selected:
         required.append(hypergen)
     if "dashing2" in selected:
         required.append(dashing2)
@@ -1202,7 +1195,8 @@ def main(
         # The Jaccard index pp-sketchlib reports is its fit's prediction at k = 25.
         "pp-sketchlib": 25,
         "bbtools": 25,
-        "hypergen": 25,
+        "hypergen-cpu": 25,
+        "hypergen-gpu": 25,
         "dashing2": 25,
         "cub-exact": 25,
         # skani exposes no k flag; its screened minimizers use k=15 internally.
@@ -1582,8 +1576,11 @@ def main(
                 (tool, "sketch"), {"wall": measurements[-1]["timings"]["wall"]}
             )
 
-        if "hypergen" in selected:
-            staged_to_real = {}
+        staged_to_real = {}
+        for tool in ("hypergen-cpu", "hypergen-gpu"):
+            if tool not in selected:
+                continue
+            device = tool.removeprefix("hypergen-")
             # (suffix, refs, queries): full-corpus sketch supplies timing in
             # sketch-all mode while the subset sketch feeds dist.
             hg_runs = [("", references, query_list)]
@@ -1606,7 +1603,9 @@ def main(
                         # hypergen names genomes by the staged path; rows join on the real one.
                         staged_to_real[str(link)] = str(path)
 
-                def hg_sketch(count: int, suffix: str = suffix) -> list[list[str]]:
+                def hg_sketch(
+                    count: int, suffix: str = suffix, device: str = device
+                ) -> list[list[str]]:
                     roles = [("hgrefs", "hgr")]
                     if topology == "batch":
                         roles.append(("hgqueries", "hgq"))
@@ -1617,13 +1616,16 @@ def main(
                             "-p",
                             str(work / f"{inputs}{suffix}"),
                             "-o",
-                            str(work / f"{output}{suffix}.sk"),
+                            str(work / f"{output}-{device}{suffix}.sk"),
                             "-t",
                             str(count),
                             "-k",
                             "25",
                             "-D",
-                            hypergen_device,
+                            device,
+                            # 2,048 dimensions instead of HyperGen's default 4,096 keep its
+                            # sketch memory in line with the other tools' sketches, at about
+                            # twice the ANI error.
                             "-d",
                             "2048",
                         ]
@@ -1633,23 +1635,16 @@ def main(
                 # The subset sketch only feeds dist; its timing is the full run's, so it runs
                 # once.
                 if suffix == timed_suffix:
-                    marks = sweep("hypergen", "sketch", hg_sketch, resident=hg_resident)
+                    marks = sweep(tool, "sketch", hg_sketch, resident=hg_resident)
                 else:
                     for command in hg_sketch(max_threads):
                         run(command, quiet=True, log_tail=True)
-            record_native_resident("hypergen", "sketch", hg_resident)
-            sketch_times["hypergen"] = marks
-            sketch_bytes["hypergen"] = (work / f"hgr{timed_suffix}.sk").stat().st_size
+            record_native_resident(tool, "sketch", hg_resident)
+            sketch_times[tool] = marks
+            sketch_bytes[tool] = (work / f"hgr-{device}{timed_suffix}.sk").stat().st_size
             if topology == "batch":
-                sketch_bytes["hypergen"] += (
-                    (work / f"hgq{timed_suffix}.sk").stat().st_size
-                )
-            record_sketch(
-                "hypergen",
-                hypergen_device,
-                marks,
-                {"sketch_bytes": sketch_bytes["hypergen"]},
-            )
+                sketch_bytes[tool] += (work / f"hgq-{device}{timed_suffix}.sk").stat().st_size
+            record_sketch(tool, "hdc", marks, {"sketch_bytes": sketch_bytes[tool]})
         if "skani" in selected:
             skani_resident: list[dict] = []
             sketch_list = work / "skani-list.txt"
@@ -2406,18 +2401,28 @@ def main(
             record_compare("dashing2", "SetSketch", marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = panel_stride
 
-        if "hypergen" in selected:
-            dist_out = work / "hg.ani"
+        for tool in ("hypergen-cpu", "hypergen-gpu"):
+            if tool not in selected:
+                continue
+            device = tool.removeprefix("hypergen-")
+            dist_out = work / f"hg-{device}.ani"
+            reference_sketch = str(work / f"hgr-{device}.sk")
             query_sketch = (
-                str(work / "hgq.sk") if topology == "batch" else str(work / "hgr.sk")
+                str(work / f"hgq-{device}.sk") if topology == "batch" else reference_sketch
             )
 
-            def hg_compare(count: int) -> list[list[str]]:
+            def hg_compare(
+                count: int,
+                device: str = device,
+                dist_out: Path = dist_out,
+                reference_sketch: str = reference_sketch,
+                query_sketch: str = query_sketch,
+            ) -> list[list[str]]:
                 dist = [
                     str(hypergen),
                     "dist",
                     "-r",
-                    str(work / "hgr.sk"),
+                    reference_sketch,
                     "-q",
                     query_sketch,
                     "-o",
@@ -2444,7 +2449,7 @@ def main(
                         "-k",
                         "25",
                         "-D",
-                        hypergen_device,
+                        device,
                         "-d",
                         "2048",
                     ],
@@ -2455,13 +2460,13 @@ def main(
             # compares as the unique pairs.
             hg_compare_resident = []
             marks = sweep(
-                "hypergen",
+                tool,
                 "compare",
                 hg_compare,
                 resident=hg_compare_resident,
                 resident_skip=1 if topology == "batch" else 0,
             )
-            record_native_resident("hypergen", "compare", hg_compare_resident)
+            record_native_resident(tool, "compare", hg_compare_resident)
             rows = []
             for line in dist_out.read_text().splitlines():
                 fields = line.split("\t")
@@ -2478,8 +2483,8 @@ def main(
                     except ValueError:
                         continue
             record_compare(
-                "hypergen",
-                hypergen_device,
+                tool,
+                "hdc",
                 marks,
                 rows,
                 evaluated=count_pairs(references, query_list, topology),
@@ -3429,24 +3434,17 @@ def main(
 
         # These lanes expose exhaustive comparison only.
         for tool, score_key in (
-            ("hypergen", "ani"),
+            ("hypergen-cpu", "ani"),
+            ("hypergen-gpu", "ani"),
             ("simdsketch", "jaccard"),
             ("pp-sketchlib", "jaccard"),
             ("cub-exact", "jaccard"),
         ):
             if tool in selected:
                 search_index_ms[tool] = sketch_times[tool]
-        search_query_ms["hypergen"] = (
-            [
-                m["timings"]["wall"]["median_ms"]
-                for m in measurements
-                if m["implementation"]["name"] == "hypergen"
-                and m["case"]["measurement"] == "micro-compare"
-            ]
-            if "hypergen" in selected
-            else []
-        )
         for tool, score_key in (
+            ("hypergen-cpu", "ani"),
+            ("hypergen-gpu", "ani"),
             ("simdsketch", "jaccard"),
             ("pp-sketchlib", "jaccard"),
             ("cub-exact", "jaccard"),
@@ -3460,7 +3458,8 @@ def main(
                 ]
         # All-to-all rows hold each unordered pair once; search ranks from both ends.
         for tool, score_key in (
-            ("hypergen", "ani"),
+            ("hypergen-cpu", "ani"),
+            ("hypergen-gpu", "ani"),
             ("simdsketch", "jaccard"),
             ("pp-sketchlib", "jaccard"),
             ("cub-exact", "jaccard"),
@@ -3533,7 +3532,8 @@ def main(
         variants = {
             "cuddl": "gpu-indexed",
             "skani": "cpu",
-            "hypergen": hypergen_device,
+            "hypergen-cpu": "hdc",
+            "hypergen-gpu": "hdc",
             "dashing2": "SetSketch",
             "rabbitsketch": "FastKMV",
             "simdsketch": "bucket-b8",
@@ -3545,7 +3545,7 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {"hypergen", "simdsketch", "pp-sketchlib", "cub-exact"}:
+                if tool in {"hypergen-cpu", "hypergen-gpu", "simdsketch", "pp-sketchlib", "cub-exact"}:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]

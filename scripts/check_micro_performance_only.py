@@ -49,8 +49,9 @@ def main() -> None:
             ("dashing2", True, "all-to-all"),
             ("dashing2", False, "all-to-all"),
             ("dashing2", True, "batch"),
-            ("hypergen", True, "all-to-all"),
-            ("hypergen", True, "batch"),
+            ("hypergen-cpu", True, "all-to-all"),
+            ("hypergen-cpu", True, "batch"),
+            ("hypergen-gpu", True, "all-to-all"),
             ("cuddl", True, "all-to-all"),
             ("cuddl", True, "batch"),
             ("rabbitsketch", True, "all-to-all"),
@@ -123,7 +124,8 @@ def main() -> None:
                         "sketchlib",
                         "bbtools",
                         "skani",
-                        "hypergen",
+                        "hypergen-cpu",
+                        "hypergen-gpu",
                         "dashing2",
                     }:
                         assert measurement["case"]["pairs"] == (
