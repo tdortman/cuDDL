@@ -460,7 +460,9 @@ To download tile after tile, create one `cuddl::host_batch_results host(stream, 
 
 If you visit each result once, call `cuddl::for_each_passing(tile, stream, f)` instead of `download`. It copies the tile in chunks through two pinned buffers and runs `f` on one chunk while the next one copies, so it never holds the whole tile on the host. On RefSeq bacteria with 4,096 queries, visiting all 82 million exhaustive results this way took about 80 ms including the search, against about 97 ms through `download`.
 
-To look up one pair, call `find(query_id, reference_id)` on `host.tile()` or on the device tile. It returns an empty optional if the pair did not pass. `passed`, `match_count`, and `count` answer the related questions. The tile's methods also work in device code.
+To look up one pair, call `find(query_id, reference_id)` on `host.tile()` or on the device tile. It returns an empty optional if the pair did not pass. `passed`, `match_count`, and `count` answer the related questions. The tile's methods also work in device code. An all-to-all tile stores each pair once, in the row of its smaller ID, but its lookups take the pair in either order: `find(a, b)` with `b < a` answers from the stored `(b, a)`, with `lower` and `higher` swapped so the counts read from `a`'s side (`pairwise_counts::mirrored`). That pair lives in the tile whose queries include `b`. `for_each_passing` still visits each pair once.
+
+To expand a large tile on several threads, give each thread a run of query rows: `for_each_passing(begin, end, f)` visits rows `[begin, end)` of the tile in the same order as the whole-tile visit, and `passing_before(begin)` is the position of their first result in it, so each thread writes its own slice of one output buffer. `cuddl-reference-index search --output` expands tiles this way.
 
 Each result takes 8 bytes as a `cuddl::packed_pairwise_counts`. Its position implies the pair, and both-empty equals the bucket count minus the other three counts. Size result storage as `maximum_pair_count` elements of `database_type::batch_result_type`. The accessors unpack each result into a full `batch_search_result`.
 

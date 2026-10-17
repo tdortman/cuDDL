@@ -1,17 +1,26 @@
 #include <CLI/CLI.hpp>
 
+#include <cuddl/detail/worker_pool.hpp>
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
 #include <cuddl/replicated_database.cuh>
 
 #include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -43,20 +52,47 @@ class result_writer {
         if (!binary_) throw std::runtime_error("cannot open " + output.string());
     }
 
-    void write(std::span<cuddl::batch_search_result const> rows) {
-        if (binary_.is_open()) {
-            binary_.write(
-                reinterpret_cast<char const*>(rows.data()),
-                static_cast<std::streamsize>(rows.size() * sizeof(cuddl::batch_search_result))
-            );
+    /// Writes the passing results of a downloaded tile. Binary records are expanded from the
+    /// packed results by a pool of threads that lives as long as the writer, each taking runs of
+    /// query rows, into one buffer reused across tiles, so neither one thread nor first-touch
+    /// page faults bound the output.
+    void write(cuddl::host_batch_results const& host) {
+        auto const tile = host.tile();
+        if (!binary_.is_open()) {
+            tile.for_each_passing([](cuddl::batch_search_result const& result) {
+                auto const& counts = result.counts;
+                std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
+                          << '\t' << counts.equal << '\t' << counts.higher << '\t'
+                          << counts.both_empty << '\n';
+            });
             return;
         }
-        for (auto const& result : rows) {
-            auto const& counts = result.counts;
-            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
-                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
-                      << '\n';
+        auto const total = tile.count();
+        if (total > capacity_) {
+            records_ = std::make_unique_for_overwrite<cuddl::batch_search_result[]>(total);
+            capacity_ = total;
         }
+        // Row runs of about equal result counts, several per thread for upper-triangle tiles.
+        auto const runs = std::min<uint64_t>(uint64_t{threads} * 8U, tile.query_count);
+        bounds_.assign(runs + 1U, tile.query_count);
+        auto const rows = std::views::iota(uint32_t{0}, tile.query_count);
+        for (uint64_t r = 0; r < runs; ++r) {
+            bounds_[r] = *std::ranges::partition_point(rows, [&](uint32_t query) {
+                return tile.passing_before(query) * runs < total * r;
+            });
+        }
+        pool_.for_each(runs, [&](size_t r) {
+            auto* out = records_.get() + tile.passing_before(bounds_[r]);
+            tile.for_each_passing(
+                bounds_[r], bounds_[r + 1U], [&](cuddl::batch_search_result const& result) {
+                    *out++ = result;
+                }
+            );
+        });
+        binary_.write(
+            reinterpret_cast<char const*>(records_.get()),
+            static_cast<std::streamsize>(total * sizeof(cuddl::batch_search_result))
+        );
     }
 
     void finish() {
@@ -66,7 +102,107 @@ class result_writer {
     }
 
    private:
+    unsigned const threads = std::max(1U, std::thread::hardware_concurrency());
     std::ofstream binary_;
+    std::unique_ptr<cuddl::batch_search_result[]> records_;
+    uint64_t capacity_ = 0;
+    std::vector<uint32_t> bounds_;
+    cuddl::detail::worker_pool pool_{threads};
+};
+
+/// @brief Writes all-to-all tiles on a thread of its own, so a replica searches its next tile
+/// while the host expands and writes the previous one.
+///
+/// Each replica downloads into two pinned buffers of this writer's, alternately: the replica's
+/// own buffer is reused by its next download, which would otherwise wait for the write. Tiles are
+/// written in the order they are pushed.
+class overlapped_writer {
+   public:
+    explicit overlapped_writer(result_writer& writer)
+        : writer_(writer), thread_([this] { run(); }) {}
+    overlapped_writer(overlapped_writer const&) = delete;
+    overlapped_writer& operator=(overlapped_writer const&) = delete;
+    ~overlapped_writer() {
+        stop();
+    }
+
+    /// Downloads @p tile, once a buffer of its replica is free, and queues it for writing.
+    void push(cuddl::replica_tile const& tile) {
+        slot* free = nullptr;
+        {
+            std::unique_lock lock(mutex_);
+            auto& [slots, next] = replicas_[tile.replica];
+            free = &slots[next];
+            next ^= 1U;
+            written_.wait(lock, [&] { return !free->queued || failure_; });
+            if (failure_) std::rethrow_exception(failure_);
+            if (!free->host) free->host.emplace(tile.stream);
+        }
+        CUDDL_UNWRAP(cuddl::download(tile.tile, tile.stream, *free->host));
+        {
+            std::lock_guard lock(mutex_);
+            free->queued = true;
+            queue_.push_back(free);
+        }
+        queued_.notify_one();
+    }
+
+    /// Writes every queued tile and flushes the output.
+    void finish() {
+        stop();
+        if (failure_) std::rethrow_exception(failure_);
+        writer_.finish();
+    }
+
+   private:
+    struct slot {
+        std::optional<cuddl::host_batch_results> host;
+        bool queued = false;
+    };
+
+    void stop() {
+        {
+            std::lock_guard lock(mutex_);
+            done_ = true;
+        }
+        queued_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    void run() {
+        while (true) {
+            slot* next = nullptr;
+            {
+                std::unique_lock lock(mutex_);
+                queued_.wait(lock, [&] { return done_ || !queue_.empty(); });
+                if (queue_.empty()) return;
+                next = queue_.front();
+                queue_.pop_front();
+            }
+            try {
+                writer_.write(*next->host);
+            } catch (...) {
+                std::lock_guard lock(mutex_);
+                failure_ = std::current_exception();
+                written_.notify_all();
+                return;
+            }
+            {
+                std::lock_guard lock(mutex_);
+                next->queued = false;
+            }
+            written_.notify_all();
+        }
+    }
+
+    result_writer& writer_;
+    std::mutex mutex_;
+    std::condition_variable queued_, written_;
+    std::map<uint32_t, std::pair<std::array<slot, 2>, uint32_t>> replicas_;
+    std::deque<slot*> queue_;
+    std::exception_ptr failure_;
+    bool done_ = false;
+    std::thread thread_;
 };
 
 void search(
@@ -95,7 +231,7 @@ void search(
     cuddl::host_batch_results host(stream);
     auto write_tile = [&](cuddl::batch_result_tile const& tile) {
         CUDDL_UNWRAP(cuddl::download(tile, stream, host));
-        writer.write(host.passing());
+        writer.write(host);
     };
     // Without an index or a threshold every pair is reported, so the dedicated exhaustive
     // kernels run instead of counting matches only to discard nothing.
@@ -149,8 +285,9 @@ void search_all_to_all(
 ) {
     auto group = CUDDL_UNWRAP(replicated_type::upload(file, devices));
     if (!index_path.empty()) CUDDL_UNWRAP(group.load_index(index_path));
+    overlapped_writer overlapped(writer);
     auto const write_tile = [&](cuddl::replica_tile const& tile) {
-        writer.write(CUDDL_UNWRAP(tile.download())->passing());
+        overlapped.push(tile);
     };
     auto const split = cuddl::replica_search{.in_query_order = true};
     // Without an index or a threshold every pair is reported, so the exhaustive search runs.
@@ -161,7 +298,7 @@ void search_all_to_all(
             group.search_all_to_all(write_tile, {.minimum_matches = minimum_matches}, split)
         );
     }
-    writer.finish();
+    overlapped.finish();
 }
 
 }  // namespace
@@ -270,6 +407,15 @@ int main(int argc, char** argv) {
             std::filesystem::equivalent(database_path, index_path)) {
             throw std::invalid_argument("index output must not overwrite the reference database");
         }
+        // Creating a CUDA context takes a few hundred milliseconds, so it overlaps loading the
+        // file. A device that fails to initialise reports the error again where it is used.
+        std::jthread initialise_devices([&] {
+            try {
+                for (auto const id : all_to_all ? device_ids : std::vector<int>{0}) {
+                    if (id < static_cast<int>(cuda::devices.size())) cuda::devices[id].init();
+                }
+            } catch (cuda::cuda_error const&) {}
+        });
         auto const file = CUDDL_UNWRAP(cuddl::reference_database_file::load(database_path));
         auto const compatibility = file.metadata().compatibility;
         cli::require_compatible(compatibility);

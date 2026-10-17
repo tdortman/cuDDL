@@ -30,6 +30,11 @@ struct pairwise_counts {
         return left += right;
     }
 
+    /// @brief The same comparison seen from the other sketch: lower and higher swap.
+    [[nodiscard]] __host__ __device__ constexpr pairwise_counts mirrored() const noexcept {
+        return {.lower = higher, .equal = equal, .higher = lower, .both_empty = both_empty};
+    }
+
     friend bool operator==(pairwise_counts const&, pairwise_counts const&) = default;
 };
 

@@ -13,6 +13,7 @@
 #include <cuda/std/cstdint>
 #include <cuda/std/functional>
 #include <cuda/std/optional>
+#include <cuda/std/utility>
 #include <cuda/stream>
 
 #include <algorithm>
@@ -135,6 +136,11 @@ struct batch_search_result {
  * one bit per reference in rows of `(reference_count + 31) / 32` words per query. Host copies
  * (@ref download) hold only the passing results, packed in order, and locate them through
  * @ref word_offsets.
+ *
+ * All-to-all tiles store each pair once, in the row of its smaller ID. The lookups take the pair
+ * in either order: asked for `(a, b)` with `b < a`, they answer from the stored `(b, a)`, with
+ * `lower` and `higher` swapped, as @ref pairwise_counts::mirrored gives. The pair is then in
+ * the tile whose queries include `b`.
  */
 struct batch_result_tile {
     packed_pairwise_counts const* results{};
@@ -167,9 +173,12 @@ struct batch_result_tile {
         return static_cast<uint64_t>(query_count) * reference_count;
     }
 
-    /// @brief Whether the pair has a result in this tile.
+    /// @brief Whether the pair has a result in this tile, in either order for all-to-all tiles.
     [[nodiscard]] __host__ __device__ bool
     passed(uint32_t query_id, uint32_t reference_id) const noexcept {
+        if (upper_triangle && reference_id < query_id) {
+            cuda::std::swap(query_id, reference_id);
+        }
         if (query_id < first_query_id || query_id - first_query_id >= query_count ||
             reference_id >= reference_count || (upper_triangle && reference_id <= query_id)) {
             return false;
@@ -178,24 +187,41 @@ struct batch_result_tile {
         return ((pass_bits[word(query_id, reference_id)] >> (reference_id % 32U)) & 1U) != 0U;
     }
 
-    /// @brief The pair's result, or nothing when it did not pass.
+    /// @brief The pair's result, or nothing when it did not pass. All-to-all tiles answer in
+    /// either order, with the counts seen from @p query_id.
     [[nodiscard]] __host__ __device__ cuda::std::optional<batch_search_result>
     find(uint32_t query_id, uint32_t reference_id) const noexcept {
         if (!passed(query_id, reference_id)) return cuda::std::nullopt;
+        if (upper_triangle && reference_id < query_id) {
+            auto const stored = results[position(reference_id, query_id)].unpack(bucket_count);
+            return batch_search_result{query_id, reference_id, stored.mirrored()};
+        }
         return result(query_id, reference_id, results[position(query_id, reference_id)]);
     }
 
-    /// @brief The pair's index match count; the pair must pass and counts must be present.
+    /// @brief The pair's index match count, in either order for all-to-all tiles; the pair must
+    /// pass and counts must be present.
     [[nodiscard]] __host__ __device__ uint32_t
     match_count(uint32_t query_id, uint32_t reference_id) const noexcept {
+        if (upper_triangle && reference_id < query_id) {
+            cuda::std::swap(query_id, reference_id);
+        }
         return match_counts[position(query_id, reference_id)];
     }
 
     /// @brief Calls @p f with every passing result, query-major and in reference order.
     template <typename F>
     __host__ __device__ void for_each_passing(F&& f) const {
-        uint64_t next = 0U;
-        for (uint32_t query = 0; query < query_count; ++query) {
+        for_each_passing(0U, query_count, f);
+    }
+
+    /// @brief Calls @p f with the passing results of the tile's query rows [@p begin, @p end), in
+    /// the order of the whole-tile visit. Disjoint row ranges can be visited concurrently; the
+    /// first result of row @p begin is passing result @ref passing_before(begin) of the tile.
+    template <typename F>
+    __host__ __device__ void for_each_passing(uint32_t begin, uint32_t end, F&& f) const {
+        auto next = begin < end ? stored_before(begin) : 0U;
+        for (uint32_t query = begin; query < end; ++query) {
             auto const query_id = first_query_id + query;
             if (pass_bits == nullptr) {
                 // Every slot passes, and slots are in this order.
@@ -217,6 +243,19 @@ struct batch_result_tile {
                 }
             }
         }
+    }
+
+    /// @brief Number of passing results in the tile's query rows before row @p query, which may
+    /// be @ref query_count.
+    [[nodiscard]] __host__ __device__ uint64_t passing_before(uint32_t query) const noexcept {
+        if (query >= query_count) return count();
+        if (pass_bits == nullptr || word_offsets != nullptr) return stored_before(query);
+        auto const words = static_cast<size_t>(query) * words_per_query();
+        uint64_t total = 0U;
+        for (size_t w = 0; w < words; ++w) {
+            total += static_cast<uint64_t>(cuda::std::popcount(pass_bits[w]));
+        }
+        return total;
     }
 
     /// @brief Number of passing results.
@@ -271,6 +310,15 @@ struct batch_result_tile {
                                     query, reference_id, first_query_id, reference_count
                                 );
     }
+
+    /// Index in @ref results of the first result stored for query row @p query.
+    [[nodiscard]] __host__ __device__ uint64_t stored_before(uint32_t query) const noexcept {
+        if (pass_bits == nullptr) {
+            return slot(query, upper_triangle ? first_query_id + query + 1U : 0U);
+        }
+        if (word_offsets == nullptr || reference_count == 0U) return 0U;
+        return word_offsets[static_cast<size_t>(query) * words_per_query()];
+    }
 };
 
 /**
@@ -286,7 +334,8 @@ class host_batch_results {
     /// @brief Empty results to @ref download into, with pinned buffers for @p stream's device.
     explicit host_batch_results(cuda::stream_ref stream)
         : host_batch_results(
-              stream, detail::device_pinned_pool(stream.device(), detail::pinned_placement::device_node)
+              stream,
+              detail::device_pinned_pool(stream.device(), detail::pinned_placement::device_node)
           ) {}
 
     /// @brief Empty results to @ref download into, with pinned buffers taken from @p pool.

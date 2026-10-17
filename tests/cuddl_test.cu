@@ -149,7 +149,9 @@ bool copy_device_buffer(cuda::device_buffer<T> const& source, std::vector<T>& de
 }
 
 /// @brief Batch-search tile callback appending every tile's passing results and, when
-/// requested, their match counts, in order.
+/// requested, their match counts, in order. It also checks that visiting a tile's query rows
+/// from a split row on reproduces the whole-tile visit from @ref passing_before of that row, as
+/// callers expanding row ranges concurrently rely on.
 struct tile_collector {
     cuda::stream_ref stream;
     std::vector<cuddl::batch_search_result> results{};
@@ -159,6 +161,22 @@ struct tile_collector {
     void operator()(cuddl::batch_result_tile const& tile) {
         auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
         auto const passing = host.passing();
+        auto const view = host.tile();
+        for (auto const split : {1U, view.query_count / 2U, view.query_count - 1U}) {
+            if (split >= view.query_count) continue;
+            auto const before = view.passing_before(split);
+            ASSERT_LE(before, passing.size());
+            auto expected = passing.begin() + static_cast<std::ptrdiff_t>(before);
+            view.for_each_passing(split, view.query_count, [&](auto const& r) {
+                ASSERT_NE(expected, passing.end());
+                EXPECT_EQ(r.query_id, expected->query_id);
+                EXPECT_EQ(r.reference_id, expected->reference_id);
+                EXPECT_EQ(r.counts.equal, expected->counts.equal);
+                ++expected;
+            });
+            EXPECT_EQ(expected, passing.end());
+        }
+        EXPECT_EQ(view.passing_before(view.query_count), passing.size());
         results.insert(results.end(), passing.begin(), passing.end());
         if (tile.match_counts != nullptr) {
             auto const counts = host.passing_match_counts();
@@ -1543,6 +1561,56 @@ TEST_F(ReferenceDatabaseTest, ExhaustiveSearchesOfNearDuplicateRowsMatchScalarOr
     // Cover incomplete reference words and query groups at both bucket widths.
     expect_near_duplicate_exhaustive_searches<b_default>(stream_, 2403U);
     expect_near_duplicate_exhaustive_searches<8192>(stream_, 300U);
+}
+
+// An all-to-all tile stores each pair once, as (smaller ID, larger ID). Asked in the other order,
+// the lookups must answer as a search from the larger ID would: the same pair, lower and higher
+// swapped. A forgotten swap would pass any symmetric check, so the oracle scores from that side.
+TEST_F(ReferenceDatabaseTest, AllToAllLookupsAnswerInEitherOrder) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    constexpr uint32_t reference_count = 300U;
+    std::mt19937 random(0x5eedU);
+    std::vector<uint16_t> rows(size_t{reference_count} * b_default);
+    // A small score range makes lower and higher buckets both common.
+    std::ranges::generate(rows, [&] { return static_cast<uint16_t>(random() % 8U); });
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    auto database = CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto all = CUDDL_UNWRAP(database.all_to_all_search_requirements());
+    auto workspace =
+        cuda::make_device_buffer<uint8_t>(stream, stream.device(), all.workspace_bytes, uint8_t{});
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), all.maximum_pair_count, cuddl::packed_pairwise_counts{}
+    );
+    uint64_t checked = 0U, mismatches = 0U;
+    CUDDL_UNWRAP(database.search_all_to_all_async(
+        workspace,
+        results,
+        [&](cuddl::batch_result_tile const& tile) {
+            auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+            auto const view = host.tile();
+            for (auto smaller = tile.first_query_id;
+                 smaller < tile.first_query_id + tile.query_count;
+                 ++smaller) {
+                for (auto larger = smaller + 1U; larger < reference_count; ++larger) {
+                    auto const row = std::span<uint16_t const>{rows}.subspan(
+                        static_cast<size_t>(larger) * b_default, b_default
+                    );
+                    auto const expected = cuddl::batch_search_result{
+                        larger, smaller, score_row_oracle(row, rows, smaller)
+                    };
+                    auto const found = view.find(larger, smaller);
+                    mismatches += !view.passed(larger, smaller) || !found || *found != expected;
+                    ++checked;
+                }
+            }
+        },
+        {},
+        stream
+    ));
+    EXPECT_EQ(checked, uint64_t{reference_count} * (reference_count - 1U) / 2U);
+    EXPECT_EQ(mismatches, 0U);
 }
 
 // Shards of an all-to-all search must split its tiles among themselves, alternating owners, and

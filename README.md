@@ -134,7 +134,7 @@ query_id    reference_id    lower    equal    higher    both_empty
 
 The actual delimiter is a tab. Query IDs are zero-based in the order supplied to `--query`; reference IDs are zero-based in the builder's sorted file order. The remaining columns contain raw sketch comparison counts. This CLI does not output ranked hits or ANI scores. Use the C++ metric helpers when you need derived metrics.
 
-For large result sets, pass `--output results.bin` to skip text formatting. The file holds headerless 24-byte little-endian records with the same six `uint32` fields in the same order. Python reads it with `struct.iter_unpack("<6I", data)`; NumPy reads it with a structured dtype of six `<u4` fields.
+For large result sets, pass `--output results.bin` to skip text formatting. The file holds headerless 24-byte little-endian records with the same six `uint32` fields in the same order. Python reads it with `struct.iter_unpack("<6I", data)`; NumPy reads it with a structured dtype of six `<u4` fields. Records are expanded from the GPU's packed results on every core, and an `--all-to-all` search writes each tile while the GPUs search the next. On one GH200, all 5×10⁹ pairs of 100,000 genomes (120 GB of records) reach the writer in 1.2 s.
 
 ## C++ API
 
