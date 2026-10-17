@@ -202,6 +202,8 @@ HyperGen runs as two tools. `hypergen-cpu` and `hypergen-gpu` sketch on that dev
 
 `--reference-count N` keeps the N genomes whose hashed file names come first. Accession order clusters species, so the first N accessions are far more or less redundant than the corpus. The hashed sample keeps the corpus's mix and picks the same genomes on every host.
 
+[`scripts/run_speed_of_light.py`](scripts/run_speed_of_light.py) measures how each tool's throughput grows with the compute it gets. GPU tools run at several CUDA MPS caps on their SMs, and CPU tools at several thread counts. [`scripts/plot_speed_of_light.py`](scripts/plot_speed_of_light.py) plots throughput against the share of SMs or cores beside the diagonal of throughput proportional to compute.
+
 Use the supplied development shell for the benchmark toolchain. RabbitSketch and Dashing2 builds are x86-only and are skipped on ARM hosts. Compare runs with their dataset, hardware, sketch settings, and timing scope attached, rather than treating one speedup as universal.
 
 ## License
