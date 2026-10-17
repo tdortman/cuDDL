@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cuddl/detail/compressed_memory.cuh>
 #include <cuddl/reference_database.cuh>
 
 namespace cuddl {
@@ -290,7 +289,9 @@ class reference_index {
         // Postings ascend by reference ID within each cell, so a search can restrict a cell to a
         // reference range with a binary search.
         auto sorted = CUDDL_CUDA_TRY(
-            detail::make_compressed_buffer<uint32_t>(stream, static_cast<size_t>(posting_capacity))
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), static_cast<size_t>(posting_capacity), cuda::no_init
+            )
         );
         CUDDL_CUDA_TRY(
             cub::DeviceSegmentedSort::SortKeys(
@@ -324,7 +325,8 @@ class reference_index {
         auto const device = stream.device();
         index_keys_ =
             CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
-        index_postings_ = CUDDL_CUDA_TRY(detail::make_compressed_buffer<uint32_t>(stream, size));
+        index_postings_ =
+            CUDDL_CUDA_TRY(cuda::make_device_buffer<uint32_t>(stream, device, size, cuda::no_init));
         auto keys =
             CUDDL_CUDA_TRY(cuda::make_device_buffer<uint16_t>(stream, device, size, cuda::no_init));
         auto ids =
@@ -439,8 +441,8 @@ class reference_index {
         CUDDL_CUDA_TRY(stream.sync());
         if (bitmap_count_ == 0U) return Ok();
         posting_bitmaps_ = CUDDL_CUDA_TRY(
-            detail::make_compressed_buffer<uint32_t>(
-                stream, static_cast<size_t>(bitmap_count_) * words
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), static_cast<size_t>(bitmap_count_) * words, cuda::no_init
             )
         );
         CUDDL_CUDA_TRY(cuda::fill_bytes(stream, posting_bitmaps_, 0));

@@ -160,7 +160,9 @@ class reference_index_file {
             database.reference_count(), database.metadata().compatibility
         ));
         index.index_postings_ = CUDDL_CUDA_TRY(
-            detail::make_compressed_buffer<uint32_t>(stream, index.index_posting_capacity_)
+            cuda::make_device_buffer<uint32_t>(
+                stream, stream.device(), index.index_posting_capacity_, cuda::no_init
+            )
         );
         if (!decoded.postings_.empty()) {
             CUDDL_CUDA_TRY(
