@@ -85,6 +85,7 @@ fits the budget; every lane runs the same files.
 """
 
 import gzip
+import hashlib
 import json
 import math
 import mmap
@@ -828,8 +829,9 @@ def main(
         int | None,
         typer.Option(
             min=1,
-            help="Use only the first N references, in sorted path order, so two hosts compare "
-            "the same corpus. Asking for more than were found is an error.",
+            help="Use only N references, those whose hashed file names come first, so the sample "
+            "keeps the corpus's mix and two hosts compare the same genomes. Asking for more than "
+            "were found is an error.",
         ),
     ] = None,
     topology: Annotated[
@@ -1027,16 +1029,19 @@ def main(
         )
     references = discover(genomes)
     if reference_count is not None:
-        # A prefix of the sorted corpus, not a spread: two hosts that collected the same
-        # accessions then compare the same references even if one collection stopped earlier.
-        # Taking fewer than asked for would silently compare different corpora, so it is an
-        # error rather than a clamp.
+        # The genomes whose hashed file names come first, as scripts/snapshot_genomes.py
+        # --sample takes them: accession order clusters species, so a prefix would be far more
+        # or less redundant than the corpus, while the hash keeps its mix, picks the same
+        # genomes on every host, and makes a smaller sample a subset of a larger one. Taking
+        # fewer than asked for would silently compare different corpora, so it is an error
+        # rather than a clamp.
         if reference_count > len(references):
             raise typer.BadParameter(
                 f"--reference-count {reference_count} exceeds the {len(references)} "
                 "genomes found"
             )
-        references = references[:reference_count]
+        sample = sorted(references, key=lambda p: hashlib.blake2b(p.name.encode()).digest())
+        references = sorted(sample[:reference_count])
     query_list = sorted(
         {
             q

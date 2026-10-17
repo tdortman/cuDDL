@@ -198,6 +198,8 @@ Every tool in the micro comparison evaluates the same pair set; all-to-all compa
 
 pp-sketchlib runs through a small harness of its own classes, `build/benchmarks/ppsketchlib-micro`. Meson builds pp-sketchlib and the HDF5 library its databases need from source, so no system HDF5 is required. It sketches assemblies on the CPU at k = 15, 19, 23, 27 and 31 and fits core and accessory distances on the GPU. Its comparison rows report the Jaccard index at k = 25 that the fit predicts. The build patches three things in its GPU kernel. Pairs with too few k-mer lengths left to fit get distance 1, as its CPU path reports them, instead of 0, which would read as identical genomes. Each block initialises its barrier once instead of once per k-mer length, which raced with warps still waiting on the previous length and hung large comparisons. The distance index is 64-bit, because all pairs of 100,000 genomes overflow a 32-bit one.
 
+`--reference-count N` keeps the N genomes whose hashed file names come first. Accession order clusters species, so the first N accessions are far more or less redundant than the corpus. The hashed sample keeps the corpus's mix and picks the same genomes on every host.
+
 Use the supplied development shell for the benchmark toolchain. RabbitSketch and Dashing2 builds are x86-only and are skipped on ARM hosts. Compare runs with their dataset, hardware, sketch settings, and timing scope attached, rather than treating one speedup as universal.
 
 ## License
