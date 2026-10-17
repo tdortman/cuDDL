@@ -1,0 +1,95 @@
+--- a/build.rs
++++ b/build.rs
+@@ -13,36 +13,24 @@
+         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+ 
+         let cuda_src = PathBuf::from("src/cuda_kernel.cu");
+-        let ptx_file = out_dir.join("cuda_kmer_hash.ptx");
++        let fatbin_file = out_dir.join("cuda_kmer_hash.fatbin");
+ 
+-        // Determine architecture based on feature flags
+-        let (arch, code) = if cfg!(feature = "cuda-sketch-ada-lovelace") {
+-            ("compute_89", "sm_89") // Ada Lovelace architecture for NIVIDA RTX 4090 series
+-        } else if cfg!(feature = "cuda-sketch-ampere") {
+-            ("compute_80", "sm_80") // Ampere architecture for NIVIDA A100 series
+-        } else if cfg!(feature = "cuda-sketch-hopper") {
+-            ("compute_90", "sm_90") // // Hopper architecture for NIVIDA H100 series
+-        } else if cfg!(feature = "cuda-sketch-blackwell") {
+-            ("compute_120", "sm_120") // Blackwell architecture, e.g. RTX 5070 Ti
+-        } else if cfg!(feature = "cuda-sketch-volta") {
+-            ("compute_70", "sm_70") // Volta architecture for NIVIDA V100 series
+-        } else {
+-            panic!("Unsupported GPU architecture feature flag!");
+-        };
+-
++        // Machine code for cuDDL's architectures (meson.build `cuda_arch_args`) runs on drivers
++        // older than this toolkit, which cannot JIT its PTX. The compute_80 PTX serves other GPUs.
+         let nvcc_status = Command::new("nvcc")
+-            .arg("-ptx")
++            .arg("--fatbin")
+             .arg("-o")
+-            .arg(&ptx_file)
++            .arg(&fatbin_file)
+             .arg(&cuda_src)
+-            .arg(format!("-arch={}", arch))
+-            .arg(format!("-code={}", code))
++            .arg("-gencode=arch=compute_80,code=[sm_80,compute_80]")
++            .arg("-gencode=arch=compute_90,code=sm_90")
++            .arg("-gencode=arch=compute_120,code=sm_120")
+             .status()
+-            .unwrap();
++            .expect("nvcc must be on PATH to build the CUDA kernels");
+ 
+         assert!(
+             nvcc_status.success(),
+-            "Failed to compile CUDA source to PTX."
++            "Failed to compile CUDA source to a fatbin."
+         );
+ 
+         let bindings = bindgen::Builder::default()
+--- a/src/sketch_cuda.rs
++++ b/src/sketch_cuda.rs
+@@ -17,8 +17,9 @@
+     std::time::Instant,
+ };
+ 
++// Loaded from the build tree at run time: binary images cannot pass through `Ptx::from_src`.
+ #[cfg(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+-const CUDA_KERNEL_MY_STRUCT: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
++const CUDA_KERNEL_FATBIN: &str = concat!(env!("OUT_DIR"), "/cuda_kmer_hash.fatbin");
+ 
+ #[cfg(any(feature = "cuda-sketch-volta", feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper", feature = "cuda-sketch-blackwell"))]
+ const SEQ_NT4_TABLE: [u8; 256] = [
+@@ -54,7 +55,7 @@
+     // setup GPU device
+     let gpu = CudaDevice::new(0).expect("CUDA device 0 must open");
+     // compile ptx
+-    let ptx = Ptx::from_src(CUDA_KERNEL_MY_STRUCT);
++    let ptx = Ptx::from_file(CUDA_KERNEL_FATBIN);
+     gpu.load_ptx(
+         ptx,
+         "cuda_kernel",
+@@ -254,9 +255,9 @@
+     let gpu = CudaDevice::new(0).unwrap();
+ 
+     // compile ptx
+-    let ptx = Ptx::from_src(CUDA_KERNEL_MY_STRUCT);
++    let ptx = Ptx::from_file(CUDA_KERNEL_FATBIN);
+     gpu.load_ptx(ptx, "cuda_kernel", &["cuda_kmer_bit_pack_mmhash"])
+-        .unwrap();
++        .expect("hypergen kernels must load");
+     let gpu = &gpu;
+ 
+     // start sketching
+@@ -343,9 +344,9 @@
+     let gpu = CudaDevice::new(0).unwrap();
+ 
+     // compile ptx
+-    let ptx = Ptx::from_src(CUDA_KERNEL_MY_STRUCT);
++    let ptx = Ptx::from_file(CUDA_KERNEL_FATBIN);
+     gpu.load_ptx(ptx, "cuda_kernel", &["cuda_kmer_t1ha2"])
+-        .unwrap();
++        .expect("hypergen kernels must load");
+     let gpu = &gpu;
+ 
+     // start sketching
