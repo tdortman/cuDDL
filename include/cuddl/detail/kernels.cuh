@@ -1861,39 +1861,6 @@ __global__ __launch_bounds__(block_size) void gather_passing_kernel(
     }
 }
 
-/// @brief Writes each query's selection signature for @ref refine_batch_bitmap_kernel groups:
-/// key q is the MinHash of query q's selected references (a hash of their IDs, minimized) in
-/// the high half and q in the low half. Queries selecting similar reference sets get equal
-/// signatures with probability equal to the sets' Jaccard similarity, so sorting the keys by
-/// their high halves clusters them. One warp per query.
-__global__ __launch_bounds__(block_size) static void selection_signature_kernel(
-    uint32_t const* candidate_bits,
-    uint32_t query_count,
-    uint32_t reference_count,
-    uint64_t* keys
-) {
-    constexpr uint32_t warp_width = 32;
-    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
-    auto const words = candidate_bit_words(reference_count);
-    for (auto query = (static_cast<uint32_t>(blockIdx.x) * block_size + threadIdx.x) / warp_width;
-         query < query_count;
-         query += gridDim.x * (block_size / warp_width)) {
-        auto signature = ~0U;
-        for (auto word = lane; word < words; word += warp_width) {
-            for (auto bits = candidate_bits[static_cast<size_t>(query) * words + word]; bits != 0U;
-                 bits &= bits - 1U) {
-                auto const reference = word * warp_width + static_cast<uint32_t>(__ffs(bits) - 1);
-                signature =
-                    cuda::std::min(signature, static_cast<uint32_t>(splitmix64(reference) >> 32U));
-            }
-        }
-        signature = __reduce_min_sync(0xffffffffU, signature);
-        if (lane == 0U) {
-            keys[query] = static_cast<uint64_t>(signature) << 32U | query;
-        }
-    }
-}
-
 /// @brief Exactly compares query bit-planes with references, sharing each reference row across
 /// a query group.
 ///
@@ -1903,10 +1870,6 @@ __global__ __launch_bounds__(block_size) static void selection_signature_kernel(
 /// 32-reference words and, for every reference any group query selects, compare the reference's
 /// bit-planes with each selecting query. A row thus crosses L2 once per group rather than once
 /// per pair.
-///
-/// Group g holds tile queries `g * QueryGroup ...` in order, or with @p query_order (staged
-/// planes only) the queries in the low halves of those entries of @p query_order, so that
-/// queries selecting the same references share a group and each row load serves more pairs.
 ///
 /// Each written result lands at its @ref batch_result_slot. @p Candidates selects which pairs are
 /// written: those in @p candidate_bits (one word per query and 32 references), or every pair of
@@ -1935,8 +1898,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     uint32_t* result_match_counts,
     uint32_t minimum_matches,
     uint32_t* pass_bits,
-    uint32_t* cell_counter,
-    uint64_t const* query_order
+    uint32_t* cell_counter
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t group = QueryGroup;
@@ -1973,12 +1935,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
         auto const group_size = cuda::std::min(group, query_count - first_query);
         auto const first_word = cells.first_word + (cell / groups) * cells.block_words;
         auto const last_word = cuda::std::min(first_word + cells.block_words, words_per_query);
-        // Tile query index of group member m: with @p query_order, the low half of its entry.
-        auto const member_query = [&](uint32_t m) {
-            return query_order == nullptr ? first_query + m
-                                          : static_cast<uint32_t>(query_order[first_query + m]);
-        };
-        auto const my_query = lane < group_size ? member_query(lane) : first_query;
+        auto const my_query = lane < group_size ? first_query + lane : first_query;
         auto const* group_planes = reinterpret_cast<uint4 const*>(
             query_planes + static_cast<size_t>(first_query) * row_words
         );
@@ -1992,7 +1949,7 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
             for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * member_vectors;
                  i += bitmap_refine_block_size) {
                 query_plane_storage[i] = reinterpret_cast<uint4 const*>(
-                    query_planes + static_cast<size_t>(member_query(i / member_vectors)) * row_words
+                    query_planes + static_cast<size_t>(first_query + i / member_vectors) * row_words
                 )[i % member_vectors];
             }
         }
