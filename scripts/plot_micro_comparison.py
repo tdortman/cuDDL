@@ -5,9 +5,10 @@
 # ///
 """Figures for micro-benchmark comparisons (operation=micro).
 
-Sixteen single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
+Eighteen single-panel figures: SKETCH wall, COMPARE wall, SEARCH query wall,
 SKETCH node energy per genome, COMPARE node energy per pair, and both above the node's idle
-power (CPU and GPU stacked),
+power (CPU and GPU stacked), each tool's run energy split into SKETCH and COMPARE on CPU and
+GPU, total and above idle,
 resident processing time for each of those operations,
 Jaccard MAE vs exact, ANI MAE vs ANIm, SEARCH recall and top-1, COMPARE
 truth coverage, Jaccard max error, ANI max error. Tools without a metric
@@ -269,6 +270,68 @@ def main(
                 f"{operation.upper()} energy per {unit} above idle",
                 f"micro_energy_dynamic_{operation}",
             )
+
+        # Where each tool's energy goes over a whole run: sketching every genome, then
+        # comparing every pair, each split into CPU packages and GPUs. A tool whose sketch and
+        # compare rows carry different variants (cuDDL's reference-db and gpu) has one of each;
+        # HyperGen's cpu and gpu runs pair by variant.
+        def breakdown_panel(prefix: str, title: str, stem: str) -> None:
+            def joules(row: dict, source: str) -> float:
+                # Shares just below zero above idle are idle noise, not energy spent.
+                return max(row["metrics"].get(f"{prefix}_{source}_j") or 0.0, 0.0)
+
+            runs = []
+            for row in compare:
+                if f"{prefix}_cpu_j" not in row["metrics"]:
+                    continue
+                own = [s for s in sketch if s["tool"] == row["tool"]]
+                if len(own) > 1:
+                    own = [s for s in own if s["variant"] == row["variant"]]
+                if len(own) != 1 or f"{prefix}_cpu_j" not in own[0]["metrics"]:
+                    continue
+                parts = [
+                    joules(own[0], "cpu"),
+                    joules(own[0], "gpu"),
+                    joules(row, "cpu"),
+                    joules(row, "gpu"),
+                ]
+                runs.append((row, [p / 1e3 for p in parts]))
+            fig, ax = plt.subplots(figsize=(width, 4))
+            if not runs:
+                ax.set_title(f"{title} (not recorded)")
+                ax.set_axis_off()
+                save_both(fig, stem)
+                return
+            runs.sort(key=lambda run: sum(run[1]))
+            names = [label(row) for row, _ in runs]
+            bottom = [0.0] * len(runs)
+            segments = (
+                ("SKETCH, CPU", "#9ecae1"),
+                ("SKETCH, GPU", "#fdae6b"),
+                ("COMPARE, CPU", "#3182bd"),
+                ("COMPARE, GPU", "#e6550d"),
+            )
+            for index, (name, color) in enumerate(segments):
+                values = [parts[index] for _, parts in runs]
+                bars = ax.bar(names, values, bottom=bottom, label=name, color=color)
+                bottom = [b + v for b, v in zip(bottom, values)]
+            texts = ax.bar_label(
+                bars, labels=[f"{total:.3g}" for total in bottom], padding=3,
+                fontsize=pu.BAR_FONT_SIZE,
+            )
+            ax.margins(y=0.15)
+            ax.set_ylabel("Energy per run (kJ)")
+            ax.set_title(title)
+            ax.tick_params(axis="x", labelrotation=20)
+            ax.legend(fontsize=8)
+            save_both(fig, stem, list(zip(bars, texts)))
+
+        breakdown_panel("energy", "Node energy of SKETCH and COMPARE", "micro_energy_breakdown")
+        breakdown_panel(
+            "energy_dynamic",
+            "Energy of SKETCH and COMPARE above idle",
+            "micro_energy_dynamic_breakdown",
+        )
 
         def scatter_panel(metric: str, title: str, ylabel: str, stem: str) -> None:
             fig, ax = plt.subplots(figsize=(5.5, 4.5))
