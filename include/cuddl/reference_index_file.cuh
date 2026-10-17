@@ -171,6 +171,8 @@ class reference_index_file {
                 )
             );
         }
+        // The driver may still read the pageable host sources after the copies return.
+        CUDDL_CUDA_TRY(stream.sync());
         CUDDL_TRY(index.build_key_directory(
             database.reference_count(),
             database.metadata().compatibility.indexed_bucket_count,
