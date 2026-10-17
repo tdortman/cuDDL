@@ -2529,6 +2529,60 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     }
 }
 
+/// @brief The all-pairs comparison of @ref refine_all_pairs_kernel over row-major 16-bit scores
+/// instead of bit-planes, one warp per pair, for ablation builds to compare with.
+///
+/// With @p Swar each lane compares 16 buckets per step from 256-bit loads, two packed scores per
+/// 32-bit subtraction (@ref classify_query_words); without, it classifies one bucket at a time.
+/// @p rows holds every reference's row, and query q of the tile is row `query_id_offset + q`.
+template <size_t BucketCount, typename SearchResult, bool UpperTriangle, bool Swar>
+__global__ __launch_bounds__(block_size) void row_major_all_pairs_kernel(
+    uint16_t const* rows,
+    uint32_t query_id_offset,
+    uint32_t query_count,
+    uint32_t reference_count,
+    SearchResult* results,
+    uint32_t const* reference_mask
+) {
+    constexpr uint32_t warp_width = 32;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const warps = uint64_t{gridDim.x} * (block_size / warp_width);
+    auto const pairs = uint64_t{query_count} * reference_count;
+    for (auto pair = (uint64_t{blockIdx.x} * block_size + threadIdx.x) / warp_width; pair < pairs;
+         pair += warps) {
+        auto const query = static_cast<uint32_t>(pair / reference_count);
+        auto const reference_id = static_cast<uint32_t>(pair % reference_count);
+        auto const query_id = query_id_offset + query;
+        if (UpperTriangle && reference_id <= query_id) continue;
+        if (reference_mask != nullptr &&
+            ((reference_mask[reference_id / 32U] >> (reference_id % 32U)) & 1U) == 0U) {
+            continue;
+        }
+        auto const* query_row = rows + size_t{query_id} * BucketCount;
+        auto const* reference_row = rows + size_t{reference_id} * BucketCount;
+        pairwise_counts counts{};
+        if constexpr (Swar) {
+            for (auto chunk = lane; chunk < BucketCount / 16U; chunk += warp_width) {
+                uint32_t q[8];
+                load_256_global_nc(reinterpret_cast<uint32_t const*>(query_row + chunk * 16U), q);
+                classify_query_words(counts, q, reference_row + chunk * 16U);
+            }
+        } else {
+            for (auto bucket = lane; bucket < BucketCount; bucket += warp_width) {
+                classify(counts, query_row[bucket], reference_row[bucket]);
+            }
+        }
+        auto const lower = __reduce_add_sync(0xffffffffU, counts.lower);
+        auto const equal = __reduce_add_sync(0xffffffffU, counts.equal);
+        auto const higher = __reduce_add_sync(0xffffffffU, counts.higher);
+        if (lane == 0U) {
+            results[batch_result_slot<UpperTriangle>(
+                query, reference_id, query_id_offset, reference_count
+            )] = SearchResult::pack(lower, equal, higher);
+        }
+    }
+}
+
 /// @brief Per-thread accumulator feeding the CUB block reduction for cardinality.
 struct cardinality_payload {
     uint32_t empty{};

@@ -71,7 +71,9 @@ class reference_index {
         detail::device_scope const scope{stream};
         auto index = CUDDL_TRY(build_index<score_type>(database, stream, storage));
         CUDDL_TRY(index.measure_pair_fraction(database, stream));
-        CUDDL_TRY(index.build_posting_bitmaps(database, stream));
+        if (!detail::ablated("posting-bitmaps")) {
+            CUDDL_TRY(index.build_posting_bitmaps(database, stream));
+        }
         return Result<reference_index>::ok(std::move(index));
     }
 

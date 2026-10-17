@@ -398,6 +398,62 @@ json communication(std::span<uint16_t> rows, MPI_Comm comm, int samples) {
     };
 }
 
+/// The all-to-all search of @p rows with the references split into one contiguous chunk per
+/// rank of @p comm instead of replicated: rank r keeps only references [b(r), b(r + 1)) and
+/// searches rows [0, b(r + 1)) against them as batch queries, which covers its pairs
+/// (query < reference) and the lower half of its diagonal block. Boundaries b(r) =
+/// n sqrt(r / P) give every rank the same share of the triangle.
+json chunked_search(
+    std::span<uint16_t const> rows,
+    cuddl::score_compatibility const& compatibility,
+    cuda::stream_ref stream,
+    MPI_Comm comm,
+    int samples,
+    int warmups
+) {
+    int rank = 0, size = 1;
+    mpi_check(MPI_Comm_rank(comm, &rank));
+    mpi_check(MPI_Comm_size(comm, &size));
+    auto const n = rows.size() / buckets;
+    auto const bound = [&](int r) {
+        return static_cast<size_t>(
+            std::llround(static_cast<double>(n) * std::sqrt(double(r) / size))
+        );
+    };
+    auto const first = bound(rank), last = bound(rank + 1);
+    auto queries =
+        cuda::make_device_buffer<uint16_t>(stream, stream.device(), last * buckets, cuda::no_init);
+    cuda::copy_bytes(stream, rows.first(last * buckets), queries);
+    auto const chunk = CUDDL_UNWRAP(
+        database::build_async(
+            std::span<uint16_t const>{queries.data() + first * buckets, (last - first) * buckets},
+            compatibility,
+            stream
+        )
+    );
+    auto const requirements = CUDDL_UNWRAP(chunk.batch_search_requirements(last, stream));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), std::max<size_t>(requirements.workspace_bytes, 1), cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<database::batch_result_type>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    stream.sync();
+    return measure("all_to_all_chunked", samples, warmups, comm, [&] {
+        CUDDL_UNWRAP(chunk.search_batch_async(
+            {queries.data(), last * buckets},
+            compatibility,
+            0,
+            {workspace.data(), workspace.size()},
+            {results.data(), results.size()},
+            [](cuddl::batch_result_tile const&) {},
+            {},
+            stream
+        ));
+        stream.sync();
+    });
+}
+
 /// Runs @p on_tile over the tiles this rank claims with @p split: every pair when
 /// @p minimum_matches is 0, otherwise the pairs with at least that many index matches, filtered
 /// on the GPU.
@@ -470,7 +526,7 @@ int run(int argc, char** argv, ranks const& r) {
     app.add_option("database", database_path, "Database from cuddl-build-reference-db")->required();
     app.add_option("--ranks", rank_counts, "Rank counts to run (default 1, 2, 4, ... all)");
     app.add_option("--consume", consumers, "Tile consumers to time")
-        ->check(CLI::IsMember({"device", "host"}));
+        ->check(CLI::IsMember({"device", "host", "chunked"}));
     app.add_option("--samples", samples)->check(CLI::Range(1, 1000));
     app.add_option("--warmups", warmups)->check(CLI::Range(0, 100));
     app.add_option("--oracle-pairs", oracle_pairs, "Pairs compared with the host scalar oracle")
@@ -631,6 +687,15 @@ int run(int argc, char** argv, ranks const& r) {
                 }
             }
             for (auto const& consumer : consumers) {
+                if (consumer == "chunked") {
+                    auto timing = chunked_search(
+                        searched_rows, source.compatibility, stream, comm, samples, warmups
+                    );
+                    timing["pairs_per_second"] =
+                        static_cast<double>(pairs) / (timing["median_ms"].get<double>() / 1000);
+                    entry[consumer] = timing;
+                    continue;
+                }
                 bool const download = consumer == "host";
                 auto timing = measure(
                     "all_to_all_" + consumer + "_" + std::to_string(count) + "_ranks",
@@ -687,7 +752,8 @@ int run(int argc, char** argv, ranks const& r) {
 
     double index_ms = 0;
     if (!thresholds.empty()) {
-        if (std::ranges::any_of(thresholds, [](uint32_t m) { return m > 0; })) {
+        if (std::ranges::any_of(thresholds, [](uint32_t m) { return m > 0; }) &&
+            !cuddl::detail::ablated("inverted-index")) {
             auto const start = wall_clock::now();
             CUDDL_UNWRAP(group.build_index());
             index_ms = ms_since(start);

@@ -696,8 +696,8 @@ class database_stager {
         auto const grid = std::min(block_end_, max_grid_);
         if (grid != 0) {
             auto const resident = CUDDL_TRY(begin_resident(kernel_stream_));
-            auto launch = [&]<bool Filter>() {
-                add_sequence_batch_kernel<BucketCount, Layout, Filter>
+            auto launch = [&]<bool Filter, bool Naive>() {
+                add_sequence_batch_kernel<BucketCount, Layout, Filter, Filter, Naive>
                     <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
                         descriptors_.data(),
                         copied_chunks_.size(),
@@ -707,10 +707,22 @@ class database_stager {
                         blacklist_.value_or(blacklist_view{})
                     );
             };
-            if (blacklist_) {
-                launch.template operator()<true>();
+            auto const encode = [&]<bool Naive>() {
+                if (blacklist_) {
+                    launch.template operator()<true, Naive>();
+                } else {
+                    launch.template operator()<false, Naive>();
+                }
+            };
+            // Only ablation builds compile the naive encoder.
+            if constexpr (ablations_enabled) {
+                if (ablated("kmer-encoding")) {
+                    encode.template operator()<true>();
+                } else {
+                    encode.template operator()<false>();
+                }
             } else {
-                launch.template operator()<false>();
+                encode.template operator()<false>();
             }
             CUDDL_CUDA_TRY(cudaGetLastError());
             CUDDL_TRY(end_resident(resident, kernel_stream_));

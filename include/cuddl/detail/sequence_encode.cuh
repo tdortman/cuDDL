@@ -38,12 +38,14 @@ __device__ __forceinline__ uint32_t load_shared_relaxed(uint32_t const* address)
 /// @brief Encodes raw ASCII windows into registers using shared overlapping tiles.
 ///
 /// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads reuse
-/// neighboring words to construct eight overlapping windows on both strands.
+/// neighboring words to construct eight overlapping windows on both strands. @p Naive instead
+/// builds every window base by base with a branch per base, for ablation studies only.
 template <
     size_t BucketCount,
     typename Layout,
     bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist>
+    bool UseFloor = HasBlacklist,
+    bool Naive = false>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
     uint32_t windows,
@@ -67,118 +69,177 @@ __device__ __forceinline__ void add_sequence_windows(
     auto const valid_mask = (uint32_t{1} << k) - 1;
     for (size_t tile = first_tile; tile < windows; tile += tile_stride) {
         auto const count = cuda::std::min(tile_size, windows - static_cast<uint32_t>(tile));
-        // Four extra cells cover the k-1 halo, including the last partial cell.
-        auto const padded = (count + 7) / 8 + 4;
-        if (packed_input) {
-            // Two-bit words hold sixteen bases, base j in bits 2j, and no ambiguous base. Tiles
-            // start on a multiple of sixteen bases, so a tile's cells are whole halves of words.
+        if constexpr (Naive) {
+            // The tiled path's cell fill ends with the barrier that orders the zeroing of
+            // @c local before its first update; this path has no fill, so it waits here.
+            __syncthreads();
+            auto const start = threadIdx.x * 8;
             auto const* const words = reinterpret_cast<uint32_t const*>(sequence);
-            auto const total = (static_cast<size_t>(windows) + k - 1 + 7) / 8;
-            for (uint32_t cell = threadIdx.x; cell < padded; cell += blockDim.x) {
-                auto const index = tile / 8 + cell;
-                if (index >= total) {
-                    cells[cell] = missing_cell;
-                    continue;
+            for (uint32_t i = start; i < cuda::std::min(start + 8U, count); ++i) {
+                uint64_t forward = 0, reverse = 0;
+                bool valid = true;
+                for (uint32_t j = 0; valid && j < k; ++j) {
+                    auto const at = tile + i + j;
+                    // Codes as the tiled path assigns them: A 0, C 1, T 2, G 3; complement ^ 2.
+                    uint32_t code = 0;
+                    if (packed_input) {
+                        code = (words[at / 16] >> (2 * (at % 16))) & 3U;
+                    } else {
+                        switch (sequence[at]) {
+                            case 'A':
+                            case 'a':
+                                code = 0;
+                                break;
+                            case 'C':
+                            case 'c':
+                                code = 1;
+                                break;
+                            case 'T':
+                            case 't':
+                                code = 2;
+                                break;
+                            case 'G':
+                            case 'g':
+                                code = 3;
+                                break;
+                            default:
+                                valid = false;
+                        }
+                    }
+                    forward = (forward << 2) | code;
+                    reverse |= uint64_t{code ^ 2U} << (2 * j);
                 }
-                // A cell holds its first base in its highest bits: reverse the codes' order.
-                auto const reversed = __brev((words[index / 2] >> (16 * (index % 2))) << 16);
-                cells[cell] = ((reversed & 0x5555U) << 1) | ((reversed >> 1) & 0x5555U);
+                if (!valid) continue;
+                auto const word = forward > reverse ? forward : reverse;
+                auto const hash = hash_kmer(word);
+                if (static_cast<uint32_t>(hash >> 32) > hash_ceiling) continue;
+                auto const incoming = score<Layout>(hash);
+                auto const bucket = bucket_of<BucketCount>(hash);
+                if (UseFloor && incoming <= floor) continue;
+                if constexpr (HasBlacklist) {
+                    if (incoming > load_shared_relaxed(&local[bucket]) &&
+                        !blacklist.contains(word, bucket)) {
+                        atomicMax(&local[bucket], incoming);
+                    }
+                } else {
+                    atomicMax(&local[bucket], incoming);
+                }
             }
-        }
-        for (uint32_t cell = threadIdx.x; !packed_input && cell < padded; cell += blockDim.x) {
-            auto const pos = cell * 8;
-            uint32_t ascii[2] = {};
-            if ((reinterpret_cast<uintptr_t>(sequence + tile) & 7U) == 0 &&
-                pos + 7 < count + k - 1) {
-                auto const value = *reinterpret_cast<uint2 const*>(sequence + tile + pos);
-                ascii[0] = value.x;
-                ascii[1] = value.y;
-            } else {
+        } else {
+            // Four extra cells cover the k-1 halo, including the last partial cell.
+            auto const padded = (count + 7) / 8 + 4;
+            if (packed_input) {
+                // Two-bit words hold sixteen bases, base j in bits 2j, and no ambiguous base. Tiles
+                // start on a multiple of sixteen bases, so a tile's cells are whole halves of
+                // words.
+                auto const* const words = reinterpret_cast<uint32_t const*>(sequence);
+                auto const total = (static_cast<size_t>(windows) + k - 1 + 7) / 8;
+                for (uint32_t cell = threadIdx.x; cell < padded; cell += blockDim.x) {
+                    auto const index = tile / 8 + cell;
+                    if (index >= total) {
+                        cells[cell] = missing_cell;
+                        continue;
+                    }
+                    // A cell holds its first base in its highest bits: reverse the codes' order.
+                    auto const reversed = __brev((words[index / 2] >> (16 * (index % 2))) << 16);
+                    cells[cell] = ((reversed & 0x5555U) << 1) | ((reversed >> 1) & 0x5555U);
+                }
+            }
+            for (uint32_t cell = threadIdx.x; !packed_input && cell < padded; cell += blockDim.x) {
+                auto const pos = cell * 8;
+                uint32_t ascii[2] = {};
+                if ((reinterpret_cast<uintptr_t>(sequence + tile) & 7U) == 0 &&
+                    pos + 7 < count + k - 1) {
+                    auto const value = *reinterpret_cast<uint2 const*>(sequence + tile + pos);
+                    ascii[0] = value.x;
+                    ascii[1] = value.y;
+                } else {
+                    _Pragma("unroll")
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        auto const byte = pos + j < count + k - 1
+                                              ? static_cast<uint8_t>(sequence[tile + pos + j])
+                                              : uint8_t{0xFF};
+                        ascii[j / 4] |= static_cast<uint32_t>(byte) << (8 * (j % 4));
+                    }
+                }
+                uint32_t packed = 0, bad = 0;
                 _Pragma("unroll")
-                for (uint32_t j = 0; j < 8; ++j) {
-                    auto const byte = pos + j < count + k - 1
-                                          ? static_cast<uint8_t>(sequence[tile + pos + j])
-                                          : uint8_t{0xFF};
-                    ascii[j / 4] |= static_cast<uint32_t>(byte) << (8 * (j % 4));
+                for (uint32_t j = 0; j < 2; ++j) {
+                    // Only the T code differs in ASCII bits 0 and 4.
+                    auto const thymine = (ascii[j] & ~(ascii[j] << 1) & 0x04040404U) >> 2;
+                    auto const normalised = (ascii[j] ^ (thymine * 0x11U)) & 0xD9D9D9D9U;
+                    auto const bad_bytes = __vsetne4(normalised, 0x41414141U);
+                    auto const codes = (ascii[j] >> 1) & 0x03030303U;
+                    // Gather four codes in reverse byte order and four invalid flags in byte order.
+                    packed = __dp4a(codes, 0x01041040U, packed << 8);
+                    bad = __dp4a(bad_bytes, 0x08040201U << (4 * j), bad);
                 }
+                cells[cell] = packed | (bad << 16);
             }
-            uint32_t packed = 0, bad = 0;
-            _Pragma("unroll")
-            for (uint32_t j = 0; j < 2; ++j) {
-                // Only the T code differs in ASCII bits 0 and 4.
-                auto const thymine = (ascii[j] & ~(ascii[j] << 1) & 0x04040404U) >> 2;
-                auto const normalised = (ascii[j] ^ (thymine * 0x11U)) & 0xD9D9D9D9U;
-                auto const bad_bytes = __vsetne4(normalised, 0x41414141U);
-                auto const codes = (ascii[j] >> 1) & 0x03030303U;
-                // Gather four codes in reverse byte order and four invalid flags in byte order.
-                packed = __dp4a(codes, 0x01041040U, packed << 8);
-                bad = __dp4a(bad_bytes, 0x08040201U << (4 * j), bad);
-            }
-            cells[cell] = packed | (bad << 16);
-        }
-        __syncthreads();
-        auto const start = threadIdx.x * 8;
-        if (start < count) {
-            auto const cell = start / 8;
-            auto const a = cells[cell], b = cells[cell + 1];
-            auto const c = cells[cell + 2], d = cells[cell + 3];
-            auto high =
-                (uint64_t{a} << 48) | (uint64_t{b & 0xFFFFU} << 32) | (c << 16) | (d & 0xFFFFU);
-            uint64_t low = 0;
-            auto bad = uint64_t{a >> 16} | (uint64_t{b >> 16} << 8) | (uint64_t{c >> 16} << 16) |
-                       (uint64_t{d >> 16} << 24);
-            if (k > 25) {
-                auto const e = cells[cell + 4];
-                low = uint64_t{e & 0xFFFFU} << 48;
-                bad |= uint64_t{e >> 16} << 32;
-            }
-            // Reverse the span once, then slide both strands across its eight windows.
-            auto reverse_word = [](uint64_t word) {
-                auto const bits = cuda::std::bit_reverse(word);
-                return (((bits & 0xAAAAAAAAAAAAAAAAULL) >> 1) |
-                        ((bits & 0x5555555555555555ULL) << 1)) ^
-                       0xAAAAAAAAAAAAAAAAULL;
-            };
-            auto reverse_high = reverse_word(high);
-            auto reverse_low = reverse_word(low);
-            // An invalid base in the common overlap excludes all eight windows.
-            auto const end = (bad & valid_mask & ~uint64_t{0x7F}) == 0
-                                 ? cuda::std::min(8U, count - start)
-                                 : 0U;
-            _Pragma("unroll")
-            for (uint32_t i = 0; i < end; ++i) {
-                if ((bad & valid_mask) == 0) {
-                    auto const forward = high >> (64 - 2 * k);
-                    auto const reverse = reverse_high & mask;
-                    auto const word = forward > reverse ? forward : reverse;
-                    auto const hash = hash_kmer(word);
-                    if (static_cast<uint32_t>(hash >> 32) <= hash_ceiling) {
-                        auto const incoming = score<Layout>(hash);
-                        auto const bucket = bucket_of<BucketCount>(hash);
-                        if (!UseFloor || incoming > floor) {
-                            // Look up only scores that can still raise the CTA's register.
-                            if constexpr (HasBlacklist) {
-                                auto const current = load_shared_relaxed(&local[bucket]);
-                                if (incoming > current && !blacklist.contains(word, bucket)) {
+            __syncthreads();
+            auto const start = threadIdx.x * 8;
+            if (start < count) {
+                auto const cell = start / 8;
+                auto const a = cells[cell], b = cells[cell + 1];
+                auto const c = cells[cell + 2], d = cells[cell + 3];
+                auto high =
+                    (uint64_t{a} << 48) | (uint64_t{b & 0xFFFFU} << 32) | (c << 16) | (d & 0xFFFFU);
+                uint64_t low = 0;
+                auto bad = uint64_t{a >> 16} | (uint64_t{b >> 16} << 8) |
+                           (uint64_t{c >> 16} << 16) | (uint64_t{d >> 16} << 24);
+                if (k > 25) {
+                    auto const e = cells[cell + 4];
+                    low = uint64_t{e & 0xFFFFU} << 48;
+                    bad |= uint64_t{e >> 16} << 32;
+                }
+                // Reverse the span once, then slide both strands across its eight windows.
+                auto reverse_word = [](uint64_t word) {
+                    auto const bits = cuda::std::bit_reverse(word);
+                    return (((bits & 0xAAAAAAAAAAAAAAAAULL) >> 1) |
+                            ((bits & 0x5555555555555555ULL) << 1)) ^
+                           0xAAAAAAAAAAAAAAAAULL;
+                };
+                auto reverse_high = reverse_word(high);
+                auto reverse_low = reverse_word(low);
+                // An invalid base in the common overlap excludes all eight windows.
+                auto const end = (bad & valid_mask & ~uint64_t{0x7F}) == 0
+                                     ? cuda::std::min(8U, count - start)
+                                     : 0U;
+                _Pragma("unroll")
+                for (uint32_t i = 0; i < end; ++i) {
+                    if ((bad & valid_mask) == 0) {
+                        auto const forward = high >> (64 - 2 * k);
+                        auto const reverse = reverse_high & mask;
+                        auto const word = forward > reverse ? forward : reverse;
+                        auto const hash = hash_kmer(word);
+                        if (static_cast<uint32_t>(hash >> 32) <= hash_ceiling) {
+                            auto const incoming = score<Layout>(hash);
+                            auto const bucket = bucket_of<BucketCount>(hash);
+                            if (!UseFloor || incoming > floor) {
+                                // Look up only scores that can still raise the CTA's register.
+                                if constexpr (HasBlacklist) {
+                                    auto const current = load_shared_relaxed(&local[bucket]);
+                                    if (incoming > current && !blacklist.contains(word, bucket)) {
+                                        atomicMax(&local[bucket], incoming);
+                                    }
+                                } else {
                                     atomicMax(&local[bucket], incoming);
                                 }
-                            } else {
-                                atomicMax(&local[bucket], incoming);
                             }
                         }
                     }
+                    // Eight overlapping windows fit in one 32-base word when k <= 25.
+                    if (k <= 25) {
+                        high <<= 2;
+                        reverse_high >>= 2;
+                    } else {
+                        high = (high << 2) | (low >> 62);
+                        low <<= 2;
+                        reverse_high = (reverse_high >> 2) | (reverse_low << 62);
+                        reverse_low >>= 2;
+                    }
+                    bad >>= 1;
                 }
-                // Eight overlapping windows fit in one 32-base word when k <= 25.
-                if (k <= 25) {
-                    high <<= 2;
-                    reverse_high >>= 2;
-                } else {
-                    high = (high << 2) | (low >> 62);
-                    low <<= 2;
-                    reverse_high = (reverse_high >> 2) | (reverse_low << 62);
-                    reverse_low >>= 2;
-                }
-                bad >>= 1;
             }
         }
         __syncthreads();
@@ -210,16 +271,20 @@ __device__ __forceinline__ void add_sequence_windows(
                 // Each thread owns its buckets here, so the merged value feeds the floor directly.
                 for (uint32_t b = threadIdx.x; b < BucketCount; b += blockDim.x) {
                     auto const value = local[b];
-                    auto global = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{registers[b]}
-                                      .load(cuda::memory_order_relaxed);
-                    if (value > global) global = cuda::std::max(value, atomicMax(&registers[b], value));
+                    auto global =
+                        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{registers[b]}.load(
+                            cuda::memory_order_relaxed
+                        );
+                    if (value > global)
+                        global = cuda::std::max(value, atomicMax(&registers[b], value));
                     local[b] = global;
                     minimum = cuda::std::min(minimum, global);
                 }
                 auto const result = reduce(exchange_scratch).Reduce(minimum, cuda::minimum<>{});
                 if (threadIdx.x == 0) {
                     // An inclusive high-word cutoff admits ties for exact per-bucket pruning.
-                    exchange_ceiling = result == 0 ? UINT32_MAX : uint32_t(restore<Layout>(result) >> 32);
+                    exchange_ceiling =
+                        result == 0 ? UINT32_MAX : uint32_t(restore<Layout>(result) >> 32);
                 }
                 __syncthreads();
                 hash_ceiling = exchange_ceiling;
@@ -279,7 +344,8 @@ template <
     size_t BucketCount,
     typename Layout,
     bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist>
+    bool UseFloor = HasBlacklist,
+    bool Naive = false>
 __global__ void add_sequence_batch_kernel(
     sequence_batch_chunk const* chunks,
     size_t chunk_count,
@@ -306,7 +372,7 @@ __global__ void add_sequence_batch_kernel(
         }
         __syncthreads();
         auto* target = registers + size_t{chunk.genome} * BucketCount;
-        add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
+        add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor, Naive>(
             chunk.bases,
             chunk.windows,
             (block - first_block) * 2048,

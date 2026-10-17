@@ -23,7 +23,9 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -2408,6 +2410,27 @@ class reference_database_view {
         return cuda_try(cudaGetLastError());
     }
 
+    /// @brief Row-major scores of every reference, decoded from the bit-planes on first use and
+    /// kept for the life of the process, for the ablation kernels of @ref launch_all_pairs.
+    [[nodiscard]] Result<uint16_t const*> row_major_rows(cuda::stream_ref stream) const {
+        static std::mutex mutex;
+        // Never freed: the buffers would outlive the CUDA context at exit.
+        static auto* const decoded = new std::map<uint32_t const*, uint16_t*>();
+        std::lock_guard lock(mutex);
+        auto& rows = (*decoded)[planes_.data()];
+        if (rows == nullptr) {
+            auto const count = metadata_.reference_count;
+            CUDDL_CUDA_TRY(cudaMalloc(&rows, static_cast<size_t>(count) * BucketCount * 2U));
+            detail::decode_score_planes_kernel<BucketCount>
+                <<<detail::warp_grid_blocks(static_cast<size_t>(count) * (BucketCount / 32U)),
+                   detail::block_size,
+                   0,
+                   stream.get()>>>(planes_.data(), count, rows);
+            CUDDL_CUDA_TRY(cudaGetLastError());
+        }
+        return Result<uint16_t const*>::ok(rows);
+    }
+
     /// @brief Exactly compares the tile's pairs selected by @p reference_mask; a null mask selects
     /// every reference. See detail::refine_all_pairs_kernel. With @p cell_counter, a zeroed word,
     /// blocks claim cells dynamically.
@@ -2421,6 +2444,34 @@ class reference_database_view {
         uint32_t* cell_counter,
         uint32_t const* reference_mask
     ) const {
+        if constexpr (detail::ablations_enabled) {
+            bool const naive = detail::ablated("lop3-kernel");
+            if (naive || detail::ablated("bit-slicing")) {
+                auto const* rows = CUDDL_TRY(row_major_rows(stream));
+                auto const kernel = naive ? detail::row_major_all_pairs_kernel<
+                                                BucketCount,
+                                                batch_result_type,
+                                                UpperTriangle,
+                                                false>
+                                          : detail::row_major_all_pairs_kernel<
+                                                BucketCount,
+                                                batch_result_type,
+                                                UpperTriangle,
+                                                true>;
+                auto const multiprocessors = static_cast<uint32_t>(
+                    stream.device().attribute(cuda::device_attributes::multiprocessor_count)
+                );
+                kernel<<<multiprocessors * 8U, detail::block_size, 0, stream.get()>>>(
+                    rows,
+                    query_id_offset,
+                    query_count,
+                    metadata_.reference_count,
+                    results.data(),
+                    reference_mask
+                );
+                return cuda_try(cudaGetLastError());
+            }
+        }
         constexpr auto group = detail::bitmap_refine_group<BucketCount>;
         constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
         auto const kernel =
@@ -2611,34 +2662,38 @@ class reference_database_view {
             // A low-plane bound selects candidates; the refinement counts their matches exactly
             // and keeps, in the same bitmap, those meeting the threshold.
             if constexpr (detail::match_filter_supported<BucketCount>) {
-                CUDDL_CUDA_TRY(cudaMemsetAsync(match_counts, 0, sizeof(uint32_t), stream.get()));
-                CUDDL_TRY((launch_match_filter<AllToAll>(
-                    query_planes,
-                    query_id_offset,
-                    query_count,
-                    indexed_bucket_count,
-                    options.minimum_matches,
-                    candidate_bits,
-                    match_counts,
-                    stream
-                )));
-                CUDDL_TRY(refine_selected(true));
-            } else {
-                // Every passing pair's summary lands at its slot as the pass bitmap is written.
-                CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
-                    query_planes,
-                    query_id_offset,
-                    query_count,
-                    indexed_bucket_count,
-                    key_mask,
-                    nullptr,
-                    results,
-                    result_match_counts,
-                    stream,
-                    options.minimum_matches,
-                    candidate_bits
-                )));
+                if (!detail::ablated("match-filter")) {
+                    CUDDL_CUDA_TRY(
+                        cudaMemsetAsync(match_counts, 0, sizeof(uint32_t), stream.get())
+                    );
+                    CUDDL_TRY((launch_match_filter<AllToAll>(
+                        query_planes,
+                        query_id_offset,
+                        query_count,
+                        indexed_bucket_count,
+                        options.minimum_matches,
+                        candidate_bits,
+                        match_counts,
+                        stream
+                    )));
+                    CUDDL_TRY(refine_selected(true));
+                    return result_tile;
+                }
             }
+            // Every passing pair's summary lands at its slot as the pass bitmap is written.
+            CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
+                query_planes,
+                query_id_offset,
+                query_count,
+                indexed_bucket_count,
+                key_mask,
+                nullptr,
+                results,
+                result_match_counts,
+                stream,
+                options.minimum_matches,
+                candidate_bits
+            )));
             return result_tile;
         }
 
@@ -2957,9 +3012,13 @@ class reference_database {
             CUDDL_CUDA_TRY(cudaGetLastError());
             // Rows are compared as base references plus changed buckets; see
             // detail::reference_delta_view. Building it waits for the stream.
-            database.deltas_ = CUDDL_TRY(
-                detail::build_reference_deltas<BucketCount>(rows.data(), reference_count, stream)
-            );
+            if (!detail::ablated("deltas")) {
+                database.deltas_ = CUDDL_TRY(
+                    detail::build_reference_deltas<BucketCount>(
+                        rows.data(), reference_count, stream
+                    )
+                );
+            }
         }
         return Result<reference_database>::ok(std::move(database));
     }
@@ -3264,7 +3323,7 @@ class reference_database {
             index->indexed_,
             index->index_keys_,
             index->key_directory_,
-            index->pair_fraction_,
+            detail::ablated("index-fallback") ? 0.0 : index->pair_fraction_,
             {index->bitmap_cells_.data(), index->bitmap_count_},
             index->posting_bitmaps_,
             delta_view()

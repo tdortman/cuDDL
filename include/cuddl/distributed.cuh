@@ -378,14 +378,16 @@ class shared_tile_counter {
             );
             // Probing a communicator nobody sends on runs MPI's progress engine, which
             // completes the claims other ranks have in flight.
-            state->progress =
-                std::jthread([comm = state->progress_comm](const std::stop_token& stop) {
-                    while (!stop.stop_requested()) {
-                        int flag = 0;
-                        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, comm, &flag, MPI_STATUS_IGNORE);
-                        std::this_thread::yield();
-                    }
-                });
+            if (!detail::ablated("progress-thread")) {
+                state->progress =
+                    std::jthread([comm = state->progress_comm](const std::stop_token& stop) {
+                        while (!stop.stop_requested()) {
+                            int flag = 0;
+                            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, comm, &flag, MPI_STATUS_IGNORE);
+                            std::this_thread::yield();
+                        }
+                    });
+            }
         }
         CUDDL_TRY(detail::mpi_try(MPI_Barrier(comm), "MPI_Barrier"));
         shared_tile_counter counter;
@@ -467,7 +469,8 @@ template <typename Search>
     return search(
         replica_search{
             .shard = {.index = static_cast<uint32_t>(rank), .count = static_cast<uint32_t>(size)},
-            .next_tile = [&counter] { return counter(); },
+            .next_tile = detail::ablated("tile-queue") ? std::function<uint64_t()>{}
+                                                       : [&counter] { return counter(); },
         }
     );
 }

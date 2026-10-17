@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <cuddl/cuda_error.hpp>
+#include <cuddl/detail/ablation.hpp>
 
 namespace cuddl::detail {
 
@@ -42,10 +43,14 @@ device_pinned_pool(cuda::device_ref device, pinned_placement placement) {
     std::lock_guard lock(mutex);
     auto& pool = pools.at(static_cast<size_t>(device.get()))[static_cast<size_t>(placement)];
     if (pool == nullptr) {
+        // Ablated, the pool behaves like CCCL's default pinned pool: mapped into every visible
+        // device and returning freed pages to the OS at every synchronisation. numa-pool
+        // separately puts device_node pages on any node.
+        bool const ablate = ablated("pinned-pool");
         int node = -1;
         CUDDL_CUDA_CALL(cudaDeviceGetAttribute(&node, cudaDevAttrHostNumaId, device.get()));
         bool const numa =
-            placement == pinned_placement::device_node && node >= 0 &&
+            !ablated("numa-pool") && placement == pinned_placement::device_node && node >= 0 &&
             device.attribute(cuda::device_attributes::host_numa_memory_pools_supported) != 0;
         cudaMemPoolProps properties{};
         properties.allocType = cudaMemAllocationTypePinned;
@@ -57,10 +62,18 @@ device_pinned_pool(cuda::device_ref device, pinned_placement placement) {
             {cudaMemLocationTypeDevice, device.get()}, cudaMemAccessFlagsProtReadWrite
         };
         CUDDL_CUDA_CALL(cudaMemPoolSetAccess(created, &access, 1));
+        if (ablate) {
+            for (auto const& other : cuda::devices) {
+                cudaMemAccessDesc const shared{
+                    {cudaMemLocationTypeDevice, other.get()}, cudaMemAccessFlagsProtReadWrite
+                };
+                CUDDL_CUDA_CALL(cudaMemPoolSetAccess(created, &shared, 1));
+            }
+        }
         // Pinning is the expensive part of an allocation: with the default threshold of zero,
         // every synchronisation returns freed pages to the OS and the next allocation pins them
         // again, which cost sketch loaders more time than inflating their files.
-        auto keep = std::numeric_limits<uint64_t>::max();
+        auto keep = ablate ? uint64_t{0} : std::numeric_limits<uint64_t>::max();
         CUDDL_CUDA_CALL(cudaMemPoolSetAttribute(created, cudaMemPoolAttrReleaseThreshold, &keep));
         pool = created;
     }

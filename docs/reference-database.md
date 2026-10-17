@@ -674,3 +674,34 @@ The limit differs by machine, so profile before tuning:
 - **MOGON A100 nodes, Lustre:** the latency of opening and probing many files. Deeper probing took 20,000 uncached genomes from 13.8–18.6 s to 9.7–11.5 s with `gpu` and 16 loaders, and from 14.1–15.4 s to 9.8–10.6 s with 64. `cpu` stayed within noise. cuFile read small files as fast as POSIX with half the CPU time, but no faster.
 - **B300:** the SM batches of large gzip files, as described under the decompression engine.
 
+## Measure what each optimisation contributes
+
+Configure a separate build with `-Dablations=true` to compile in switches that turn optimisations off. The `CUDDL_ABLATE` environment variable then takes a comma-separated list of them. `include/cuddl/detail/ablation.hpp` lists every switch and what it turns off; an unknown name aborts the process. Results stay the same with any switch. Without the option, the switches are compile-time constants and the alternative code paths are not compiled at all, so normal builds pay nothing for them.
+
+```sh
+nix develop -c meson setup build-ablation -Dablations=true
+CUDDL_ABLATE=deltas,tile-queue build-ablation/benchmarks/cuddl-multi-gpu-all-to-all-benchmark db.cuddl
+```
+
+Some optimisations replace a whole stage, so their switch runs a simpler stand-in:
+
+- `bit-slicing` compares row-major 16-bit scores, two buckets per 32-bit subtraction from 256-bit loads, instead of bit-planes.
+- `lop3-kernel` compares row-major scores one bucket per lane step.
+- `kmer-encoding` builds every k-mer base by base with a branch per base, instead of eight windows per thread from shared two-bit tiles.
+- `--consume chunked` in `cuddl-multi-gpu-all-to-all-benchmark` splits the references into one contiguous chunk per rank instead of replicating them.
+
+Unpatched libdeflate needs its own build, from a source tree whose `subprojects/libdeflate` has the patch reverted. `scripts/ablation_builds.sh JOBS [MESON OPTIONS...]` sets up both under `build/ablation`: `main-build` from this tree and `stock-build` from such a copy.
+
+`scripts/ablation.py` measures every optimisation twice: on the stage it targets and end to end.
+
+- `micro` runs `cuddl-ablation-micro-benchmark` on one thread: libdeflate inflation, FASTX loading, base packing and pinned allocation.
+- `build` times `cuddl-build-reference-db`. For the k-mer encoder it compares the sketch kernels' GPU time.
+- `search` times `cuddl-multi-gpu-all-to-all-benchmark` on a resident database.
+- `e2e` times `cuddl-distributed-all-to-all-benchmark`, from genome files to written results.
+
+Each configuration runs next to the one it is compared with, interleaved over repetitions. `scripts/plot_ablation.py` takes the JSON lines, prints every slowdown as a table, and draws a figure one ACM column wide, set in Linux Libertine like `acmart`. A stage panel and an end-to-end panel share one row per optimisation, ranked by the end-to-end slowdown, with one labelled marker per machine on linear axes. Stage slowdowns past `--stage-cap` (12×) sit at the edge as an arrow. `--minimum` (1.1) drops optimisations, and machines, that change no time by that factor either way. Optimisations that only the end-to-end run can turn off get their stage slowdown from the phase they target, such as the time spent writing results.
+
+Two drivers run the whole study:
+
+- `scripts/ablation_gh200.sh GENOMES` runs every suite on one GH200 over a whole collection, with a 1,000-genome hashed sample for the micro suite. Ablations that need several ranks or GPUs are left out.
+- `scripts/ablation_mogon.sh` runs on MOGON A40 nodes. `SUITES` picks the steps (`compile micro build search e2e`), so the study fits in several jobs of `ki-gpu-devel`'s two hours: `compile micro build` on one GPU, then `search` and `e2e` on two 8-GPU nodes with `-d afterok:` on the first.

@@ -175,6 +175,7 @@ using fastx_line_end_fn = decltype(&fastx_line_end_scalar);
 
 /// @brief Selects the fastest line-end scanner the host supports.
 [[nodiscard]] inline fastx_line_end_fn resolve_fastx_line_end() {
+    if (ablated("simd-parsing")) return fastx_line_end_scalar;
 #if defined(__ARM_FEATURE_SVE)
     return fastx_line_end_sve;
 #elif defined(__aarch64__) || defined(_M_ARM64)
@@ -676,6 +677,7 @@ struct bases_packer {
 
 /// @brief Selects the widest base packer the host supports.
 [[nodiscard]] inline bases_packer resolve_bases_packer() {
+    if (ablated("simd-parsing")) return {pack_bases_portable, 16};
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     if (__builtin_cpu_supports("avx512bw")) return {pack_bases_avx512, 64};
     if (__builtin_cpu_supports("avx2")) return {pack_bases_avx2, 32};
@@ -1083,9 +1085,12 @@ compact_sequence_whitespace_avx2(char const* first, char const* last, char* out)
 }
 #endif
 
+static bool const simd_compaction = !ablated("simd-parsing");
+
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-static bool const compact_avx512 =
-    __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi2");
+static bool const compact_avx512 = simd_compaction && __builtin_cpu_supports("avx512bw") &&
+                                   __builtin_cpu_supports("avx512vbmi2");
+static bool const compact_avx2 = simd_compaction && __builtin_cpu_supports("avx2");
 
 __attribute__((target("avx512f,avx512bw,avx512vbmi2,popcnt"))) inline char*
 compact_sequence_whitespace_avx512(char const* first, char const* last, char* out) {
@@ -1117,12 +1122,12 @@ compact_sequence_whitespace_avx512(char const* first, char const* last, char* ou
 ///
 /// @return The end of the written span.
 inline char* compact_sequence_whitespace(char const* first, char const* last, char* out) {
-    if (static_cast<size_t>(last - first) >= 64) {
+    if (static_cast<size_t>(last - first) >= 64 && simd_compaction) {
 #if defined(__ARM_NEON)
         return compact_sequence_whitespace_neon(first, last, out);
 #elif defined(__x86_64__) || defined(__i386__)
         if (compact_avx512) return compact_sequence_whitespace_avx512(first, last, out);
-        if (__builtin_cpu_supports("avx2")) {
+        if (compact_avx2) {
             return compact_sequence_whitespace_avx2(first, last, out);
         }
 #endif
@@ -1299,10 +1304,10 @@ inline char*
 fasta_sequence_compact(char const* first, char const* last, char* out, char const*& stop) {
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     if (compact_avx512) return fasta_sequence_compact_avx512(first, last, out, stop);
-    if (__builtin_cpu_supports("avx2")) return fasta_sequence_compact_avx2(first, last, out, stop);
+    if (compact_avx2) return fasta_sequence_compact_avx2(first, last, out, stop);
 #endif
 #if defined(__ARM_NEON)
-    return fasta_sequence_compact_neon(first, last, out, stop);
+    if (simd_compaction) return fasta_sequence_compact_neon(first, last, out, stop);
 #endif
     stop = fasta_next_header(first, last);
     return compact_sequence_whitespace(first, stop, out);

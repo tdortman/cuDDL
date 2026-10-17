@@ -314,6 +314,7 @@ struct tile_claims {
     /// it before each search.
     cuddl::replica_search next() {
         CUDDL_UNWRAP(counter.reset());
+        if (cuddl::detail::ablated("tile-queue")) return {.shard = shard};
         return {.shard = shard, .next_tile = [this] { return counter(); }};
     }
 };

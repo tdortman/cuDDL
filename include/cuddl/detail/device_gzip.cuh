@@ -303,6 +303,7 @@ inline bool has_gzip_signature_neon(char const* data, size_t size) {
 
 /// @brief Selects the widest signature scanner the host supports.
 [[nodiscard]] inline auto resolve_gzip_signature_scanner() -> bool (*)(char const*, size_t) {
+    if (ablated("simd-parsing")) return has_gzip_signature_portable;
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     if (__builtin_cpu_supports("avx512bw")) return has_gzip_signature_avx512;
     if (__builtin_cpu_supports("avx2")) return has_gzip_signature_avx2;

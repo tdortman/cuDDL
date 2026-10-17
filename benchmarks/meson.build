@@ -165,6 +165,16 @@ executable(
     install: false,
 )
 
+# Stage micro-benchmarks for scripts/ablation.py: host inflation, parsing, packing and pinned
+# allocation, each alone.
+executable(
+    'cuddl-ablation-micro-benchmark',
+    'cuddl_ablation_micro_benchmark.cu',
+    dependencies: [cuddl_dep, nvbench_dep, nvbench_main],
+    cuda_args: cuda_args,
+    install: false,
+)
+
 # Measures launch overhead and bounded-output indexed selection on resident inputs.
 executable(
     'cuddl-search-overhead-benchmark',

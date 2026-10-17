@@ -153,7 +153,9 @@ int run(int argc, char** argv, ranks const& r) {
     meter.run("build", [&] {
         group.emplace(CUDDL_UNWRAP(group_type::upload(*gathered, std::array{device})));
     });
-    if (minimum_matches > 0) meter.run("index", [&] { CUDDL_UNWRAP(group->build_index()); });
+    if (minimum_matches > 0 && !cuddl::detail::ablated("inverted-index")) {
+        meter.run("index", [&] { CUDDL_UNWRAP(group->build_index()); });
+    }
 
     auto const path = fs::path(output_dir) / ("rank-" + std::to_string(r.rank) + ".bin");
     uint64_t pairs = 0;
