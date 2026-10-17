@@ -274,7 +274,10 @@ def main(
         # Where each tool's energy goes over a whole run: sketching every genome, then
         # comparing every pair, each split into CPU packages and GPUs. A tool whose sketch and
         # compare rows carry different variants (cuDDL's reference-db and gpu) has one of each;
-        # HyperGen's cpu and gpu runs pair by variant.
+        # a tool with several sketch rows pairs them by variant. A tool that compared only a
+        # budget subset of the pairs (cub-exact) did not run the whole pipeline and is left out.
+        every_pair = max((row["units"] or 0 for row in compare), default=0)
+
         def breakdown_panel(prefix: str, title: str, stem: str) -> None:
             def joules(row: dict, source: str) -> float:
                 # Shares just below zero above idle are idle noise, not energy spent.
@@ -282,7 +285,7 @@ def main(
 
             runs = []
             for row in compare:
-                if f"{prefix}_cpu_j" not in row["metrics"]:
+                if f"{prefix}_cpu_j" not in row["metrics"] or row["units"] != every_pair:
                     continue
                 own = [s for s in sketch if s["tool"] == row["tool"]]
                 if len(own) > 1:
