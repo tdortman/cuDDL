@@ -37,7 +37,7 @@ LABELS = {
 
 def main(
     logs: Annotated[list[Path], typer.Argument(exists=True, dir_okay=False)],
-    title: Annotated[str, typer.Option(help="Figure title")] = "B300, 10,000 genomes",
+    title: Annotated[str, typer.Option(help="Figure title")] = "B300, 100,000 genomes",
     names: Annotated[
         list[str],
         typer.Option("--name", help="Legend name for an input, as INPUT=NAME"),
