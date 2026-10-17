@@ -216,6 +216,24 @@ def main(
             "streamed ingestion differs from packed-input construction"
         )
         typer.echo("PASS streamed sequence ingestion")
+        # All-to-all tiles also answer mirrored pairs; the resident search must retain only the
+        # upper triangle, or a mirrored row overwrites an earlier query's pair. With 48
+        # references the two writes land in different warps, so the overwrite shows reliably.
+        triangle = root / "streamed-all-to-all.json"
+        triangle_command = [str(binary.resolve())]
+        for _ in range(16):
+            for name in ("genome", "partial", "repeats"):
+                triangle_command.extend(("--reference", str(paths[name])))
+        # The CLI requires queries even though all-to-all compares only the references.
+        triangle_command.extend(("--query", str(paths["reverse"])))
+        triangle_command.extend(command[command.index("--ingest") :])
+        triangle_command[triangle_command.index("--topology") + 1] = "all-to-all"
+        triangle_command[triangle_command.index("--minimum-matches") + 1] = "0"
+        triangle_command[triangle_command.index("--output") + 1] = str(triangle)
+        subprocess.run(triangle_command, check=True)
+        triangle_pipeline = load_result(triangle, "pipeline")["measurements"][0]
+        assert triangle_pipeline["metrics"]["oracle_passed"]
+        typer.echo("PASS streamed all-to-all keeps the upper triangle")
         automatic = root / "streamed-auto.json"
         command[command.index("--resident-bytes") + 1] = "0"
         command[command.index("--output") + 1] = str(automatic)

@@ -955,6 +955,9 @@ json resident_timings(
                     auto const qid =
                         tile.first_query_id + static_cast<uint32_t>(i / tile.reference_count);
                     auto const rid = static_cast<uint32_t>(i % tile.reference_count);
+                    // All-to-all tiles also answer mirrored pairs, whose upper-triangle position
+                    // would fall in an earlier query's row.
+                    if (all && rid <= qid) return;
                     if (auto const row = tile.find(qid, rid)) {
                         auto const position =
                             all ? size_t{qid} * (2 * n - qid - 1) / 2 + rid - qid - 1
