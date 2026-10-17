@@ -704,4 +704,4 @@ Each configuration runs next to the one it is compared with, interleaved over re
 Two drivers run the whole study:
 
 - `scripts/ablation_gh200.sh GENOMES` runs every suite on one GH200 over a whole collection, with a 1,000-genome hashed sample for the micro suite. Ablations that need several ranks or GPUs are left out.
-- `scripts/ablation_mogon.sh` runs on MOGON A40 nodes. `SUITES` picks the steps (`compile micro build search e2e`), so the study fits in several jobs of `ki-gpu-devel`'s two hours: `compile micro build` on one GPU, then `search` and `e2e` on two 8-GPU nodes with `-d afterok:` on the first.
+- `scripts/ablation_mogon.sh` runs on whole MOGON GPU nodes. It builds the variants for the node's GPU and labels the results with its model. `SUITES` picks the steps (`compile micro build search e2e`): on `a100ai` one two-node job runs them all, and in `ki-gpu-devel`'s two hours they split into `compile micro build` on one GPU, then `search` and `e2e` on two nodes with `-d afterok:` on the first. Run one rank per usable GPU: 8 on an A40 node, 7 on an A100 node, where GPU 0 is in MIG mode without instances.

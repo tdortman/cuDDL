@@ -1,6 +1,6 @@
 #!/bin/bash
-# Ablation study on MOGON A40 nodes. SUITES (default: all) picks the steps, so the study fits
-# ki-gpu-devel's two hours as several jobs:
+# Ablation study on whole MOGON GPU nodes. SUITES (default: all) picks the steps, so the study can
+# also run as several jobs within ki-gpu-devel's two hours:
 #   compile  builds the ablation variants through scripts/ablation_builds.sh;
 #   micro, build, search, e2e  run that suite of scripts/ablation.py.
 # Each job writes results/ablation-mogon-<job>.jsonl. Submit from the project root.
@@ -13,13 +13,15 @@ S=/localscratch/$SLURM_JOB_ID
 nodes=$SLURM_JOB_NUM_NODES
 ranks=$SLURM_NTASKS
 out=results/ablation-mogon-$SLURM_JOB_ID.jsonl
-label="MOGON A40"
+# The variants are built for this node's GPU, and the results carry its model.
+cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 | tr -d .)
+label="MOGON $(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | grep -oiE 'a[0-9]+')"
 suites=" ${SUITES:-compile micro build search e2e} "
 want() { [[ $suites == *" $1 "* ]]; }
 if want compile; then
   scripts/ablation_builds.sh "$SLURM_CPUS_ON_NODE" -Dwrap_mode=default -Dnvcomp=enabled \
     -Drapids_cmake_source=/home/tdortman/cpm-deps/rapids-cmake-src -Ddriver_library_dir=/usr/lib64 \
-    "-Dcuda_args=-gencode=arch=compute_86,code=sm_86"
+    "-Dcuda_args=-gencode=arch=compute_$cc,code=sm_$cc"
 fi
 
 [ -d $mgpu/genomes-1k-sample ] ||
