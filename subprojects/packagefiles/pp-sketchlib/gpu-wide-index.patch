@@ -1,0 +1,15 @@
+diff --git a/src/gpu/dist.cu b/src/gpu/dist.cu
+index 83578b0..e26bd36 100644
+--- a/src/gpu/dist.cu
++++ b/src/gpu/dist.cu
+@@ -177,7 +177,9 @@ __global__ void calculate_dists(
+     progress_ptrs progress, const bool use_shared,
+     const int dist_col, const bool max_diagonal) {
+   // Calculate indices for query, ref and results
+-  int ref_idx, query_idx, dist_idx;
++  int ref_idx, query_idx;
++  // All pairs of 100,000 genomes, 5e9, overflow an int.
++  long long dist_idx;
+   if (self) {
+     // Blocks have the same i -- calculate blocks needed by each row up
+     // to this point (blockIdx.x)
