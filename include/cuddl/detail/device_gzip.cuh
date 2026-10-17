@@ -28,8 +28,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cub/block/block_reduce.cuh>
 #include <cub/device/device_copy.cuh>
-#include <cub/device/device_segmented_reduce.cuh>
 #include <cub/device/device_select.cuh>
 #include <cuda/algorithm>
 #include <cuda/buffer>
@@ -332,12 +332,6 @@ struct kept_byte {
     }
 };
 
-struct kept_byte_count {
-    __device__ unsigned long long operator()(char c) const {
-        return kept_byte{}(c);
-    }
-};
-
 /// @brief a * b modulo the CRC-32 polynomial, bit-reflected (zlib's multmodp).
 __device__ inline uint32_t crc_multiply(uint32_t a, uint32_t b) {
     uint32_t m = 1U << 31U, p = 0;
@@ -469,6 +463,21 @@ static __global__ void header_kernel(
     }
 }
 
+/// @brief The last of @p files slots that starts at or before @p position.
+__device__ __forceinline__ uint32_t
+slot_containing(uint64_t const* slots, uint32_t files, uint64_t position) {
+    uint32_t low = 0, high = files;
+    while (high - low > 1) {
+        auto const middle = (low + high) / 2;
+        if (slots[middle] <= position) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
 /// @brief Blanks each header's text to line endings, keeping its '>' between records, and
 /// records each file's first header. One warp per header.
 static __global__ void blank_header_kernel(
@@ -486,15 +495,7 @@ static __global__ void blank_header_kernel(
     for (uint64_t h = (blockIdx.x * uint64_t{blockDim.x} + threadIdx.x) / 32U; h < total;
          h += warps) {
         auto const position = headers[h];
-        uint32_t low = 0, high = files;  // last slot starting at or before the header
-        while (high - low > 1) {
-            auto const middle = (low + high) / 2;
-            if (slots[middle] <= position) {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
+        auto const low = slot_containing(slots, files, position);
         if (lane == 0) atomicMin(first_header + low, static_cast<unsigned long long>(position));
         auto const end = slots[low + 1];
         for (uint64_t at = position + 1; at < end; at += 32) {
@@ -505,6 +506,89 @@ static __global__ void blank_header_kernel(
             if (lane < stop) buffer[index] = '\n';
             if (stops != 0) break;
         }
+    }
+}
+
+/// @brief How many of @p word's bytes [first, last) kept_byte keeps.
+__device__ __forceinline__ uint32_t kept_in_word(uint64_t word, uint32_t first, uint32_t last) {
+    constexpr uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL, ones = 0x0101010101010101ULL;
+    // The high bit of every zero byte of x, exactly: the addition carries within bytes only.
+    auto const zero_bytes = [](uint64_t x) {
+        return ~(((x & low7) + low7) | x | low7);
+    };
+    auto const blank = zero_bytes(word ^ (ones * '\n')) | zero_bytes(word ^ (ones * '\r')) |
+                       zero_bytes(word ^ (ones * ' ')) | zero_bytes(word ^ (ones * '\t'));
+    auto const width = last - first;
+    auto const span = (width == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * width)) - 1) << (8 * first);
+    return static_cast<uint32_t>(__popcll(~blank & span & ~low7));
+}
+
+/// @brief Bytes a tile of kept_count_kernel covers: 8 aligned 16-byte loads per thread.
+inline constexpr uint64_t kept_tile = uint64_t{block_size} * 16 * 8;
+
+/// @brief Adds the bytes kept_byte keeps in slot f, [slots[f], slots[f + 1]), to kept[f], which
+/// starts zeroed. Blocks take whole tiles, so every SM works however few files a batch holds; a
+/// tile inside one slot adds its block's sum with one atomic, and the few that straddle slots
+/// add per word, splitting only the words that straddle too. Reads up to 15 bytes past
+/// slots[files].
+static __global__ void kept_count_kernel(
+    char const* buffer,
+    uint64_t const* slots,
+    uint32_t files,
+    unsigned long long* kept
+) {
+    using block_reduce = cub::BlockReduce<uint32_t, block_size>;
+    __shared__ typename block_reduce::TempStorage reduce_storage;
+    __shared__ uint32_t tile_slot;
+    constexpr uint32_t straddles = ~uint32_t{0};
+    auto const begin = slots[0], end = slots[files];
+    auto const last_tile = (end + kept_tile - 1) / kept_tile;
+    for (auto tile = begin / kept_tile + blockIdx.x; tile < last_tile; tile += gridDim.x) {
+        auto const low = cuda::std::max(begin, tile * kept_tile);
+        auto const high = cuda::std::min(end, (tile + 1) * kept_tile);
+        if (threadIdx.x == 0) {
+            auto const slot = slot_containing(slots, files, low);
+            tile_slot = slots[slot + 1] >= high ? slot : straddles;
+        }
+        __syncthreads();
+        auto const slot = tile_slot;
+        uint32_t count = 0;
+        for (auto at = tile * kept_tile + uint64_t{threadIdx.x} * 16; at < (tile + 1) * kept_tile;
+             at += uint64_t{block_size} * 16) {
+            if (at + 16 <= low || at >= high) continue;
+            auto const words = *reinterpret_cast<ulonglong2 const*>(buffer + at);
+            uint64_t const halves[2] = {words.x, words.y};
+            _Pragma("unroll")
+            for (uint32_t half = 0; half < 2; ++half) {
+                auto const base = at + 8 * half;
+                auto const first =
+                    static_cast<uint32_t>(low > base ? cuda::std::min<uint64_t>(low - base, 8) : 0);
+                auto const last = static_cast<uint32_t>(
+                    high > base ? cuda::std::min<uint64_t>(high - base, 8) : 0
+                );
+                if (first >= last) continue;
+                if (slot != straddles) {
+                    count += kept_in_word(halves[half], first, last);
+                    continue;
+                }
+                auto const head = slot_containing(slots, files, base + first);
+                if (head == slot_containing(slots, files, base + last - 1)) {
+                    atomicAdd(kept + head, kept_in_word(halves[half], first, last));
+                    continue;
+                }
+                for (auto byte = first; byte < last; ++byte) {
+                    atomicAdd(
+                        kept + slot_containing(slots, files, base + byte),
+                        kept_in_word(halves[half], byte, byte + 1)
+                    );
+                }
+            }
+        }
+        if (slot != straddles) {
+            auto const sum = block_reduce(reduce_storage).Sum(count);
+            if (threadIdx.x == 0) atomicAdd(kept + slot, sum);
+        }
+        __syncthreads();
     }
 }
 
@@ -668,19 +752,6 @@ class device_fasta_pipeline {
             throw std::bad_alloc();
         }
         select_temp_bytes_ = 0;
-        auto const counted = cub::DeviceSegmentedReduce::Sum(
-            nullptr,
-            count_temp_bytes_,
-            cuda::make_transform_iterator(
-                static_cast<char*>(nullptr), device_gzip::kept_byte_count{}
-            ),
-            static_cast<unsigned long long*>(nullptr),
-            max_files,
-            static_cast<uint64_t*>(nullptr),
-            static_cast<uint64_t*>(nullptr),
-            stream.get()
-        );
-        if (counted != cudaSuccess) throw std::runtime_error(cudaGetErrorString(counted));
         auto const selected = compressed_capacity_ == 0 ? cub::DeviceSelect::If(
                                                               nullptr,
                                                               select_temp_bytes_,
@@ -1062,19 +1133,13 @@ class device_fasta_pipeline {
             device_table.first_char
         );
         CUDDL_CUDA_TRY(cudaGetLastError());
-        auto count_temp_bytes = count_temp_bytes_;
         CUDDL_CUDA_TRY(
-            cub::DeviceSegmentedReduce::Sum(
-                lane.temp->data(),
-                count_temp_bytes,
-                cuda::make_transform_iterator(lane.slots->data(), device_gzip::kept_byte_count{}),
-                device_table.kept,
-                count,
-                device_table.slots,
-                device_table.slots + 1,
-                stream
-            )
+            cudaMemsetAsync(device_table.kept, 0, count * sizeof(unsigned long long), stream)
         );
+        device_gzip::kept_count_kernel<<<grid, device_gzip::block_size, 0, stream>>>(
+            lane.slots->data(), device_table.slots, count, device_table.kept
+        );
+        CUDDL_CUDA_TRY(cudaGetLastError());
         auto temp_bytes = select_temp_bytes_;
         if (lane.decoded) {
             CUDDL_CUDA_TRY(
@@ -1367,10 +1432,7 @@ class device_fasta_pipeline {
         );
         lane.temp.emplace(
             cuda::make_device_buffer<char>(
-                s,
-                device,
-                std::max({nvcomp_temp_bytes_, select_temp_bytes_, count_temp_bytes_}) + 1,
-                cuda::no_init
+                s, device, std::max(nvcomp_temp_bytes_, select_temp_bytes_) + 1, cuda::no_init
             )
         );
         // Sixteen bytes of tail padding let the header scan read whole words. Allocated last, so
@@ -1398,7 +1460,7 @@ class device_fasta_pipeline {
     size_t hardware_limit_ = 0;  // device_gzip::hardware_inflate_limit of the stream's device
     PFN_cuMemBatchDecompressAsync_v12060 batch_decompress_ = nullptr;
     std::vector<CUmemDecompressParams> engine_params_;  // one batch's, reused
-    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0, count_temp_bytes_ = 0;
+    size_t nvcomp_temp_bytes_ = 0, select_temp_bytes_ = 0;
     uint32_t header_capacity_ = 0;
     std::array<lane_state, lane_count> lanes_;
 };
