@@ -1189,6 +1189,10 @@ def main(
         its placement. @p resident receives the fastest count's resident records. Output files
         are the last count's; thread counts change how fast a tool runs, not what it writes.
         """
+        # scripts/run_ncu_sol.py assigns a lane's kernels to the operation announced last.
+        typer.echo(
+            f"  {tool} {operation}: timing at {', '.join(map(str, thread_counts))} threads"
+        )
         best: tuple[list[float], list[dict], int] | None = None
         for count in thread_counts:
             built = command(count)
