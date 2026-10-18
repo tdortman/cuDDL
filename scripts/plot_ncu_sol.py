@@ -69,7 +69,11 @@ def main(
     ]
     positions = range(len(kernels))[::-1]
     fig, (sm_ax, memory_ax) = plt.subplots(
-        1, 2, figsize=(12, 0.45 * len(kernels) + 1.5), sharey=True
+        1,
+        2,
+        figsize=(12, 0.45 * len(kernels) + 1.5),
+        sharey=True,
+        layout="constrained",
     )
     bar_colors = [colors[row["tool"]] for row in kernels]
     sm_ax.barh(positions, [row["sm"] for row in kernels], color=bar_colors)
@@ -90,16 +94,15 @@ def main(
     for ax, title in ((sm_ax, "SM throughput"), (memory_ax, "Memory throughput")):
         ax.set_xlim(0, 100)
         ax.set_xlabel(pu.paper_text("% of peak"))
-        ax.set_title(f"{title}, {genomes:,} genomes", fontsize=pu.TITLE_FONT_SIZE)
+        ax.set_title(title, fontsize=pu.TITLE_FONT_SIZE)
         ax.grid(True, axis="x", ls="--", alpha=pu.GRID_ALPHA)
-    memory_ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.22),
+    fig.legend(
+        *memory_ax.get_legend_handles_labels(),
+        loc="outside lower center",
         ncol=len(UNITS),
         fontsize=pu.LEGEND_FONT_SIZE * 0.7,
         framealpha=pu.LEGEND_FRAME_ALPHA,
     )
-    fig.tight_layout()
     fig.savefig(output_dir / f"ncu_sol_{genomes}.png", dpi=200, bbox_inches="tight")
     pu.save_figure(fig, output_dir / f"ncu_sol_{genomes}.pdf")
 
