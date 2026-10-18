@@ -194,7 +194,17 @@ def main(
             f"results/mogon-{gpu}-{tag}-e2e-{size}-{name}.json",
         )
 
-    # The first read of the genomes comes from Lustre; later runs find them in the page cache.
+    # Earlier jobs on these nodes may have left genomes in the page cache: drop them so that the
+    # cold run reads every byte from Lustre.
+    per_node(
+        nodes,
+        "uv",
+        "run",
+        "--offline",
+        "scripts/warm_page_cache.py",
+        genomes,
+        "--evict",
+    )
     pipeline(ranks, 20, f"{nodes}x{ranks_per_node}-m20-cold")
     # The cold run read only each node's share; every node reads all genomes once so that runs on
     # fewer nodes find their larger shares cached too.
