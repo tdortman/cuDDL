@@ -80,7 +80,6 @@ def main(
     rows = [
         json.loads(line) for line in ceilings.read_text().splitlines() if line.strip()
     ]
-    gzip_bytes = ceiling(rows, "filesystem_read_direct")["bytes"]
     cold_run, warm_run = json.loads(cold.read_text()), json.loads(warm.read_text())
     (single,) = (r for r in json.loads(strong.read_text())["runs"] if r["ranks"] == 1)
     alu_rate = json.loads(alu.read_text())["alu_warp_instructions_per_second"]
@@ -92,14 +91,14 @@ def main(
     phases = [
         (
             "Read\n(cold)",
-            per_node(cold_run, gzip_bytes, "sketch"),
+            per_node(cold_run, cold_run["input_bytes"], "sketch"),
             ceiling(rows, "filesystem_read_direct")["gbps"] * 1e9,
             1e9,
             "GB/s",
         ),
         (
             "Inflate +\nsketch (warm)",
-            per_node(warm_run, gzip_bytes, "sketch"),
+            per_node(warm_run, warm_run["input_bytes"], "sketch"),
             max(r["gbps"] for r in rows if r["phase"].startswith("libdeflate_inflate_"))
             * 1e9,
             1e9,
