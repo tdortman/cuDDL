@@ -24,11 +24,8 @@ if want compile; then
     "-Dcuda_args=-gencode=arch=compute_$cc,code=sm_$cc"
 fi
 
-for size in 1k 25k; do
-  [ -d $mgpu/genomes-$size-sample ] ||
-    uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k $((${size%k} * 1000)) \
-      $mgpu/genomes-$size-sample
-done
+[ -d $mgpu/genomes-1k-sample ] ||
+  uv run --offline scripts/snapshot_genomes.py $mgpu/genomes-100k 1000 $mgpu/genomes-1k-sample
 if [ ! -e $mgpu/refseq211-100k.cuddl ]; then
   build/ablation/main-build/examples/cuddl-build-reference-db $mgpu/genomes-100k -o "$S/db.cuddl" \
     --workers "$SLURM_CPUS_ON_NODE"
@@ -49,8 +46,8 @@ if want micro; then
   abl micro $mgpu/genomes-1k-sample --stock-build build/ablation/stock-build --label "$label"
 fi
 if want build; then
-  abl build $mgpu/genomes-25k-sample --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --label "$label"
-  abl build $mgpu/genomes-25k-sample --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --uncached \
+  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --label "$label"
+  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --uncached \
     --reps 2 --label "$label, Lustre" --only "Read depth (gpu)" --only "Read depth (cpu)" \
     --only "Probe depth" --only "GPU/host co-scheduling" --only "GPU decompression (nvCOMP)"
 fi
