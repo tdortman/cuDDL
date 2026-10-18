@@ -42,10 +42,10 @@ Every wall is a whole process, timed from spawn to exit, one operation per proce
   search mode, so their SEARCH is the exhaustive COMPARE.
 
 pp-sketchlib runs through a harness of its own classes (benchmarks/ppsketchlib_micro.cpp):
-SKETCH is its CPU sketching of assemblies at k = 15, 19, 23, 27 and 31 with 2048 bins each,
-writing its HDF5 database and random match chances; COMPARE loads that database and fits core
-and accessory distances on the GPU, its only GPU comparison, and reports the Jaccard index at
-k = 25 the fit predicts.
+SKETCH is its CPU sketching of assemblies at k = 15, 19, 23, 27 and 31 (or --ppsketchlib-kmers)
+with 2048 bins each, writing its HDF5 database and random match chances; COMPARE loads that
+database and fits core and accessory distances on the GPU, its only GPU comparison, and reports
+the Jaccard index at k = 25 the fit predicts.
 
 HyperGen runs as two tools: hypergen-cpu and hypergen-gpu sketch on that device, and both compare
 with HyperGen's CPU `dist`.
@@ -937,6 +937,14 @@ def main(
             "at 4 MB per reference, 16000 on a 250 GiB host.",
         ),
     ] = None,
+    ppsketchlib_kmers: Annotated[
+        str,
+        typer.Option(
+            help="Comma-separated k-mer lengths pp-sketchlib sketches and fits, at least two "
+            "(its GPU distances fit a line across them). The default is its CLI's; any other "
+            "list is recorded as variant core-accessory-k<list>.",
+        ),
+    ] = "15,19,23,27,31",
     ani_truth: Annotated[
         bool,
         typer.Option(
@@ -1014,6 +1022,19 @@ def main(
         typer.echo(f"idle power: {IDLE}")
     if performance_only:
         ani_truth = False
+    pp_kmers = [int(k) for k in ppsketchlib_kmers.split(",") if k.strip().isdigit()]
+    if len(pp_kmers) != len(ppsketchlib_kmers.split(",")) or len(pp_kmers) < 2:
+        raise typer.BadParameter(
+            "give two or more integers", param_hint="--ppsketchlib-kmers"
+        )
+    if pp_kmers != sorted(set(pp_kmers)):
+        raise typer.BadParameter(
+            "give strictly ascending lengths", param_hint="--ppsketchlib-kmers"
+        )
+    pp_kmer_arg = ",".join(map(str, pp_kmers))
+    pp_variant = "core-accessory" + (
+        "" if pp_kmer_arg == "15,19,23,27,31" else f"-k{pp_kmer_arg}"
+    )
     layout = cpu_layout()
     threads_auto = threads is None
     if threads is None:
@@ -2039,6 +2060,7 @@ def main(
                     str(pp_sketch_list),
                     str(pp_sketch),
                     str(count),
+                    pp_kmer_arg,
                 ],
                 resident=pp_resident,
             )
@@ -2047,7 +2069,7 @@ def main(
             sketch_bytes["pp-sketchlib"] = pp_sketch.with_suffix(".h5").stat().st_size
             record_sketch(
                 "pp-sketchlib",
-                "core-accessory",
+                pp_variant,
                 marks,
                 {"sketch_bytes": sketch_bytes["pp-sketchlib"]},
             )
@@ -2063,6 +2085,7 @@ def main(
                         str(pp_reference_list),
                         str(pp_references),
                         str(max_threads),
+                        pp_kmer_arg,
                     ],
                     quiet=True,
                 )
@@ -2902,6 +2925,7 @@ def main(
                                 str(pp_query_list),
                                 pp_queries,
                                 str(count),
+                                pp_kmer_arg,
                             ]
                         ]
                         if topology == "batch"
@@ -2938,9 +2962,7 @@ def main(
                     stride,
                 )
             ]
-            record_compare(
-                "pp-sketchlib", "core-accessory", marks, rows, evaluated=evaluated
-            )
+            record_compare("pp-sketchlib", pp_variant, marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
         if "bbtools" in selected:
@@ -3556,7 +3578,7 @@ def main(
             "rabbitsketch": "FastKMV",
             "simdsketch": "bucket-b8",
             "sketchlib": "one-perm-minhash",
-            "pp-sketchlib": "core-accessory",
+            "pp-sketchlib": pp_variant,
             "bbtools": "ddl",
             "cub-exact": "gpu-exact",
         }

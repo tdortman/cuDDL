@@ -2,17 +2,17 @@
 // pp-sketchlib's own classes: the sketching its CLI runs on the CPU for assemblies and the
 // distances it runs on the GPU.
 //
-//   sketch LIST OUT THREADS             one sketch per listed FASTX path, with the k-mer lengths
-//                                       15, 19, 23, 27 and 31 its CLI uses by default and 2048
-//                                       bins per length; writes OUT.h5 and the names to
-//                                       OUT.names, and the random match chances its database
-//                                       construction adds
+//   sketch LIST OUT THREADS [K,K...]    one sketch per listed FASTX path, with the given k-mer
+//                                       lengths, by default 15, 19, 23, 27 and 31 as its CLI
+//                                       uses, and 2048 bins per length; writes OUT.h5, the names
+//                                       to OUT.names, the k-mer lengths to OUT.kmers, and the
+//                                       random match chances its database construction adds
 //   compare REFS QUERIES|- OUT THREADS  core and accessory distances on GPU 0, the fit across
-//                                       the k-mer lengths that its GPU path computes; writes one
-//                                       little-endian f32 per pair, the Jaccard index at k = 25
-//                                       that the fit predicts, (1 - a)(1 - c)^25: row-major
-//                                       query x reference, or the strict upper triangle of REFS
-//                                       for '-'
+//                                       the k-mer lengths that its GPU path computes (at least
+//                                       two); writes one little-endian f32 per pair, the Jaccard
+//                                       index at k = 25 that the fit predicts, (1 - a)(1 - c)^25:
+//                                       row-major query x reference, or the strict upper triangle
+//                                       of REFS for '-'
 //
 // REFS and QUERIES are prefixes written by `sketch`. With CUDDL_RESIDENT_TIMINGS set, both
 // commands write their in-memory time: hashing sequences already read, or computing the
@@ -26,12 +26,14 @@
 
 #include <omp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -39,7 +41,7 @@
 
 namespace {
 
-std::vector<size_t> const kmer_lengths{15, 19, 23, 27, 31};
+std::vector<size_t> const default_kmer_lengths{15, 19, 23, 27, 31};
 constexpr size_t sketch_bins = 2048;
 /// FASTX bytes on disk read per sketching batch, so reading stays outside the hashing time.
 constexpr uintmax_t batch_bytes = uintmax_t{1} << 30;
@@ -52,6 +54,29 @@ std::vector<std::string> read_lines(std::filesystem::path const& path) {
         if (!line.empty()) lines.push_back(line);
     }
     return lines;
+}
+
+/// Strictly ascending k-mer lengths, at least two: pp-sketchlib's GPU distances fit a line
+/// across them.
+std::vector<size_t> parse_kmers(std::string const& text) {
+    std::vector<size_t> kmers;
+    for (size_t start = 0; start <= text.size();) {
+        auto const end = std::min(text.find(',', start), text.size());
+        kmers.push_back(std::stoul(text.substr(start, end - start)));
+        start = end + 1;
+    }
+    if (kmers.size() < 2 || !std::is_sorted(kmers.begin(), kmers.end(), std::less_equal<>{})) {
+        throw std::invalid_argument(
+            "k-mer lengths must be two or more, strictly ascending: " + text
+        );
+    }
+    return kmers;
+}
+
+std::vector<size_t> read_kmers(std::string const& prefix) {
+    auto const lines = read_lines(prefix + ".kmers");
+    if (lines.size() != 1) throw std::runtime_error("expected one line in " + prefix + ".kmers");
+    return parse_kmers(lines[0]);
 }
 
 void write_resident(double milliseconds, char const* device, char const* input) {
@@ -67,7 +92,12 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
         .count();
 }
 
-void sketch(std::filesystem::path const& list, std::string const& out, int threads) {
+void sketch(
+    std::filesystem::path const& list,
+    std::string const& out,
+    int threads,
+    std::vector<size_t> const& kmer_lengths
+) {
     auto const files = read_lines(list);
     std::vector<std::string> names(files.size());
     for (size_t i = 0; i < files.size(); ++i) names[i] = std::to_string(i);
@@ -107,6 +137,11 @@ void sketch(std::filesystem::path const& list, std::string const& out, int threa
         for (auto const& name : names) text += name + "\n";
         return text;
     }();
+    std::ofstream(out + ".kmers") << [&] {
+        std::string text;
+        for (auto const k : kmer_lengths) text += (text.empty() ? "" : ",") + std::to_string(k);
+        return text + "\n";
+    }();
     write_resident(hashing_ms, "cpu", "fastx sequences read into memory");
 }
 
@@ -116,9 +151,15 @@ void compare(
     std::filesystem::path const& out,
     int threads
 ) {
+    auto const kmer_lengths = read_kmers(references);
     auto ref_sketches =
         load_sketches(references, read_lines(references + ".names"), kmer_lengths, false);
     auto const self = queries == "-";
+    if (!self && read_kmers(queries) != kmer_lengths) {
+        throw std::runtime_error(
+            queries + " was sketched at other k-mer lengths than " + references
+        );
+    }
     auto query_sketches =
         self ? std::vector<Reference>{}
              : load_sketches(queries, read_lines(queries + ".names"), kmer_lengths, false);
@@ -146,13 +187,18 @@ void compare(
 int main(int argc, char** argv) {
     std::vector<std::string> const args(argv + 1, argv + argc);
     try {
-        if (args.size() == 4 && args[0] == "sketch") {
-            sketch(args[1], args[2], std::stoi(args[3]));
+        if ((args.size() == 4 || args.size() == 5) && args[0] == "sketch") {
+            sketch(
+                args[1],
+                args[2],
+                std::stoi(args[3]),
+                args.size() == 5 ? parse_kmers(args[4]) : default_kmer_lengths
+            );
         } else if (args.size() == 5 && args[0] == "compare") {
             compare(args[1], args[2], args[3], std::stoi(args[4]));
         } else {
             std::cerr << "usage: " << argv[0]
-                      << " sketch LIST OUT THREADS | compare REFS QUERIES|- OUT THREADS\n";
+                      << " sketch LIST OUT THREADS [K,K...] | compare REFS QUERIES|- OUT THREADS\n";
             return 2;
         }
     } catch (std::exception const& error) {
