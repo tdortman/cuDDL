@@ -3,12 +3,14 @@
 # requires-python = ">=3.12"
 # dependencies = ["matplotlib", "pandas", "typer"]
 # ///
-"""Speed-of-light throughputs from scripts/run_ncu_sol.py, one figure per corpus size.
+"""Speed-of-light throughputs from scripts/run_ncu_sol.py at the largest corpus profiled.
 
 ncu_sol_<genomes>: every profiled kernel of every tool, SKETCH before COMPARE, labelled with its
-share of that operation's GPU time. The left panel is SM throughput, the right one memory
-throughput, with the L1, L2 and DRAM throughputs it is the maximum of marked on the bar. All
-values are percentages of the peak.
+share of that operation's GPU time. A tool profiled only on a smaller corpus, such as cub-exact,
+whose exact all-to-all re-sorts every genome for each block it is loaded into, shows its largest
+corpus in its label: per-launch throughputs do not depend on the corpus. The left panel is SM
+throughput, the right one memory throughput, with the L1, L2 and DRAM throughputs it is the
+maximum of marked on the bar. All values are percentages of the peak.
 """
 
 import json
@@ -40,57 +42,66 @@ def main(
     ]
     tools = list(dict.fromkeys(row["tool"] for row in rows))
     colors = {tool: plt.cm.tab10(i % 10) for i, tool in enumerate(tools)}
-    for genomes in sorted({row["genomes"] for row in rows}):
-        operations = ("sketch", "compare")
-        kernels = sorted(
-            (row for row in rows if row["genomes"] == genomes),
-            key=lambda row: (
-                tools.index(row["tool"]),
-                operations.index(row["operation"]),
-                -row["time_share"],
-            ),
+    largest = {
+        tool: max(row["genomes"] for row in rows if row["tool"] == tool)
+        for tool in tools
+    }
+    genomes = max(largest.values())
+    operations = ("sketch", "compare")
+    kernels = sorted(
+        (row for row in rows if row["genomes"] == largest[row["tool"]]),
+        key=lambda row: (
+            tools.index(row["tool"]),
+            operations.index(row["operation"]),
+            -row["time_share"],
+        ),
+    )
+
+    def tool_label(row: dict) -> str:
+        smaller = row["genomes"] < genomes
+        return row["tool"] + (f" ({row['genomes']:,} genomes)" if smaller else "")
+
+    labels = [
+        pu.paper_text(
+            f"{tool_label(row)} {row['operation']}: {row['kernel'][:36]} ({row['time_share']:.0%})"
         )
-        labels = [
-            pu.paper_text(
-                f"{row['tool']} {row['operation']}: {row['kernel'][:36]} ({row['time_share']:.0%})"
-            )
-            for row in kernels
-        ]
-        positions = range(len(kernels))[::-1]
-        fig, (sm_ax, memory_ax) = plt.subplots(
-            1, 2, figsize=(12, 0.45 * len(kernels) + 1.5), sharey=True
+        for row in kernels
+    ]
+    positions = range(len(kernels))[::-1]
+    fig, (sm_ax, memory_ax) = plt.subplots(
+        1, 2, figsize=(12, 0.45 * len(kernels) + 1.5), sharey=True
+    )
+    bar_colors = [colors[row["tool"]] for row in kernels]
+    sm_ax.barh(positions, [row["sm"] for row in kernels], color=bar_colors)
+    memory_ax.barh(
+        positions, [row["memory"] for row in kernels], color=bar_colors, alpha=0.6
+    )
+    for key, name, marker in UNITS:
+        memory_ax.scatter(
+            [row[key] for row in kernels],
+            positions,
+            marker=marker,
+            color="black",
+            s=pu.MARKER_SIZE * 4,
+            label=name,
+            zorder=3,
         )
-        bar_colors = [colors[row["tool"]] for row in kernels]
-        sm_ax.barh(positions, [row["sm"] for row in kernels], color=bar_colors)
-        memory_ax.barh(
-            positions, [row["memory"] for row in kernels], color=bar_colors, alpha=0.6
-        )
-        for key, name, marker in UNITS:
-            memory_ax.scatter(
-                [row[key] for row in kernels],
-                positions,
-                marker=marker,
-                color="black",
-                s=pu.MARKER_SIZE * 4,
-                label=name,
-                zorder=3,
-            )
-        sm_ax.set_yticks(list(positions), labels)
-        for ax, title in ((sm_ax, "SM throughput"), (memory_ax, "Memory throughput")):
-            ax.set_xlim(0, 100)
-            ax.set_xlabel(pu.paper_text("% of peak"))
-            ax.set_title(f"{title}, {genomes:,} genomes", fontsize=pu.TITLE_FONT_SIZE)
-            ax.grid(True, axis="x", ls="--", alpha=pu.GRID_ALPHA)
-        memory_ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.22),
-            ncol=len(UNITS),
-            fontsize=pu.LEGEND_FONT_SIZE * 0.7,
-            framealpha=pu.LEGEND_FRAME_ALPHA,
-        )
-        fig.tight_layout()
-        fig.savefig(output_dir / f"ncu_sol_{genomes}.png", dpi=200, bbox_inches="tight")
-        pu.save_figure(fig, output_dir / f"ncu_sol_{genomes}.pdf")
+    sm_ax.set_yticks(list(positions), labels)
+    for ax, title in ((sm_ax, "SM throughput"), (memory_ax, "Memory throughput")):
+        ax.set_xlim(0, 100)
+        ax.set_xlabel(pu.paper_text("% of peak"))
+        ax.set_title(f"{title}, {genomes:,} genomes", fontsize=pu.TITLE_FONT_SIZE)
+        ax.grid(True, axis="x", ls="--", alpha=pu.GRID_ALPHA)
+    memory_ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.22),
+        ncol=len(UNITS),
+        fontsize=pu.LEGEND_FONT_SIZE * 0.7,
+        framealpha=pu.LEGEND_FRAME_ALPHA,
+    )
+    fig.tight_layout()
+    fig.savefig(output_dir / f"ncu_sol_{genomes}.png", dpi=200, bbox_inches="tight")
+    pu.save_figure(fig, output_dir / f"ncu_sol_{genomes}.pdf")
 
 
 if __name__ == "__main__":
