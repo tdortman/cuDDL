@@ -50,17 +50,17 @@ def main(
     cold: Annotated[
         Path,
         typer.Option(exists=True, help="End-to-end run reading from the filesystem"),
-    ] = Path("results/mogon-a100-eval-e2e-100k-1x6-m20-cold.json"),
+    ] = Path("results/mogon-a100-eval-e2e-100k-3x7-m20-cold.json"),
     warm: Annotated[
         Path,
         typer.Option(
             exists=True,
             help="End-to-end run from the page cache that writes every pair",
         ),
-    ] = Path("results/mogon-a100-eval-e2e-100k-1x6-m0-warm.json"),
+    ] = Path("results/mogon-a100-eval-e2e-100k-1x7-m0-warm.json"),
     strong: Annotated[
         Path, typer.Option(exists=True, help="Strong-scaling search run with one rank")
-    ] = Path("results/mogon-a100-eval-100k-1x6-strong.json"),
+    ] = Path("results/mogon-a100-eval-100k-3x7-strong.json"),
     alu: Annotated[
         Path,
         typer.Option(
