@@ -228,39 +228,65 @@ struct staged_chunk {
     uint32_t windows;    // complete windows the piece holds
 };
 
-/// @brief Emits the canonical packed k-mers of every staged piece, one block per piece.
+/// Windows each emit block covers. A long piece spans many tiles and a tile can span short pieces,
+/// so the grid follows the windows: one block per piece left a batch of a few genomes, whose
+/// pieces are whole contigs, on a handful of SMs.
+constexpr uint32_t emit_tile = 8192;
+
+/// @brief Emits the canonical packed k-mers of every staged piece, emit_tile windows per block.
 ///
 /// Packing k-mers on the host spent the corpus on 72 cores while the device idled. A window is
 /// one k-mer unless an ambiguous base breaks it, which emits nothing and clears its flag for the
 /// compaction to drop. A genome's pieces stay in order, so its keys stay together for the sort.
+/// A piece's valid windows add up in `valid`, which starts at zero, across the tiles it spans.
 __global__ void emit_chunk_kmers(
     char const* bases,
     staged_chunk const* chunks,
+    uint32_t chunk_count,
+    uint64_t window_count,
     uint32_t k,
     uint64_t* keys,
     uint8_t* flags,
     uint32_t* valid
 ) {
-    auto const chunk = chunks[blockIdx.x];
-    char const* const sequence = bases + chunk.offset;
-    uint32_t mine = 0;
-    for (uint32_t i = threadIdx.x; i < chunk.windows; i += blockDim.x) {
-        uint64_t forward = 0;
-        bool complete = true;
-        for (uint32_t j = 0; j < k; ++j) {
-            auto const symbol = cuddl::detail::encode_base(sequence[i + j]);
-            complete = complete && symbol != 0xFFU;
-            forward = (forward << 2U) | (symbol & 3U);
+    auto const first = uint64_t{blockIdx.x} * emit_tile;
+    auto const last = min(first + emit_tile, window_count);
+    // The last piece that starts at or before the tile.
+    uint32_t piece = 0;
+    for (uint32_t hi = chunk_count - 1; piece < hi;) {
+        auto const mid = piece + (hi - piece + 1) / 2;
+        if (chunks[mid].window_base <= first) {
+            piece = mid;
+        } else {
+            hi = mid - 1;
         }
-        auto const reverse = cuddl::detail::reverse_complement(forward, k);
-        keys[chunk.window_base + i] = forward > reverse ? forward : reverse;
-        flags[chunk.window_base + i] = complete ? 1U : 0U;
-        mine += complete ? 1U : 0U;
     }
     using reduce_type = cub::BlockReduce<uint32_t, 256>;
     __shared__ typename reduce_type::TempStorage storage;
-    auto const total = reduce_type(storage).Sum(mine);
-    if (threadIdx.x == 0) valid[blockIdx.x] = total;
+    for (; piece < chunk_count && chunks[piece].window_base < last; ++piece) {
+        auto const chunk = chunks[piece];
+        auto const end = min(last, chunk.window_base + chunk.windows);
+        char const* const sequence = bases + chunk.offset;
+        uint32_t mine = 0;
+        for (auto w = max(first, chunk.window_base) + threadIdx.x; w < end; w += blockDim.x) {
+            auto const i = w - chunk.window_base;
+            uint64_t forward = 0;
+            bool complete = true;
+            for (uint32_t j = 0; j < k; ++j) {
+                auto const symbol = cuddl::detail::encode_base(sequence[i + j]);
+                complete = complete && symbol != 0xFFU;
+                forward = (forward << 2U) | (symbol & 3U);
+            }
+            auto const reverse = cuddl::detail::reverse_complement(forward, k);
+            keys[w] = forward > reverse ? forward : reverse;
+            flags[w] = complete ? 1U : 0U;
+            mine += complete ? 1U : 0U;
+        }
+        auto const total = reduce_type(storage).Sum(mine);
+        if (threadIdx.x == 0 && total) atomicAdd(valid + piece, total);
+        // The next piece's sum reuses the reduction storage.
+        __syncthreads();
+    }
 }
 
 /// @brief One pair of sorted, deduplicated k-mer arrays to count the intersection of.
@@ -507,15 +533,6 @@ int run_main(
     size_t const query_base = all_to_all ? 0 : reference_count;
     size_t const query_count = all_to_all ? genomes : genomes - reference_count;
 
-    // A rebuilt side re-parses a single genome, so it parses on one thread: the default would
-    // spin up the machine's whole thread count for a file the device then waits on anyway.
-    auto parse_one = [&](size_t g) {
-        auto parsed = CUDDL_UNWRAP(cuddl::parse_fasta_file(names[g], kmer_length, 1));
-        if (parsed.kmers.size() > max_kmers) {
-            throw std::runtime_error("genome exceeds --max-kmers, refusing: " + names[g]);
-        }
-        return parsed.kmers;
-    };
     // Pair space enumeration needs no packed data, only indices.
     size_t const total_pairs = [&] {
         if (all_to_all) return genomes * (genomes - 1) / 2;
@@ -619,14 +636,23 @@ int run_main(
         window_keys.reset(windows_total * sizeof(uint64_t));
         window_flags.reset(windows_total);
         chunk_valid.reset(pieces.size() * sizeof(uint32_t));
+        CUDDL_CUDA_CALL(
+            cudaMemsetAsync(chunk_valid.data, 0, pieces.size() * sizeof(uint32_t), stream)
+        );
         compacted_keys.reset(windows_total * sizeof(uint64_t));
         temp_bytes = std::max(temp_bytes, select_temp_bytes(windows_total));
         temp.reset(temp_bytes);
         size_t emit_span = std::numeric_limits<size_t>::max();
         if (timed) emit_span = timed->begin();
-        emit_chunk_kmers<<<static_cast<uint32_t>(pieces.size()), 256, 0, stream>>>(
+        emit_chunk_kmers<<<
+            static_cast<uint32_t>((windows_total + emit_tile - 1) / emit_tile),
+            256,
+            0,
+            stream>>>(
             static_cast<char const*>(staged_bases.data),
             static_cast<staged_chunk const*>(staged_chunks.data),
+            static_cast<uint32_t>(pieces.size()),
+            windows_total,
             static_cast<uint32_t>(kmer_length),
             static_cast<uint64_t*>(window_keys.data),
             static_cast<uint8_t*>(window_flags.data),
@@ -701,23 +727,26 @@ int run_main(
         std::vector<uint32_t> chunk_valid_host;
         std::vector<size_t> batch_genomes, batch_offsets;
         std::vector<int> batch_runs;
+        // Lays a loaded batch's pieces out for the emitter, dropping those too short for a window.
+        auto const chunk_batch = [&](resident_sequence::batch const& batch) {
+            chunk_host.clear();
+            chunk_genomes.clear();
+            size_t windows_total = 0;
+            for (auto const& chunk : batch.chunks) {
+                if (chunk.size < kmer_length) continue;
+                auto const windows = chunk.size - kmer_length + 1;
+                chunk_host.push_back({chunk.offset, windows_total, static_cast<uint32_t>(windows)});
+                chunk_genomes.push_back(chunk.genome);
+                windows_total += windows;
+            }
+            return windows_total;
+        };
         resident_sequence::for_each_batch(
             sketch_paths,
             static_cast<uint32_t>(kmer_length),
             staging_bytes,
             [&](resident_sequence::batch const& batch) {
-                chunk_host.clear();
-                chunk_genomes.clear();
-                size_t windows_total = 0;
-                for (auto const& chunk : batch.chunks) {
-                    if (chunk.size < kmer_length) continue;
-                    auto const windows = chunk.size - kmer_length + 1;
-                    chunk_host.push_back(
-                        {chunk.offset, windows_total, static_cast<uint32_t>(windows)}
-                    );
-                    chunk_genomes.push_back(chunk.genome);
-                    windows_total += windows;
-                }
+                auto const windows_total = chunk_batch(batch);
                 if (chunk_host.empty() || !windows_total) return;
                 stage_and_compact(batch.bases, chunk_host, windows_total, &sketch_device);
                 chunk_valid_host.resize(chunk_host.size());
@@ -1021,43 +1050,17 @@ int run_main(
         if (all_stored) {
             for (size_t g = 0; g < genomes; ++g) sorted_at[g] = store + sorted_offset[g];
         }
-        device_buffer rebuild_keys;
         // Sorts and deduplicates a block's genomes into a region, from their held sequence or,
-        // outside the host budget, a fresh parse.
+        // outside the host budget, from the files again through the sketch's parallel loader.
         auto build_block = [&](size_t block, size_t region) {
             // Pending jobs read the region this overwrites.
             flush_jobs();
             auto* out = store + region * region_words;
-            for (size_t const g : blocks[block]) {
+            auto const sort_into_region = [&](size_t g, uint64_t* keys) {
                 sorted_at[g] = out;
-                if (!distinct[g]) continue;
-                uint64_t* keys = nullptr;
-                size_t count = 0;
-                if (resident[g]) {
-                    // The emitter fills a slot per window, broken ones included, so the array is
-                    // sized by the genome's windows and the compaction leaves the valid ones.
-                    size_t windows = 0;
-                    for (auto const& piece : stashed[g].pieces) windows += piece.windows;
-                    stage_and_compact(stashed[g].bases, stashed[g].pieces, windows, nullptr);
-                    keys = static_cast<uint64_t*>(compacted_keys.data);
-                    count = kmers_of[g];
-                } else {
-                    auto const parsed = parse_one(g);
-                    ++reparsed_genomes;
-                    count = parsed.size();
-                    rebuild_keys.reset(count * sizeof(uint64_t));
-                    CUDDL_CUDA_CALL(cudaMemcpyAsync(
-                        rebuild_keys.data,
-                        parsed.data(),
-                        count * sizeof(uint64_t),
-                        cudaMemcpyHostToDevice,
-                        stream
-                    ));
-                    keys = static_cast<uint64_t*>(rebuild_keys.data);
-                }
                 CUDDL_CUDA_CALL(
                     cub::DeviceRadixSort::SortKeys(
-                        temp.data, temp.bytes, keys, keys, count, 0, 64, stream
+                        temp.data, temp.bytes, keys, keys, kmers_of[g], 0, 64, stream
                     )
                 );
                 CUDDL_CUDA_CALL(
@@ -1068,13 +1071,87 @@ int run_main(
                         out,
                         static_cast<int*>(pair_counts.data),
                         static_cast<int*>(num_runs_dev.data),
-                        count,
+                        kmers_of[g],
                         stream
                     )
                 );
                 out += distinct[g];
                 ++rebuilt_genomes;
+            };
+            // A packed batch's valid windows sit in the compacted keys genome after genome, as many
+            // as the sketch counted for each.
+            auto const sort_batch = [&](std::vector<size_t> const& members) {
+                auto* keys = static_cast<uint64_t*>(compacted_keys.data);
+                for (size_t const g : members) {
+                    sort_into_region(g, keys);
+                    keys += kmers_of[g];
+                }
+            };
+            // Held genomes are packed in batches like the sketch's, so a copy and an emit cover
+            // many genomes rather than one: a pageable copy first waits for the work before it.
+            std::vector<char> held_bases;
+            std::vector<staged_chunk> held_pieces;
+            std::vector<size_t> held_genomes, reload_genomes;
+            std::vector<std::string> reload_paths;
+            size_t held_windows = 0;
+            auto const flush_held = [&] {
+                if (held_genomes.empty()) return;
+                stage_and_compact(held_bases, held_pieces, held_windows, nullptr);
+                sort_batch(held_genomes);
+                held_bases.clear();
+                held_pieces.clear();
+                held_genomes.clear();
+                held_windows = 0;
+            };
+            for (size_t const g : blocks[block]) {
+                if (!distinct[g]) {
+                    sorted_at[g] = out;
+                    continue;
+                }
+                if (!resident[g]) {
+                    reload_paths.push_back(names[g]);
+                    reload_genomes.push_back(g);
+                    continue;
+                }
+                auto const& held = stashed[g];
+                if (!held_bases.empty() && held_bases.size() + held.bases.size() > staging_bytes) {
+                    flush_held();
+                }
+                auto const window_base = held_windows;
+                for (auto const& piece : held.pieces) {
+                    held_pieces.push_back({
+                        held_bases.size() + piece.offset,
+                        window_base + piece.window_base,
+                        piece.windows,
+                    });
+                    held_windows += piece.windows;
+                }
+                held_bases.insert(held_bases.end(), held.bases.begin(), held.bases.end());
+                held_genomes.push_back(g);
             }
+            flush_held();
+            if (reload_paths.empty()) return;
+            reparsed_genomes += reload_paths.size();
+            std::vector<size_t> members;
+            resident_sequence::for_each_batch(
+                reload_paths,
+                static_cast<uint32_t>(kmer_length),
+                staging_bytes,
+                [&](resident_sequence::batch const& batch) {
+                    auto const windows_total = chunk_batch(batch);
+                    if (chunk_host.empty() || !windows_total) return;
+                    members.clear();
+                    for (size_t c = 0; c < chunk_genomes.size(); ++c) {
+                        if (c == 0 || chunk_genomes[c] != chunk_genomes[c - 1]) {
+                            members.push_back(reload_genomes[chunk_genomes[c]]);
+                        }
+                    }
+                    stage_and_compact(batch.bases, chunk_host, windows_total, nullptr);
+                    sort_batch(members);
+                },
+                parse_workers,
+                /*whole_genomes=*/true
+            );
         };
         for (size_t lo = 0; lo < blocks.size(); ++lo) {
             bool built = all_stored;
