@@ -1,0 +1,27 @@
+diff --git a/src/random/random_match.cpp b/src/random/random_match.cpp
+--- a/src/random/random_match.cpp
++++ b/src/random/random_match.cpp
+@@ -104,7 +104,10 @@
+ 
+   // Generate random sequences and sketch them (in parallel)
+   KmerSeeds kmer_seeds = generate_seeds(kmer_lengths, codon_phased);
+-  std::vector<std::vector<Reference>> random_seqs(n_clusters);
++  // Sized up front so that each parallel iteration fills its own slot: concurrent push_backs
++  // into one shared vector raced on its reallocation and corrupted the heap.
++  std::vector<std::vector<Reference>> random_seqs(n_clusters,
++                                                  std::vector<Reference>(n_MC));
+   Xoshiro generator(1);
+ #pragma omp parallel for collapse(2) firstprivate(generator) schedule(static)  \
+     num_threads(num_threads)
+@@ -121,9 +124,9 @@
+                                                  sketches[0].seq_length(),
+                                                  use_rc, generator));
+       // Sketch it
+-      random_seqs[r_idx].push_back(Reference(
++      random_seqs[r_idx][copies] = Reference(
+           "random" + std::to_string(r_idx * n_MC + copies), random_seq,
+-          kmer_seeds, sketchsize64, codon_phased, use_rc, 0, false));
++          kmer_seeds, sketchsize64, codon_phased, use_rc, 0, false);
+     }
+   }
+ 
