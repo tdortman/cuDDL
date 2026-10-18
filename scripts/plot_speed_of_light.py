@@ -12,6 +12,9 @@ and a tool keeps its faster run there). Per timing scope, process wall and resid
 - sol_speedup_<scope>: SKETCH and COMPARE throughput relative to the tool's full-device run,
   against the diagonal of throughput proportional to compute;
 - sol_absolute_<scope>: the same runs as genomes/s and pairs/s.
+
+Each tool is drawn from the largest corpus it ran on. A smaller one, such as cub-exact's, whose
+exact all-to-all re-sorts every genome for each block it loads, is named in the legend.
 """
 
 import json
@@ -51,13 +54,28 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     # (tool, kind, operation, scope) -> {share: best rate}
     curves: dict[tuple, dict[float, float]] = {}
+    runs = []
     for line in (results / "points.jsonl").read_text().splitlines():
         point = json.loads(line)
+        report = load_result(results / point["report"], "micro")
+        runs.append((point, report["measurements"]))
+    corpus: dict[str, int] = {}
+    for point, measurements in runs:
+        for measurement in measurements:
+            if measurement["case"]["measurement"] == "micro-sketch":
+                corpus[point["tool"]] = max(
+                    corpus.get(point["tool"], 0), measurement["case"]["genomes"]
+                )
+    largest = max(corpus.values(), default=0)
+    for point, measurements in runs:
         units = point["sms"] if point["kind"] == "gpu" else point["cores"]
         share = units / point["total"]
-        for measurement in load_result(results / point["report"], "micro")[
-            "measurements"
-        ]:
+        sketch = next(
+            m for m in measurements if m["case"]["measurement"] == "micro-sketch"
+        )
+        if sketch["case"]["genomes"] != corpus[point["tool"]]:
+            continue
+        for measurement in measurements:
             operation = measurement["case"]["measurement"].removeprefix("micro-")
             if operation not in {o for o, _, _ in OPERATIONS}:
                 continue
@@ -88,7 +106,12 @@ def main(
                         marker="o",
                         color=colors[tool],
                         ls="-" if kind == "gpu" else "--",
-                        label=f"{tool} ({kind.upper()})",
+                        label=f"{tool} ({kind.upper()})"
+                        + (
+                            f", {corpus[tool]:,} genomes"
+                            if corpus[tool] < largest
+                            else ""
+                        ),
                         lw=pu.LINE_WIDTH,
                         ms=pu.MARKER_SIZE,
                     )
