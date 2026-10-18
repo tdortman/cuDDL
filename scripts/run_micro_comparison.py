@@ -2438,8 +2438,10 @@ def main(
                     query_sketch,
                     "-o",
                     str(dist_out),
-                    "-a",
-                    "0",
+                    # Accuracy needs every pair's ANI. Timing runs keep hypergen's own 85% ANI
+                    # screen, as skani keeps its own: every pair is still compared, but text rows
+                    # for all 5e9 pairs of 100k genomes would fill a terabyte.
+                    *(["-a", "0"] if not performance_only else []),
                     "-t",
                     str(count),
                 ]

@@ -1,0 +1,171 @@
+--- a/src/dist.rs
++++ b/src/dist.rs
+@@ -53,7 +53,13 @@
+     );
+ 
+     // Dump dist file
+-    utils::dump_ani_file(&sketch_dist);
++    if let Err(error) = utils::dump_ani_file(&sketch_dist) {
++        log::error!(
++            "Dump ANI file {} failed: {error}",
++            sketch_dist.out_file.display()
++        );
++        std::process::exit(1);
++    }
+ 
+     info!(
+         "Computed ANIs for {} ref files and {} query files took {:.3}s",
+@@ -251,8 +257,7 @@
+     let pb = utils::get_progress_bar(num_dists);
+     let compute = ResidentClock::new();
+ 
+-    let mut cnt = 0;
+-    let mut index_dist = vec![(0, 0); num_dists];
++    sketch_dist.file_ani = Vec::with_capacity(num_dists);
+     for i in 0..num_ref_files {
+         for j in {
+             if if_symmetric {
+@@ -262,35 +267,27 @@
+             }
+         }..num_query_files
+         {
+-            index_dist[cnt] = (i, j);
+-            cnt += 1;
++            sketch_dist.file_ani.push(((i as u32, j as u32), 0.0));
+         }
+     }
++    sketch_dist.ref_files = ref_filesketch.iter().map(|s| s.file_str.clone()).collect();
++    sketch_dist.query_files = query_filesketch.iter().map(|s| s.file_str.clone()).collect();
+ 
+-    sketch_dist.file_ani = vec![(("".to_string(), "".to_string()), 0.0); num_dists];
+     sketch_dist
+         .file_ani
+         .par_iter_mut()
+-        .zip(index_dist)
+-        .for_each(|(file_ani_pair, ind)| {
+-            let ani = {
++        .for_each(|((r, q), file_ani)| {
++            let (r, q) = (*r as usize, *q as usize);
++            *file_ani = {
+                 let _active = compute.interval();
+                 compute_pairwise_ani(
+-                    &ref_filesketch[ind.0].hv,
+-                    ref_filesketch[ind.0].hv_norm_2,
+-                    &query_filesketch[ind.1].hv,
+-                    query_filesketch[ind.1].hv_norm_2,
++                    &ref_filesketch[r].hv,
++                    ref_filesketch[r].hv_norm_2,
++                    &query_filesketch[q].hv,
++                    query_filesketch[q].hv_norm_2,
+                     ksize,
+                 )
+             };
+-
+-            *file_ani_pair = (
+-                (
+-                    ref_filesketch[ind.0].file_str.clone(),
+-                    query_filesketch[ind.1].file_str.clone(),
+-                ),
+-                ani,
+-            );
+ 
+             pb.inc(1);
+             pb.eta();
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -244,7 +244,11 @@
+     pub ksize: u8,
+     pub hv_d: usize,
+     pub ani_threshold: f32,
+-    pub file_ani: Vec<((String, String), f32)>,
++    /// (reference index, query index) and ANI of every pair: two cloned path strings per pair
++    /// need over a terabyte for 100k genomes.
++    pub file_ani: Vec<((u32, u32), f32)>,
++    pub ref_files: Vec<String>,
++    pub query_files: Vec<String>,
+ }
+ 
+ impl Default for SketchDist {
+@@ -256,7 +260,9 @@
+             ksize: (21),
+             hv_d: (1024),
+             ani_threshold: (85.0),
+-            file_ani: (Vec::<((String, String), f32)>::new()),
++            file_ani: Vec::new(),
++            ref_files: Vec::new(),
++            query_files: Vec::new(),
+         }
+     }
+ }
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -263,38 +263,30 @@
+     file_sketch
+ }
+ 
+-pub fn dump_ani_file(sketch_dist: &SketchDist) {
+-    // Sort based on ANIs
+-    let mut indices = (0..sketch_dist.file_ani.len()).collect::<Vec<_>>();
+-    indices.sort_by(|&i1, &i2| {
+-        sketch_dist.file_ani[i1]
+-            .1
+-            .partial_cmp(&sketch_dist.file_ani[i2].1)
+-            .unwrap()
+-    });
++/// Writes the pairs at or above the ANI threshold, highest ANI first. Only the kept pairs are
++/// sorted and lines stream to the file: the whole output as one string outgrows memory at 100k
++/// genomes.
++pub fn dump_ani_file(sketch_dist: &SketchDist) -> std::io::Result<()> {
++    let mut indices = (0..sketch_dist.file_ani.len())
++        .filter(|&i| sketch_dist.file_ani[i].1 >= sketch_dist.ani_threshold)
++        .collect::<Vec<_>>();
++    // A stable ascending sort, reversed, keeps the order of sorting every pair.
++    indices.sort_by(|&i1, &i2| sketch_dist.file_ani[i1].1.total_cmp(&sketch_dist.file_ani[i2].1));
+     indices.reverse();
+ 
+-    // Dump in order
+-    let mut csv_str = String::new();
+-    let mut cnt: f32 = 0.0;
+-    for i in 0..sketch_dist.file_ani.len() {
+-        if sketch_dist.file_ani[indices[i]].1 >= sketch_dist.ani_threshold {
+-            csv_str.push_str(&format!(
+-                "{}\t{}\t{:.3}\n",
+-                sketch_dist.file_ani[indices[i]].0 .0,
+-                sketch_dist.file_ani[indices[i]].0 .1,
+-                sketch_dist.file_ani[indices[i]].1
+-            ));
+-            cnt += 1.0;
+-        } else {
+-            break;
+-        }
++    let mut out = std::io::BufWriter::new(fs::File::create(&sketch_dist.out_file)?);
++    for &i in &indices {
++        let ((r, q), ani) = sketch_dist.file_ani[i];
++        writeln!(
++            out,
++            "{}\t{}\t{:.3}",
++            sketch_dist.ref_files[r as usize], sketch_dist.query_files[q as usize], ani
++        )?;
+     }
+-
+-    fs::write(sketch_dist.out_file.to_str().unwrap(), &csv_str.as_bytes())
+-        .expect("Dump ANI file failed!");
++    out.flush()?;
+ 
+     // Warning if output ANIs are too sparse
++    let cnt = indices.len() as f32;
+     let total_dist = sketch_dist.file_ani.len() as f32;
+     let perc = cnt / total_dist * 100.0;
+     if perc < 5.0 {
+@@ -308,9 +300,10 @@
+             cnt,
+             total_dist,
+             sketch_dist.ani_threshold,
+-            sketch_dist.out_file.to_str().unwrap()
++            sketch_dist.out_file.display()
+         )
+     }
++    Ok(())
+ }
+ 
+ use std::collections::HashMap;
