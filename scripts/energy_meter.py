@@ -5,6 +5,10 @@ if CUDA_VISIBLE_DEVICES lists them (UUIDs or NVML indices; unset means all, empt
 on MOGON a job sees every GPU of an exclusive node, allocated or not, and seven idle A100s drew
 about 480 W. RAPL covers every socket, so on a shared node other jobs' CPU energy is counted
 too: run on whole nodes. Neither covers DRAM on AMD, disks, NICs or fans.
+
+Grace Hopper has no RAPL, and its NVML energy counts the whole module. There the GPU is billed its
+own power, integrated by a background thread from when the meter starts, and the CPU the rest
+of the module: Grace, its LPDDR5X and SysIO.
 """
 
 import bisect
@@ -12,10 +16,37 @@ import ctypes
 import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Self
 
 RAPL = Path("/sys/class/powercap")
+HWMON = Path("/sys/class/hwmon")
+
+
+class PowerIntegrator:
+    """Joules since construction of @p watts, read every @p period seconds."""
+
+    def __init__(self, watts: Callable[[], float], period: float = 0.05) -> None:
+        self.watts = watts
+        self.period = period
+        self.total = 0.0
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        last = time.monotonic()
+        while True:
+            time.sleep(self.period)
+            now = time.monotonic()
+            watts = self.watts()
+            with self._lock:
+                self.total += watts * (now - last)
+            last = now
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self.total
 
 
 class EnergyMeter:
@@ -30,9 +61,11 @@ class EnergyMeter:
             not in domain.name.removeprefix("intel-rapl:")  # packages, not subdomains
             and os.access(domain / "energy_uj", os.R_OK)
         ]
+        # The value each CPU counter wraps at, 0 for one that never does.
         self.ranges = [
             int((d / "max_energy_range_uj").read_text()) for d in self.packages
         ]
+        self.gpu_power: list[PowerIntegrator] = []
         self.gpus: list[ctypes.c_void_p] = []
         try:
             self.nvml = ctypes.CDLL("libnvidia-ml.so.1")
@@ -58,14 +91,31 @@ class EnergyMeter:
                 )
             self._check(status)
             self.gpus.append(handle)
+        if not self.packages and any(
+            (hwmon / "power1_oem_info").read_text().startswith("Module Power Socket")
+            for hwmon in HWMON.glob("hwmon*")
+            if (hwmon / "power1_oem_info").exists()
+        ):
+            self.gpu_power = [
+                PowerIntegrator(lambda handle=handle: self._milliwatts(handle) / 1e3)
+                for handle in self.gpus
+            ]
+            # Module minus GPU can step back between two readings close together.
+            self.ranges = [0] * len(self.gpus)
 
     @staticmethod
     def _check(status: int) -> None:
         if status != 0:
             raise RuntimeError(f"NVML call failed with status {status}")
 
+    def _milliwatts(self, handle: ctypes.c_void_p) -> int:
+        milliwatts = ctypes.c_uint()
+        self._check(self.nvml.nvmlDeviceGetPowerUsage(handle, ctypes.byref(milliwatts)))
+        return milliwatts.value
+
     def read(self) -> tuple[list[int], list[int]]:
-        """Microjoules per CPU package and millijoules per GPU, since boot."""
+        """Microjoules per CPU and millijoules per GPU, since boot or, on Grace Hopper, the GPU
+        since the meter started."""
         cpus = [int((d / "energy_uj").read_text()) for d in self.packages]
         gpus = []
         for handle in self.gpus:
@@ -76,6 +126,10 @@ class EnergyMeter:
                 )
             )
             gpus.append(millijoules.value)
+        if self.gpu_power:
+            modules = gpus
+            gpus = [int(power() * 1e3) for power in self.gpu_power]
+            cpus = [(m - g) * 1000 for m, g in zip(modules, gpus)]
         return cpus, gpus
 
     def joules(
@@ -84,14 +138,14 @@ class EnergyMeter:
         """Energy between two readings: {"cpu_j": ..., "gpu_j": ...}, None where unmeasured."""
         cpu = (
             sum(
-                (b - a) % wrap
+                b - a + (wrap if b < a and wrap else 0)
                 for a, b, wrap in zip(start[0], end[0], self.ranges)  # RAPL wraps
             )
             / 1e6
         )
         gpu = sum(b - a for a, b in zip(start[1], end[1])) / 1e3
         return {
-            "cpu_j": cpu if self.packages else None,
+            "cpu_j": cpu if self.ranges else None,
             "gpu_j": gpu if self.gpus else None,
         }
 
@@ -161,7 +215,7 @@ class EnergySampler:
         """Energy between epoch seconds @p start and @p end, as EnergyMeter.joules reports it."""
         return {
             "cpu_j": self._at(self.cpu, end) - self._at(self.cpu, start)
-            if self.meter.packages
+            if self.meter.ranges
             else None,
             "gpu_j": self._at(self.gpu, end) - self._at(self.gpu, start)
             if self.meter.gpus
