@@ -5,17 +5,18 @@
 # ///
 """Read every file of GENOMES once, so later runs on this node find them in the page cache.
 
-With --evict, drop them from this node's page cache instead (posix_fadvise DONTNEED, which also
-works on Lustre), so the next run reads them from storage.
+Prints the read as one JSON line. With --evict, drops the files from this node's page cache
+instead, so the next run reads them from storage.
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
+import json
+import socket
+import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from slurm_utils import genome_files, read_files
+from slurm_utils import evict_files, genome_files, read_files
 
 
 def main(
@@ -25,19 +26,26 @@ def main(
         bool, typer.Option(help="Drop the files from the page cache")
     ] = False,
 ) -> None:
-    if not evict:
-        read_files(genome_files(genomes), threads)
+    paths = genome_files(genomes)
+    if evict:
+        evict_files(paths, threads)
         return
-
-    def drop(path: Path) -> None:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-
-    with ThreadPoolExecutor(threads) as pool:
-        list(pool.map(drop, genome_files(genomes)))
+    start = time.perf_counter()
+    read_files(paths, threads)
+    seconds = time.perf_counter() - start
+    size = sum(p.stat().st_size for p in paths)
+    print(
+        json.dumps(
+            {
+                "host": socket.gethostname(),
+                "threads": threads,
+                "bytes": size,
+                "seconds": round(seconds, 3),
+                "gbps": round(size / seconds / 1e9, 3),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

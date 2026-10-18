@@ -133,3 +133,18 @@ def read_files(paths: list[Path], threads: int, direct: bool = False) -> None:
 
     with ThreadPoolExecutor(threads) as pool:
         list(pool.map(read, paths))
+
+
+def evict_files(paths: list[Path], threads: int) -> None:
+    """Drop every file from this node's page cache (posix_fadvise DONTNEED, which also works
+    on Lustre without root), so the next read comes from storage."""
+
+    def drop(path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+    with ThreadPoolExecutor(threads) as pool:
+        list(pool.map(drop, paths))

@@ -207,8 +207,22 @@ def main(
     )
     pipeline(ranks, 20, f"{nodes}x{ranks_per_node}-m20-cold")
     # The cold run read only each node's share; every node reads all genomes once so that runs on
-    # fewer nodes find their larger shares cached too.
-    per_node(nodes, "uv", "run", "--offline", "scripts/warm_page_cache.py", genomes)
+    # fewer nodes find their larger shares cached too. Evicting first times that read from Lustre
+    # with every node reading at once and as many reads in flight as the ranks' readers keep.
+    evict = [genomes, "--evict", "--threads", "64"]
+    per_node(nodes, "uv", "run", "--offline", "scripts/warm_page_cache.py", *evict)
+    reads = per_node(
+        nodes,
+        *["uv", "run", "--offline", "scripts/warm_page_cache.py", genomes],
+        *["--threads", str(64 * ranks_per_node)],
+    )
+    with open(
+        f"results/mogon-{gpu}-{tag}-read-{size}-{nodes}x{ranks_per_node}.json", "w"
+    ) as f:
+        f.write(
+            json.dumps([json.loads(line) for line in reads if line.startswith("{")])
+            + "\n"
+        )
     for n in range(1, nodes + 1):
         for minimum in [20, 0]:
             pipeline(

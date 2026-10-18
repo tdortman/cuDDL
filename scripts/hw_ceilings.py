@@ -8,7 +8,8 @@
 Appends one JSON line per measurement to OUTPUT:
 
 - reading the genome snapshot with the pipeline's pattern of many ~1 MB gzip files, first with
-  O_DIRECT (bypassing the client page cache, so from the filesystem), then from the page cache;
+  O_DIRECT (bypassing the client page cache, so from the filesystem), then buffered after
+  evicting them (as the pipeline reads), then from the page cache;
 - sequential write (buffered, as the pipeline writes its results, then fsync) and O_DIRECT read
   on the node-local scratch and on the shared filesystem;
 - CPU inflation with libdeflate, the library and patches the loaders use, built from
@@ -44,6 +45,7 @@ from slurm_utils import (
     BLOCK,
     MGPU,
     OWN_GPU,
+    evict_files,
     genome_files,
     gpu_tag,
     read_files,
@@ -268,8 +270,10 @@ def main(
     libdeflate = build_libdeflate(build)
 
     # Direct reads come first: the page-cache pass afterwards would otherwise warm nothing new.
+    # The buffered cold read is how the pipeline reads, through the client page cache.
     timed("filesystem_read_direct", gzip_bytes, read_files, paths, threads, True)
-    read_files(paths, threads, direct=False)
+    evict_files(paths, threads)
+    timed("filesystem_read_buffered", gzip_bytes, read_files, paths, threads, False)
     timed("page_cache_read", gzip_bytes, read_files, paths, threads, False)
 
     stream_bytes = streams * (stream_gib << 30)
