@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import plot_utils as pu
 import typer
 from benchmark_schema import load_result
+from matplotlib.artist import Artist
 
 app = typer.Typer(add_completion=False)
 OPERATIONS = (("sketch", "SKETCH", "genomes/s"), ("compare", "COMPARE", "pairs/s"))
@@ -39,8 +40,12 @@ def rate(measurement: dict, scope: str) -> float | None:
 
 @app.command()
 def main(
-    results: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Sweep directory")],
-    output_dir: Annotated[Path | None, typer.Option(help="Defaults to RESULTS/plots")] = None,
+    results: Annotated[
+        Path, typer.Argument(exists=True, file_okay=False, help="Sweep directory")
+    ],
+    output_dir: Annotated[
+        Path | None, typer.Option(help="Defaults to RESULTS/plots")
+    ] = None,
 ) -> None:
     output_dir = output_dir or results / "plots"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -50,13 +55,17 @@ def main(
         point = json.loads(line)
         units = point["sms"] if point["kind"] == "gpu" else point["cores"]
         share = units / point["total"]
-        for measurement in load_result(results / point["report"], "micro")["measurements"]:
+        for measurement in load_result(results / point["report"], "micro")[
+            "measurements"
+        ]:
             operation = measurement["case"]["measurement"].removeprefix("micro-")
             if operation not in {o for o, _, _ in OPERATIONS}:
                 continue
             for scope in ("wall", "resident"):
                 if value := rate(measurement, scope):
-                    curve = curves.setdefault((point["tool"], point["kind"], operation, scope), {})
+                    curve = curves.setdefault(
+                        (point["tool"], point["kind"], operation, scope), {}
+                    )
                     curve[share] = max(value, curve.get(share, 0.0))
 
     tools = sorted({(tool, kind) for tool, kind, _, _ in curves})
@@ -73,12 +82,25 @@ def main(
                     values = [curve[s] for s in shares]
                     if relative:
                         values = [v / curve[shares[-1]] for v in values]
-                    ax.plot(shares, values, marker="o", color=colors[tool],
-                            ls="-" if kind == "gpu" else "--", label=f"{tool} ({kind.upper()})",
-                            lw=pu.LINE_WIDTH, ms=pu.MARKER_SIZE)
+                    ax.plot(
+                        shares,
+                        values,
+                        marker="o",
+                        color=colors[tool],
+                        ls="-" if kind == "gpu" else "--",
+                        label=f"{tool} ({kind.upper()})",
+                        lw=pu.LINE_WIDTH,
+                        ms=pu.MARKER_SIZE,
+                    )
                 if relative:
-                    ax.plot([0, 1], [0, 1], color="grey", ls=":", lw=pu.REFERENCE_LINE_WIDTH,
-                            label="proportional to compute")
+                    ax.plot(
+                        [0, 1],
+                        [0, 1],
+                        color="grey",
+                        ls=":",
+                        lw=pu.REFERENCE_LINE_WIDTH,
+                        label="proportional to compute",
+                    )
                     ax.set_ylim(0, 1.15)
                     ax.set_ylabel("Throughput relative to the full device")
                 else:
@@ -89,18 +111,26 @@ def main(
                 ax.set_title(f"{title} ({scope})", fontsize=pu.TITLE_FONT_SIZE)
                 ax.grid(True, ls="--", alpha=pu.GRID_ALPHA)
             # Every tool appears in the legend once, whichever panel holds it.
-            labels = {}
+            labels: dict[str, Artist] = {}
             for ax in axes:
                 for handle, label in zip(*ax.get_legend_handles_labels()):
                     labels.setdefault(label, handle)
             if not labels:
                 plt.close(fig)
                 continue
-            fig.legend(labels.values(), labels.keys(), loc="upper center", ncol=4,
-                       fontsize=pu.LEGEND_FONT_SIZE * 0.7, framealpha=pu.LEGEND_FRAME_ALPHA,
-                       bbox_to_anchor=(0.5, 1.12))
+            fig.legend(
+                list(labels.values()),
+                list(labels.keys()),
+                loc="upper center",
+                ncol=4,
+                fontsize=pu.LEGEND_FONT_SIZE * 0.7,
+                framealpha=pu.LEGEND_FRAME_ALPHA,
+                bbox_to_anchor=(0.5, 1.12),
+            )
             fig.tight_layout()
-            fig.savefig(output_dir / f"{stem}_{scope}.png", dpi=200, bbox_inches="tight")
+            fig.savefig(
+                output_dir / f"{stem}_{scope}.png", dpi=200, bbox_inches="tight"
+            )
             pu.save_figure(fig, output_dir / f"{stem}_{scope}.pdf")
 
 

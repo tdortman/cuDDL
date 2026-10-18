@@ -571,6 +571,9 @@ def main(
             "--ani-min-aligned-fraction applies to --genome-dir runs only; "
             "synthetic pairs carry their own realised ANI"
         )
+    powers = powers or list(DEFAULT_POWERS)
+    ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
+    size_ratios = size_ratios or list(DEFAULT_SIZE_RATIOS)
     if genome_mode:
         genome_dir = project_path(genome_dir)
         if not genome_dir.is_dir():
@@ -582,9 +585,6 @@ def main(
                 f"fewer than genome-count={genome_count}"
             )
     else:
-        powers = powers or list(DEFAULT_POWERS)
-        ani_levels = ani_levels or list(DEFAULT_ANI_LEVELS)
-        size_ratios = size_ratios or list(DEFAULT_SIZE_RATIOS)
         if not powers or not ani_levels or not size_ratios:
             raise typer.BadParameter(
                 "powers, ANI levels, and size ratios must not be empty"
@@ -780,8 +780,6 @@ def main(
         dashing2_result = None
         skani_rows: list = []
         skani_result = None
-        hypergen_rows: list = []
-        hypergen_result = None
         cub_rows: list = []
         cub_result = None
         if "dashing2" in selected:
@@ -1109,6 +1107,7 @@ def main(
         normalized["implementation"] = original["implementation"]
     result["measurements"].extend(rabbit_measurements)
     if "dashing2" in selected:
+        assert dashing2_result is not None  # set when the dashing2 lane ran
         dashing2_measurements = benchmark_schema.measurements_from_rows(
             dashing2_rows,
             case_fields=(*CASE_FIELDS, "sketch_size"),
@@ -1129,6 +1128,7 @@ def main(
     ):
         if lane not in selected:
             continue
+        assert lane_result is not None  # set when the lane ran
         lane_measurements = benchmark_schema.measurements_from_rows(
             lane_rows,
             case_fields=CASE_FIELDS,

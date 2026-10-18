@@ -252,7 +252,12 @@ def main(
         grid = fig.add_gridspec(2, 3)
         plot_synthetic(fig.add_subplot(grid[0, :]), synthetic)
         plot_refseq(
-            tuple(fig.add_subplot(grid[1, column]) for column in range(3)), refseq
+            (
+                fig.add_subplot(grid[1, 0]),
+                fig.add_subplot(grid[1, 1]),
+                fig.add_subplot(grid[1, 2]),
+            ),
+            refseq,
         )
     elif not synthetic.empty:
         fig, ax = plt.subplots(figsize=(9.0, 3.6), layout="constrained")

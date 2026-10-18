@@ -68,7 +68,9 @@ def csv_rows(text: str, first_column: str) -> list[dict[str, str]]:
     """Rows of a CSV report whose header starts with @p first_column, skipping the lines a tool
     prints before it."""
     lines = text.splitlines(keepends=True)
-    start = next(i for i, line in enumerate(lines) if line.lstrip('"').startswith(first_column))
+    start = next(
+        i for i, line in enumerate(lines) if line.lstrip('"').startswith(first_column)
+    )
     return list(csv.DictReader(io.StringIO("".join(lines[start:]))))
 
 
@@ -78,10 +80,16 @@ LANE = re.compile(r"^\s+\S+ (sketch|compare|search)\b")
 
 def tool_path(name: str) -> str:
     path = shutil.which(name) or next(
-        (str(p) for p in sorted(Path("/usr/local").glob(f"cuda*/bin/{name}"), reverse=True)), None
+        (
+            str(p)
+            for p in sorted(Path("/usr/local").glob(f"cuda*/bin/{name}"), reverse=True)
+        ),
+        None,
     )
     if path is None:
-        raise typer.BadParameter(f"{name} is neither on PATH nor in /usr/local/cuda*/bin")
+        raise typer.BadParameter(
+            f"{name} is neither on PATH nor in /usr/local/cuda*/bin"
+        )
     return path
 
 
@@ -92,9 +100,20 @@ def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list
     # (wall-clock ns, operation) at each lane announcement, read as the runner prints it.
     lanes: list[tuple[int, str]] = []
     with subprocess.Popen(
-        [nsys, "profile", "--trace=cuda", "--sample=none", "--cpuctxsw=none",
-         "--force-overwrite=true", "-o", str(report), *command],
-        stdout=subprocess.PIPE, text=True, env=os.environ | {"PYTHONUNBUFFERED": "1"},
+        [
+            nsys,
+            "profile",
+            "--trace=cuda",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--force-overwrite=true",
+            "-o",
+            str(report),
+            *command,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=os.environ | {"PYTHONUNBUFFERED": "1"},
     ) as process:
         assert process.stdout is not None
         for line in process.stdout:
@@ -104,12 +123,23 @@ def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list
     if process.returncode != 0:
         raise subprocess.CalledProcessError(process.returncode, process.args)
     subprocess.run(
-        [nsys, "export", "--type", "sqlite", "--force-overwrite", "true", "-o",
-         str(report.with_suffix(".sqlite")), f"{report}.nsys-rep"],
+        [
+            nsys,
+            "export",
+            "--type",
+            "sqlite",
+            "--force-overwrite",
+            "true",
+            "-o",
+            str(report.with_suffix(".sqlite")),
+            f"{report}.nsys-rep",
+        ],
         check=True,
     )
     with sqlite3.connect(report.with_suffix(".sqlite")) as db:
-        (session_start,) = db.execute("SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME").fetchone()
+        (session_start,) = db.execute(
+            "SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME"
+        ).fetchone()
         launches = db.execute(
             "SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
             "JOIN StringIds s ON s.id = k.shortName"
@@ -132,7 +162,9 @@ def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list
     ranked: dict[str, list[dict]] = {}
     for operation, by_name in kernels.items():
         total = sum(k["ns"] for k in by_name.values())
-        ranked[operation] = sorted(by_name.values(), key=lambda k: k["ns"], reverse=True)
+        ranked[operation] = sorted(
+            by_name.values(), key=lambda k: k["ns"], reverse=True
+        )
         for entry in ranked[operation]:
             entry["time_share"] = entry["ns"] / total if total else 0.0
     return ranked
@@ -151,20 +183,39 @@ def kernel_throughputs(
     # --kill ends the run once the launches are profiled, so the lane reports a failure; only the
     # report matters here.
     subprocess.run(
-        [ncu, "--target-processes", "all", "--kernel-name", f"regex:^{kernel['kernel']}$",
-         "--launch-skip", str(skip), "--launch-count", str(count), "--kill", "yes",
-         "--metrics", ",".join([DURATION, *METRICS.values()]), "-o", str(base),
-         *command],
+        [
+            ncu,
+            "--target-processes",
+            "all",
+            "--kernel-name",
+            f"regex:^{kernel['kernel']}$",
+            "--launch-skip",
+            str(skip),
+            "--launch-count",
+            str(count),
+            "--kill",
+            "yes",
+            "--metrics",
+            ",".join([DURATION, *METRICS.values()]),
+            "-o",
+            str(base),
+            *command,
+        ],
         check=False,
     )
     # Recent Nsight Compute versions write compressed .ncu-repz reports.
     report = next(scratch.glob("kernel.ncu-rep*"), None)
     if report is None:
         raise RuntimeError(f"Nsight Compute profiled no launch of {kernel['kernel']}")
-    rows = csv_rows(subprocess.run(
-        [ncu, "--import", str(report), "--csv", "--page", "raw"],
-        check=True, capture_output=True, text=True,
-    ).stdout, "ID")
+    rows = csv_rows(
+        subprocess.run(
+            [ncu, "--import", str(report), "--csv", "--page", "raw"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout,
+        "ID",
+    )
     rows = [row for row in rows if row["ID"].isdigit()]
     weight = sum(number(row[DURATION]) for row in rows)
     means = {
@@ -176,27 +227,44 @@ def kernel_throughputs(
 
 @app.command()
 def main(
-    genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Genome directory")],
-    output_dir: Annotated[Path, typer.Option(help="kernels.jsonl and the lanes' reports land here")],
+    genomes: Annotated[
+        Path, typer.Argument(exists=True, file_okay=False, help="Genome directory")
+    ],
+    output_dir: Annotated[
+        Path, typer.Option(help="kernels.jsonl and the lanes' reports land here")
+    ],
     reference_count: Annotated[
-        list[int], typer.Option(min=2, help="Hashed sample of N genomes, all-to-all")
-    ] = [1000, 10000, 100000],
+        list[int] | None,
+        typer.Option(
+            min=2,
+            help="Hashed sample of N genomes, all-to-all [default: 1000 10000 100000]",
+        ),
+    ] = None,
     tools: Annotated[str, typer.Option(help="GPU tools to profile")] = (
         "cuddl,cub-exact,pp-sketchlib,hypergen-gpu"
     ),
-    max_pairs: Annotated[int, typer.Option(min=1, help="Pairs a lane compares at most")] = 10_000_000,
+    max_pairs: Annotated[
+        int, typer.Option(min=1, help="Pairs a lane compares at most")
+    ] = 10_000_000,
     coverage: Annotated[
         float,
-        typer.Option(min=0, max=1, help="Profile kernels up to this share of an operation's GPU time"),
+        typer.Option(
+            min=0,
+            max=1,
+            help="Profile kernels up to this share of an operation's GPU time",
+        ),
     ] = 0.9,
     max_kernels: Annotated[
         int, typer.Option(min=1, help="Kernels profiled per operation at most")
     ] = 5,
-    launches: Annotated[int, typer.Option(min=1, help="Launches profiled per kernel")] = 10,
+    launches: Annotated[
+        int, typer.Option(min=1, help="Launches profiled per kernel")
+    ] = 10,
     threads: Annotated[int, typer.Option(min=1, help="Host threads per lane")] = len(
         os.sched_getaffinity(0)
     ),
 ) -> None:
+    reference_count = reference_count or [1000, 10000, 100000]
     nsys, ncu = tool_path("nsys"), tool_path("ncu")
     output_dir.mkdir(parents=True, exist_ok=True)
     kernels_path = output_dir / "kernels.jsonl"
@@ -204,10 +272,27 @@ def main(
         pairs = min(max_pairs, count * (count - 1) // 2)
         for tool in filter(None, tools.split(",")):
             command = [
-                str(MICRO), str(genomes), "--reference-count", str(count), "--topology",
-                "all-to-all", "--performance-only", "--tools", tool, "--samples", "1",
-                "--warmups", "0", "--threads", str(threads), "--idle-seconds", "0",
-                "--max-pairs", str(pairs), "--output", str(output_dir / f"{tool}-{count}.json"),
+                str(MICRO),
+                str(genomes),
+                "--reference-count",
+                str(count),
+                "--topology",
+                "all-to-all",
+                "--performance-only",
+                "--tools",
+                tool,
+                "--samples",
+                "1",
+                "--warmups",
+                "0",
+                "--threads",
+                str(threads),
+                "--idle-seconds",
+                "0",
+                "--max-pairs",
+                str(pairs),
+                "--output",
+                str(output_dir / f"{tool}-{count}.json"),
             ]
             with tempfile.TemporaryDirectory(prefix="ncu-sol-") as scratch:
                 ranked = kernel_times(nsys, command, Path(scratch))
@@ -217,16 +302,26 @@ def main(
                         if covered >= coverage:
                             break
                         covered += kernel["time_share"]
-                        profiled, means = kernel_throughputs(ncu, command, kernel, launches,
-                                                             Path(scratch))
+                        profiled, means = kernel_throughputs(
+                            ncu, command, kernel, launches, Path(scratch)
+                        )
                         with kernels_path.open("a") as stream:
-                            stream.write(json.dumps({
-                                "tool": tool, "genomes": count, "pairs": pairs,
-                                "operation": operation, "kernel": kernel["kernel"],
-                                "time_share": kernel["time_share"],
-                                "launches": kernel["launches"], "profiled_launches": profiled,
-                                **means,
-                            }) + "\n")
+                            stream.write(
+                                json.dumps(
+                                    {
+                                        "tool": tool,
+                                        "genomes": count,
+                                        "pairs": pairs,
+                                        "operation": operation,
+                                        "kernel": kernel["kernel"],
+                                        "time_share": kernel["time_share"],
+                                        "launches": kernel["launches"],
+                                        "profiled_launches": profiled,
+                                        **means,
+                                    }
+                                )
+                                + "\n"
+                            )
 
 
 if __name__ == "__main__":

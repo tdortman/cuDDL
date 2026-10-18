@@ -43,7 +43,7 @@ VARIANTS = {"simdsketch": "bucket-b8", "sketchlib": "one-perm-minhash"}
 
 
 def run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"{cmd[0]} failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
 
@@ -178,7 +178,8 @@ def main(
         if ref_path == qry_path:
             jaccard = 1.0
         else:
-            jaccard = similarities[tuple(sorted((index[ref_path], index[qry_path])))]
+            i, j = sorted((index[ref_path], index[qry_path]))
+            jaccard = similarities[(i, j)]
         if not math.isfinite(jaccard):
             raise RuntimeError(f"{tool} returned a nonfinite Jaccard at row {n}")
         ani = poisson_ani(jaccard)

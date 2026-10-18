@@ -12,6 +12,7 @@ from typing import Annotated
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import plot_utils as pu
 import typer
@@ -107,6 +108,14 @@ def timing(row: dict, key: str) -> dict | None:
         raise ValueError(f"{row['path']}: {key} requires finite min/median/max timings")
     if not 0 <= bounds[0] <= bounds[1] <= bounds[2]:
         raise ValueError(f"{row['path']}: {key} has invalid timing bounds")
+    return value
+
+
+def measured(row: dict, key: str) -> dict:
+    """The timing under KEY, which a report must carry."""
+    value = timing(row, key)
+    if value is None:
+        raise ValueError(f"{row['path']}: missing {key}; rerun benchmark")
     return value
 
 
@@ -210,16 +219,16 @@ def main(
             != has_resident
             for row in rows
         ):
-            raise ValueError("mixed resident and legacy sequence reports; rerun benchmarks")
+            raise ValueError(
+                "mixed resident and legacy sequence reports; rerun benchmarks"
+            )
         scope = rows[0]["pipeline"]["case"].get("resident_timing_scope")
         batched = sequence_resident and scope == BATCHED_SCOPE
         if sequence_resident:
             stages = SEQUENCE_STAGES
             totals = [
                 (
-                    "Resident total (summed segments)"
-                    if batched
-                    else "Resident total",
+                    "Resident total (summed segments)" if batched else "Resident total",
                     "resident_total_wall",
                 ),
                 ("Files to JSON", "end_to_end_wall"),
@@ -272,8 +281,7 @@ def main(
                 *(key for _, key in totals),
                 *(key for _, key in stages[row["implementation"]]),
             ):
-                if timing(row, key) is None:
-                    raise ValueError(f"{row['path']}: missing {key}; rerun benchmark")
+                measured(row, key)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
 
@@ -298,7 +306,7 @@ def main(
                 *totals,
                 *stages[row["implementation"]],
             ):
-                value = timing(row, key)
+                value = measured(row, key)
                 writer.writerow(
                     [
                         str(row["path"]),
@@ -393,7 +401,7 @@ def main(
         ):
             if legacy_sequence and key == "resident_total_wall":
                 continue
-            values = [timing(row, key) for row in rows]
+            values = [measured(row, key) for row in rows]
             medians = [value["median_ms"] for value in values]
             maximum = max(value["max_ms"] for value in values)
             fig, ax = pu.setup_figure(figsize=(max(10, 2 * len(rows)), 6))
@@ -474,7 +482,7 @@ def main(
         values = np.full((len(stage_labels), len(rows), 3), np.nan)
         for column, row in enumerate(rows):
             for _, key in stages[row["implementation"]]:
-                value = timing(row, key)
+                value = measured(row, key)
                 values[stage_index[key], column] = [
                     value[field] for field in ("min_ms", "median_ms", "max_ms")
                 ]

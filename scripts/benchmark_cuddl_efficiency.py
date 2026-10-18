@@ -219,6 +219,7 @@ def main(
         )
 
     if suite == Suite.blacklist:
+        assert blacklist is not None  # the blacklist suite defaults it above
         variants = [("unfiltered", None), ("bbtools", str(blacklist.resolve()))]
         reports = []
         for order in ("forward", "reverse"):

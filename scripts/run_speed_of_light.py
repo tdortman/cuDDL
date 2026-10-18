@@ -53,14 +53,25 @@ def sms_under(env: dict[str, str]) -> int:
     """SMs a fresh client started with @p env gets."""
     probe = f"import sys; sys.path.insert(0, {str(ROOT / 'scripts')!r}); "
     probe += "from run_speed_of_light import device_sms; print(device_sms())"
-    return int(subprocess.run([sys.executable, "-c", probe], env=env, check=True,
-                              capture_output=True, text=True).stdout)
+    return int(
+        subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
 
 
 @app.command()
 def main(
-    genomes: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Genome directory")],
-    output_dir: Annotated[Path, typer.Option(help="Reports and points.jsonl land here")],
+    genomes: Annotated[
+        Path, typer.Argument(exists=True, file_okay=False, help="Genome directory")
+    ],
+    output_dir: Annotated[
+        Path, typer.Option(help="Reports and points.jsonl land here")
+    ],
     reference_count: Annotated[
         int, typer.Option(min=1, help="Hashed sample of N genomes, all-to-all")
     ] = 10000,
@@ -70,27 +81,51 @@ def main(
     cpu_tools: Annotated[str, typer.Option(help="Tools run at each thread count")] = (
         "simdsketch,sketchlib,dashing2,rabbitsketch,bbtools,hypergen-cpu,skani"
     ),
-    sm_percent: Annotated[list[int], typer.Option(min=1, max=100, help="MPS SM caps")] = [
-        10, 20, 30, 50, 70, 100
-    ],
-    threads: Annotated[list[int], typer.Option(min=1, help="CPU thread counts")] = [
-        8, 15, 30, 60, 120
-    ],
-    gpu_threads: Annotated[int, typer.Option(min=1, help="Host threads for GPU tools")] = 120,
+    sm_percent: Annotated[
+        list[int] | None,
+        typer.Option(min=1, max=100, help="MPS SM caps [default: 10 20 30 50 70 100]"),
+    ] = None,
+    threads: Annotated[
+        list[int] | None,
+        typer.Option(min=1, help="CPU thread counts [default: 8 15 30 60 120]"),
+    ] = None,
+    gpu_threads: Annotated[
+        int, typer.Option(min=1, help="Host threads for GPU tools")
+    ] = 120,
     samples: Annotated[int, typer.Option(min=1)] = 3,
     warmups: Annotated[int, typer.Option(min=0)] = 1,
 ) -> None:
+    sm_percent = sm_percent or [10, 20, 30, 50, 70, 100]
+    threads = threads or [8, 15, 30, 60, 120]
     output_dir.mkdir(parents=True, exist_ok=True)
     points = output_dir / "points.jsonl"
 
     def measure(tool: str, label: str, thread_count: int, env: dict[str, str]) -> Path:
         report = output_dir / f"{tool}-{label}.json"
         subprocess.run(
-            [str(MICRO), str(genomes), "--reference-count", str(reference_count),
-             "--topology", "all-to-all", "--performance-only", "--tools", tool,
-             "--samples", str(samples), "--warmups", str(warmups),
-             "--threads", str(thread_count), "--idle-seconds", "0", "--output", str(report)],
-            env=env, check=True,
+            [
+                str(MICRO),
+                str(genomes),
+                "--reference-count",
+                str(reference_count),
+                "--topology",
+                "all-to-all",
+                "--performance-only",
+                "--tools",
+                tool,
+                "--samples",
+                str(samples),
+                "--warmups",
+                str(warmups),
+                "--threads",
+                str(thread_count),
+                "--idle-seconds",
+                "0",
+                "--output",
+                str(report),
+            ],
+            env=env,
+            check=True,
         )
         return report
 
@@ -114,16 +149,37 @@ def main(
                 sms = sms_under(capped)
                 for tool in filter(None, gpu_tools.split(",")):
                     report = measure(tool, f"sm{percent}", gpu_threads, capped)
-                    record({"tool": tool, "kind": "gpu", "sm_percent": percent, "sms": sms,
-                            "total": full_sms, "report": report.name})
+                    record(
+                        {
+                            "tool": tool,
+                            "kind": "gpu",
+                            "sm_percent": percent,
+                            "sms": sms,
+                            "total": full_sms,
+                            "report": report.name,
+                        }
+                    )
         finally:
-            subprocess.run(["nvidia-cuda-mps-control"], input="quit\n", text=True, env=env,
-                           check=True)
+            subprocess.run(
+                ["nvidia-cuda-mps-control"],
+                input="quit\n",
+                text=True,
+                env=env,
+                check=True,
+            )
     for count in threads:
         for tool in filter(None, cpu_tools.split(",")):
             report = measure(tool, f"t{count}", count, dict(os.environ))
-            record({"tool": tool, "kind": "cpu", "threads": count, "cores": min(count, cores),
-                    "total": cores, "report": report.name})
+            record(
+                {
+                    "tool": tool,
+                    "kind": "cpu",
+                    "threads": count,
+                    "cores": min(count, cores),
+                    "total": cores,
+                    "report": report.name,
+                }
+            )
 
 
 def _smt_enabled() -> bool:

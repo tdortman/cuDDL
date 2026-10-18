@@ -39,9 +39,9 @@ def main(
     logs: Annotated[list[Path], typer.Argument(exists=True, dir_okay=False)],
     title: Annotated[str, typer.Option(help="Figure title")] = "B300, 100,000 genomes",
     names: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option("--name", help="Legend name for an input, as INPUT=NAME"),
-    ] = [],
+    ] = None,
     output: Annotated[
         Path, typer.Option(help="PDF to write; a PNG goes beside it")
     ] = Path("results/decompression-engine.pdf"),
@@ -58,7 +58,7 @@ def main(
         rows, columns=["input", "rep", "workers", "backend", "seconds"]
     ).astype({"rep": int, "workers": int, "seconds": float})
     runs["input"] = runs["input"].fillna("input")
-    legend = dict(name.split("=", 1) for name in names)
+    legend = dict(name.split("=", 1) for name in names or [])
     stats = runs.groupby(["input", "workers", "backend"])["seconds"].agg(
         ["median", "min", "max"]
     )
@@ -88,7 +88,9 @@ def main(
         ax.set_visible(False)
     for ax, count in zip(axes.flat, workers):
         for i, backend in enumerate(backends):
-            part = stats.xs((count, backend), level=("workers", "backend")).reindex(inputs)
+            part = stats.xs((count, backend), level=("workers", "backend")).reindex(
+                inputs
+            )
             bars = ax.bar(
                 x + (i - (len(backends) - 1) / 2) * width,
                 part["median"],
@@ -115,7 +117,12 @@ def main(
     # Room above the tallest whisker for its label.
     bottom, top = stats["min"].min() * 0.7, stats["max"].max() * 1.5
     first.set_yticks(
-        [t for e in range(-1, 4) for t in (10**e, 2 * 10**e, 5 * 10**e) if bottom <= t <= top]
+        [
+            t
+            for e in range(-1, 4)
+            for t in (10**e, 2 * 10**e, 5 * 10**e)
+            if bottom <= t <= top
+        ]
     )
     first.set_ylim(bottom, top)
     first.yaxis.set_major_formatter(plt.FormatStrFormatter("%g"))

@@ -45,7 +45,9 @@ def main(
         )
     staging = output.with_name(output.name + ".partial")
     staging.mkdir(parents=True)
-    chosen = sorted(complete, key=lambda n: hashlib.blake2b(n.encode()).digest())[:count]
+    chosen = sorted(complete, key=lambda n: hashlib.blake2b(n.encode()).digest())[
+        :count
+    ]
     for name in chosen:
         (staging / name).symlink_to(source / name)
     # Rename last, so an interrupted run never leaves a short snapshot under OUTPUT.

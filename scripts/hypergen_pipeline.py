@@ -108,15 +108,11 @@ def skani_truth(
     for i in range(len(names)):
         ani_vals = [float(x) for x in rows[1 + i].split("\t")[1:]]
         af_vals = [float(x) for x in af_rows[1 + i].split("\t")[1:]]
-
-        def get(vals: list[float], a: int, b: int) -> float:
-            if a < len(vals):
-                return vals[a]
-
+        # skani's lower triangle gives row i one value per earlier genome j < i.
         for j in range(i):
             left = str(Path(names[i]).resolve())
             right = str(Path(names[j]).resolve())
-            table[(left, right)] = (get(ani_vals, j, i), get(af_vals, j, i))
+            table[(left, right)] = (ani_vals[j], af_vals[j])
             table[(right, left)] = table[(left, right)]
     return table
 

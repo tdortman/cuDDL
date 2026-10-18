@@ -36,7 +36,10 @@ def main(
 
         def run(*arguments: str, succeeds: bool = True) -> None:
             result = subprocess.run(
-                [str(binary), str(genomes), *arguments], capture_output=True, text=True
+                [str(binary), str(genomes), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
             )
             assert (result.returncode == 0) == succeeds, result.stdout + result.stderr
 
@@ -45,7 +48,16 @@ def main(
         run("--output", str(output))
         data = output.read_bytes()
         assert data[:8] == b"CUDDLDB\0"
-        assert struct.unpack_from("<HBBHHIIQ", data, 8) == (1, k, 5, buckets, 0x7FFF, 2, 0, 0)
+        assert struct.unpack_from("<HBBHHIIQ", data, 8) == (
+            1,
+            k,
+            5,
+            buckets,
+            0x7FFF,
+            2,
+            0,
+            0,
+        )
         assert struct.unpack_from("<I", data, len(data) - 4)[0] == zlib.crc32(data[:-4])
         offset = 32
         for expected in (first, second):
@@ -72,7 +84,9 @@ def main(
         assert many_output.read_bytes() == many_saved
         for path in extra:
             path.unlink()
-        first.write_bytes(gzip.compress(b">first\nAA\n") + gzip.compress(b">second\nA\n"))
+        first.write_bytes(
+            gzip.compress(b">first\nAA\n") + gzip.compress(b">second\nA\n")
+        )
         second.write_bytes(gzip.compress(second.read_bytes()))
         run("-o", str(output))
         assert output.read_bytes() == saved

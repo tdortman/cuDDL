@@ -346,7 +346,9 @@ def _check_runner_probe(root: Path) -> None:
         assert probe[probe.index("--resident-bytes") + 1] == "0"
         assert probe[probe.index("--topology") + 1] == "batch"
         assert "--config" in probe and "--output" in probe
-    actuals = [call for call in calls if call[0] != "meson" and "--resident-plan" not in call]
+    actuals = [
+        call for call in calls if call[0] != "meson" and "--resident-plan" not in call
+    ]
     assert len(actuals) == 3
     for command in actuals:
         assert command[command.index("--resident-bytes") + 1] == "80000"
@@ -429,6 +431,7 @@ def _check_runner_probe(root: Path) -> None:
     else:
         raise AssertionError("invalid plan caps must fail")
 
+
 def main(
     plot_script: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = PLOT,
     output: Annotated[
@@ -479,7 +482,12 @@ def main(
 
         seq_resident_dir = root / "seq-resident"
         cuddl_s, rabbit_s, cuddl_st, rabbit_st = _reports(
-            seq_resident_dir, system, datasets, "sequence", "sequence", seq_resident=True
+            seq_resident_dir,
+            system,
+            datasets,
+            "sequence",
+            "sequence",
+            seq_resident=True,
         )
         result = _run(plot_script, [cuddl_s, rabbit_s], seq_resident_dir / "plots")
         assert result.returncode == 0, result.stderr

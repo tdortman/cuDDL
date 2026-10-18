@@ -9,6 +9,7 @@ import math
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -161,7 +162,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
         raise typer.Exit(1)
 
 
-def resolve_output_dir(output_dir: Path | None, script_path: Path) -> Path:
+def resolve_output_dir(output_dir: Path | None, script_path: str | Path) -> Path:
     """Resolve and create the output directory.
 
     Args:
@@ -297,13 +298,13 @@ def get_filter_style(filter_type: str, positive_negative: str | None = None) -> 
 
 
 def setup_figure(
-    figsize: tuple[int, int] = (12, 8),
+    figsize: tuple[float, float] = (12, 8),
     title: str | None = None,
     nrows: int = 1,
     ncols: int = 1,
     sharex: bool = False,
     sharey: bool = False,
-) -> tuple[plt.Figure, plt.Axes]:
+) -> tuple[plt.Figure, Any]:
     """Create a figure with consistent styling.
 
     Args:

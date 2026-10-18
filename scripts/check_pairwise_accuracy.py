@@ -226,7 +226,6 @@ def verify(output: Path) -> None:
         ):
             assert hll[field] == reversed_hll[field]
         assert hll["sketch_cardinality"] == reversed_hll["sketch_right_cardinality"]
-        forward = implementations["rabbitsketch"]
     typer.echo(
         f"PASS: {len(rows)} accuracy rows, exact small sets, identical inputs, and both orientations"
     )

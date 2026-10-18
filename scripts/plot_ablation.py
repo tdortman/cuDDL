@@ -25,6 +25,7 @@ from typing import Annotated
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import pandas as pd
 import plot_utils as pu
@@ -37,7 +38,9 @@ MARKERS = "osD^v"
 
 # acmart sets text in Linux Libertine. Computer Modern at these sizes switches to its wide
 # small-size designs, so labels would run wider than the paper's text.
-mpl.rcParams["text.latex.preamble"] = r"\usepackage{libertine}\usepackage[libertine]{newtxmath}"
+mpl.rcParams["text.latex.preamble"] = (
+    r"\usepackage{libertine}\usepackage[libertine]{newtxmath}"
+)
 
 
 def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -47,7 +50,9 @@ def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
             entry = json.loads(line)
             if "ablations" in entry:
                 for a in entry["ablations"]:
-                    ablations.append({"suite": entry["suite"], "label": entry["label"], **a})
+                    ablations.append(
+                        {"suite": entry["suite"], "label": entry["label"], **a}
+                    )
             else:
                 phases = entry.pop("phases_s", None) or {}
                 runs.append(entry | {f"phase:{k}": v for k, v in phases.items()})
@@ -56,22 +61,28 @@ def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def slowdowns(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for a in ablations.itertuples():
-        mine = runs[(runs.suite == a.suite) & (runs.label == a.label)]
-        if a.metric not in mine:
+    for a in ablations.to_dict("records"):
+        mine = runs[(runs.suite == a["suite"]) & (runs.label == a["label"])]
+        if a["metric"] not in mine:
             continue
-        without = mine[mine.config == a.without].set_index("rep")[a.metric].dropna()
-        reference = mine[mine.config == a.reference].set_index("rep")[a.metric].dropna()
+        without = (
+            mine[mine.config == a["without"]].set_index("rep")[a["metric"]].dropna()
+        )
+        reference = (
+            mine[mine.config == a["reference"]].set_index("rep")[a["metric"]].dropna()
+        )
         if without.empty or reference.empty:
             continue
         paired = (without / reference).dropna()
         rows.append(
             {
-                "label": a.label,
-                "scope": "stage" if a.metric.startswith("phase:") else SCOPES[a.suite],
-                "suite": a.suite,
-                "metric": a.metric,
-                "optimisation": a.optimisation,
+                "label": a["label"],
+                "scope": "stage"
+                if a["metric"].startswith("phase:")
+                else SCOPES[a["suite"]],
+                "suite": a["suite"],
+                "metric": a["metric"],
+                "optimisation": a["optimisation"],
                 "with_s": reference.median(),
                 "without_s": without.median(),
                 "slowdown": without.median() / reference.median(),
@@ -107,29 +118,38 @@ def main(
     ] = 1.15,
     top_n: Annotated[
         int,
-        typer.Option("--top", help="Keep at most this many top optimisations by slowdown"),
+        typer.Option(
+            "--top", help="Keep at most this many top optimisations by slowdown"
+        ),
     ] = 9,
     stage_cap: Annotated[
         float, typer.Option(help="Largest slowdown the stage axis shows")
     ] = 12.0,
     names: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option("--name", help="Legend label for a machine label, as LABEL=NAME"),
-    ] = [],
+    ] = None,
 ) -> None:
     runs, ablations = load(results)
     table = slowdowns(runs, ablations)
     if table.empty:
         raise typer.BadParameter("no ablation has both of its configurations measured")
-    print(table.sort_values("slowdown", ascending=False).to_markdown(index=False, floatfmt=".3f"))
+    print(
+        table.sort_values("slowdown", ascending=False).to_markdown(
+            index=False, floatfmt=".3f"
+        )
+    )
 
     # Turning an optimisation off can also be faster, so the effect counts both ways.
     table = table.assign(effect=np.abs(np.log(table.slowdown)))
     noteworthy = table[table.effect >= np.log(minimum)]
     table = table[
-        table.optimisation.isin(noteworthy.optimisation) & table.label.isin(noteworthy.label)
+        table.optimisation.isin(noteworthy.optimisation)
+        & table.label.isin(noteworthy.label)
     ]
-    end_to_end = table[table.scope == "end to end"].groupby("optimisation").slowdown.max()
+    end_to_end = (
+        table[table.scope == "end to end"].groupby("optimisation").slowdown.max()
+    )
     stage = table[table.scope == "stage"].groupby("optimisation").slowdown.max()
     # Largest end-to-end slowdown on top; stage-only optimisations follow, by their stage slowdown.
     order = sorted(
@@ -140,7 +160,7 @@ def main(
         table = table[table.optimisation.isin(order)]
     row = {name: i for i, name in enumerate(order)}
     labels = list(dict.fromkeys(table.label))
-    legend = dict(n.split("=", 1) for n in names)
+    legend = dict(n.split("=", 1) for n in names or [])
 
     row_inches = 0.09 * max(1, len(labels))
     fig, axes = plt.subplots(
@@ -164,7 +184,13 @@ def main(
             y = points.optimisation.map(row).to_numpy() + offsets[i]
             clipped = points.slowdown > cap
             x = points.slowdown.clip(upper=cap)
-            ax.hlines(y, points.low.clip(upper=cap), points.high.clip(upper=cap), color=f"C{i}", lw=0.7)
+            ax.hlines(
+                y,
+                points.low.clip(upper=cap),
+                points.high.clip(upper=cap),
+                color=f"C{i}",
+                lw=0.7,
+            )
             ax.plot(
                 x[~clipped],
                 y[~clipped],
@@ -189,9 +215,15 @@ def main(
         ax.axvline(1, color="black", lw=0.5)
         left = min(0.8, np.nanmin(values) * 0.95) if values.size else 0.8
         ax.set_xlim(left, right)
-        ticks = mpl.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(left, right)
-        ax.set_xticks(sorted({1.0, *(t for t in ticks if left <= t <= right and t >= 1.5)}))
-        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$"))
+        ticks = mpl.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
+            left, right
+        )
+        ax.set_xticks(
+            sorted({1.0, *(t for t in ticks if left <= t <= right and t >= 1.5)})
+        )
+        ax.xaxis.set_major_formatter(
+            plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$")
+        )
         ax.tick_params(labelsize=6, length=2, pad=1)
         ax.grid(True, axis="x", lw=0.3, alpha=0.5)
         ax.set_title(scope, fontsize=7, pad=2)

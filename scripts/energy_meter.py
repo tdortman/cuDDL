@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Self
 
 RAPL = Path("/sys/class/powercap")
 
@@ -142,7 +143,7 @@ class EnergySampler:
             if stop:
                 return
 
-    def __enter__(self) -> "EnergySampler":
+    def __enter__(self) -> Self:
         self._thread.start()
         return self
 

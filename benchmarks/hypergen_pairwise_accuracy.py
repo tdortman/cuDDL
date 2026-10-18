@@ -22,9 +22,11 @@ from pathlib import Path
 
 
 def run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
-        raise RuntimeError(f"hyper-gen failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
+        raise RuntimeError(
+            f"hyper-gen failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}"
+        )
 
 
 def all_pairs_ani(
@@ -43,8 +45,22 @@ def all_pairs_ani(
     ref_sk, qry_sk, out = work / "r.sk", work / "q.sk", work / "dist.tsv"
     run([binary, "sketch", "-p", str(farm), "-o", str(ref_sk), "-t", threads])
     shutil.copyfile(ref_sk, qry_sk)
-    run([binary, "dist", "-r", str(ref_sk), "-q", str(qry_sk),
-         "-o", str(out), "-t", threads, "-a", "0"])
+    run(
+        [
+            binary,
+            "dist",
+            "-r",
+            str(ref_sk),
+            "-q",
+            str(qry_sk),
+            "-o",
+            str(out),
+            "-t",
+            threads,
+            "-a",
+            "0",
+        ]
+    )
     ani = {}
     for line in out.read_text().splitlines():
         if not line.strip():
@@ -54,16 +70,22 @@ def all_pairs_ani(
     return ani
 
 
-def main(cases_path: str, truth_path: str, output_path: str, binary: str, threads: str) -> None:
+def main(
+    cases_path: str, truth_path: str, output_path: str, binary: str, threads: str
+) -> None:
     with open(cases_path, newline="") as handle:
         cases = list(csv.DictReader(handle))
     paths = {
         (row["reference_sha256"], row["query_sha256"]): (
-            row["reference_path"], row["query_path"])
+            row["reference_path"],
+            row["query_path"],
+        )
         for row in cases
     }
     report = json.loads(Path(truth_path).read_text())
-    rows = [m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"]
+    rows = [
+        m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"
+    ]
     if not rows:
         raise RuntimeError("no cuDDL rows to replay")
 
@@ -76,8 +98,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
     for n, row in enumerate(rows):
         task, truth = row["case"], row["metrics"]
         try:
-            ref_path, qry_path = paths[
-                (task["reference_sha256"], task["query_sha256"])]
+            ref_path, qry_path = paths[(task["reference_sha256"], task["query_sha256"])]
         except KeyError:
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         key = (ref_path, qry_path)
@@ -94,16 +115,33 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str, thread
         metrics["ani_signed_error"] = ani - exact
         metrics["ani_absolute_error"] = abs(ani - exact)
         metrics["ani_estimator"] = "hyper-gen dist ANI/100"
-        out_rows.append({
-            "implementation": {"name": "hypergen", "variant": "gpu"},
-            "case": {k: v for k, v in task.items()
-                     if k in ("generator_seed", "power", "trial", "size_ratio",
-                              "requested_ani", "actual_ani", "mutation_count",
-                              "reference_bases", "query_bases", "reference_sha256",
-                              "query_sha256", "left_cardinality",
-                              "right_cardinality", "intersection")},
-            "metrics": metrics,
-        })
+        out_rows.append(
+            {
+                "implementation": {"name": "hypergen", "variant": "gpu"},
+                "case": {
+                    k: v
+                    for k, v in task.items()
+                    if k
+                    in (
+                        "generator_seed",
+                        "power",
+                        "trial",
+                        "size_ratio",
+                        "requested_ani",
+                        "actual_ani",
+                        "mutation_count",
+                        "reference_bases",
+                        "query_bases",
+                        "reference_sha256",
+                        "query_sha256",
+                        "left_cardinality",
+                        "right_cardinality",
+                        "intersection",
+                    )
+                },
+                "metrics": metrics,
+            }
+        )
 
     truth_report = json.loads(Path(truth_path).read_text())
     report_out = {

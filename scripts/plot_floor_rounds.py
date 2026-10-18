@@ -183,7 +183,8 @@ def figures(frame, evaluation, directory):
                 4.5 * len(panels),
                 max(
                     6,
-                    1.5 + 0.22 * frame.groupby(["Input", "Buckets"]).Items.nunique().max(),
+                    1.5
+                    + 0.22 * frame.groupby(["Input", "Buckets"]).Items.nunique().max(),
                 ),
             ),
             layout="constrained",

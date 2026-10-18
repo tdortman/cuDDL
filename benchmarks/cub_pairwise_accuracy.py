@@ -24,14 +24,45 @@ def pair_results(
     binary: str, references: list[str], queries: list[str], out: Path
 ) -> dict[tuple[str, str], dict]:
     """Pair rows keyed by (reference, query) path."""
-    cmd = [binary, "--topology", "batch", "--reference", *references,
-           "--query", *queries, "--samples", "1", "--warmups", "0",
-           "--max-pairs", "0", "--match-rows", "0", "--output", str(out)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [
+        binary,
+        "--topology",
+        "batch",
+        "--reference",
+        *references,
+        "--query",
+        *queries,
+        "--samples",
+        "1",
+        "--warmups",
+        "0",
+        "--max-pairs",
+        "0",
+        "--match-rows",
+        "0",
+        "--output",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
-        raise RuntimeError(f"cub-exact failed ({' '.join(cmd[:4])} ...):\n{proc.stderr[-2000:]}")
-    return {(pair["reference"], pair["query"]): pair
-            for pair in json.loads(out.read_text())["pairs"]}
+        raise RuntimeError(
+            f"cub-exact failed ({' '.join(cmd[:4])} ...):\n{proc.stderr[-2000:]}"
+        )
+    return {
+        (pair["reference"], pair["query"]): pair
+        for pair in json.loads(out.read_text())["pairs"]
+    }
+
+
+def add_metric(
+    metrics: dict, truth: dict, name: str, estimate: float, exact_key: str | None = None
+) -> None:
+    """Records an estimate next to its exact value from the cuDDL truth row."""
+    exact = truth[exact_key or ("exact_" + name)]
+    metrics["exact_" + name] = exact
+    metrics["sketch_" + name] = estimate
+    metrics[name + "_signed_error"] = estimate - exact
+    metrics[name + "_absolute_error"] = abs(estimate - exact)
 
 
 def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> None:
@@ -39,11 +70,15 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         cases = list(csv.DictReader(handle))
     paths = {
         (row["reference_sha256"], row["query_sha256"]): (
-            row["reference_path"], row["query_path"])
+            row["reference_path"],
+            row["query_path"],
+        )
         for row in cases
     }
     report = json.loads(Path(truth_path).read_text())
-    rows = [m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"]
+    rows = [
+        m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"
+    ]
     if not rows:
         raise RuntimeError("no cuDDL rows to replay")
 
@@ -63,8 +98,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         if orientation not in ("query_to_reference", "reference_to_query"):
             raise RuntimeError(f"unknown pair orientation: {orientation}")
         try:
-            ref_path, qry_path = paths[
-                (task["reference_sha256"], task["query_sha256"])]
+            ref_path, qry_path = paths[(task["reference_sha256"], task["query_sha256"])]
         except KeyError:
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         key = (ref_path, qry_path)
@@ -75,48 +109,68 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         # small-query run reports distinct_a=small, containment_a_in_b=1.0).
         left_size = truth["left_cardinality"]
         right_size = truth["right_cardinality"]
-        cont = (pair["containment_a_in_b"] if forward
-                else pair["containment_b_in_a"])
+        cont = pair["containment_a_in_b"] if forward else pair["containment_b_in_a"]
         comp = min(1.0, left_size / right_size)
         wkid = pair["intersection"] / min(left_size, right_size)
         ani = pair["mash_ani"] / 100.0
 
         metrics: dict = {}
-        for extra in ("left_cardinality", "right_cardinality",
-                      "intersection", "exact_set_derived_ani"):
+        for extra in (
+            "left_cardinality",
+            "right_cardinality",
+            "intersection",
+            "exact_set_derived_ani",
+        ):
             metrics[extra] = truth[extra]
         metrics["orientation"] = orientation
 
-        def add(name: str, estimate: float, exact_key: str | None = None) -> None:
-            exact = truth[exact_key or ("exact_" + name)]
-            metrics["exact_" + name] = exact
-            metrics["sketch_" + name] = estimate
-            metrics[name + "_signed_error"] = estimate - exact
-            metrics[name + "_absolute_error"] = abs(estimate - exact)
-
-        add("cardinality", float(pair["distinct_a"] if forward
-                                 else pair["distinct_b"]))
-        add("containment", cont)
-        add("completeness", comp)
-        add("wkid", wkid)
-        add("ani", ani)
+        add_metric(
+            metrics,
+            truth,
+            "cardinality",
+            float(pair["distinct_a"] if forward else pair["distinct_b"]),
+        )
+        add_metric(metrics, truth, "containment", cont)
+        add_metric(metrics, truth, "completeness", comp)
+        add_metric(metrics, truth, "wkid", wkid)
+        add_metric(metrics, truth, "ani", ani)
         metrics["cardinality_relative_error"] = (
-            metrics["cardinality_signed_error"] / truth["exact_cardinality"])
+            metrics["cardinality_signed_error"] / truth["exact_cardinality"]
+        )
         metrics["cardinality_absolute_relative_error"] = abs(
-            metrics["cardinality_relative_error"])
+            metrics["cardinality_relative_error"]
+        )
         metrics["sketch_jaccard"] = pair["jaccard"]
         metrics["ani_estimator"] = "cub mash_ani/100"
         metrics["query_method"] = "exact sorted k-mer sets"
-        out_rows.append({
-            "implementation": {"name": "cub-exact", "variant": "gpu-exact"},
-            "case": {k: v for k, v in task.items()
-                     if k in ("generator_seed", "power", "trial", "size_ratio",
-                              "requested_ani", "actual_ani", "mutation_count",
-                              "reference_bases", "query_bases", "reference_sha256",
-                              "query_sha256", "orientation", "left_cardinality",
-                              "right_cardinality", "intersection")},
-            "metrics": metrics,
-        })
+        out_rows.append(
+            {
+                "implementation": {"name": "cub-exact", "variant": "gpu-exact"},
+                "case": {
+                    k: v
+                    for k, v in task.items()
+                    if k
+                    in (
+                        "generator_seed",
+                        "power",
+                        "trial",
+                        "size_ratio",
+                        "requested_ani",
+                        "actual_ani",
+                        "mutation_count",
+                        "reference_bases",
+                        "query_bases",
+                        "reference_sha256",
+                        "query_sha256",
+                        "orientation",
+                        "left_cardinality",
+                        "right_cardinality",
+                        "intersection",
+                    )
+                },
+                "metrics": metrics,
+            }
+        )
     truth_report = json.loads(Path(truth_path).read_text())
     report_out = {
         "schema": truth_report["schema"],

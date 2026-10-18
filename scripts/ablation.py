@@ -71,7 +71,9 @@ class Ablation:
 
 
 def check_build(build_dir: Path) -> None:
-    options = json.loads((build_dir / "meson-info" / "intro-buildoptions.json").read_text())
+    options = json.loads(
+        (build_dir / "meson-info" / "intro-buildoptions.json").read_text()
+    )
     if not any(o["name"] == "ablations" and o["value"] is True for o in options):
         raise typer.BadParameter(f"{build_dir} is not configured with -Dablations=true")
 
@@ -150,7 +152,10 @@ def run_suite(
     run,
 ) -> None:
     label = label or socket.gethostname()
-    record(output, {"suite": suite, "label": label, "ablations": [a.__dict__ for a in ablations]})
+    record(
+        output,
+        {"suite": suite, "label": label, "ablations": [a.__dict__ for a in ablations]},
+    )
     for rep in range(reps):
         for config in configs:
             started = time.time()
@@ -174,20 +179,29 @@ def run_suite(
 @app.command()
 def build(
     genomes: Annotated[Path, typer.Argument(exists=True, help="Genome directory")],
-    build_dir: Annotated[Path, typer.Option(help="Build configured with -Dablations=true")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="JSON lines to append to")],
+    build_dir: Annotated[
+        Path, typer.Option(help="Build configured with -Dablations=true")
+    ],
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="JSON lines to append to")
+    ],
     workers: Annotated[int, typer.Option(help="Loaders")] = 16,
     reps: Annotated[int, typer.Option(help="Repetitions of every configuration")] = 3,
     uncached: Annotated[
-        bool, typer.Option(help="Evict the genomes from the page cache before every run")
+        bool,
+        typer.Option(help="Evict the genomes from the page cache before every run"),
     ] = False,
     engine: Annotated[
-        bool, typer.Option(help="Compare gpu with gpu-cores (GPUs with a decompression engine)")
+        bool,
+        typer.Option(
+            help="Compare gpu with gpu-cores (GPUs with a decompression engine)"
+        ),
     ] = False,
     only: Annotated[list[str] | None, typer.Option(help="Optimisations to run")] = None,
     label: Annotated[str, typer.Option(help="Machine label for the results")] = "",
     scratch: Annotated[
-        Path | None, typer.Option(help="Directory for the database [default: a temporary one]")
+        Path | None,
+        typer.Option(help="Directory for the database [default: a temporary one]"),
     ] = None,
 ) -> None:
     check_build(build_dir)
@@ -216,8 +230,18 @@ def build(
         Ablation("Input-sized lanes", "gpu input-lanes", "gpu"),
         Ablation("Pre-pinned packed buffers", "cpu pinned-reservation", "cpu"),
         Ablation("Two-bit base packing", "cpu base-packing", "cpu"),
-        Ablation("Branchless k-mer encoding (gpu)", "gpu kmer-encoding", "gpu", "kernel_seconds"),
-        Ablation("Branchless k-mer encoding (cpu)", "cpu kmer-encoding", "cpu", "kernel_seconds"),
+        Ablation(
+            "Branchless k-mer encoding (gpu)",
+            "gpu kmer-encoding",
+            "gpu",
+            "kernel_seconds",
+        ),
+        Ablation(
+            "Branchless k-mer encoding (cpu)",
+            "cpu kmer-encoding",
+            "cpu",
+            "kernel_seconds",
+        ),
     ]
     if engine:
         configs.append(Config("gpu-cores", args=["--decompression", "gpu-cores"]))
@@ -235,12 +259,23 @@ def build(
         def run(config: Config) -> dict:
             if uncached:
                 evict(paths)
-            binary = config.binary or build_dir / "examples" / "cuddl-build-reference-db"
-            command = [str(binary), str(genomes), "-o", str(database), "--workers", str(workers)]
+            binary = (
+                config.binary or build_dir / "examples" / "cuddl-build-reference-db"
+            )
+            command = [
+                str(binary),
+                str(genomes),
+                "-o",
+                str(database),
+                "--workers",
+                str(workers),
+            ]
             # The CLI writes the GPU time of its sketch kernels here.
             env = environment(config) | {"CUDDL_RESIDENT_TIMINGS": str(kernels)}
             start = time.perf_counter()
-            subprocess.run(command + config.args, check=True, env=env, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                command + config.args, check=True, env=env, stdout=subprocess.DEVNULL
+            )
             seconds = time.perf_counter() - start
             return {
                 "seconds": seconds,
@@ -260,10 +295,14 @@ def nvbench_seconds(report: Path) -> dict[str, float]:
     for benchmark in json.loads(report.read_text())["benchmarks"]:
         for state in benchmark["states"]:
             if state.get("is_skipped"):
-                raise RuntimeError(f"{benchmark['name']} skipped: {state.get('skip_reason')}")
+                raise RuntimeError(
+                    f"{benchmark['name']} skipped: {state.get('skip_reason')}"
+                )
             for summary in state["summaries"]:
                 if summary["tag"] == "nv/cpu_only/time/cpu/mean":
-                    value = next(d for d in summary["data"] if d["name"] == "value")["value"]
+                    value = next(d for d in summary["data"] if d["name"] == "value")[
+                        "value"
+                    ]
                     seconds[benchmark["name"]] = float(value)
     return seconds
 
@@ -271,8 +310,12 @@ def nvbench_seconds(report: Path) -> dict[str, float]:
 @app.command()
 def micro(
     genomes: Annotated[Path, typer.Argument(exists=True, help="Genome directory")],
-    build_dir: Annotated[Path, typer.Option(help="Build configured with -Dablations=true")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="JSON lines to append to")],
+    build_dir: Annotated[
+        Path, typer.Option(help="Build configured with -Dablations=true")
+    ],
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="JSON lines to append to")
+    ],
     stock_build: Annotated[
         Path | None,
         typer.Option(help="Ablation build compiled against unpatched libdeflate"),
@@ -287,14 +330,21 @@ def micro(
     configs.append(Config("micro pinned-pool", ["pinned-pool"]))
     ablations = [
         Ablation("SIMD FASTX parsing", "micro simd-parsing", "micro", "pack_seconds"),
-        Ablation("Device-only pinned pools", "micro pinned-pool", "micro", "pinned_seconds"),
+        Ablation(
+            "Device-only pinned pools", "micro pinned-pool", "micro", "pinned_seconds"
+        ),
     ]
     if stock_build is not None:
         check_build(stock_build)
         binary = stock_build / "benchmarks" / "cuddl-ablation-micro-benchmark"
         configs.append(Config("micro stock-libdeflate", binary=binary))
         ablations.append(
-            Ablation("DNA-tuned libdeflate", "micro stock-libdeflate", "micro", "inflate_seconds")
+            Ablation(
+                "DNA-tuned libdeflate",
+                "micro stock-libdeflate",
+                "micro",
+                "inflate_seconds",
+            )
         )
     configs, ablations = select(configs, ablations, only)
     warm(genome_paths(genomes))
@@ -302,8 +352,13 @@ def micro(
         report = Path(directory) / "micro.json"
 
         def run(config: Config) -> dict:
-            binary = config.binary or build_dir / "benchmarks" / "cuddl-ablation-micro-benchmark"
-            env = environment(config) | {"CUDDL_ABLATION_GENOMES": str(genomes.resolve())}
+            binary = (
+                config.binary
+                or build_dir / "benchmarks" / "cuddl-ablation-micro-benchmark"
+            )
+            env = environment(config) | {
+                "CUDDL_ABLATION_GENOMES": str(genomes.resolve())
+            }
             subprocess.run(
                 [str(binary), "--json", str(report)],
                 check=True,
@@ -318,12 +373,22 @@ def micro(
 @app.command()
 def search(
     database: Annotated[Path, typer.Argument(exists=True, help="Database file")],
-    build_dir: Annotated[Path, typer.Option(help="Build configured with -Dablations=true")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="JSON lines to append to")],
-    write_dir: Annotated[Path, typer.Option(help="Node-local directory for threshold results")],
-    launcher: Annotated[str, typer.Option(help="MPI launcher with its rank count")] = "",
+    build_dir: Annotated[
+        Path, typer.Option(help="Build configured with -Dablations=true")
+    ],
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="JSON lines to append to")
+    ],
+    write_dir: Annotated[
+        Path, typer.Option(help="Node-local directory for threshold results")
+    ],
+    launcher: Annotated[
+        str, typer.Option(help="MPI launcher with its rank count")
+    ] = "",
     ranks: Annotated[int, typer.Option(help="Ranks the launcher starts")] = 1,
-    minimum: Annotated[int, typer.Option(help="--minimum-matches of the threshold search")] = 20,
+    minimum: Annotated[
+        int, typer.Option(help="--minimum-matches of the threshold search")
+    ] = 20,
     reps: Annotated[int, typer.Option(help="Repetitions of every configuration")] = 1,
     samples: Annotated[int, typer.Option(help="Timed searches per run")] = 10,
     only: Annotated[list[str] | None, typer.Option(help="Optimisations to run")] = None,
@@ -340,17 +405,35 @@ def search(
         Config("exhaustive bit-slicing", ["bit-slicing"], exhaustive, own_gpu=False),
         Config("exhaustive lop3-kernel", ["lop3-kernel"], exhaustive, own_gpu=False),
         Config("exhaustive tile-queue", ["tile-queue"], exhaustive, own_gpu=False),
-        Config("exhaustive progress-thread", ["progress-thread"], exhaustive, own_gpu=False),
-        Config("exhaustive rcache", args=exhaustive, env={"UCX_RCACHE_ENABLE": "y"}, own_gpu=False),
+        Config(
+            "exhaustive progress-thread", ["progress-thread"], exhaustive, own_gpu=False
+        ),
+        Config(
+            "exhaustive rcache",
+            args=exhaustive,
+            env={"UCX_RCACHE_ENABLE": "y"},
+            own_gpu=False,
+        ),
         Config("chunked", args=["--consume", "chunked"], own_gpu=False),
         Config("downloads", args=downloads, own_gpu=False),
         Config("downloads numa-pool", ["numa-pool"], downloads, own_gpu=False),
         Config("downloads pinned-pool", ["pinned-pool"], downloads, own_gpu=False),
         Config("threshold", args=threshold, own_gpu=False),
-        Config("threshold inverted-index", ["inverted-index"], threshold, own_gpu=False),
-        Config("threshold posting-bitmaps", ["posting-bitmaps"], threshold, own_gpu=False),
-        Config("threshold index-fallback", ["index-fallback"], threshold, own_gpu=False),
-        Config("threshold match-filter", ["match-filter", "inverted-index"], threshold, own_gpu=False),
+        Config(
+            "threshold inverted-index", ["inverted-index"], threshold, own_gpu=False
+        ),
+        Config(
+            "threshold posting-bitmaps", ["posting-bitmaps"], threshold, own_gpu=False
+        ),
+        Config(
+            "threshold index-fallback", ["index-fallback"], threshold, own_gpu=False
+        ),
+        Config(
+            "threshold match-filter",
+            ["match-filter", "inverted-index"],
+            threshold,
+            own_gpu=False,
+        ),
         Config("threshold tile-queue", ["tile-queue"], threshold, own_gpu=False),
     ]
     ablations = [
@@ -366,7 +449,11 @@ def search(
         Ablation("Inverted index", "threshold inverted-index", "threshold"),
         Ablation("Posting bitmaps", "threshold posting-bitmaps", "threshold"),
         Ablation("Index fallback to planes", "threshold index-fallback", "threshold"),
-        Ablation("Low-plane match filter", "threshold match-filter", "threshold inverted-index"),
+        Ablation(
+            "Low-plane match filter",
+            "threshold match-filter",
+            "threshold inverted-index",
+        ),
         Ablation("Shared tile queue (threshold)", "threshold tile-queue", "threshold"),
     ]
     configs, ablations = select(configs, ablations, only)
@@ -392,7 +479,9 @@ def search(
                 "-o",
                 str(report_path),
             ]
-            subprocess.run(command, check=True, env=environment(config), stdout=subprocess.DEVNULL)
+            subprocess.run(
+                command, check=True, env=environment(config), stdout=subprocess.DEVNULL
+            )
             report = json.loads(report_path.read_text())
             entry = max(report["runs"], key=lambda r: r["ranks"])
             consumer = next(c for c in ("device", "host", "chunked") if c in entry)
@@ -413,16 +502,28 @@ def search(
 @app.command()
 def e2e(
     genomes: Annotated[Path, typer.Argument(exists=True, help="Genome directory")],
-    build_dir: Annotated[Path, typer.Option(help="Build configured with -Dablations=true")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="JSON lines to append to")],
-    output_dir: Annotated[Path, typer.Option(help="Node-local directory for the result files")],
-    launcher: Annotated[str, typer.Option(help="MPI launcher with its rank count")] = "",
-    own_gpu: Annotated[str, typer.Option(help="Wrapper giving each rank only its GPU")] = OWN_GPU,
+    build_dir: Annotated[
+        Path, typer.Option(help="Build configured with -Dablations=true")
+    ],
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="JSON lines to append to")
+    ],
+    output_dir: Annotated[
+        Path, typer.Option(help="Node-local directory for the result files")
+    ],
+    launcher: Annotated[
+        str, typer.Option(help="MPI launcher with its rank count")
+    ] = "",
+    own_gpu: Annotated[
+        str, typer.Option(help="Wrapper giving each rank only its GPU")
+    ] = OWN_GPU,
     decompression: Annotated[
         str, typer.Option(help="Backend of the runs not about decompression")
     ] = "automatic",
     workers: Annotated[int, typer.Option(help="Loaders per rank")] = 16,
-    minimum: Annotated[int, typer.Option(help="--minimum-matches of the threshold runs")] = 20,
+    minimum: Annotated[
+        int, typer.Option(help="--minimum-matches of the threshold runs")
+    ] = 20,
     reps: Annotated[int, typer.Option(help="Repetitions of every configuration")] = 3,
     stock_build: Annotated[
         Path | None,
@@ -449,7 +550,9 @@ def e2e(
         Ablation("One visible GPU per rank", "all-gpus", "threshold"),
     ]
 
-    def add(optimisation: str, ablate: list[str], base: str, env: dict | None = None) -> None:
+    def add(
+        optimisation: str, ablate: list[str], base: str, env: dict | None = None
+    ) -> None:
         reference = next(c for c in configs if c.name == base)
         name = f"{base} {'+'.join(ablate) or 'env'}"
         configs.append(
@@ -483,14 +586,22 @@ def e2e(
     add("UCX registration cache off", [], "threshold", {"UCX_RCACHE_ENABLE": "y"})
     configs += [
         Config("threshold match-filter", ["inverted-index"], threshold),
-        Config("threshold no-match-filter", ["inverted-index", "match-filter"], threshold),
+        Config(
+            "threshold no-match-filter", ["inverted-index", "match-filter"], threshold
+        ),
         Config("every counts", args=[*every, "--records", "counts"]),
         Config("every one-stream", args=[*every, "--write-streams", "1"]),
     ]
     ablations += [
-        Ablation("Low-plane match filter", "threshold no-match-filter", "threshold match-filter"),
+        Ablation(
+            "Low-plane match filter",
+            "threshold no-match-filter",
+            "threshold match-filter",
+        ),
         Ablation("Similarity records on the GPU", "every counts", "every"),
-        Ablation("Similarity records on the GPU", "every counts", "every", "phase:write"),
+        Ablation(
+            "Similarity records on the GPU", "every counts", "every", "phase:write"
+        ),
         Ablation("Index filtering on the GPU", "every", "threshold", "phase:search"),
         Ablation("Parallel result streams", "every one-stream", "every"),
         Ablation("Parallel result streams", "every one-stream", "every", "phase:write"),
@@ -499,14 +610,19 @@ def e2e(
         check_build(stock_build)
         binary = stock_build / "benchmarks" / "cuddl-distributed-all-to-all-benchmark"
         configs.append(Config("cpu stock-libdeflate", args=cpu, binary=binary))
-        ablations.append(Ablation("DNA-tuned libdeflate", "cpu stock-libdeflate", "cpu"))
+        ablations.append(
+            Ablation("DNA-tuned libdeflate", "cpu stock-libdeflate", "cpu")
+        )
     configs, ablations = select(configs, ablations, only)
     warm(genome_paths(genomes))
     with tempfile.TemporaryDirectory() as directory:
         report_path = Path(directory) / "report.json"
 
         def run(config: Config) -> dict:
-            binary = config.binary or build_dir / "benchmarks" / "cuddl-distributed-all-to-all-benchmark"
+            binary = (
+                config.binary
+                or build_dir / "benchmarks" / "cuddl-distributed-all-to-all-benchmark"
+            )
             command = [
                 *launch(launcher, config, own_gpu),
                 str(binary),
@@ -519,7 +635,9 @@ def e2e(
                 "-o",
                 str(report_path),
             ]
-            subprocess.run(command, check=True, env=environment(config), stdout=subprocess.DEVNULL)
+            subprocess.run(
+                command, check=True, env=environment(config), stdout=subprocess.DEVNULL
+            )
             report = json.loads(report_path.read_text())
             return {
                 "ranks": report["ranks"],

@@ -138,11 +138,15 @@ def main(
     ] = None,
     implementations: Annotated[
         str,
-        typer.Option(help="Comma-separated implementations to run: cuddl, rabbitsketch, hypergen"),
+        typer.Option(
+            help="Comma-separated implementations to run: cuddl, rabbitsketch, hypergen"
+        ),
     ] = "cuddl,rabbitsketch",
     hypergen_bin: Annotated[
         Path | None,
-        typer.Option(help="HyperGen binary; default: build/subprojects/hypergen/hyper-gen"),
+        typer.Option(
+            help="HyperGen binary; default: build/subprojects/hypergen/hyper-gen"
+        ),
     ] = None,
     hypergen_device: Annotated[
         str,
@@ -230,9 +234,13 @@ def main(
             "output directory already contains JSON reports; use a new directory"
         )
     selected = [name.strip() for name in implementations.split(",") if name.strip()]
-    unknown = [name for name in selected if name not in ("cuddl", "rabbitsketch", "hypergen")]
+    unknown = [
+        name for name in selected if name not in ("cuddl", "rabbitsketch", "hypergen")
+    ]
     if unknown or not selected:
-        raise typer.BadParameter(f"unknown implementations: {', '.join(unknown) or 'none'}")
+        raise typer.BadParameter(
+            f"unknown implementations: {', '.join(unknown) or 'none'}"
+        )
     if ingest not in ("packed", "sequence"):
         raise typer.BadParameter("ingest must be packed or sequence")
     build_dir = build_dir if build_dir.is_absolute() else ROOT / build_dir
@@ -382,13 +390,19 @@ def main(
                         "--device",
                         hypergen_device,
                         *(["--threads", str(threads)] if threads is not None else []),
-                        *(["--hypergen-bin", str(hypergen_bin)] if hypergen_bin is not None else []),
+                        *(
+                            ["--hypergen-bin", str(hypergen_bin)]
+                            if hypergen_bin is not None
+                            else []
+                        ),
                     ],
                 )
             )
         for name, command in commands:
             report = Path(temporary) / name
-            implementation = "cuddl" if name.startswith("cuddl-") else name.removesuffix(".json")
+            implementation = (
+                "cuddl" if name.startswith("cuddl-") else name.removesuffix(".json")
+            )
             run(
                 [
                     *command,

@@ -159,8 +159,10 @@ def inflate_worker(
                 offset += consumed.value
         spans.put((start, time.monotonic()))
     except BaseException as error:
+        # The parent re-raises what lands on SPANS; an abort frees workers held at the barrier.
         barrier.abort()
         spans.put(error)
+        raise
 
 
 def inflate_files(library: Path, paths: list[Path], processes: int) -> float:

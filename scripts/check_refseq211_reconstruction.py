@@ -110,13 +110,13 @@ def main() -> None:
         # Truncated input must fail without publishing a partial download list.
         with historical.open("a", encoding="utf-8") as stream:
             stream.write("GCF_000000099.1\ttruncated\n")
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode != 0 and result.stdout == "", result
         assert manifest.read_text(encoding="utf-8").splitlines() == expected
 
         manifest.unlink()
         historical.write_text("## missing column header\n", encoding="utf-8")
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode != 0 and result.stdout == "", result
         assert not manifest.exists()
     print("RefSeq reconstruction CLI checks passed.")

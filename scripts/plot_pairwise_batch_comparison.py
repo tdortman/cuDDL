@@ -85,7 +85,6 @@ def main(
         thread_counts[mode] = values[0]
     thread_count = thread_counts["parallel"]
 
-
     fig, throughput_ax = pu.setup_figure()
     throughput_ax.plot(
         sketch_pair_counts,

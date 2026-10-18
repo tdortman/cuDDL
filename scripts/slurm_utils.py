@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
@@ -60,6 +61,7 @@ def run(
         stderr=subprocess.STDOUT,
         errors="replace",
     ) as process:
+        assert process.stdout is not None  # stdout=PIPE
         for line in process.stdout:
             if re.search(keep, line):
                 print(line.rstrip()[:400], flush=True)
@@ -70,7 +72,7 @@ def run(
 def per_node(
     nodes: int,
     *command: str | Path,
-    srun_args: list[str] = (),
+    srun_args: Sequence[str] = (),
     env: dict[str, str] | None = None,
 ) -> list[str]:
     """Run COMMAND once on each of the job's first NODES nodes; returns their output lines."""

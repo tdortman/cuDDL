@@ -102,7 +102,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -193,7 +193,7 @@ def run(
                 if timing_file
                 else None,
             )
-            if timing_file is not None:
+            if timing_file is not None and resident is not None:
                 native = json.load(timing_file)
                 elapsed = native["resident_ms"]
                 if (
@@ -368,7 +368,9 @@ def above_idle(energy: dict, seconds: float) -> dict:
     """
     for source in ("cpu", "gpu"):
         if energy[f"{source}_j"] is not None and IDLE.get(f"{source}_w") is not None:
-            energy[f"dynamic_{source}_j"] = energy[f"{source}_j"] - IDLE[f"{source}_w"] * seconds
+            energy[f"dynamic_{source}_j"] = (
+                energy[f"{source}_j"] - IDLE[f"{source}_w"] * seconds
+            )
     return energy
 
 
@@ -411,13 +413,17 @@ def wall_of(
     @p prepare runs untimed before each rep. Resident timings sum over the group, except its
     first @p resident_skip commands, which count toward wall time only.
     """
-    groups = command if command and isinstance(command[0], list) else [command]
+    groups: list[list[str]] = (
+        [list(item) for item in command]
+        if command and isinstance(command[0], list)
+        else [[str(arg) for arg in command]]
+    )
     marks = Marks()
     marks.energy = []
     for rep in range(warmups + samples):
         if prepare is not None:
             prepare()
-        resident_parts = [] if resident is not None else None
+        resident_parts: list[dict] = []
         # Sampled throughout, since one rep can outlast a RAPL counter's wrap.
         with EnergySampler(METER, period=1.0) as sampler:
             start = time.time()
@@ -427,7 +433,9 @@ def wall_of(
                     item,
                     quiet=True,
                     log_tail=log_tail,
-                    resident=resident_parts if index >= resident_skip else None,
+                    resident=resident_parts
+                    if resident is not None and index >= resident_skip
+                    else None,
                 )
             done = time.perf_counter()
             end = time.time()
@@ -599,10 +607,15 @@ def read_f32_pairs(
     # 100,000 genomes write 20 GB; read only the sampled values.
     values = []
     if count:
-        with path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        with (
+            path.open("rb") as handle,
+            mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view,
+        ):
             values = [struct.unpack_from("<f", view, 4 * p)[0] for p in positions]
     if queries:
-        return [(queries[p // n], references[p % n], v) for p, v in zip(positions, values)]
+        return [
+            (queries[p // n], references[p % n], v) for p, v in zip(positions, values)
+        ]
     pairs = []
     i, start = 0, 0
     for p, v in zip(positions, values):
@@ -1155,20 +1168,26 @@ def main(
         its placement. @p resident receives the fastest count's resident records. Output files
         are the last count's; thread counts change how fast a tool runs, not what it writes.
         """
-        best: tuple[list[float], list[dict] | None, int] | None = None
+        best: tuple[list[float], list[dict], int] | None = None
         for count in thread_counts:
             built = command(count)
-            groups = built if built and isinstance(built[0], list) else [built]
-            records = [] if resident is not None else None
+            groups: list[list[str]] = (
+                [list(item) for item in built]
+                if built and isinstance(built[0], list)
+                else [[str(arg) for arg in built]]
+            )
+            records: list[dict] = []
             marks = wall_of(
                 [[*placement(count, layout), *group] for group in groups],
                 samples,
                 warmups,
-                resident=records,
+                resident=records if resident is not None else None,
                 **options,
             )
             if best is None or statistics.median(marks) < statistics.median(best[0]):
                 best = (marks, records, count)
+        if best is None:
+            raise typer.BadParameter("no thread counts to sweep")
         marks, records, count = best
         if resident is not None:
             resident.extend(records)
@@ -1204,13 +1223,11 @@ def main(
         sizes = {
             p: _est_genome_bases(p) for p in dict.fromkeys([*references, *query_list])
         }
-        if query_fraction is not None or query_count is not None:
-            # Batch queries are a hashed sample of the discovered files.
-            count = (
-                query_count
-                if query_count is not None
-                else max(1, round(query_fraction * len(references)))
-            )
+        # Batch queries are a hashed sample of the discovered files.
+        count = query_count
+        if count is None and query_fraction is not None:
+            count = max(1, round(query_fraction * len(references)))
+        if count is not None:
             count = max(1, min(count, len(references)))
             query_list = _hash_pick(references, count)
         typer.echo(f"sampling {len(references) + len(query_list)} genomes...")
@@ -1242,10 +1259,9 @@ def main(
                     f"genomes exceed VRAM-derived max-kmers={max_kmers}: {', '.join(over)}"
                 )
         else:
-            try:
+            # The GPU name only labels the report; a host without a working nvidia-smi has none.
+            with suppress(OSError, subprocess.CalledProcessError):
                 gpu_name, _ = _gpu_free_bytes()
-            except Exception:
-                pass
         orig_pairs = count_pairs(references, query_list, topology)
         probe_per_pair_ms = 0.0
         subset_note = "all pairs"
@@ -1622,9 +1638,13 @@ def main(
                         run(command, quiet=True, log_tail=True)
             record_native_resident(tool, "sketch", hg_resident)
             sketch_times[tool] = marks
-            sketch_bytes[tool] = (work / f"hgr-{device}{timed_suffix}.sk").stat().st_size
+            sketch_bytes[tool] = (
+                (work / f"hgr-{device}{timed_suffix}.sk").stat().st_size
+            )
             if topology == "batch":
-                sketch_bytes[tool] += (work / f"hgq-{device}{timed_suffix}.sk").stat().st_size
+                sketch_bytes[tool] += (
+                    (work / f"hgq-{device}{timed_suffix}.sk").stat().st_size
+                )
             record_sketch(tool, "hdc", marks, {"sketch_bytes": sketch_bytes[tool]})
         if "skani" in selected:
             skani_resident: list[dict] = []
@@ -1724,7 +1744,9 @@ def main(
 
         if "cuddl" in selected:
             db_out = work / "ref.cuddl"
-            sketched = [Path(p) for p in (sketch_file_args if sketch_all else file_args)]
+            sketched = [
+                Path(p) for p in (sketch_file_args if sketch_all else file_args)
+            ]
             # The builder takes a folder and sorts its paths, so zero-padded symlinks pin the order.
             farm = work / "cuddl-sketch-refs"
             farm.mkdir()
@@ -1863,7 +1885,10 @@ def main(
 
             rabbit_marks = {
                 operation: sweep(
-                    "rabbitsketch", operation, rabbit_operation(operation), log_tail=True
+                    "rabbitsketch",
+                    operation,
+                    rabbit_operation(operation),
+                    log_tail=True,
                 )
                 for operation in ("sketch", "compare", "search")
             }
@@ -2158,7 +2183,10 @@ def main(
             cub_args = [
                 *cub_stash,
                 *cub_inputs(
-                    work, "compare", references, query_list if topology == "batch" else []
+                    work,
+                    "compare",
+                    references,
+                    query_list if topology == "batch" else [],
                 ),
                 "--max-kmers",
                 str(max_kmers),
@@ -2389,7 +2417,9 @@ def main(
             dist_out = work / f"hg-{device}.ani"
             reference_sketch = str(work / f"hgr-{device}.sk")
             query_sketch = (
-                str(work / f"hgq-{device}.sk") if topology == "batch" else reference_sketch
+                str(work / f"hgq-{device}.sk")
+                if topology == "batch"
+                else reference_sketch
             )
 
             def hg_compare(
@@ -2591,7 +2621,7 @@ def main(
             rows = []
             for dist_out in compare_outs:
                 for line in dist_out.read_text().splitlines():
-                    if not line or line.startswith("#") or line.startswith("Ref_file"):
+                    if not line or line.startswith(("#", "Ref_file")):
                         continue
                     fields = line.split("\t")
                     if len(fields) >= 4:
@@ -3004,10 +3034,15 @@ def main(
             return oracle[key]["jaccard"]
 
         exact_rank: dict[str, list[str]] = {}
-        for query, refs in candidates.items():
-            known = [r for r in refs if (query, r) in oracle or (r, query) in oracle]
-            ranked = sorted(known, key=lambda r: (-exact_jaccard(query, r), r))
-            exact_rank[query] = ranked
+        for query_name, refs in candidates.items():
+            known = [
+                r
+                for r in refs
+                if (query_name, r) in oracle or (r, query_name) in oracle
+            ]
+            exact_rank[query_name] = sorted(
+                known, key=lambda r: (-exact_jaccard(query_name, r), r)
+            )
         search_index_ms: dict[str, list[float]] = {}
         search_query_ms: dict[str, list[float]] = {}
         search_phases: dict[str, dict[str, float]] = {}
@@ -3526,7 +3561,13 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {"hypergen-cpu", "hypergen-gpu", "simdsketch", "pp-sketchlib", "cub-exact"}:
+                if tool in {
+                    "hypergen-cpu",
+                    "hypergen-gpu",
+                    "simdsketch",
+                    "pp-sketchlib",
+                    "cub-exact",
+                }:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]

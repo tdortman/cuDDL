@@ -34,9 +34,7 @@ def main(
             "genome": f">genome\n{sequence}\n",
             "partial": f">partial\n{sequence[:4096]}NNNN{sequence[5000:]}\n",
             # Several records of one genome share each batch and repeat a common winner.
-            "repeats": "".join(
-                f">repeats{i}\n{'A' * 1024}\n" for i in range(70)
-            ),
+            "repeats": "".join(f">repeats{i}\n{'A' * 1024}\n" for i in range(70)),
             "empty": ">short\nACGTNN\n>another\nACGT\n",
             "reverse": f">reverse\n{sequence.translate(str.maketrans('ACGT', 'TGCA'))[::-1]}\n",
         }
@@ -134,7 +132,10 @@ def main(
                 if case["measurement"] == "genome":
                     assert 0 <= values["empty_buckets"] <= 2048
                     if case["role"] == "query" and case["genome_id"] == 1:
-                        assert values["cardinality"] == 0 and values["empty_buckets"] == 2048
+                        assert (
+                            values["cardinality"] == 0
+                            and values["empty_buckets"] == 2048
+                        )
                 elif case["measurement"] == "match" and topology == "batch":
                     assert case["query_id"] != 1, (
                         "empty query passed the positive retrieval threshold"
@@ -242,8 +243,16 @@ def main(
         auto_pipeline = auto_data["measurements"][0]
         assert auto_pipeline["case"]["resident_batch_bytes"] >= 25
         assert auto_pipeline["case"]["resident_batches"] >= 1
-        assert 0 < auto_pipeline["memory_bytes"]["resident_input"] <= auto_pipeline["case"]["resident_batch_bytes"]
-        assert 0 <= auto_pipeline["memory_bytes"]["resident_input_metadata"] <= auto_pipeline["case"]["resident_batch_bytes"]
+        assert (
+            0
+            < auto_pipeline["memory_bytes"]["resident_input"]
+            <= auto_pipeline["case"]["resident_batch_bytes"]
+        )
+        assert (
+            0
+            <= auto_pipeline["memory_bytes"]["resident_input_metadata"]
+            <= auto_pipeline["case"]["resident_batch_bytes"]
+        )
         assert auto_data["measurements"][1:] == packed["measurements"][1:], (
             "automatic GPU memory sizing changed sketches or pair results"
         )
@@ -286,7 +295,9 @@ def main(
         assert single_pipeline["case"]["resident_batch_bytes"] == 1048576
         assert single_pipeline["case"]["resident_batches"] == 1
         assert 0 < single_pipeline["memory_bytes"]["resident_input"] < 1048576
-        assert 0 <= single_pipeline["memory_bytes"]["resident_input_metadata"] <= 1048576
+        assert (
+            0 <= single_pipeline["memory_bytes"]["resident_input_metadata"] <= 1048576
+        )
         assert single_pipeline["memory_bytes"]["input_kmers"] == 0
         assert single_pipeline["metrics"]["oracle_passed"]
         assert single_data["measurements"][1:] == packed["measurements"][1:], (

@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Annotated
 
 import matplotlib as mpl
+import matplotlib.axes
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import pandas as pd
 import plot_utils as pu
 import typer
@@ -115,7 +117,6 @@ def main(
     if "cub-exact" in set(quality["implementation"]):
         implementations.append(("cub-exact", "cub-exact", {"color": "#999999"}))
     lanes = [name for name, _, _ in implementations]
-    labels = [label for _, label, _ in implementations]
     styles = {name: style for name, _, style in implementations}
 
     def frame_for(implementation: str, column: str) -> pd.DataFrame:

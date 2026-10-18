@@ -26,23 +26,29 @@ from slurm_utils import MGPU, genome_files
 def main(
     genomes: Annotated[Path, typer.Option(exists=True, file_okay=False)] = MGPU
     / "genomes-30k",
-    sizes: Annotated[list[int], typer.Option(help="Genome counts, one run each")] = [
-        1000,
-        3000,
-        10000,
-        20000,
-        30000,
-    ],
+    sizes: Annotated[
+        list[int] | None,
+        typer.Option(
+            help="Genome counts, one run each [default: 1000 3000 10000 20000 30000]"
+        ),
+    ] = None,
     threads: Annotated[int, typer.Option(help="SimdSketch threads")] = len(
         os.sched_getaffinity(0)
     ),
-    scratch: Annotated[Path, typer.Option(help="Working directory")] = Path(
-        f"/localscratch/{os.environ.get('SLURM_JOB_ID', 'local')}/cpu-baseline"
-    ),
+    scratch: Annotated[
+        Path | None,
+        typer.Option(
+            help="Working directory [default: /localscratch/$SLURM_JOB_ID/cpu-baseline]"
+        ),
+    ] = None,
     simdsketch: Annotated[
         Path, typer.Option(help="simdsketch-benchmark binary")
     ] = SIMDSKETCH,
 ) -> None:
+    sizes = sizes or [1000, 3000, 10000, 20000, 30000]
+    scratch = scratch or Path(
+        f"/localscratch/{os.environ.get('SLURM_JOB_ID', 'local')}/cpu-baseline"
+    )
     if "SLURM_JOB_ID" in os.environ and not simdsketch.exists():
         build_simdsketch()
     scratch.mkdir(parents=True, exist_ok=True)

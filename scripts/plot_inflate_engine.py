@@ -26,9 +26,11 @@ def main(
     csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     title: Annotated[str, typer.Option(help="Figure title")] = "B300, inflation alone",
     names: Annotated[
-        list[str],
-        typer.Option("--name", help="Label for an input directory's name, as NAME=LABEL"),
-    ] = [],
+        list[str] | None,
+        typer.Option(
+            "--name", help="Label for an input directory's name, as NAME=LABEL"
+        ),
+    ] = None,
     output: Annotated[
         Path, typer.Option(help="PDF to write; a PNG goes beside it")
     ] = Path("results/inflate-engine.pdf"),
@@ -36,7 +38,7 @@ def main(
     runs = pd.read_csv(csv)
     runs["input"] = runs["input"].map(lambda p: Path(p).name)
     runs["gbps"] = runs["GlobalMem BW (bytes/sec)"] / 1e9
-    labels = dict(name.split("=", 1) for name in names)
+    labels = dict(name.split("=", 1) for name in names or [])
     inputs = list(dict.fromkeys(runs["input"]))
     table = runs.pivot(index="input", columns="backend", values="gbps").reindex(inputs)
     table["engine speedup"] = table["engine"] / table["sm"]
@@ -48,14 +50,20 @@ def main(
     for i, (backend, label) in enumerate(BACKENDS.items()):
         values = table[backend].to_numpy()
         bars = ax.bar(
-            x + (i - (len(BACKENDS) - 1) / 2) * width, values, width, color=f"C{i + 2}", label=label
+            x + (i - (len(BACKENDS) - 1) / 2) * width,
+            values,
+            width,
+            color=f"C{i + 2}",
+            label=label,
         )
         ax.bar_label(bars, fmt="%.0f", fontsize=8, padding=2)
     ax.set_xticks(x, [labels.get(i, i) for i in inputs], fontsize=8)
     ax.set_ylabel("inflated GB/s")
     ax.set_ylim(top=table[list(BACKENDS)].to_numpy().max() * 1.12)
     ax.set_title(title)
-    fig.legend(loc="outside lower center", ncol=len(BACKENDS), fontsize=8, frameon=False)
+    fig.legend(
+        loc="outside lower center", ncol=len(BACKENDS), fontsize=8, frameon=False
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output.with_suffix(".png"), dpi=200, bbox_inches="tight")
     pu.save_figure(fig, output)

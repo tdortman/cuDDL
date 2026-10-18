@@ -95,8 +95,9 @@ def main(
     ],
     pairs: Annotated[int, typer.Option(help="Pairs the profiled search produced")],
     gpu: Annotated[
-        list[str], typer.Option(help=f"GPU specs: {', '.join(GPUS)}")
-    ] = list(GPUS),
+        list[str] | None,
+        typer.Option(help=f"GPU specs: {', '.join(GPUS)} [default: all]"),
+    ] = None,
     clock_ghz: Annotated[
         list[float] | None,
         typer.Option(help="Override sustained clocks, in --gpu order"),
@@ -105,6 +106,7 @@ def main(
         list[float] | None, typer.Option(help="Measured Gpairs/s, in --gpu order")
     ] = None,
 ) -> None:
+    gpu = gpu or list(GPUS)
     kernels = load(metrics)
     total = {c: sum(k[c] for k in kernels.values()) for c in COUNTERS}
     typer.secho(f"Per kernel ({pairs:,} pairs)", bold=True)
@@ -177,7 +179,7 @@ def main(
             "FMA": cycles * 2 / fma if fma else float("inf"),
             "DRAM": dram_gbps * 1e9 / dram if dram else float("inf"),
         }
-        bound = min(ceilings, key=ceilings.get)
+        bound = min(ceilings, key=ceilings.__getitem__)
         measured = measured_gpairs[i] if measured_gpairs else None
         rows.append(
             [

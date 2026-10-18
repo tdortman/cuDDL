@@ -137,10 +137,10 @@ def main(
             fig.tight_layout()
             if runtime_labels:
                 fig.canvas.draw()
-                renderer = fig.canvas.get_renderer()
+                # After a draw, extents without a renderer use the figure's cached one.
                 for bar, text in runtime_labels:
-                    width = bar.get_window_extent(renderer).width * 0.95
-                    while text.get_window_extent(renderer).width > width:
+                    width = bar.get_window_extent().width * 0.95
+                    while text.get_window_extent().width > width:
                         text.set_fontsize(text.get_fontsize() * 0.9)
             fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
             pu.save_figure(fig, output_dir / f"{stem}.pdf")
@@ -216,7 +216,9 @@ def main(
         # Energy over the same wall as the time panels; lanes without CPU counters have none.
         # Above idle subtracts the node's power at rest, so a tool that leaves most cores idle
         # is not billed for them, and neither is a CPU tool for the GPUs it never counted.
-        def energy_panel(rows: list[dict], unit: str, prefix: str, title: str, stem: str) -> None:
+        def energy_panel(
+            rows: list[dict], unit: str, prefix: str, title: str, stem: str
+        ) -> None:
             metered = sorted(
                 (r for r in rows if f"{prefix}_per_{unit}_j" in r["metrics"]),
                 key=lambda r: r["metrics"][f"{prefix}_per_{unit}_j"],
@@ -242,20 +244,28 @@ def main(
             ax.bar(names, cpu, label="CPU packages (RAPL)")
             bars = ax.bar(names, gpu, bottom=cpu, label="GPUs (NVML)")
             texts = ax.bar_label(
-                bars, labels=[f"{c + g:.3g}" for c, g in zip(cpu, gpu)],
-                padding=3, fontsize=pu.BAR_FONT_SIZE,
+                bars,
+                labels=[f"{c + g:.3g}" for c, g in zip(cpu, gpu)],
+                padding=3,
+                fontsize=pu.BAR_FONT_SIZE,
             )
             ax.set_yscale("log")
             ax.margins(y=0.15)
             # The smallest bar would otherwise sit below the axis.
-            ax.set_ylim(bottom=min((c + g for c, g in zip(cpu, gpu) if c + g > 0), default=1e-3) / 3)
+            ax.set_ylim(
+                bottom=min((c + g for c, g in zip(cpu, gpu) if c + g > 0), default=1e-3)
+                / 3
+            )
             ax.set_ylabel(f"Energy per {unit} (µJ), log scale")
             ax.set_title(title)
             ax.tick_params(axis="x", labelrotation=20)
             ax.legend(fontsize=8)
             save_both(fig, stem, list(zip(bars, texts)))
 
-        for rows, unit, operation in ((sketch, "genome", "sketch"), (compare, "pair", "compare")):
+        for rows, unit, operation in (
+            (sketch, "genome", "sketch"),
+            (compare, "pair", "compare"),
+        ):
             energy_panel(
                 rows,
                 unit,
@@ -285,7 +295,10 @@ def main(
 
             runs = []
             for row in compare:
-                if f"{prefix}_cpu_j" not in row["metrics"] or row["units"] != every_pair:
+                if (
+                    f"{prefix}_cpu_j" not in row["metrics"]
+                    or row["units"] != every_pair
+                ):
                     continue
                 own = [s for s in sketch if s["tool"] == row["tool"]]
                 if len(own) > 1:
@@ -319,7 +332,9 @@ def main(
                 bars = ax.bar(names, values, bottom=bottom, label=name, color=color)
                 bottom = [b + v for b, v in zip(bottom, values)]
             texts = ax.bar_label(
-                bars, labels=[f"{total:.3g}" for total in bottom], padding=3,
+                bars,
+                labels=[f"{total:.3g}" for total in bottom],
+                padding=3,
                 fontsize=pu.BAR_FONT_SIZE,
             )
             ax.margins(y=0.15)
@@ -329,7 +344,9 @@ def main(
             ax.legend(fontsize=8)
             save_both(fig, stem, list(zip(bars, texts)))
 
-        breakdown_panel("energy", "Node energy of SKETCH and COMPARE", "micro_energy_breakdown")
+        breakdown_panel(
+            "energy", "Node energy of SKETCH and COMPARE", "micro_energy_breakdown"
+        )
         breakdown_panel(
             "energy_dynamic",
             "Energy of SKETCH and COMPARE above idle",

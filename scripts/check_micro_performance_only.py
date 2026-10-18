@@ -7,8 +7,8 @@
 
 import json
 import random
-import subprocess
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -67,7 +67,14 @@ def main() -> None:
             ("cub-exact", False, "all-to-all"),
         ]:
             output = work / "result.json"
-            sampled = {"cuddl", "rabbitsketch", "simdsketch", "sketchlib", "bbtools", "dashing2"}
+            sampled = {
+                "cuddl",
+                "rabbitsketch",
+                "simdsketch",
+                "sketchlib",
+                "bbtools",
+                "dashing2",
+            }
             samples = 3 if tool in sampled else 1
             command = [
                 str(runner),

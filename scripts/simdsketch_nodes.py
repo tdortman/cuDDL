@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from slurm_utils import genome_files, per_node, read_files, run, scratch
@@ -34,7 +34,7 @@ SELF = ["uv", "run", "--offline", "scripts/simdsketch_nodes.py"]
 app = typer.Typer(add_completion=False)
 
 
-def timed(*command: str | Path, env: dict[str, str] | None = None) -> float:
+def timed(*command: str | Path | int, env: dict[str, str] | None = None) -> float:
     start = time.perf_counter()
     subprocess.run(
         [str(c) for c in command], check=True, env=env, stdout=subprocess.DEVNULL
@@ -94,7 +94,7 @@ def simdsketch_nodes(genomes: Path, nodes: int, threads: int) -> dict:
         assert len(times) == nodes, lines
         return max(times, key=lambda t: sum(t.values()))
 
-    report = {
+    report: dict[str, Any] = {
         "tool": "simdsketch",
         "genomes": len(paths),
         "nodes": nodes,
@@ -182,10 +182,10 @@ def compare(shared: SharedArg, nodes: NodesArg, threads: ThreadsArg) -> None:
         local / "pairs.f32",
         env={**os.environ, "CUDDL_RESIDENT_TIMINGS": str(timings)},
     )
-    comparing = (
-        float(re.search(r'"resident_ms":\s*([0-9.eE+-]+)', timings.read_text())[1])
-        / 1e3
-    )
+    resident = re.search(r'"resident_ms":\s*([0-9.eE+-]+)', timings.read_text())
+    if resident is None:
+        raise RuntimeError(f"{timings} holds no resident_ms")
+    comparing = float(resident[1]) / 1e3
     shutil.rmtree(local)
     print(json.dumps({"compare_s": comparing, "write_s": total - comparing}))
 

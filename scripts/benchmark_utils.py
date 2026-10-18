@@ -162,7 +162,7 @@ def merge_csv_files(
             continue
 
         # Apply transformer if provided
-        if line_transformers and line_transformers[idx]:
+        if line_transformers:
             lines = [line_transformers[idx](line) for line in lines]
 
         if header is None:

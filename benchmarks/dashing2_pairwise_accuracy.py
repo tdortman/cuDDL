@@ -29,6 +29,7 @@ ani = wkid^(1/25) compared against exact_set_derived_ani.
 
 import csv
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -52,11 +53,23 @@ def panel(
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     cmd = [
-        binary, "cmp", f"-k{K}", f"-S{SKETCH_SIZE}", "--full", *flags,
-        "--cache", "--outprefix", str(cache),
-        "-F", str(listing), "-Q", str(listing), "--cmpout", str(out),
+        binary,
+        "cmp",
+        f"-k{K}",
+        f"-S{SKETCH_SIZE}",
+        "--full",
+        *flags,
+        "--cache",
+        "--outprefix",
+        str(cache),
+        "-F",
+        str(listing),
+        "-Q",
+        str(listing),
+        "--cmpout",
+        str(out),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"dashing2 failed ({' '.join(cmd)}):\n{proc.stderr[-2000:]}")
     table: list[list[float]] = []
@@ -71,7 +84,9 @@ def panel(
         try:
             table.append([float(cell) for cell in cells])
         except ValueError as error:
-            raise RuntimeError(f"dashing2 returned a non-numeric panel cell in {out}") from error
+            raise RuntimeError(
+                f"dashing2 returned a non-numeric panel cell in {out}"
+            ) from error
     if len(table) != len(genomes):
         raise RuntimeError(
             f"dashing2 returned {len(table)} rows for {len(genomes)} genomes in {out}"
@@ -84,11 +99,15 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         cases = list(csv.DictReader(handle))
     paths = {
         (row["reference_sha256"], row["query_sha256"]): (
-            row["reference_path"], row["query_path"])
+            row["reference_path"],
+            row["query_path"],
+        )
         for row in cases
     }
     report = json.loads(Path(truth_path).read_text())
-    rows = [m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"]
+    rows = [
+        m for m in report["measurements"] if m["implementation"].get("name") == "cuddl"
+    ]
     if not rows:
         raise RuntimeError("no cuDDL rows to replay")
     for m in rows:
@@ -112,8 +131,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         if orientation not in ("query_to_reference", "reference_to_query"):
             raise RuntimeError(f"unknown pair orientation: {orientation}")
         try:
-            ref_path, qry_path = paths[
-                (task["reference_sha256"], task["query_sha256"])]
+            ref_path, qry_path = paths[(task["reference_sha256"], task["query_sha256"])]
         except KeyError:
             raise RuntimeError(f"case CSV lacks FASTA paths at row {n}")
         left = qry_path if forward else ref_path
@@ -129,40 +147,47 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
         ani = wkid ** (1.0 / K) if wkid > 0 else 0.0
 
         metrics: dict = {}
-        for key in ("orientation", "left_cardinality", "right_cardinality",
-                    "intersection", "exact_set_derived_ani"):
+        for key in (
+            "orientation",
+            "left_cardinality",
+            "right_cardinality",
+            "intersection",
+            "exact_set_derived_ani",
+        ):
             metrics[key] = truth[key]
 
-        def add(name: str, estimate: float) -> None:
-            if estimate != estimate:  # NaN guard
+        for name, estimate in (
+            ("cardinality", card_l),
+            ("containment", cont),
+            ("completeness", comp),
+            ("wkid", wkid),
+            ("ani", ani),
+        ):
+            if not math.isfinite(estimate):
                 raise RuntimeError(f"Dashing2 returned nonfinite {name} at row {n}")
             exact = truth["exact_" + name]
             metrics["exact_" + name] = exact
             metrics["sketch_" + name] = estimate
             metrics[name + "_signed_error"] = estimate - exact
             metrics[name + "_absolute_error"] = abs(estimate - exact)
-
-        add("cardinality", card_l)
-        add("containment", cont)
-        add("completeness", comp)
-        add("wkid", wkid)
-        add("ani", ani)
         metrics["cardinality_relative_error"] = (
-            metrics["cardinality_signed_error"] / truth["exact_cardinality"])
+            metrics["cardinality_signed_error"] / truth["exact_cardinality"]
+        )
         metrics["cardinality_absolute_relative_error"] = abs(
-            metrics["cardinality_relative_error"])
+            metrics["cardinality_relative_error"]
+        )
         metrics["sketch_jaccard"] = jac
         metrics["ani_estimator"] = "wkid^(1/k), wkid=I/min(A,B) from intersection-size"
         metrics["completeness_estimator"] = "min(1, estimated_left/estimated_right)"
         metrics["query_method"] = "FullSetSketch rectangular cmp"
-        out_rows.append({
-            "implementation": {"name": "dashing2", "variant": "FullSetSketch"},
-            "case": {k: v for k, v in task.items()},
-            "metrics": metrics,
-        })
+        out_rows.append(
+            {
+                "implementation": {"name": "dashing2", "variant": "FullSetSketch"},
+                "case": {**task, "sketch_size": SKETCH_SIZE},
+                "metrics": metrics,
+            }
+        )
 
-    for m in out_rows:
-        m["case"]["sketch_size"] = SKETCH_SIZE
     truth_report = json.loads(Path(truth_path).read_text())
     report_out = {
         "schema": truth_report["schema"],
