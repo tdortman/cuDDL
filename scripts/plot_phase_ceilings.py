@@ -46,27 +46,27 @@ def ceiling(rows: list[dict], phase: str) -> dict:
 def main(
     ceilings: Annotated[
         Path, typer.Option(exists=True, help="scripts/hw_ceilings.py JSON lines")
-    ] = Path("results/mogon-a40-ceilings-100k.jsonl"),
+    ] = Path("results/mogon-a100-ceilings-100k.jsonl"),
     cold: Annotated[
         Path,
         typer.Option(exists=True, help="End-to-end run reading from the filesystem"),
-    ] = Path("results/mogon-a40-eval-e2e-100k-5x8-m20-cold.json"),
+    ] = Path("results/mogon-a100-eval-e2e-100k-2x6-m20-cold.json"),
     warm: Annotated[
         Path,
         typer.Option(
             exists=True,
             help="End-to-end run from the page cache that writes every pair",
         ),
-    ] = Path("results/mogon-a40-eval-e2e-100k-1x8-m0-warm.json"),
+    ] = Path("results/mogon-a100-eval-e2e-100k-1x6-m0-warm.json"),
     strong: Annotated[
         Path, typer.Option(exists=True, help="Strong-scaling search run with one rank")
-    ] = Path("results/mogon-a40-eval-100k-5x8-strong.json"),
+    ] = Path("results/mogon-a100-eval-100k-2x6-strong.json"),
     alu: Annotated[
         Path,
         typer.Option(
             exists=True, help="alu-power-ceiling result of the same GPU model"
         ),
-    ] = Path("results/mogon-a40-alu-power-ceiling-gpu0.json"),
+    ] = Path("results/mogon-a100-alu-power-ceiling.json"),
     alu_per_pair: Annotated[
         float,
         typer.Option(
