@@ -660,6 +660,40 @@ def read_sketchlib_dists(
     return rows, count
 
 
+def read_ani_rows(
+    paths: list[Path], names: dict[str, str], stride: int
+) -> tuple[list[dict], int]:
+    """Samples every @p stride-th row of skani's or HyperGen's `reference<TAB>query<TAB>ANI`
+    text, with paths mapped through @p names.
+
+    Each tool writes only the pairs past its ANI screen, tens of gigabytes at 100k genomes, so
+    the files are streamed. The returned count is every row the tools wrote.
+    """
+    rows: list[dict] = []
+    count = 0
+    for path in paths:
+        with path.open() as handle:
+            for line in handle:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 3 or line.startswith(("#", "Ref_file")):
+                    continue
+                try:
+                    ani = float(fields[2])
+                except ValueError:
+                    continue
+                if count % stride == 0:
+                    rows.append(
+                        {
+                            "query": names.get(fields[1], fields[1]),
+                            "reference": names.get(fields[0], fields[0]),
+                            "jaccard": None,
+                            "ani": ani,
+                        }
+                    )
+                count += 1
+    return rows, count
+
+
 def discover(directory: Path) -> list[Path]:
     exts = (".fa", ".fna", ".fasta", ".ffn", ".frn")
     files = {
@@ -2303,6 +2337,13 @@ def main(
             cub_phases = cub_compare["phases_ms"]
             resident_timings[("cub-exact", "compare")] = cub_phases["resident_compare"]
 
+        def report_stride(evaluated: int) -> int:
+            """Stride over the rows of a tool that reports only screened pairs. Accuracy runs
+            score every row against ANIm; timing runs keep about match_rows of them."""
+            if not performance_only or not match_rows:
+                return 1
+            return max(1, (evaluated + match_rows - 1) // match_rows)
+
         # COMPARE op per tool; errors join cub-exact Jaccard and ANIm.
         def record_compare(
             tool: str,
@@ -2507,28 +2548,12 @@ def main(
                 resident_skip=1 if topology == "batch" else 0,
             )
             record_native_resident(tool, "compare", hg_compare_resident)
-            rows = []
-            for line in dist_out.read_text().splitlines():
-                fields = line.split("\t")
-                if len(fields) == 3:
-                    try:
-                        rows.append(
-                            {
-                                "query": staged_to_real.get(fields[1], fields[1]),
-                                "reference": staged_to_real.get(fields[0], fields[0]),
-                                "jaccard": None,
-                                "ani": float(fields[2]),
-                            }
-                        )
-                    except ValueError:
-                        continue
-            record_compare(
-                tool,
-                "hdc",
-                marks,
-                rows,
-                evaluated=count_pairs(references, query_list, topology),
-            )
+            evaluated = count_pairs(references, query_list, topology)
+            stride = report_stride(evaluated)
+            rows, reported = read_ani_rows([dist_out], staged_to_real, stride)
+            record_compare(tool, "hdc", marks, rows, evaluated=evaluated)
+            measurements[-1]["metrics"]["native_pair_rows"] = reported
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
         if "skani" in selected:
             # References are sketched once, untimed, like every other tool's saved reference
             # sketches; the wall loads them. Batch walls sketch the FASTX queries first, then
@@ -2647,29 +2672,13 @@ def main(
                 log_tail=True,
             )
             record_native_resident("skani", "compare", skani_compare_resident)
-            rows = []
-            for dist_out in compare_outs:
-                for line in dist_out.read_text().splitlines():
-                    if not line or line.startswith(("#", "Ref_file")):
-                        continue
-                    fields = line.split("\t")
-                    if len(fields) >= 4:
-                        rows.append(
-                            {
-                                "query": fields[1],
-                                "reference": fields[0],
-                                "jaccard": None,
-                                "ani": float(fields[2]),
-                            }
-                        )
             # skani writes only the pairs past its ANI screen; it evaluated all of them.
-            record_compare(
-                "skani",
-                "cpu",
-                marks,
-                rows,
-                evaluated=count_pairs(references, query_list, topology),
-            )
+            evaluated = count_pairs(references, query_list, topology)
+            stride = report_stride(evaluated)
+            rows, reported = read_ani_rows(compare_outs, {}, stride)
+            record_compare("skani", "cpu", marks, rows, evaluated=evaluated)
+            measurements[-1]["metrics"]["native_pair_rows"] = reported
+            measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
         if "cuddl" in selected:
             import json as jsonlib5
