@@ -3363,17 +3363,19 @@ def main(
             record_native_resident("skani", "search", skani_search_resident)
             search_index_ms["skani"] = sketch_times["skani"]
             search_query_ms["skani"] = marks
-            for line in search_out.read_text().splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split()
-                if len(fields) >= 3:
-                    try:
-                        search_scores[("skani", fields[1], fields[0])] = float(
-                            fields[2]
-                        )
-                    except ValueError:
-                        continue
+            if not performance_only:
+                with search_out.open() as handle:
+                    for line in handle:
+                        if not line or line.startswith("#"):
+                            continue
+                        fields = line.split()
+                        if len(fields) >= 3:
+                            try:
+                                search_scores[("skani", fields[1], fields[0])] = float(
+                                    fields[2]
+                                )
+                            except ValueError:
+                                continue
 
         if "dashing2" in selected:
             records = []
