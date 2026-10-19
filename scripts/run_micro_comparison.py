@@ -3093,15 +3093,19 @@ def main(
             cfg = work / "cuddl-search.toml"
             import json as jsonlib6
 
-            # The stage suite needs a query file even for all-to-all; match
-            # rows stay triangular over references.
-            search_queries = query_list or references[:1]
-            # Sketch-all searches the full-corpus index with the subset as queries. All-to-all
-            # over that index would need N*(N-1)/2 result rows on the device, which is more than
-            # a GPU holds, so the lane runs as batch: same index, queries on one side.
+            # Sketch-all searches the full-corpus index with the compare subset as queries.
+            # All-to-all over that index would need N*(N-1)/2 result rows on the device, which
+            # is more than a GPU holds, so the lane runs as batch: same index, the subset on the
+            # query side. Without a subset both sides are the corpus, so it stays all-to-all.
             search_references = sketch_references if sketch_all else references
-            search_topology = (
-                "batch" if sketch_all and topology == "all-to-all" else topology
+            subset_search = topology == "all-to-all" and len(search_references) > len(
+                references
+            )
+            search_topology = "batch" if subset_search else topology
+            # The stage suite needs a query file even for all-to-all; match rows stay
+            # triangular over references.
+            search_queries = (
+                references if subset_search else query_list or references[:1]
             )
             cfg.write_text(
                 "reference = "
