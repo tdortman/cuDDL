@@ -3395,7 +3395,10 @@ def main(
             if topology == "all-to-all":
                 neighbors = work / "d2-neighbors.tsv"
 
-                def d2_topk(count: int) -> list[str]:
+                # Every pair at cuDDL's minimum matching-bucket fraction, the same threshold
+                # join cuDDL runs. Its --topk mode compares only ceil(3.5 k) LSH candidates per
+                # genome; the threshold mode compares every candidate its LSH tables return.
+                def d2_search(count: int) -> list[str]:
                     return [
                         str(dashing2),
                         "cmp",
@@ -3407,15 +3410,15 @@ def main(
                         str(d2_dir),
                         "-F",
                         str(reference_list),
-                        "--topk",
-                        str(k),
+                        "--similarity-threshold",
+                        f"{min_matches / 2048:g}",
                         "--cmpout",
                         str(neighbors),
                     ]
 
                 # No index file format: the process wall loads cached sketches, builds the
                 # LSH index, and queries it.
-                marks = sweep("dashing2", "search", d2_topk, resident=records)
+                marks = sweep("dashing2", "search", d2_search, resident=records)
                 if any(record.get("index_build_ms", 0) <= 0 for record in records):
                     raise ValueError("Dashing2 did not execute its native LSH index")
                 search_index_ms["dashing2"] = [r["index_build_ms"] for r in records]
