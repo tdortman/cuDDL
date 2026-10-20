@@ -87,6 +87,7 @@ from host RAM. Large corpora evaluate a hashed genome sample that
 fits the budget; every lane runs the same files.
 """
 
+import array
 import gzip
 import hashlib
 import json
@@ -302,13 +303,15 @@ def cuddl_search_command(
     workers: int,
     decompression: CuddlDecompression,
     index: Path | None = None,
+    top_k: int = 0,
 ) -> list[str]:
     """Returns a CLI search that loads @p database (and @p index).
 
     FASTX @p queries are sketched and searched against every reference; None searches the
     database rows against each other, each unordered pair once. Binary results go to
     `/dev/null`: every row still reaches the host, but a full corpus would otherwise spend the
-    wall writing tens of gigabytes to disk.
+    wall writing tens of gigabytes to disk. A nonzero @p top_k keeps each genome's best
+    @p top_k neighbours on the device and writes only those.
     """
     # --config belongs to the top-level app, --all-to-all to the search subcommand.
     before, after = [], ["--all-to-all"]
@@ -333,6 +336,7 @@ def cuddl_search_command(
         str(workers),
         "--decompression",
         decompression,
+        *([f"--top-k={top_k}"] if top_k else []),
     ]
 
 
@@ -2719,6 +2723,8 @@ def main(
                     "--exhaustive",
                     "--minimum-matches",
                     "0",
+                    "--match-rows",
+                    str(match_rows),
                     "--workers",
                     str(cuddl_workers),
                     "--decompression",
@@ -3048,8 +3054,9 @@ def main(
                 }
             )
 
-        # SEARCH op: ranked retrieval per query; recall@k and top-1 hit rate
-        # against the exact Jaccard ranking. Self-pairs never rank.
+        # SEARCH op: every pair each tool's index passes (all pairs without an index), ranked
+        # per query; recall@k and top-1 hit rate against the exact Jaccard ranking. Self-pairs
+        # never rank.
         query_set = query_list if topology == "batch" else references
         # One shared name list: rebuilding the reference names per query allocates a fresh
         # string per reference per query, which is tens of gigabytes of identical text at a few
@@ -3085,6 +3092,14 @@ def main(
         search_phases: dict[str, dict[str, float]] = {}
         search_scores: dict[tuple[str, str, str], float] = {}
         search_cases: dict[str, dict] = {}
+        # TOP-K op: each genome's k best neighbours among all references, for the tools whose
+        # search returns k-nearest-neighbour lists. All-to-all only; scored like SEARCH.
+        top_k_lane = topology == "all-to-all"
+        topk_index_ms: dict[str, list[float]] = {}
+        topk_query_ms: dict[str, list[float]] = {}
+        topk_phases: dict[str, dict[str, float]] = {}
+        topk_scores: dict[tuple[str, str, str], float] = {}
+        topk_cases: dict[str, dict] = {}
 
         if "cuddl" in selected:
             pipeline_bin = build / "benchmarks/cuddl-pipeline-benchmark"
@@ -3114,55 +3129,58 @@ def main(
                 + jsonlib6.dumps([str(path) for path in search_queries])
                 + "\n"
             )
-            rep = work / "cuddl-search.json"
-            run_timed(
-                f"cuddl search: index {len(search_references)} references, "
-                f"query {len(search_queries)}",
-                [
-                    str(pipeline_bin),
-                    "--topology",
-                    search_topology,
-                    *(["--performance-only"] if performance_only else []),
-                    "--samples",
-                    str(max(samples, 2)),
-                    "--warmups",
-                    str(warmups),
-                    "--ingest",
-                    cuddl_ingest,
-                    "--resident-bytes",
-                    "0",
-                    *_CUDDL_FILE_CONFIGURATION,
-                    "--index",
-                    cuddl_index,
-                    "--minimum-matches",
-                    str(min_matches),
-                    "--workers",
-                    str(cuddl_workers),
-                    "--decompression",
-                    cuddl_decompression,
-                    "--config",
-                    str(cfg),
-                    "--output",
-                    str(rep),
-                ],
-            )
-            payload = jsonlib6.loads(rep.read_text())
-            pipe = next(
-                m
-                for m in payload["measurements"]
-                if m["case"].get("measurement") == "pipeline"
-            )
+            device_phase = f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed"
+
+            def search_pipeline(rep: Path, top_k: int) -> dict:
+                run_timed(
+                    f"cuddl search: index {len(search_references)} references, "
+                    f"query {len(search_queries)}"
+                    + (f", top {top_k}" if top_k else ""),
+                    [
+                        str(pipeline_bin),
+                        "--topology",
+                        search_topology,
+                        *(["--performance-only"] if performance_only else []),
+                        *(["--top-k", str(top_k)] if top_k else []),
+                        "--samples",
+                        str(max(samples, 2)),
+                        "--warmups",
+                        str(warmups),
+                        "--ingest",
+                        cuddl_ingest,
+                        "--resident-bytes",
+                        "0",
+                        *_CUDDL_FILE_CONFIGURATION,
+                        "--index",
+                        cuddl_index,
+                        "--minimum-matches",
+                        str(min_matches),
+                        "--workers",
+                        str(cuddl_workers),
+                        "--decompression",
+                        cuddl_decompression,
+                        "--config",
+                        str(cfg),
+                        "--output",
+                        str(rep),
+                    ],
+                )
+                return jsonlib6.loads(rep.read_text())
+
+            def pipeline_of(payload: dict) -> dict:
+                return next(
+                    m
+                    for m in payload["measurements"]
+                    if m["case"].get("measurement") == "pipeline"
+                )
+
+            payload = search_pipeline(work / "cuddl-search.json", 0)
+            pipe = pipeline_of(payload)
             # Same counting rule as the compare lane: the query interval here also runs the
             # benchmark's output phase, which prunes nothing when the threshold drops pairs.
-            phases = retrieval_phases(
-                pipe,
-                "search_and_download",
-                f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed",
-            )
+            phases = retrieval_phases(pipe, "search_and_download", device_phase)
             search_phases["cuddl"] = phases
-            resident_timings[("cuddl", "search")] = pipe["timings"][
-                f"{_CUDDL_DEVICE_PHASES[search_topology]}_indexed"
-            ]
+            resident_timings[("cuddl", "search")] = pipe["timings"][device_phase]
             # Wall is the CLI: load the database and the saved index, sketch FASTX queries
             # (batch) or reuse its rows (all-to-all, unique pairs only), search, and discard
             # the binary results.
@@ -3203,29 +3221,100 @@ def main(
             }
             search_index_ms["cuddl"] = [pipe["timings"]["prepare_wall"]["median_ms"]]
             search_query_ms["cuddl"] = marks
-            for m in payload["measurements"]:
-                if m["case"].get("measurement") == "match":
-                    metrics = m.get("metrics", {})
-                    if metrics.get("wkid") is None:
+            # Accuracy ranks the passing pairs the CLI writes by their exhaustive COMPARE ANI:
+            # the index only filters pairs, so a passing pair keeps its counts. SEARCH holds
+            # all-to-all pairs in both orientations, TOP-K each genome's kept neighbours.
+            compare_ani = {
+                (row["query"], row["reference"]): row["ani"]
+                for row in pair_table
+                if row["tool"] == "cuddl" and row.get("ani") is not None
+            }
+            cli_queries = query_set if search_topology == "batch" else search_references
+
+            def cuddl_result_scores(
+                name: str, top_k: int, both: bool
+            ) -> dict[tuple[str, str, str], float]:
+                out = work / f"{name}.bin"
+                command = cuddl_search_command(
+                    cuddl_cli,
+                    work,
+                    name,
+                    search_db,
+                    query_set if search_topology == "batch" else None,
+                    min_matches,
+                    cuddl_workers,
+                    cuddl_decompression,
+                    search_index_file,
+                    top_k,
+                )
+                command[command.index(os.devnull)] = str(out)
+                run_timed(f"{name}: passing pairs for accuracy", command)
+                # Each record is query_id, reference_id and four uint32 counts.
+                ids = array.array("I", out.read_bytes())
+                out.unlink()
+                scores = {}
+                for query_id, reference_id in zip(ids[0::6], ids[1::6]):
+                    query = str(cli_queries[query_id])
+                    reference = str(search_references[reference_id])
+                    ani = compare_ani.get(
+                        (query, reference), compare_ani.get((reference, query))
+                    )
+                    if ani is None:
                         continue
-                    search_scores[
-                        (
-                            "cuddl",
-                            str(
-                                search_references[m["case"]["query_id"]]
-                                if search_topology != "batch"
-                                else search_queries[m["case"]["query_id"]]
-                            ),
-                            str(search_references[m["case"]["reference_id"]]),
-                        )
-                    ] = metrics["wkid"]
+                    scores[("cuddl", query, reference)] = ani
+                    if both:
+                        scores[("cuddl", reference, query)] = ani
+                return scores
+
+            if not performance_only:
+                search_scores.update(
+                    cuddl_result_scores("cuddl-search", 0, search_topology != "batch")
+                )
+            if top_k_lane:
+                # The same search keeping each genome's k best neighbours on the device.
+                if performance_only:
+                    top_pipe = pipeline_of(
+                        search_pipeline(work / "cuddl-top-k.json", k)
+                    )
+                    topk_phases["cuddl"] = retrieval_phases(
+                        top_pipe, "search_and_download", device_phase
+                    )
+                    resident_timings[("cuddl", "top-k")] = top_pipe["timings"][
+                        device_phase
+                    ]
+                typer.echo(f"  cuddl top-k: CLI wall ({search_topology})")
+                top_marks = wall_of(
+                    cuddl_search_command(
+                        cuddl_cli,
+                        work,
+                        "cuddl-top-k",
+                        search_db,
+                        query_set if search_topology == "batch" else None,
+                        min_matches,
+                        cuddl_workers,
+                        cuddl_decompression,
+                        search_index_file,
+                        k,
+                    ),
+                    samples,
+                    warmups,
+                )
+                native_timings[("cuddl", "top-k")] = {
+                    "query": summarize(top_marks),
+                    "index_build": pipe["timings"]["prepare_wall"],
+                }
+                topk_index_ms["cuddl"] = search_index_ms["cuddl"]
+                topk_query_ms["cuddl"] = top_marks
+                if not performance_only:
+                    topk_scores.update(cuddl_result_scores("cuddl-top-k", k, False))
 
         if "sketchlib" in selected:
-            # The inverted index is built from FASTA, not from the sketch database. Batch
-            # queries count matching bins per reference; all-to-all preclusters through the
-            # index and keeps each genome's k nearest Jaccard neighbours.
+            # The inverted index is built from FASTA, not from the sketch database and saved
+            # to disk. Batch queries count matching bins per reference. All-to-all preclusters
+            # through the index for TOP-K, keeping the k nearest by Jaccard; SEARCH reuses the
+            # dense COMPARE instead, as keeping every neighbour preallocates samples^2 slots.
             skl_index = work / "skl-index"
-            search_index_ms["sketchlib"] = sweep(
+            skl_index_ms = sweep(
                 "sketchlib",
                 "search-index",
                 lambda count: [
@@ -3246,198 +3335,246 @@ def main(
                     *(["--write-skq"] if topology == "all-to-all" else []),
                 ],
             )
-            skl_search = work / "skl-search.tsv"
-            if topology == "batch":
-                skl_query = [
-                    "query",
-                    str(skl_index),
-                    "-f",
-                    str(skl_query_list),
-                ]
-            else:
-                skl_query = [
-                    "precluster",
-                    str(skl_index),
-                    "--skd",
-                    str(skl_references),
-                    "--knn",
-                    str(k),
-                ]
-            skl_search_resident: list[dict] = []
-            search_query_ms["sketchlib"] = sweep(
-                "sketchlib",
-                "search",
-                lambda count: [
-                    str(sketchlib),
-                    "inverted",
-                    *skl_query,
-                    "--threads",
-                    str(count),
-                    "-o",
-                    str(skl_search),
-                    "--quiet",
-                ],
-                resident=skl_search_resident,
-            )
-            record_native_resident("sketchlib", "search", skl_search_resident)
-            search_cases["sketchlib"] = {
-                "index": "native-inverted",
-                "index_supported": True,
-            }
-            if not performance_only:
-                with skl_search.open() as handle:
-                    if topology == "batch":
+
+            def skl_search(
+                operation: str, query: list[str], scores: dict, out: Path
+            ) -> list[float]:
+                resident: list[dict] = []
+                marks = sweep(
+                    "sketchlib",
+                    operation,
+                    lambda count: [
+                        str(sketchlib),
+                        "inverted",
+                        *query,
+                        "--threads",
+                        str(count),
+                        "-o",
+                        str(out),
+                        "--quiet",
+                    ],
+                    resident=resident,
+                )
+                record_native_resident("sketchlib", operation, resident)
+                if performance_only:
+                    return marks
+                with out.open() as handle:
+                    if query[0] == "query":
                         columns = next(handle).rstrip("\n").split("\t")[1:]
                         for line in handle:
-                            query, *counts = line.rstrip("\n").split("\t")
+                            name, *counts = line.rstrip("\n").split("\t")
                             for reference, count in zip(columns, counts, strict=True):
-                                search_scores[
+                                scores[
                                     (
                                         "sketchlib",
-                                        str(skl_names[query]),
+                                        str(skl_names[name]),
                                         str(skl_names[reference]),
                                     )
                                 ] = float(count)
                     else:
                         for line in handle:
-                            query, reference, distance = line.rstrip("\n").split("\t")[
+                            name, reference, distance = line.rstrip("\n").split("\t")[
                                 :3
                             ]
-                            search_scores[
+                            scores[
                                 (
                                     "sketchlib",
-                                    str(skl_names[query]),
+                                    str(skl_names[name]),
                                     str(skl_names[reference]),
                                 )
                             ] = 1 - float(distance)
+                return marks
+
+            def skl_precluster(knn: int) -> list[str]:
+                return [
+                    "precluster",
+                    str(skl_index),
+                    "--skd",
+                    str(skl_references),
+                    "--knn",
+                    str(knn),
+                ]
+
+            skl_cases = {"index": "native-inverted", "index_supported": True}
+            if topology == "batch":
+                search_index_ms["sketchlib"] = skl_index_ms
+                search_query_ms["sketchlib"] = skl_search(
+                    "search",
+                    ["query", str(skl_index), "-f", str(skl_query_list)],
+                    search_scores,
+                    work / "skl-search.tsv",
+                )
+                search_cases["sketchlib"] = skl_cases
+            if top_k_lane:
+                topk_query_ms["sketchlib"] = skl_search(
+                    "top-k", skl_precluster(k), topk_scores, work / "skl-top-k.tsv"
+                )
+                topk_index_ms["sketchlib"] = skl_index_ms
+                topk_cases["sketchlib"] = skl_cases
 
         if "bbtools" in selected:
             # BBTools has no index file: the wall loads the sketch file and builds the CSR
-            # index, whose build the harness reports apart from the ranked search.
-            bb_search = work / "bb-search.tsv"
-            records = []
-            search_query_ms["bbtools"] = sweep(
-                "bbtools",
-                "search",
-                lambda count: [
-                    *bb_query_sketch(count),
-                    [
-                        *bb_java,
-                        "search",
-                        str(bb_references),
-                        bb_queries,
-                        str(k),
-                        str(bb_search),
-                        str(count),
+            # index, whose build the harness reports apart from the ranked search. SEARCH
+            # keeps every reference reaching MIN_HITS, TOP-K the k best.
+            bb_query_paths = query_list if topology == "batch" else references
+
+            def bb_search(
+                operation: str, keep: int, scores: dict, out: Path
+            ) -> tuple[list[float], list[float]]:
+                records: list[dict] = []
+                marks = sweep(
+                    "bbtools",
+                    operation,
+                    lambda count: [
+                        *bb_query_sketch(count),
+                        [
+                            *bb_java,
+                            "search",
+                            str(bb_references),
+                            bb_queries,
+                            str(keep),
+                            str(out),
+                            str(count),
+                        ],
                     ],
-                ],
-                resident=records,
-                resident_skip=1 if topology == "batch" else 0,
+                    resident=records,
+                    resident_skip=1 if topology == "batch" else 0,
+                )
+                record_native_resident("bbtools", operation, records)
+                if not performance_only:
+                    with out.open() as handle:
+                        for line in handle:
+                            query, reference, wkid = line.rstrip("\n").split("\t")
+                            scores[
+                                (
+                                    "bbtools",
+                                    str(bb_query_paths[int(query)]),
+                                    str(references[int(reference)]),
+                                )
+                            ] = float(wkid)
+                return marks, [r["index_build_ms"] for r in records]
+
+            bb_cases = {"index": "native-csr2", "index_supported": True}
+            search_query_ms["bbtools"], search_index_ms["bbtools"] = bb_search(
+                "search", 0, search_scores, work / "bb-search.tsv"
             )
-            search_index_ms["bbtools"] = [r["index_build_ms"] for r in records]
-            record_native_resident("bbtools", "search", records)
-            search_cases["bbtools"] = {"index": "native-csr2", "index_supported": True}
-            if not performance_only:
-                bb_query_paths = query_list if topology == "batch" else references
-                with bb_search.open() as handle:
-                    for line in handle:
-                        query, reference, wkid = line.rstrip("\n").split("\t")
-                        search_scores[
-                            (
-                                "bbtools",
-                                str(bb_query_paths[int(query)]),
-                                str(references[int(reference)]),
-                            )
-                        ] = float(wkid)
+            search_cases["bbtools"] = bb_cases
+            if top_k_lane:
+                topk_query_ms["bbtools"], topk_index_ms["bbtools"] = bb_search(
+                    "top-k", k, topk_scores, work / "bb-top-k.tsv"
+                )
+                topk_cases["bbtools"] = bb_cases
 
         if "skani" in selected:
             skdb = work / "skdb"
-            search_out = work / "skani-search.tsv"
-            skani_search_resident = []
-            marks = sweep(
-                "skani",
-                "search",
-                lambda count: [
-                    str(skani),
-                    "search",
-                    "-d",
-                    str(skdb),
-                    "--ql",
-                    str(skani_list(work, "search-q", [str(q) for q in query_set])),
-                    "-o",
-                    str(search_out),
-                    "--min-af",
-                    "0",
-                    "-t",
-                    str(count),
-                ],
-                resident=skani_search_resident,
-            )
-            record_native_resident("skani", "search", skani_search_resident)
-            search_index_ms["skani"] = sketch_times["skani"]
-            search_query_ms["skani"] = marks
-            if not performance_only:
-                with search_out.open() as handle:
-                    for line in handle:
-                        if not line or line.startswith("#"):
-                            continue
-                        fields = line.split()
-                        if len(fields) >= 3:
-                            try:
-                                search_scores[("skani", fields[1], fields[0])] = float(
-                                    fields[2]
-                                )
-                            except ValueError:
+
+            # The sketch database loads from disk; SEARCH reports every pair past skani's
+            # screen, TOP-K the k best per genome.
+            def skani_search(
+                operation: str, limit: list[str], scores: dict, out: Path
+            ) -> list[float]:
+                resident: list[dict] = []
+                marks = sweep(
+                    "skani",
+                    operation,
+                    lambda count: [
+                        str(skani),
+                        "search",
+                        "-d",
+                        str(skdb),
+                        "--ql",
+                        str(skani_list(work, "search-q", [str(q) for q in query_set])),
+                        "-o",
+                        str(out),
+                        "--min-af",
+                        "0",
+                        *limit,
+                        "-t",
+                        str(count),
+                    ],
+                    resident=resident,
+                )
+                record_native_resident("skani", operation, resident)
+                if not performance_only:
+                    with out.open() as handle:
+                        for line in handle:
+                            if not line or line.startswith("#"):
                                 continue
+                            fields = line.split()
+                            if len(fields) >= 3:
+                                try:
+                                    scores[("skani", fields[1], fields[0])] = float(
+                                        fields[2]
+                                    )
+                                except ValueError:
+                                    continue
+                return marks
+
+            search_index_ms["skani"] = sketch_times["skani"]
+            search_query_ms["skani"] = skani_search(
+                "search", [], search_scores, work / "skani-search.tsv"
+            )
+            if top_k_lane:
+                topk_index_ms["skani"] = sketch_times["skani"]
+                topk_query_ms["skani"] = skani_search(
+                    "top-k", ["-n", str(k)], topk_scores, work / "skani-top-k.tsv"
+                )
 
         if "dashing2" in selected:
             records = []
             if topology == "all-to-all":
-                neighbors = work / "d2-neighbors.tsv"
+                # TOP-K is its --topk mode, which compares ceil(3.5 k) LSH candidates per
+                # genome. SEARCH reuses the dense COMPARE: its threshold join over the LSH
+                # index crashes at 100,000 genomes. No index file format: the process wall
+                # loads cached sketches, builds the LSH index, and queries it.
+                def d2_search(
+                    operation: str, mode: list[str], scores: dict, out: Path
+                ) -> tuple[list[float], list[dict]]:
+                    resident: list[dict] = []
+                    marks = sweep(
+                        "dashing2",
+                        operation,
+                        lambda count: [
+                            str(dashing2),
+                            "cmp",
+                            "-k25",
+                            "-S2048",
+                            f"-p{count}",
+                            "--cache",
+                            "--outprefix",
+                            str(d2_dir),
+                            "-F",
+                            str(reference_list),
+                            *mode,
+                            "--cmpout",
+                            str(out),
+                        ],
+                        resident=resident,
+                    )
+                    if any(record.get("index_build_ms", 0) <= 0 for record in resident):
+                        raise ValueError(
+                            "Dashing2 did not execute its native LSH index"
+                        )
+                    if not performance_only:
+                        with out.open() as handle:
+                            for line in handle:
+                                if not line.strip() or line.startswith("#"):
+                                    continue
+                                query, *hits = line.rstrip("\n").split("\t")
+                                for hit in hits:
+                                    reference, _, score = hit.rpartition(":")
+                                    scores[("dashing2", query, reference)] = float(
+                                        score
+                                    )
+                    return marks, resident
 
-                # Every pair at cuDDL's minimum matching-bucket fraction, the same threshold
-                # join cuDDL runs. Its --topk mode compares only ceil(3.5 k) LSH candidates per
-                # genome; the threshold mode compares every candidate its LSH tables return.
-                def d2_search(count: int) -> list[str]:
-                    return [
-                        str(dashing2),
-                        "cmp",
-                        "-k25",
-                        "-S2048",
-                        f"-p{count}",
-                        "--cache",
-                        "--outprefix",
-                        str(d2_dir),
-                        "-F",
-                        str(reference_list),
-                        "--similarity-threshold",
-                        f"{min_matches / 2048:g}",
-                        "--cmpout",
-                        str(neighbors),
-                    ]
-
-                # No index file format: the process wall loads cached sketches, builds the
-                # LSH index, and queries it.
-                marks = sweep("dashing2", "search", d2_search, resident=records)
-                if any(record.get("index_build_ms", 0) <= 0 for record in records):
-                    raise ValueError("Dashing2 did not execute its native LSH index")
-                search_index_ms["dashing2"] = [r["index_build_ms"] for r in records]
-                search_query_ms["dashing2"] = marks
-                if not performance_only:
-                    with neighbors.open() as handle:
-                        for line in handle:
-                            if not line.strip() or line.startswith("#"):
-                                continue
-                            query, *hits = line.rstrip("\n").split("\t")
-                            for hit in hits:
-                                reference, _, score = hit.rpartition(":")
-                                search_scores[("dashing2", query, reference)] = float(
-                                    score
-                                )
-                search_cases["dashing2"] = {
-                    "index": "native-lsh",
-                    "index_supported": True,
-                }
+                d2_cases = {"index": "native-lsh", "index_supported": True}
+                topk_query_ms["dashing2"], topk_records = d2_search(
+                    "top-k", ["--topk", str(k)], topk_scores, work / "d2-top-k.tsv"
+                )
+                topk_index_ms["dashing2"] = [r["index_build_ms"] for r in topk_records]
+                topk_cases["dashing2"] = d2_cases
+                record_native_resident("dashing2", "top-k", topk_records)
             else:
                 search_query_ms["dashing2"] = sweep(
                     "dashing2", "search", d2_cmp, resident=records, prepare=d2_prepare
@@ -3459,7 +3596,7 @@ def main(
                         search_scores[("dashing2", row["query"], row["reference"])] = (
                             row["jaccard"]
                         )
-            record_native_resident("dashing2", "search", records)
+                record_native_resident("dashing2", "search", records)
 
         if "rabbitsketch" in selected:
             timings = rabbit_timed["search"]["timings"]
@@ -3494,59 +3631,106 @@ def main(
                     search_scores[("rabbitsketch", query, reference)] = score
                     search_scores[("rabbitsketch", reference, query)] = score
 
-        # These lanes expose exhaustive comparison only.
-        for tool, score_key in (
-            ("hypergen-cpu", "ani"),
-            ("hypergen-gpu", "ani"),
-            ("simdsketch", "jaccard"),
-            ("pp-sketchlib", "jaccard"),
-            ("cub-exact", "jaccard"),
-        ):
-            if tool in selected:
-                search_index_ms[tool] = sketch_times[tool]
-        for tool, score_key in (
-            ("hypergen-cpu", "ani"),
-            ("hypergen-gpu", "ani"),
-            ("simdsketch", "jaccard"),
-            ("pp-sketchlib", "jaccard"),
-            ("cub-exact", "jaccard"),
-        ):
-            if tool in selected:
-                search_query_ms[tool] = [
-                    m["timings"]["wall"]["median_ms"]
-                    for m in measurements
-                    if m["implementation"]["name"] == tool
-                    and m["case"]["measurement"] == "micro-compare"
-                ]
-        # All-to-all rows hold each unordered pair once; search ranks from both ends.
-        for tool, score_key in (
-            ("hypergen-cpu", "ani"),
-            ("hypergen-gpu", "ani"),
-            ("simdsketch", "jaccard"),
-            ("pp-sketchlib", "jaccard"),
-            ("cub-exact", "jaccard"),
-        ):
-            if tool in selected:
-                for row in pair_table:
-                    if row["tool"] == tool and row.get(score_key) is not None:
-                        search_scores[(tool, row["query"], row["reference"])] = row[
-                            score_key
-                        ]
-                        search_scores[(tool, row["reference"], row["query"])] = row[
-                            score_key
-                        ]
+        if "pp-sketchlib" in selected and top_k_lane:
+            # Its sparse search: each genome's k nearest by core distance, picked on the GPU
+            # chunk by chunk without the dense matrix. No index; the database loads from disk.
+            pp_top_k = work / "pp-top-k.tsv"
+            pp_top_k_resident: list[dict] = []
+            topk_query_ms["pp-sketchlib"] = sweep(
+                "pp-sketchlib",
+                "top-k",
+                lambda count: [
+                    str(ppsketchlib),
+                    "knn",
+                    str(pp_references),
+                    str(k),
+                    str(pp_top_k),
+                    str(count),
+                ],
+                resident=pp_top_k_resident,
+            )
+            record_native_resident("pp-sketchlib", "top-k", pp_top_k_resident)
+            topk_index_ms["pp-sketchlib"] = sketch_times["pp-sketchlib"]
+            topk_cases["pp-sketchlib"] = {
+                "index": "none",
+                "index_supported": False,
+                "index_build_includes_sketching": True,
+            }
+            if not performance_only:
+                with pp_top_k.open() as handle:
+                    for line in handle:
+                        row, column, distance = line.split("\t")
+                        topk_scores[
+                            (
+                                "pp-sketchlib",
+                                str(references[int(row)]),
+                                str(references[int(column)]),
+                            )
+                        ] = 1 - float(distance)
+
+        # These lanes' SEARCH is their exhaustive COMPARE: they have no index, or for
+        # sketchlib.rust and Dashing2 all-to-all, no index join that runs at 100,000 genomes.
+        dense_search = {
+            "hypergen-cpu": "ani",
+            "hypergen-gpu": "ani",
+            "simdsketch": "jaccard",
+            "pp-sketchlib": "jaccard",
+            "cub-exact": "jaccard",
+        }
+        if topology == "all-to-all":
+            dense_search |= {"sketchlib": "jaccard", "dashing2": "jaccard"}
+            for tool, reason in (
+                (
+                    "sketchlib",
+                    "keeping every precluster neighbour preallocates samples^2",
+                ),
+                ("dashing2", "the LSH threshold join crashes at 100,000 genomes"),
+            ):
+                search_cases[tool] = {
+                    "index": "none",
+                    "index_supported": True,
+                    "index_unavailable_reason": reason,
+                }
+        for tool, score_key in dense_search.items():
+            if tool not in selected:
+                continue
+            search_index_ms[tool] = sketch_times[tool]
+            search_query_ms[tool] = [
+                m["timings"]["wall"]["median_ms"]
+                for m in measurements
+                if m["implementation"]["name"] == tool
+                and m["case"]["measurement"] == "micro-compare"
+            ]
+            # All-to-all rows hold each unordered pair once; search ranks from both ends.
+            for row in pair_table:
+                if row["tool"] == tool and row.get(score_key) is not None:
+                    search_scores[(tool, row["query"], row["reference"])] = row[
+                        score_key
+                    ]
+                    search_scores[(tool, row["reference"], row["query"])] = row[
+                        score_key
+                    ]
+
+        lanes = {
+            "search": (search_scores, search_index_ms, search_query_ms, search_cases),
+            "top-k": (topk_scores, topk_index_ms, topk_query_ms, topk_cases),
+        }
 
         def record_search(
-            tool: str, variant: str, extra: dict[str, float] | None = None
+            tool: str,
+            variant: str,
+            extra: dict[str, float] | None = None,
+            operation: str = "search",
         ) -> None:
+            scores, index_ms, query_ms, cases = lanes[operation]
             recalls, top1 = [], 0
             counted = 0
             for query in candidates:
                 exact = exact_rank[query]
                 scored = [
-                    (search_scores[(tool, query, ref)], ref)
+                    (scores[(tool, query, ref)], ref)
                     for ref in exact
-                    if (tool, query, ref) in search_scores
+                    if (tool, query, ref) in scores
                 ]
                 ranked = [ref for _, ref in sorted(scored, key=lambda t: (-t[0], t[1]))]
                 kk = min(k, len(exact))
@@ -3559,15 +3743,15 @@ def main(
                 {
                     "implementation": {"name": tool, "variant": variant},
                     "case": {
-                        "measurement": "micro-search",
+                        "measurement": f"micro-{operation}",
                         "topology": topology,
                         "queries": len(query_set),
                         "k": k,
-                        **search_cases.get(tool, {}),
+                        **cases.get(tool, {}),
                     },
                     "timings": {
-                        "index_build": summarize(search_index_ms[tool]),
-                        "query": summarize(search_query_ms[tool]),
+                        "index_build": summarize(index_ms[tool]),
+                        "query": summarize(query_ms[tool]),
                     },
                     "metrics": {
                         **(
@@ -3583,8 +3767,7 @@ def main(
                             else {}
                         ),
                         "per_query_ms": (
-                            statistics.median(search_query_ms[tool])
-                            / max(len(query_set), 1)
+                            statistics.median(query_ms[tool]) / max(len(query_set), 1)
                         ),
                         **(extra or {}),
                     },
@@ -3607,13 +3790,7 @@ def main(
         for tool in selected:
             if tool in search_index_ms and tool in search_query_ms:
                 record_search(tool, variants[tool], search_phases.get(tool))
-                if tool in {
-                    "hypergen-cpu",
-                    "hypergen-gpu",
-                    "simdsketch",
-                    "pp-sketchlib",
-                    "cub-exact",
-                }:
+                if tool in dense_search:
                     resident_timings[(tool, "search")] = resident_timings[
                         (tool, "compare")
                     ]
@@ -3627,6 +3804,8 @@ def main(
                             "query": native_timings[(tool, "compare")]["wall"],
                             "index_build": native_timings[(tool, "sketch")]["wall"],
                         }
+            if tool in topk_query_ms:
+                record_search(tool, variants[tool], topk_phases.get(tool), "top-k")
 
     for measurement in measurements:
         tool = measurement["implementation"]["name"]
@@ -3643,7 +3822,7 @@ def main(
                 else "sorted_kmer_sets"
                 if tool == "cub-exact"
                 else "indexed_sketches"
-                if operation == "search"
+                if operation in {"search", "top-k"}
                 and (
                     tool in {"cuddl", "skani"}
                     or measurement["case"].get("index", "none") != "none"
@@ -3653,7 +3832,7 @@ def main(
             measurement["case"].update(resident_metadata.get((tool, operation), {}))
         if measurement["implementation"]["name"] == "cuddl" and measurement["case"][
             "measurement"
-        ] in {"micro-compare", "micro-search"}:
+        ] in {"micro-compare", "micro-search", "micro-top-k"}:
             measurement["case"]["index"] = (
                 "none"
                 if measurement["case"]["measurement"] == "micro-compare"
@@ -3669,7 +3848,11 @@ def main(
             )
             measurement["case"]["threads"] = chosen_threads[(tool, swept)]
             measurement["case"]["thread_candidates"] = ",".join(map(str, thread_counts))
-            if operation == "search" and (tool, "search-index") in chosen_threads:
+            if (
+                operation in {"search", "top-k"}
+                and swept != "compare"
+                and (tool, "search-index") in chosen_threads
+            ):
                 measurement["case"]["index_threads"] = chosen_threads[
                     (tool, "search-index")
                 ]
@@ -3700,7 +3883,7 @@ def main(
     header = f"{'tool':<14}{'op':<9}{'wall_ms':>10}{'per_unit_ms':>13}{'/exact':>10}{'/anim':>10}"
     typer.echo(header)
     for m in measurements:
-        if m["case"]["measurement"] == "micro-search":
+        if m["case"]["measurement"] in {"micro-search", "micro-top-k"}:
             continue
         metrics = m["metrics"]
         op = m["case"]["measurement"].replace("micro-", "")

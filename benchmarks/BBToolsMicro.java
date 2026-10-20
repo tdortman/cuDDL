@@ -40,7 +40,8 @@ import structures.ListNum;
  *                                     reference, or the strict upper triangle of REFS for '-'
  * search REFS QUERIES|- K OUT THREADS DDLCompare's indexed search: index match counts prefilter
  *                                     references, full comparisons rank them, and the K best
- *                                     are written as 'query reference wkid' index rows
+ *                                     are written as 'query reference wkid' index rows; K = 0
+ *                                     writes every reference reaching MIN_HITS, ranked
  * </pre>
  *
  * REFS and QUERIES are sketch files written by {@code sketch}; the list file holds one FASTX path
@@ -243,8 +244,9 @@ public class BBToolsMicro {
             int[] counts = index.query(query.ddl);
             ArrayList<DDLComparison> ranked = new ArrayList<>();
             // DDLCompare's CompareThread: references reaching MIN_HITS are compared in full; when
-            // that leaves fewer than its buffer, references with any match are added.
-            int buffer = 20 + 2 * k;
+            // that leaves fewer than its buffer, references with any match are added. K = 0
+            // keeps every reference reaching MIN_HITS and nothing else.
+            int buffer = k == 0 ? 0 : 20 + 2 * k;
             for (int pass = 0; pass < 2; pass++) {
                 for (int r = 0; r < n; r++) {
                     if (all && r == q) {
@@ -261,7 +263,7 @@ public class BBToolsMicro {
                 }
             }
             ranked.sort(null);
-            int kept = Math.min(k, ranked.size());
+            int kept = k == 0 ? ranked.size() : Math.min(k, ranked.size());
             hits[q] = new int[kept];
             scores[q] = new float[kept];
             for (int i = 0; i < kept; i++) {

@@ -13,10 +13,13 @@
 //                                       index at k = 25 that the fit predicts, (1 - a)(1 - c)^25:
 //                                       row-major query x reference, or the strict upper triangle
 //                                       of REFS for '-'
+//   knn REFS K OUT THREADS              each sketch's K nearest neighbours among REFS by core
+//                                       distance, through the sparse search on GPU 0; writes
+//                                       one `row<TAB>neighbour<TAB>core distance` line each
 //
-// REFS and QUERIES are prefixes written by `sketch`. With CUDDL_RESIDENT_TIMINGS set, both
-// commands write their in-memory time: hashing sequences already read, or computing the
-// distances of loaded sketches up to the host matrix the library returns.
+// REFS and QUERIES are prefixes written by `sketch`. With CUDDL_RESIDENT_TIMINGS set, every
+// command writes its in-memory time: hashing sequences already read, or computing the
+// distances of loaded sketches up to the host matrix or neighbour lists the library returns.
 
 #include "api.hpp"
 #include "database/database.hpp"
@@ -182,6 +185,22 @@ void compare(
     if (!file) throw std::runtime_error("cannot write " + out.string());
 }
 
+void knn(std::string const& references, int k, std::filesystem::path const& out, int threads) {
+    auto const kmer_lengths = read_kmers(references);
+    auto ref_sketches =
+        load_sketches(references, read_lines(references + ".names"), kmer_lengths, false);
+    auto random = get_random(references, true);
+    auto const start = std::chrono::steady_clock::now();
+    auto const [rows, columns, distances] =
+        query_db_sparse_cuda(ref_sketches, kmer_lengths, random, k, 0, 0, threads);
+    write_resident(elapsed_ms(start), "gpu", "loaded sketches to host neighbour lists");
+    std::ofstream file(out);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        file << rows[i] << '\t' << columns[i] << '\t' << distances[i] << '\n';
+    }
+    if (!file) throw std::runtime_error("cannot write " + out.string());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -196,9 +215,12 @@ int main(int argc, char** argv) {
             );
         } else if (args.size() == 5 && args[0] == "compare") {
             compare(args[1], args[2], args[3], std::stoi(args[4]));
+        } else if (args.size() == 5 && args[0] == "knn") {
+            knn(args[1], std::stoi(args[2]), args[3], std::stoi(args[4]));
         } else {
             std::cerr << "usage: " << argv[0]
-                      << " sketch LIST OUT THREADS [K,K...] | compare REFS QUERIES|- OUT THREADS\n";
+                      << " sketch LIST OUT THREADS [K,K...] | compare REFS QUERIES|- OUT THREADS"
+                         " | knn REFS K OUT THREADS\n";
             return 2;
         }
     } catch (std::exception const& error) {

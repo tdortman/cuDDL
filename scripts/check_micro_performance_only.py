@@ -111,6 +111,12 @@ def main() -> None:
                 "micro-sketch",
                 "micro-compare",
                 "micro-search",
+                *(
+                    ["micro-top-k"]
+                    if topology == "all-to-all"
+                    and tool in {"cuddl", "skani", "dashing2", "sketchlib", "bbtools"}
+                    else []
+                ),
             }
             for measurement in measurements:
                 operation = measurement["case"]["measurement"]
