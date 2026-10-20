@@ -3,4 +3,4 @@ url = https://github.com/bacpop/pp-sketchlib.git
 revision = 052c7da7f605eef7596a11caa1c9c8ab1d084f8c
 depth = 1
 patch_directory = pp-sketchlib
-diff_files = pp-sketchlib/no-python.patch,pp-sketchlib/gpu-unfit-distance.patch,pp-sketchlib/gpu-barrier-once.patch,pp-sketchlib/gpu-wide-index.patch,pp-sketchlib/random-mc-race.patch
+diff_files = pp-sketchlib/no-python.patch,pp-sketchlib/gpu-unfit-distance.patch,pp-sketchlib/gpu-barrier-once.patch,pp-sketchlib/gpu-wide-index.patch,pp-sketchlib/random-mc-race.patch,pp-sketchlib/gpu-register-read-only.patch

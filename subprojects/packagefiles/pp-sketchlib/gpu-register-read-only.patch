@@ -1,0 +1,20 @@
+diff --git a/src/gpu/dist.cu b/src/gpu/dist.cu
+--- a/src/gpu/dist.cu
++++ b/src/gpu/dist.cu
+@@ -629,8 +629,14 @@
+ 
+-  // Register sketches on host so they can be copied async
++  // Register sketches on host so they can be copied async. Read-only registration
++  // is an optional device feature, absent on GeForce cards; plain registration works.
++  int device = 0, read_only = 0;
++  CUDA_CALL(cudaGetDevice(&device));
++  CUDA_CALL(cudaDeviceGetAttribute(
++      &read_only, cudaDevAttrHostRegisterReadOnlySupported, device));
+   for (size_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+     CUDA_CALL(cudaHostRegister((void *)ref_sketches[chunk_idx].data(),
+                                ref_sketches[chunk_idx].size() * sizeof(uint64_t),
+-                               cudaHostRegisterReadOnly));
++                               read_only ? cudaHostRegisterReadOnly
++                                         : cudaHostRegisterDefault));
+   }
+ 
