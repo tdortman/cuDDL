@@ -472,6 +472,26 @@ Each result takes 8 bytes as a `cuddl::packed_pairwise_counts`. Its position imp
 
 On the device, every pair has a fixed slot. A tile holds one row of `reference_count` slots per query, or the upper triangle for all-to-all. A threshold search writes only the passing slots and marks them in a pass bitmap. `download` gathers the passing results on the device first, so only they cross the bus.
 
+## Keep each genome's top k neighbours
+
+`cuddl::top_k_search` (in `<cuddl/top_k.cuh>`) keeps each genome's `k` best neighbours on the device while tiles stream past, so only `k` results per genome reach the host. Neighbours rank by weighted k-mer identity, and ties go to the smaller ID:
+
+```cpp
+auto best = CUDDL_UNWRAP(
+    cuddl::top_k_search::make(query_count, reference_count, BucketCount, 3, stream)
+);
+CUDDL_UNWRAP(database.search_batch_async(
+    queries, compatibility, 0U, workspace, results,
+    [&](cuddl::batch_result_tile const& tile) { CUDDL_UNWRAP(best.add(tile, stream)); },
+    {}, {.minimum_matches = 5U}, stream, &index
+));
+auto const neighbours = CUDDL_UNWRAP(best.download(stream));  // best first per genome
+```
+
+For an all-to-all search, pass the reference count as both counts. Each stored pair then counts for both of its genomes. Only pairs the search reports compete, so a threshold or an index can leave a genome with fewer than `k` neighbours. The collector keeps each genome's neighbours as a heap of 16 bytes per entry and visits only the passing pairs, one warp per genome. The shared memory the device gives a block therefore bounds `k`, to about 6,300 with 99 KiB, and `make` fails above it. On 20,000 RefSeq bacteria with an RTX 5070 Ti, the indexed all-to-all search took 38.5 ms on its own and 40.6 ms keeping the best 3, or 42.0 ms keeping the best 40. Collectors that saw disjoint tiles, such as one per replica of a multi-GPU search, merge with `cuddl::select_top_k(rows, k)`.
+
+`cuddl-reference-index search --top-k` writes these neighbours instead of every passing pair, three per genome by default, or `K` with `--top-k=K`.
+
 ## Search all-to-all on several GPUs
 
 Include `<cuddl/replicated_database.cuh>`. A `cuddl::replicated_database<K, BucketCount, Layout>` keeps one replica of a database on each device you name. It searches all-to-all with all of them at once:

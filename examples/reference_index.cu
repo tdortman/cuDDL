@@ -4,6 +4,7 @@
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
 #include <cuddl/replicated_database.cuh>
+#include <cuddl/top_k.cuh>
 
 #include <algorithm>
 #include <array>
@@ -93,6 +94,23 @@ class result_writer {
             reinterpret_cast<char const*>(records_.get()),
             static_cast<std::streamsize>(total * sizeof(cuddl::batch_search_result))
         );
+    }
+
+    /// Writes result rows already expanded on the host, such as each genome's top-k neighbours.
+    void write(std::span<cuddl::batch_search_result const> rows) {
+        if (binary_.is_open()) {
+            binary_.write(
+                reinterpret_cast<char const*>(rows.data()),
+                static_cast<std::streamsize>(rows.size_bytes())
+            );
+            return;
+        }
+        for (auto const& result : rows) {
+            auto const& counts = result.counts;
+            std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
+                      << '\t' << counts.equal << '\t' << counts.higher << '\t' << counts.both_empty
+                      << '\n';
+        }
     }
 
     void finish() {
@@ -211,6 +229,7 @@ void search(
     std::vector<std::filesystem::path> const& paths,
     result_writer& writer,
     uint32_t minimum_matches,
+    uint32_t top_k,
     unsigned workers,
     cuddl::decompression_backend decompression,
     std::optional<std::reference_wrapper<cuddl::device_blacklist const>> blacklist,
@@ -227,9 +246,25 @@ void search(
         stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
     );
     // Each tile's results are written before the next tile reuses the storage; the pinned host
-    // copy is reused too.
+    // copy is reused too. A top-k search keeps each query's neighbours on the device instead.
     cuddl::host_batch_results host(stream);
+    std::optional<cuddl::top_k_search> neighbours;
+    if (top_k != 0U) {
+        neighbours.emplace(CUDDL_UNWRAP(
+            cuddl::top_k_search::make(
+                static_cast<uint32_t>(paths.size()),
+                database.metadata().reference_count,
+                cli::buckets,
+                top_k,
+                stream
+            )
+        ));
+    }
     auto write_tile = [&](cuddl::batch_result_tile const& tile) {
+        if (neighbours) {
+            CUDDL_UNWRAP(neighbours->add(tile, stream));
+            return;
+        }
         CUDDL_UNWRAP(cuddl::download(tile, stream, host));
         writer.write(host);
     };
@@ -271,34 +306,63 @@ void search(
             ));
         }
     }
+    if (neighbours) writer.write(CUDDL_UNWRAP(neighbours->download(stream)));
     writer.finish();
 }
 
 /// Searches every unique database-row pair (query_id < reference_id) on @p devices, each holding
 /// a replica. Tiles are written in query order, so the output does not depend on the devices.
+/// A top-k search instead keeps each row's neighbours on every replica's device and merges them.
 void search_all_to_all(
     cuddl::reference_database_file const& file,
     std::filesystem::path const& index_path,
     result_writer& writer,
     uint32_t minimum_matches,
+    uint32_t top_k,
     std::span<cuda::device_ref const> devices
 ) {
     auto group = CUDDL_UNWRAP(replicated_type::upload(file, devices));
     if (!index_path.empty()) CUDDL_UNWRAP(group.load_index(index_path));
-    overlapped_writer overlapped(writer);
-    auto const write_tile = [&](cuddl::replica_tile const& tile) {
-        overlapped.push(tile);
+    auto run = [&](auto const& on_tile, const cuddl::replica_search& split) {
+        // Without an index or a threshold every pair is reported, so the exhaustive search runs.
+        if (index_path.empty() && minimum_matches == 0) {
+            CUDDL_UNWRAP(group.search_all_to_all(on_tile, split));
+        } else {
+            CUDDL_UNWRAP(
+                group.search_all_to_all(on_tile, {.minimum_matches = minimum_matches}, split)
+            );
+        }
     };
-    auto const split = cuddl::replica_search{.in_query_order = true};
-    // Without an index or a threshold every pair is reported, so the exhaustive search runs.
-    if (index_path.empty() && minimum_matches == 0) {
-        CUDDL_UNWRAP(group.search_all_to_all(write_tile, split));
-    } else {
-        CUDDL_UNWRAP(
-            group.search_all_to_all(write_tile, {.minimum_matches = minimum_matches}, split)
-        );
+    if (top_k == 0U) {
+        overlapped_writer overlapped(writer);
+        run([&](cuddl::replica_tile const& tile) { overlapped.push(tile); },
+            {.in_query_order = true});
+        overlapped.finish();
+        return;
     }
-    overlapped.finish();
+    auto const rows = file.metadata().reference_count;
+    std::vector<cuda::stream> streams;
+    std::vector<cuddl::top_k_search> neighbours;
+    streams.reserve(devices.size());
+    for (auto const device : devices) {
+        auto& stream = streams.emplace_back(device);
+        neighbours.push_back(
+            CUDDL_UNWRAP(cuddl::top_k_search::make(rows, rows, cli::buckets, top_k, stream))
+        );
+        stream.sync();
+    }
+    // Replicas call back concurrently, each with its own tiles and collector.
+    run([&](
+            cuddl::replica_tile const& tile
+        ) { CUDDL_UNWRAP(neighbours[tile.replica].add(tile.tile, tile.stream)); },
+        {});
+    std::vector<cuddl::batch_search_result> kept;
+    for (size_t replica = 0; replica < devices.size(); ++replica) {
+        auto const part = CUDDL_UNWRAP(neighbours[replica].download(streams[replica]));
+        kept.insert(kept.end(), part.begin(), part.end());
+    }
+    writer.write(cuddl::select_top_k(std::move(kept), top_k));
+    writer.finish();
 }
 
 }  // namespace
@@ -311,6 +375,7 @@ int main(int argc, char** argv) {
     std::vector<std::filesystem::path> queries;
     std::filesystem::path output;
     uint32_t minimum_matches = 1;
+    uint32_t top_k = 0;
     unsigned workers = cuddl::default_parser_workers();
     auto decompression = cuddl::decompression_backend::automatic;
     auto* build = app.add_subcommand(
@@ -372,6 +437,12 @@ int main(int argc, char** argv) {
             "Required matching indexed buckets; zero searches all references"
         )
         ->default_val(minimum_matches);
+    query->add_flag(
+        "--top-k{3}",
+        top_k,
+        "Keep each genome's K most similar genomes by weighted k-mer identity instead of every "
+        "passing pair; --top-k alone keeps 3, --top-k=K keeps K"
+    );
     query->add_option(
         "-o,--output",
         output,
@@ -434,7 +505,7 @@ int main(int argc, char** argv) {
                 devices.push_back(cuda::devices[id]);
             }
             result_writer writer(output);
-            search_all_to_all(file, index_path, writer, minimum_matches, devices);
+            search_all_to_all(file, index_path, writer, minimum_matches, top_k, devices);
             return 0;
         }
         cuda::stream stream{cuda::devices[0]};
@@ -465,6 +536,7 @@ int main(int argc, char** argv) {
             queries,
             writer,
             minimum_matches,
+            top_k,
             workers,
             decompression,
             blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt,
