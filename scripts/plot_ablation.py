@@ -12,11 +12,12 @@ stage it targets and end to end (the `e2e` suite's wall time). The stage is the 
 `search` suite (the search on resident sketches), and the `e2e` suite's time in the phase the
 optimisation targets (metrics `phase:NAME`).
 
-Draws a figure one ACM column wide, set in Linux Libertine like acmart: a stage panel and an
-end-to-end panel share one row per optimisation, ranked by the largest end-to-end slowdown,
-with one marker per machine, labelled with its slowdown, and lines spanning the slowdowns of
-repetitions paired by index. Slowdowns past an axis's cap sit at the cap as an arrow. Prints
-every slowdown as a Markdown table, largest first.
+Draws a figure one ACM column wide, set in Linux Libertine like acmart, to be included at 100%
+scale: a stage panel and an end-to-end panel share one row per optimisation, ranked by the
+largest end-to-end slowdown, with one marker per machine, labelled with its slowdown, and lines
+spanning the slowdowns of repetitions paired by index. A row's markers are centred on it, one
+lane per machine measured in that panel. Slowdowns past an axis's cap sit at the cap as an
+arrow. Prints every slowdown as a Markdown table, largest first.
 """
 
 import json
@@ -34,6 +35,10 @@ import typer
 SCOPES = {"micro": "stage", "build": "stage", "search": "stage", "e2e": "end to end"}
 SUITE_ORDER = {"micro": 0, "build": 1, "search": 2, "e2e": 3}
 COLUMN_INCHES = 3.33  # an ACM two-column layout's column width
+ROW_INCHES = 0.16
+LANE_INCHES = 0.065  # two value labels this far apart do not touch
+FONT = 6.5
+VALUE_FONT = 5.2
 MARKERS = "osD^v"
 
 # acmart sets text in Linux Libertine. Computer Modern at these sizes switches to its wide
@@ -159,29 +164,37 @@ def main(
         order = order[-top_n:]
         table = table[table.optimisation.isin(order)]
     row = {name: i for i, name in enumerate(order)}
-    labels = list(dict.fromkeys(table.label))
+    machines = {label: i for i, label in enumerate(dict.fromkeys(table.label))}
     legend = dict(n.split("=", 1) for n in names or [])
 
-    row_inches = 0.09 * max(1, len(labels))
+    rows_inches = ROW_INCHES * len(order)
     fig, axes = plt.subplots(
         1,
         2,
         sharey=True,
-        figsize=(COLUMN_INCHES, 0.45 + row_inches * len(order)),
+        figsize=(COLUMN_INCHES, 0.42 + rows_inches),
         layout="constrained",
-        gridspec_kw={"wspace": 0.03},
+        gridspec_kw={"wspace": 0.04},
     )
-    spread = 0.46 if len(labels) > 1 else 0.0
-    offsets = np.linspace(-spread / 2, spread / 2, len(labels))
-    for ax, scope in zip(axes, ("stage", "end to end")):
-        mine = table[table.scope == scope]
+    lane = LANE_INCHES / ROW_INCHES
+    for ax, scope, title in zip(
+        axes, ("stage", "end to end"), ("stage slowdown", "end-to-end slowdown")
+    ):
+        mine = table[table.scope == scope].copy()
+        # Lanes from the top: the first machine sits highest in a row.
+        rank = mine.label.map(machines)
+        index = rank.groupby(mine.optimisation).rank(method="first") - 1
+        count = mine.groupby("optimisation").label.transform("size")
+        mine["y"] = mine.optimisation.map(row) + ((count - 1) / 2 - index) * lane
         values = mine[["low", "slowdown", "high"]].to_numpy()
         top = np.nanmax(values) if values.size else 2.0
         cap = min(top, stage_cap) if scope == "stage" else top
-        right = cap * 1.22
-        for i, label in enumerate(labels):
+        right = cap * 1.25
+        for label, i in machines.items():
             points = mine[mine.label == label]
-            y = points.optimisation.map(row).to_numpy() + offsets[i]
+            if points.empty:
+                continue
+            y = points.y.to_numpy()
             clipped = points.slowdown > cap
             x = points.slowdown.clip(upper=cap)
             ax.hlines(
@@ -196,8 +209,7 @@ def main(
                 y[~clipped],
                 MARKERS[i % len(MARKERS)],
                 color=f"C{i}",
-                ms=2.6,
-                label=pu.paper_text(legend.get(label, label)),
+                ms=2.8,
             )
             ax.plot(x[clipped], y[clipped], ">", color=f"C{i}", ms=3)
             ends = np.fmax(points.high.clip(upper=cap), x)
@@ -205,11 +217,11 @@ def main(
                 ax.annotate(
                     times(value),
                     (xi, yi),
-                    xytext=(-3, 0) if past else (3, 0),
+                    xytext=(-3, 0) if past else (2.5, 0),
                     textcoords="offset points",
                     ha="right" if past else "left",
-                    va="center",
-                    fontsize=4.8,
+                    va="center_baseline",
+                    fontsize=VALUE_FONT,
                     color=f"C{i}",
                 )
         ax.axvline(1, color="black", lw=0.5)
@@ -218,33 +230,40 @@ def main(
         ticks = mpl.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
             left, right
         )
+        # A tick within a fifth of the axis of 1x would print over it.
+        gap = 0.2 * (right - left)
         ax.set_xticks(
-            sorted({1.0, *(t for t in ticks if left <= t <= right and t >= 1.5)})
+            sorted({1.0, *(t for t in ticks if 1 + gap <= t <= right)})
         )
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$")
         )
-        ax.tick_params(labelsize=6, length=2, pad=1)
+        ax.tick_params(labelsize=FONT, length=2, pad=1)
         ax.grid(True, axis="x", lw=0.3, alpha=0.5)
-        ax.set_title(scope, fontsize=7, pad=2)
-    axes[0].set_yticks(range(len(order)), [pu.paper_text(o) for o in order], fontsize=6)
+        ax.set_xlabel(title, fontsize=FONT + 0.5, labelpad=1)
+    axes[0].set_yticks(
+        range(len(order)), [pu.paper_text(o) for o in order], fontsize=FONT
+    )
     axes[0].tick_params(axis="y", length=0)
-    axes[0].set_ylim(-0.6, len(order) - 0.4)
-    if len(labels) > 1:
+    axes[0].set_ylim(-0.55, len(order) - 0.45)
+    if len(machines) > 1:
+        handles = [
+            mpl.lines.Line2D(
+                [], [], ls="", marker=MARKERS[i % len(MARKERS)], color=f"C{i}", ms=3
+            )
+            for i in machines.values()
+        ]
         fig.legend(
-            *axes[0].get_legend_handles_labels(),
+            handles,
+            [pu.paper_text(legend.get(label, label)) for label in machines],
             loc="outside upper center",
-            ncol=len(labels),
-            fontsize=6,
+            ncol=len(machines),
+            fontsize=FONT,
             frameon=False,
-            handletextpad=0.2,
-            columnspacing=0.8,
+            handletextpad=0.1,
+            columnspacing=0.9,
+            borderpad=0,
         )
-    fig.canvas.draw()
-    pos0 = axes[0].get_position()
-    pos1 = axes[1].get_position()
-    box_center = (pos0.x0 + pos1.x1) / 2
-    fig.supxlabel("slowdown without the optimisation", x=box_center, fontsize=7)
     fig.savefig(output.with_suffix(".png"), dpi=300, bbox_inches="tight")
     pu.save_figure(fig, output)
 
