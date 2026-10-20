@@ -2110,6 +2110,150 @@ TEST_F(ReferenceDatabaseTest, BitmapSeededAllToAllMatchesExhaustive) {
     }
 }
 
+/// Each genome's k best neighbours from every tile streamed to the host, ranked by weighted k-mer
+/// identity and then the smaller ID. All-to-all pairs count for both of their rows.
+struct top_k_oracle {
+    cuda::stream_ref stream;
+    uint32_t k;
+    uint32_t first_id;
+    std::vector<std::vector<cuddl::batch_search_result>> best;
+
+    void offer(cuddl::batch_search_result const& result) {
+        auto& kept = best[result.query_id - first_id];
+        auto const identity = cuddl::weighted_kmer_identity(result.counts);
+        auto const beats = [&](cuddl::batch_search_result const& other) {
+            auto const other_identity = cuddl::weighted_kmer_identity(other.counts);
+            return identity > other_identity ||
+                   (identity == other_identity && result.reference_id < other.reference_id);
+        };
+        if (kept.size() == k && !beats(kept.back())) return;
+        auto const at = std::ranges::find_if(kept, beats);
+        kept.insert(at, result);
+        if (kept.size() > k) kept.pop_back();
+    }
+
+    void operator()(cuddl::batch_result_tile const& tile) {
+        auto const host = CUDDL_UNWRAP(cuddl::download(tile, stream));
+        for (auto const& result : host.passing()) {
+            offer(result);
+            if (tile.upper_triangle) {
+                offer({result.reference_id, result.query_id, result.counts.mirrored()});
+            }
+        }
+    }
+
+    [[nodiscard]] std::vector<cuddl::batch_search_result> rows() const {
+        std::vector<cuddl::batch_search_result> all;
+        for (auto const& kept : best) all.insert(all.end(), kept.begin(), kept.end());
+        return all;
+    }
+};
+
+// Top-k collectors must keep exactly the oracle's neighbours across several all-to-all tiles, for
+// exhaustive and indexed tiles, for a k deep enough that inserts shift many entries, and for a
+// batch whose query IDs start past zero. Collectors that saw alternate tiles, as replicas sharing
+// a queue do, must merge to the same.
+TEST_F(ReferenceDatabaseTest, TopKSearchKeepsEachGenomesBestNeighbours) {
+    auto const stream = cuda::stream_ref{stream_};
+    using database_type = cuddl::reference_database<k_default, b_default>;
+    using index_type = cuddl::reference_index<k_default, b_default>;
+    constexpr uint32_t references = 6000U;
+    constexpr uint32_t k = 3U;
+    ASSERT_GT(references, cuddl::detail::all_to_all_tile_queries(references));
+    std::mt19937 random(0x70bU);
+    std::vector<uint16_t> rows(size_t{references} * b_default);
+    // A small score range makes equal buckets common and identities tie often.
+    std::ranges::generate(rows, [&] { return static_cast<uint16_t>(random() % 8U); });
+    auto device_rows = cuda::make_device_buffer<uint16_t>(stream, stream.device(), rows);
+    auto const compatibility = cuddl::score_compatibility::current<k_default, b_default>();
+    auto const database =
+        CUDDL_UNWRAP(database_type::build_async(device_rows, compatibility, stream));
+    auto const index = CUDDL_UNWRAP(index_type::build_async(database, stream));
+
+    auto all_to_all = [&](index_type const* search_index, uint32_t minimum, uint32_t keep) {
+        SCOPED_TRACE(minimum);
+        SCOPED_TRACE(keep);
+        auto const requirements =
+            CUDDL_UNWRAP(database.all_to_all_search_requirements(search_index));
+        auto workspace = cuda::make_device_buffer<uint8_t>(
+            stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+        );
+        auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+            stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+        );
+        top_k_oracle oracle{
+            stream, keep, 0U, std::vector<std::vector<cuddl::batch_search_result>>(references)
+        };
+        auto make = [&] {
+            return CUDDL_UNWRAP(
+                cuddl::top_k_search::make(references, references, b_default, keep, stream)
+            );
+        };
+        auto whole = make();
+        std::array halves{make(), make()};
+        uint32_t tiles = 0U;
+        auto consume = [&](cuddl::batch_result_tile const& tile) {
+            CUDDL_UNWRAP(whole.add(tile, stream));
+            CUDDL_UNWRAP(halves[tiles++ % 2U].add(tile, stream));
+            oracle(tile);
+        };
+        if (search_index == nullptr && minimum == 0U) {
+            CUDDL_UNWRAP(database.search_all_to_all_async(workspace, results, consume, {}, stream));
+        } else {
+            CUDDL_UNWRAP(database.search_all_to_all_async(
+                workspace, results, consume, {}, {.minimum_matches = minimum}, stream, search_index
+            ));
+        }
+        EXPECT_GT(tiles, 1U);
+        auto const expected = oracle.rows();
+        if (minimum == 0U) EXPECT_EQ(expected.size(), size_t{references} * keep);
+        EXPECT_EQ(CUDDL_UNWRAP(whole.download(stream)), expected);
+        auto merged = CUDDL_UNWRAP(halves[0].download(stream));
+        auto const other = CUDDL_UNWRAP(halves[1].download(stream));
+        merged.insert(merged.end(), other.begin(), other.end());
+        EXPECT_EQ(cuddl::select_top_k(std::move(merged), keep), expected);
+    };
+    all_to_all(nullptr, 0U, k);
+    all_to_all(nullptr, 0U, 40U);
+    // About an eighth of buckets match by chance, 256 on average; this keeps the upper tail.
+    all_to_all(&index, 290U, k);
+
+    constexpr uint32_t queries = 300U;
+    constexpr uint32_t first_query_id = 1000U;
+    std::vector<uint16_t> query_rows(size_t{queries} * b_default);
+    std::ranges::generate(query_rows, [&] { return static_cast<uint16_t>(random() % 8U); });
+    auto device_queries = cuda::make_device_buffer<uint16_t>(stream, stream.device(), query_rows);
+    auto const requirements = CUDDL_UNWRAP(database.batch_search_requirements(queries, stream));
+    auto workspace = cuda::make_device_buffer<uint8_t>(
+        stream, stream.device(), requirements.workspace_bytes, cuda::no_init
+    );
+    auto results = cuda::make_device_buffer<cuddl::packed_pairwise_counts>(
+        stream, stream.device(), requirements.maximum_pair_count, cuda::no_init
+    );
+    top_k_oracle oracle{
+        stream, k, first_query_id, std::vector<std::vector<cuddl::batch_search_result>>(queries)
+    };
+    auto batch = CUDDL_UNWRAP(
+        cuddl::top_k_search::make(queries, references, b_default, k, stream, first_query_id)
+    );
+    CUDDL_UNWRAP(database.search_batch_async(
+        {device_queries.data(), device_queries.size()},
+        compatibility,
+        first_query_id,
+        workspace,
+        results,
+        [&](cuddl::batch_result_tile const& tile) {
+            CUDDL_UNWRAP(batch.add(tile, stream));
+            oracle(tile);
+        },
+        {},
+        stream
+    ));
+    auto const expected = oracle.rows();
+    EXPECT_EQ(expected.size(), size_t{queries} * k);
+    EXPECT_EQ(CUDDL_UNWRAP(batch.download(stream)), expected);
+}
+
 // A threshold all-to-all tile starting at query q never compares the reference words below q / 32.
 // Its pass bitmap must still report no pair there, even when the workspace held set bits before.
 // Rows come in groups of four that share every indexed bucket except one emptied bucket per row;
