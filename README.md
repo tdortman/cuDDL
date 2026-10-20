@@ -182,32 +182,6 @@ meson test -C build --print-errorlogs
 
 GPU tests require a working CUDA device. The suite covers sketch operations and persistent reference index files, alongside result serialization checks.
 
-## Benchmarks
-
-Benchmarks are separate from the quick-start build because they pull in NVBench and additional comparison tools.
-
-```sh
-meson configure build -Dbenchmarks=enabled
-meson compile -C build
-uv run scripts/run_micro_comparison.py --help
-```
-
-The [micro-comparison runner](scripts/run_micro_comparison.py) measures sketch construction, pairwise comparison, and search. It records native tool settings and separates resident processing from end-to-end timings where the tools can isolate it. Dashing2 stages FASTX reads before sketching, so its sketch, compare, and search operations all report resident timings. The [pairwise accuracy runner](scripts/run_pairwise_accuracy.py) evaluates comparison quality; [plot_micro_comparison.py](scripts/plot_micro_comparison.py) plots micro-benchmark results.
-
-Every tool in the micro comparison evaluates the same pair set; all-to-all compares each unordered pair once. Each CPU tool runs at every `--threads` count, which defaults to half the physical cores, all of them, and all logical CPUs, and reports its fastest count in `case.threads`. CPU lanes bind OpenMP threads to cores and stay on one NUMA node when their threads fit its physical cores. Every wall is a whole process, timed from spawn to exit with one operation per process, so start-up and teardown count for every tool alike. `case.timing_scope` is `process`, or `process_jvm` for BBTools, whose wall includes JVM start-up; the plots label the latter. `--ani-truth` scores ANI against ANIm, built from MUMmer 4 `nucmer` alignments that `delta-filter -1` reduces to 1-to-1 matches, on a sample of the exact oracle's pairs at or above 80 percent exact Mash ANI.
-
-pp-sketchlib runs through a small harness of its own classes, `build/benchmarks/ppsketchlib-micro`. Meson builds pp-sketchlib and the HDF5 library its databases need from source, so no system HDF5 is required. It sketches assemblies on the CPU at k = 15, 19, 23, 27 and 31 and fits core and accessory distances on the GPU. Its comparison rows report the Jaccard index at k = 25 that the fit predicts. The build patches three things in its GPU kernel. Pairs with too few k-mer lengths left to fit get distance 1, as its CPU path reports them, instead of 0, which would read as identical genomes. Each block initialises its barrier once instead of once per k-mer length, which raced with warps still waiting on the previous length and hung large comparisons. The distance index is 64-bit, because all pairs of 100,000 genomes overflow a 32-bit one.
-
-HyperGen runs as two tools. `hypergen-cpu` and `hypergen-gpu` sketch on that device, and both compare with HyperGen's CPU `dist`.
-
-`--reference-count N` keeps the N genomes whose hashed file names come first. Accession order clusters species, so the first N accessions are far more or less redundant than the corpus. The hashed sample keeps the corpus's mix and picks the same genomes on every host.
-
-[`scripts/run_speed_of_light.py`](scripts/run_speed_of_light.py) measures how each tool's throughput grows with the compute it gets. GPU tools run at several CUDA MPS caps on their SMs, and CPU tools at several thread counts. [`scripts/plot_speed_of_light.py`](scripts/plot_speed_of_light.py) plots throughput against the share of SMs or cores beside the diagonal of throughput proportional to compute.
-
-[`scripts/run_ncu_sol.py`](scripts/run_ncu_sol.py) measures how close each GPU tool's kernels come to the hardware. It runs a tool's micro-comparison lane under Nsight Systems to find the kernels that take most of its GPU time. It then reruns the lane under Nsight Compute once per kernel and records SM, memory, L1, L2 and DRAM throughput as a percentage of peak over a few launches from the middle of the run. Compared pairs are capped (`--max-pairs`), so the time shares describe the capped run, while per-launch throughputs do not depend on the pair count. [`scripts/plot_ncu_sol.py`](scripts/plot_ncu_sol.py) draws one figure per corpus size.
-
-Use the supplied development shell for the benchmark toolchain. RabbitSketch and Dashing2 builds are x86-only and are skipped on ARM hosts. Compare runs with their dataset, hardware, sketch settings, and timing scope attached, rather than treating one speedup as universal.
-
 ## License
 
 cuDDL is distributed under the [Boost Software License 1.0](LICENSE). Third-party dependencies retain their own licenses.
