@@ -49,6 +49,9 @@ struct options {
     std::string index = "dense", topology = "batch";
     std::string ingest = "packed";
     uint32_t minimum_matches = 5, indexed_buckets = buckets / 2, key_bits = 15;
+    /// With --performance-only, keep each genome's top_k neighbours on the device instead of
+    /// downloading every passing pair; 0 downloads every pair.
+    uint32_t top_k = 0;
     unsigned workers = cuddl::default_parser_workers();
     cuddl::decompression_backend decompression = cuddl::decompression_backend::automatic;
     size_t resident_bytes = 0;  // 0 selects the batch budget from free GPU memory.
@@ -1421,6 +1424,24 @@ json run(options const& opts) {
         bool const all = opts.topology == "all-to-all";
         auto const phase = std::string(all ? "search_all_to_all_" : "search_batch_") +
                            (opts.exhaustive ? "exhaustive" : "indexed");
+        // A top-k search feeds every tile to a fresh collector, made inside the timed interval.
+        std::optional<cuddl::top_k_search> neighbours;
+        auto collect =
+            [&](cuda::stream_ref s) -> std::function<void(cuddl::batch_result_tile const&)> {
+            if (opts.top_k == 0U) return {};
+            neighbours.emplace(CUDDL_UNWRAP(
+                cuddl::top_k_search::make(
+                    static_cast<uint32_t>(all ? refs.rows() : queries.rows()),
+                    static_cast<uint32_t>(refs.rows()),
+                    buckets,
+                    opts.top_k,
+                    s
+                )
+            ));
+            return [&, s](cuddl::batch_result_tile const& tile) {
+                CUDDL_UNWRAP(neighbours->add(tile, s));
+            };
+        };
         json wall;
         timings[phase] = measure(
             opts,
@@ -1435,8 +1456,12 @@ json run(options const& opts) {
                     opts,
                     s,
                     !opts.exhaustive,
-                    all
+                    all,
+                    nullptr,
+                    collect(s)
                 );
+                // Free on the sample's stream, which ends with the sample.
+                neighbours.reset();
             },
             {},
             &wall
@@ -1446,6 +1471,25 @@ json run(options const& opts) {
         size_t host_bytes = 0, tiles = 0;
         timings["search_and_download"] =
             measure(opts, "search_and_download", true, [&](cuda::stream_ref) {
+                if (opts.top_k != 0U) {
+                    search(
+                        db,
+                        acceleration ? &*acceleration : nullptr,
+                        queries,
+                        buffers,
+                        opts,
+                        stream,
+                        !opts.exhaustive,
+                        all,
+                        nullptr,
+                        collect(stream)
+                    );
+                    auto kept = CUDDL_UNWRAP(neighbours->download(stream));
+                    downloaded = kept.size();
+                    host_bytes = kept.size() * sizeof(cuddl::batch_search_result);
+                    do_not_optimise(kept);
+                    return;
+                }
                 host_results output;
                 search(
                     db,
@@ -1478,6 +1522,7 @@ json run(options const& opts) {
               {"topology", opts.topology},
               {"ingest", opts.ingest},
               {"minimum_matches", opts.minimum_matches},
+              {"top_k", opts.top_k},
               {"parser_threads", streamed ? reference_rows.parser_workers : 0},
               {"references", refs.rows()},
               {"queries", all ? refs.rows() : queries.rows()},
@@ -2026,6 +2071,12 @@ int main(int argc, char** argv) try {
     app.add_option("--topology", opts.topology, "Search used in the E2E total")
         ->check(CLI::IsMember({"batch", "all-to-all"}));
     app.add_option("--minimum-matches", opts.minimum_matches)->check(CLI::Range(0, int(buckets)));
+    app.add_option(
+           "--top-k",
+           opts.top_k,
+           "With --performance-only, keep each genome's K best neighbours on the device"
+    )
+        ->check(CLI::Range(0, 4096));
     app.add_option("--indexed-buckets", opts.indexed_buckets)
         ->check(CLI::IsMember({int(buckets / 2), int(buckets)}));
     app.add_option("--key-bits", opts.key_bits)->check(CLI::IsMember({15, 16}));
@@ -2107,6 +2158,9 @@ int main(int argc, char** argv) try {
     }
     if (opts.performance_only && opts.resident_plan) {
         throw std::runtime_error("--performance-only and --resident-plan are mutually exclusive");
+    }
+    if (opts.top_k != 0U && !opts.performance_only) {
+        throw std::runtime_error("--top-k requires --performance-only");
     }
     if (!(opts.topology != "all-to-all" || opts.references.size() >= 2)) {
         throw std::runtime_error("all-to-all E2E needs at least two reference genomes");
