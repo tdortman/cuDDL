@@ -8,10 +8,12 @@
 import csv
 import hashlib
 import io
+import math
 import os
 import shlex
 import subprocess
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, TextIO
 
@@ -466,6 +468,48 @@ def write_cases(
     return cases_csv
 
 
+ERROR_SUFFIX = "_absolute_error"
+SUMMARY_QUANTILES = {"median": 0.5, "p90": 0.9, "p95": 0.95, "p99": 0.99}
+
+
+def percentile(ordered: list[float], q: float) -> float:
+    """Linear interpolation between the closest ranks of sorted values, numpy's default."""
+    position = q * (len(ordered) - 1)
+    low = math.floor(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def error_summaries(measurements: list[dict]) -> list[dict]:
+    """One measurement per implementation and metric: the distribution of its absolute error
+    over every row that scored it. Each row is one ordered pair in one orientation."""
+    errors: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for measurement in measurements:
+        name = measurement["implementation"]["name"]
+        for key, value in measurement["metrics"].items():
+            if key.endswith(ERROR_SUFFIX):
+                errors[name, key.removesuffix(ERROR_SUFFIX)].append(value)
+    summaries = []
+    for (name, metric), values in errors.items():
+        values.sort()
+        summaries.append(
+            {
+                "implementation": {"name": name},
+                "case": {"measurement": "error_summary", "metric": metric},
+                "metrics": {
+                    "count": len(values),
+                    "absolute_error_mean": math.fsum(values) / len(values),
+                    **{
+                        f"absolute_error_{label}": percentile(values, q)
+                        for label, q in SUMMARY_QUANTILES.items()
+                    },
+                    "absolute_error_max": values[-1],
+                },
+            }
+        )
+    return summaries
+
+
 def case_matcher(original_rows: list[dict]):
     """Tests whether a lane row matches some cuDDL case on the case fields both carry, with
     one set lookup per row. cuDDL rows all carry the same fields."""
@@ -543,6 +587,14 @@ def main(
             "validate against."
         ),
     ] = "cuddl,bbtools,rabbitsketch,cuco_hll,dashing2,skani,hypergen,simdsketch,sketchlib,pp-sketchlib,cub-exact",
+    pair_rows: Annotated[
+        bool,
+        typer.Option(
+            help="Keep one measurement per implementation, ordered pair and orientation "
+            "beside the per-implementation error summaries. They number about 20 per ordered "
+            "pair at 2 KB each, so a corpus of 1,000 genomes would write 40 GB of them."
+        ),
+    ] = True,
 ) -> None:
     """Build and run all implementations, then publish one JSON result."""
     selected = [name.strip() for name in implementations.split(",") if name.strip()]
@@ -1172,8 +1224,14 @@ def main(
             f"ANI scored on {scored} of {len(result['measurements'])} rows; the rest are "
             f"below the {ani_min_aligned_fraction:.0%} aligned-fraction floor"
         )
+    pairs = result["measurements"]
+    summaries = error_summaries(pairs)
+    result["measurements"] = [*pairs, *summaries] if pair_rows else summaries
     benchmark_schema.write_result(output, result)
-    typer.echo(f"Saved {len(result['measurements'])} measurements to {output}")
+    typer.echo(
+        f"Saved {len(summaries)} error summaries over {len(pairs)} rows to {output}"
+        + ("" if pair_rows else ", without the rows")
+    )
 
 
 if __name__ == "__main__":

@@ -154,7 +154,14 @@ def main(
         result = load_result(result_path, "pairwise_accuracy")
     except ValueError as error:
         raise typer.BadParameter(f"{result_path}: {error}") from error
-    data = pd.DataFrame(flatten_measurements(result))
+    # The runner's per-implementation error summaries sit beside the rows; this plot reads rows.
+    data = pd.DataFrame(
+        [
+            row
+            for row in flatten_measurements(result)
+            if row.get("measurement") != "error_summary"
+        ]
+    )
     required = {
         "implementation",
         "orientation",

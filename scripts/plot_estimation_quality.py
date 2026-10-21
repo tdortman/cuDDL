@@ -77,7 +77,14 @@ def main(
         quality_result = load_result(quality_json, "pairwise_accuracy")
     except ValueError as error:
         raise typer.BadParameter(f"{quality_json}: {error}") from error
-    quality = pd.DataFrame(flatten_measurements(quality_result))
+    # The runner's per-implementation error summaries sit beside the rows; this plot reads rows.
+    quality = pd.DataFrame(
+        [
+            row
+            for row in flatten_measurements(quality_result)
+            if row.get("measurement") != "error_summary"
+        ]
+    )
     require(
         quality,
         {"implementation", *(column for column, _ in METRICS)},

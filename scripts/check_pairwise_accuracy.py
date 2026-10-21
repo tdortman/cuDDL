@@ -6,8 +6,10 @@
 """Check four-way accuracy output against exact sets and pair orientation."""
 
 import math
+import statistics
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated
 
@@ -63,7 +65,12 @@ def main(
 
 
 def verify(output: Path) -> None:
-    rows = flatten_measurements(load_result(output, "pairwise_accuracy"))
+    flattened = flatten_measurements(load_result(output, "pairwise_accuracy"))
+    rows = [row for row in flattened if row.get("measurement") != "error_summary"]
+    assert rows, "verifying a result needs its pair rows (run without --no-pair-rows)"
+    verify_summaries(
+        rows, [row for row in flattened if row.get("measurement") == "error_summary"]
+    )
     sources = {row.get("case_source", "synthetic") for row in rows}
     if sources == {"refseq"}:
         verify_genome(rows)
@@ -229,6 +236,39 @@ def verify(output: Path) -> None:
     typer.echo(
         f"PASS: {len(rows)} accuracy rows, exact small sets, identical inputs, and both orientations"
     )
+
+
+def verify_summaries(rows: list[dict], summaries: list[dict]) -> None:
+    """Each summary restates one implementation's absolute error over one metric: recomputed
+    here from the rows with the standard library, independently of the runner."""
+    errors: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        for key, value in row.items():
+            if key.endswith("_absolute_error"):
+                metric = key.removesuffix("_absolute_error")
+                errors[row["implementation"], metric].append(value)
+    covered = {(summary["implementation"], summary["metric"]) for summary in summaries}
+    assert covered == set(errors), covered ^ set(errors)
+    for summary in summaries:
+        values = errors[summary["implementation"], summary["metric"]]
+        assert summary["count"] == len(values), summary
+        cuts = (
+            statistics.quantiles(values, n=100, method="inclusive")
+            if len(values) > 1
+            else values * 99
+        )
+        expected = {
+            "mean": statistics.fmean(values),
+            "median": statistics.median(values),
+            "p90": cuts[89],
+            "p95": cuts[94],
+            "p99": cuts[98],
+            "max": max(values),
+        }
+        for label, value in expected.items():
+            assert math.isclose(
+                summary[f"absolute_error_{label}"], value, rel_tol=1e-9, abs_tol=1e-15
+            ), (summary, label, value)
 
 
 def verify_genome(rows: list[dict]) -> None:
