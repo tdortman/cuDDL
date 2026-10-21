@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # the contract its rows claim: below this aligned fraction a pair's ANI is not scored.
 ANI_ALIGNED_FLOOR = 0.15
 # Lanes that estimate ANI alone and emit one orientation-free row per ordered pair.
-ANI_ONLY = ("skani", "hypergen", "simdsketch", "sketchlib")
+ANI_ONLY = ("skani", "hypergen", "simdsketch", "sketchlib", "pp-sketchlib")
 
 
 def main(

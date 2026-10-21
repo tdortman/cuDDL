@@ -3,17 +3,20 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""Replay pairwise accuracy cases through SimdSketch or sketchlib.rust (ANI only).
+"""Replay pairwise accuracy cases through SimdSketch, sketchlib.rust or pp-sketchlib (ANI only).
 
-Both tools estimate Jaccard similarity alone, so neither has cardinality, containment,
-completeness, or WKID estimates. Each reports ANI through the Mash Poisson model,
-1 + ln(2j / (1 + j)) / k, floored at zero as sketchlib's `ani_pois` does. Every genome is
-sketched once and compared all-to-all in one call. Jaccard is symmetric, so each pair yields
-one row, as for the other ANI-only lanes.
+None of the three has cardinality, containment, completeness, or WKID estimates. All three report
+ANI through the Mash Poisson model, 1 + ln(2j / (1 + j)) / k, floored at zero as sketchlib's
+`ani_pois` does. SimdSketch and sketchlib.rust estimate Jaccard similarity j alone; pp-sketchlib
+fits PopPUNK's core and accessory distances across its k-mer lengths, and j is the Jaccard index
+that fit predicts at k = 25. Its rows also carry `core_ani`, one minus the core distance, its
+native per-base identity. Every genome is sketched once and compared all-to-all in one call. All
+three are symmetric, so each pair yields one row, as for the other ANI-only lanes.
 
 Usage: jaccard_pairwise_accuracy.py TOOL CASES TRUTH OUTPUT BINARY THREADS
-TOOL is simdsketch (the `simdsketch-benchmark` harness, bucket sketch, s=2048, b=8) or
-sketchlib (`sketchlib`, s=2048 64-bit bins).
+TOOL is simdsketch (the `simdsketch-benchmark` harness, bucket sketch, s=2048, b=8), sketchlib
+(`sketchlib`, s=2048 64-bit bins), or pp-sketchlib (the `ppsketchlib-micro` harness, 2048
+14-bit bins at k = 15, 19, 23, 27, 31, distances on GPU 0).
 """
 
 import csv
@@ -39,7 +42,11 @@ CASE_KEYS = (
     "reference_sha256",
     "query_sha256",
 )
-VARIANTS = {"simdsketch": "bucket-b8", "sketchlib": "one-perm-minhash"}
+VARIANTS = {
+    "simdsketch": "bucket-b8",
+    "sketchlib": "one-perm-minhash",
+    "pp-sketchlib": "core-accessory",
+}
 
 
 def run(cmd: list[str]) -> None:
@@ -129,6 +136,34 @@ def poisson_ani(jaccard: float) -> float:
     return max(0.0, 1.0 + math.log(2.0 * jaccard / (1.0 + jaccard)) / K)
 
 
+def mash_estimates(
+    measure, binary: str, genomes: list[str], work: Path, threads: str
+) -> dict[tuple[int, int], tuple[float, float | None]]:
+    """(Jaccard, no core ANI) per pair from a Jaccard-only tool."""
+    return {
+        pair: (jaccard, None)
+        for pair, jaccard in measure(binary, genomes, work, threads).items()
+    }
+
+
+def ppsketchlib_estimates(
+    binary: str, genomes: list[str], work: Path, threads: str
+) -> dict[tuple[int, int], tuple[float, float | None]]:
+    """(Jaccard at k = 25 from the fit, 1 - core distance) per pair."""
+    listing = work / "genomes.txt"
+    listing.write_text("".join(f"{path}\n" for path in genomes))
+    prefix, out = work / "sketches", work / "jaccard.f32"
+    run([binary, "sketch", str(listing), str(prefix), threads])
+    run([binary, "compare", str(prefix), "-", str(out), threads])
+    jaccard = struct.iter_unpack("<f", out.read_bytes())
+    core = struct.iter_unpack("<f", Path(f"{out}.core").read_bytes())
+    # The harness writes the strict upper triangle row by row.
+    pairs = [(i, j) for i in range(len(genomes)) for j in range(i + 1, len(genomes))]
+    return {
+        pair: (j[0], 1.0 - c[0]) for pair, j, c in zip(pairs, jaccard, core, strict=True)
+    }
+
+
 def main(
     tool: str,
     cases_path: str,
@@ -158,11 +193,14 @@ def main(
     work.mkdir(parents=True, exist_ok=True)
     genomes = sorted({path for pair in paths.values() for path in pair})
     index = {path: i for i, path in enumerate(genomes)}
-    measure = simdsketch_jaccard if tool == "simdsketch" else sketchlib_jaccard
-    similarities = measure(binary, genomes, work, threads)
+    if tool == "pp-sketchlib":
+        estimates = ppsketchlib_estimates(binary, genomes, work, threads)
+    else:
+        measure = simdsketch_jaccard if tool == "simdsketch" else sketchlib_jaccard
+        estimates = mash_estimates(measure, binary, genomes, work, threads)
     expected = len(genomes) * (len(genomes) - 1) // 2
-    if len(similarities) != expected:
-        raise RuntimeError(f"{tool} returned {len(similarities)} of {expected} pairs")
+    if len(estimates) != expected:
+        raise RuntimeError(f"{tool} returned {len(estimates)} of {expected} pairs")
 
     emitted: set[tuple[str, str]] = set()
     out_rows = []
@@ -176,26 +214,29 @@ def main(
             continue
         emitted.add((ref_path, qry_path))
         if ref_path == qry_path:
-            jaccard = 1.0
+            jaccard, core_ani = 1.0, (None if tool != "pp-sketchlib" else 1.0)
         else:
             i, j = sorted((index[ref_path], index[qry_path]))
-            jaccard = similarities[(i, j)]
+            jaccard, core_ani = estimates[(i, j)]
         if not math.isfinite(jaccard):
             raise RuntimeError(f"{tool} returned a nonfinite Jaccard at row {n}")
         ani = poisson_ani(jaccard)
         exact = truth["exact_ani"]
+        metrics = {
+            "exact_ani": exact,
+            "sketch_ani": ani,
+            "ani_signed_error": ani - exact,
+            "ani_absolute_error": abs(ani - exact),
+            "sketch_jaccard": jaccard,
+            "ani_estimator": "Mash Poisson ANI from sketch Jaccard",
+        }
+        if core_ani is not None:
+            metrics["core_ani"] = core_ani
         out_rows.append(
             {
                 "implementation": {"name": tool, "variant": VARIANTS[tool]},
                 "case": {key: task[key] for key in CASE_KEYS if key in task},
-                "metrics": {
-                    "exact_ani": exact,
-                    "sketch_ani": ani,
-                    "ani_signed_error": ani - exact,
-                    "ani_absolute_error": abs(ani - exact),
-                    "sketch_jaccard": jaccard,
-                    "ani_estimator": "Mash Poisson ANI from sketch Jaccard",
-                },
+                "metrics": metrics,
             }
         )
 

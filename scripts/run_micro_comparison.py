@@ -2972,6 +2972,8 @@ def main(
                     "query": str(query),
                     "reference": str(reference),
                     "jaccard": jaccard,
+                    # Mash ANI from the fitted Jaccard tracks alignment ANI more closely than
+                    # one minus the core distance (scripts/run_pairwise_accuracy.py).
                     "ani": mash_ani(jaccard, sketch_k["pp-sketchlib"]),
                 }
                 for query, reference, jaccard in read_f32_pairs(

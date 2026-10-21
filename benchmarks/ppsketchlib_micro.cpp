@@ -9,8 +9,9 @@
 //                                       random match chances its database construction adds
 //   compare REFS QUERIES|- OUT THREADS  core and accessory distances on GPU 0, the fit across
 //                                       the k-mer lengths that its GPU path computes (at least
-//                                       two); writes one little-endian f32 per pair, the Jaccard
-//                                       index at k = 25 that the fit predicts, (1 - a)(1 - c)^25:
+//                                       two); writes one little-endian f32 per pair to OUT, the
+//                                       Jaccard index at k = 25 that the fit predicts,
+//                                       (1 - a)(1 - c)^25, and the core distance c to OUT.core:
 //                                       row-major query x reference, or the strict upper triangle
 //                                       of REFS for '-'
 //   knn REFS K OUT THREADS              each sketch's K nearest neighbours among REFS by core
@@ -173,16 +174,22 @@ void compare(
     );
     write_resident(elapsed_ms(start), "gpu", "loaded sketches to host distance matrix");
     std::vector<float> jaccard(static_cast<size_t>(dists.rows()));
+    std::vector<float> core(jaccard.size());
     for (size_t i = 0; i < jaccard.size(); ++i) {
         auto const row = static_cast<Eigen::Index>(i);
-        jaccard[i] = (1.0f - dists(row, 1)) * std::pow(1.0f - dists(row, 0), 25.0f);
+        core[i] = dists(row, 0);
+        jaccard[i] = (1.0f - dists(row, 1)) * std::pow(1.0f - core[i], 25.0f);
     }
-    std::ofstream file(out, std::ios::binary);
-    file.write(
-        reinterpret_cast<char const*>(jaccard.data()),
-        static_cast<std::streamsize>(jaccard.size() * sizeof(float))
-    );
-    if (!file) throw std::runtime_error("cannot write " + out.string());
+    for (auto const& [path, values] :
+         {std::pair{out, &jaccard},
+          std::pair{std::filesystem::path{out.string() + ".core"}, &core}}) {
+        std::ofstream file(path, std::ios::binary);
+        file.write(
+            reinterpret_cast<char const*>(values->data()),
+            static_cast<std::streamsize>(values->size() * sizeof(float))
+        );
+        if (!file) throw std::runtime_error("cannot write " + path.string());
+    }
 }
 
 void knn(std::string const& references, int k, std::filesystem::path const& out, int threads) {

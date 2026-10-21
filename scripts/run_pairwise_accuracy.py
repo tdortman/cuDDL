@@ -524,11 +524,11 @@ def main(
         str,
         typer.Option(
             help="Comma-separated lanes to run: cuddl, bbtools, rabbitsketch, "
-            "cuco_hll, dashing2, skani, hypergen, simdsketch, sketchlib, cub-exact. "
+            "cuco_hll, dashing2, skani, hypergen, simdsketch, sketchlib, pp-sketchlib, cub-exact. "
             "cuDDL and BBTools always run, they define cases and the CSV all lanes "
             "validate against."
         ),
-    ] = "cuddl,bbtools,rabbitsketch,cuco_hll,dashing2,skani,hypergen,simdsketch,sketchlib,cub-exact",
+    ] = "cuddl,bbtools,rabbitsketch,cuco_hll,dashing2,skani,hypergen,simdsketch,sketchlib,pp-sketchlib,cub-exact",
 ) -> None:
     """Build and run all implementations, then publish one JSON result."""
     selected = [name.strip() for name in implementations.split(",") if name.strip()]
@@ -546,6 +546,7 @@ def main(
             "hypergen",
             "simdsketch",
             "sketchlib",
+            "pp-sketchlib",
             "cub-exact",
         )
     ]
@@ -912,13 +913,17 @@ def main(
                 "subprojects/sketchlib/sketchlib",
                 build_dir / "subprojects/sketchlib/sketchlib",
             ),
+            "pp-sketchlib": (
+                "ppsketchlib-micro",
+                build_dir / "benchmarks/ppsketchlib-micro",
+            ),
         }
         for lane, (target, lane_bin) in jaccard_lanes.items():
             if lane not in selected:
                 continue
             run(
                 ["meson", "compile", "-C", str(build_dir), target]
-                if lane == "simdsketch"
+                if lane in ("simdsketch", "pp-sketchlib")
                 else ["ninja", "-C", str(build_dir), target]
             )
             lane_json = temporary_dir / f"{lane}.json"
