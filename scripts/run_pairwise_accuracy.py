@@ -466,6 +466,20 @@ def write_cases(
     return cases_csv
 
 
+def case_matcher(original_rows: list[dict]):
+    """Tests whether a lane row matches some cuDDL case on the case fields both carry, with
+    one set lookup per row. cuDDL rows all carry the same fields."""
+    keys: dict[tuple[str, ...], set[tuple]] = {}
+
+    def matches(row: dict) -> bool:
+        fields = tuple(f for f in CASE_FIELDS if f in row and f in original_rows[0])
+        if fields not in keys:
+            keys[fields] = {tuple(o[f] for f in fields) for o in original_rows}
+        return tuple(row[f] for f in fields) in keys[fields]
+
+    return matches
+
+
 @app.command()
 def main(
     output: Annotated[
@@ -664,18 +678,15 @@ def main(
                 | {r["query_path"] for r in case_rows}
             )
             genome_tri = skani_triangle(skani_bin, tri_genomes, temporary_dir, threads)
+            reference_paths: dict[str, str] = {}
+            query_paths: dict[str, str] = {}
+            for r in case_rows:
+                reference_paths.setdefault(r["reference_sha256"], r["reference_path"])
+                query_paths.setdefault(r["query_sha256"], r["query_path"])
             for row in cuddl_result["measurements"]:
                 task = row["case"]
-                ref = next(
-                    r["reference_path"]
-                    for r in case_rows
-                    if r["reference_sha256"] == task["reference_sha256"]
-                )
-                qry = next(
-                    r["query_path"]
-                    for r in case_rows
-                    if r["query_sha256"] == task["query_sha256"]
-                )
+                ref = reference_paths[task["reference_sha256"]]
+                qry = query_paths[task["query_sha256"]]
                 key = (qry, ref)
                 if key not in genome_tri:
                     raise RuntimeError(f"skani triangle lacks pair {key}")
@@ -832,21 +843,13 @@ def main(
             skani_rows = benchmark_schema.flatten_measurements(skani_result)
             # ANI-only lane on synthetic pairs below the detection floor:
             # subset match on KEY_FIELDS, not row-count equality.
+            matches_case = case_matcher(original_rows)
             for index, skani in enumerate(skani_rows):
                 if skani["implementation"] != "skani":
                     raise RuntimeError(
                         f"skani emitted an unexpected implementation at row {index}"
                     )
-                match = [
-                    o
-                    for o in original_rows
-                    if all(
-                        o[field] == skani[field]
-                        for field in CASE_FIELDS
-                        if field in o and field in skani
-                    )
-                ]
-                if not match:
+                if not matches_case(skani):
                     raise RuntimeError(f"skani case metadata differs at row {index}")
             skani_skipped = len(original_rows) - len(skani_rows)
             if skani_skipped:
@@ -950,6 +953,7 @@ def main(
                     )
                     for r in csv.DictReader(handle)
                 }
+        matches_case = case_matcher(original_rows)
         for lane, lane_result in ani_lane_results.items():
             # ANI lanes emit one row per ordered pair, not per orientation.
             # Every row must match a cuDDL case on shared fields.
@@ -960,14 +964,7 @@ def main(
                     raise RuntimeError(
                         f"{lane} emitted an unexpected implementation at row {index}"
                     )
-                if not any(
-                    all(
-                        o[field] == lane_row[field]
-                        for field in CASE_FIELDS
-                        if field in o and field in lane_row
-                    )
-                    for o in original_rows
-                ):
+                if not matches_case(lane_row):
                     raise RuntimeError(f"{lane} case metadata differs at row {index}")
             if genome_mode:
                 for row in lane_result["measurements"]:

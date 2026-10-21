@@ -137,8 +137,7 @@ def measurements_from_rows(
     implementation_field: str = "implementation",
     omit_fields: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
-    cases = set(case_fields)
-    omitted = set(omit_fields) | {implementation_field}
+    skipped = set(case_fields) | set(omit_fields) | {implementation_field}
     measurements: list[dict[str, Any]] = []
     for row in rows:
         implementation = str(row[implementation_field])
@@ -150,7 +149,7 @@ def measurements_from_rows(
         metrics = {
             key: scalar
             for key, value in row.items()
-            if key not in cases | omitted and (scalar := _scalar(value)) is not None
+            if key not in skipped and (scalar := _scalar(value)) is not None
         }
         measurements.append(
             {
