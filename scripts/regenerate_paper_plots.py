@@ -237,6 +237,92 @@ def cardinality_latency(hll_gh200: Path, hll_rtx5090: Path, hll_items: int) -> N
     plt.close(fig)
 
 
+# Pairwise accuracy tools, top to bottom, and the metrics drawn for each: implementation name ->
+# label. Tools that estimate only Jaccard similarity or core distance have no containment,
+# completeness or WKID.
+PAIRWISE_TOOLS = {
+    "cuddl": "cuDDL",
+    "bbtools": "BBTools",
+    "dashing2": "Dashing2",
+    "rabbitsketch": "RabbitSketch",
+    "simdsketch": "SimdSketch",
+    "sketchlib": "sketchlib.rust",
+    "pp-sketchlib": "pp-sketchlib",
+    "cuco_hll": "cuco HLL++",
+}
+PAIRWISE_METRICS = {
+    "containment": ("Containment", "#2ca02c"),
+    "completeness": ("Completeness", "#9467bd"),
+    "wkid": ("WKID", "#5b9bd5"),
+    "ani": ("ANI", "#ff8c38"),
+}
+# Only DDL estimates completeness from the sketch comparison itself; the benchmark derives the
+# other tools' completeness from two cardinality estimates, so it is not drawn for them.
+COMPLETENESS_TOOLS = {"cuddl", "bbtools"}
+
+
+def pairwise_error(path: Path) -> None:
+    """pairwise_error_refseq100.pdf (median and p95 absolute error per tool and metric)."""
+    summaries = {
+        (m["implementation"]["name"], m["case"]["metric"]): m["metrics"]
+        for m in json.loads(path.read_text())["measurements"]
+        if m["case"].get("measurement") == "error_summary"
+    }
+    if not summaries:
+        raise typer.BadParameter(
+            f"{path} has no error summaries, rerun scripts/run_pairwise_accuracy.py"
+        )
+
+    fig, ax = plt.subplots(figsize=(2.3, 2.2), dpi=300)
+    h_bar = 0.2
+    offsets = (
+        np.arange(len(PAIRWISE_METRICS)) - (len(PAIRWISE_METRICS) - 1) / 2
+    ) * h_bar
+    for offset, (metric, (label, colour)) in zip(offsets, PAIRWISE_METRICS.items()):
+        rows, medians, p95s = [], [], []
+        for row, (name, tool) in enumerate(PAIRWISE_TOOLS.items()):
+            # Absent where the tool has no such metric. Only DDL estimates completeness.
+            summary = summaries.get((name, metric))
+            if summary is None or (
+                metric == "completeness" and name not in COMPLETENESS_TOOLS
+            ):
+                continue
+            rows.append(row + offset)
+            medians.append(100 * summary["absolute_error_median"])
+            p95s.append(100 * summary["absolute_error_p95"])
+            print(
+                f"{tool:15} {label:13} median {medians[-1]:.3f}%  "
+                f"p95 {p95s[-1]:.3f}%  n={summary['count']}"
+            )
+        ax.barh(rows, p95s, h_bar, color=colour, label=label)
+        ax.plot(medians, rows, "o", color="black", ms=1.6)
+    ax.plot([], [], "o", color="black", ms=1.6, label="Median")
+    ax.set_yticks(range(len(PAIRWISE_TOOLS)), PAIRWISE_TOOLS.values())
+    ax.set_ylim(len(PAIRWISE_TOOLS) - 0.5, -0.5)
+    ax.set_xlabel("Abs. error, p95 (bars) [%]", fontsize=7.8)
+    ax.tick_params(axis="x", labelsize=7.2)
+    ax.tick_params(axis="y", labelsize=7.2, length=0)
+    ax.grid(True, axis="x")
+    ax.grid(False, axis="y")
+    ax.legend(
+        frameon=False,
+        # The rows of the Jaccard-only tools leave this corner empty.
+        loc="upper right",
+        bbox_to_anchor=(1.02, 0.46),
+        fontsize=6.0,
+        handlelength=0.9,
+        handletextpad=0.3,
+        labelspacing=0.15,
+        borderpad=0.1,
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout(pad=0.2)
+    fig.savefig(out_dir / "pairwise_error_refseq100.pdf")
+    fig.savefig(out_dir / "pairwise_error_refseq100.png")
+    plt.close(fig)
+
+
 def build_medians(paths: list[Path]) -> list[tuple[str, float, float]]:
     """(category, cpu, gpu) median build seconds per ablation label, warm before cold per system."""
     seconds: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
@@ -896,6 +982,9 @@ def main(
     hll_items: Annotated[
         int, typer.Option(help="Items per sketch for the speedup panel.")
     ] = 1 << 28,
+    pairwise_accuracy: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False)
+    ] = Path("results/pairwise-accuracy-refseq100-all.json"),
     ablation: Annotated[
         list[Path] | None,
         typer.Option(
@@ -955,6 +1044,7 @@ def main(
     out_dir.mkdir(parents=True, exist_ok=True)
     cardinality_accuracy(hll_accuracy, bbtools_accuracy)
     cardinality_latency(hll_gh200, hll_rtx5090, hll_items)
+    pairwise_error(pairwise_accuracy)
     b300_inflate(b300_csv)
     b300_build(b300_log, b300_input, b300_workers)
     io_backend_build(ablation)
