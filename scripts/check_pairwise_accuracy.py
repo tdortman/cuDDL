@@ -289,7 +289,7 @@ def verify_genome(rows: list[dict]) -> None:
         full = {
             k: v
             for k, v in implementations.items()
-            if v["implementation"] not in ("skani", "hypergen")
+            if v["implementation"] not in ANI_ONLY
         }
         for field in (
             "left_cardinality",
