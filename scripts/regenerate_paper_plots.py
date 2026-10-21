@@ -652,15 +652,39 @@ def load_tool_ops(path: Path) -> dict[tuple[str, str], tuple[float, float]]:
 
 def micro_ops(runs: list[dict]) -> None:
     """micro_ops_10k.pdf (100k RefSeq resident and E2E times across 5090 and GH200)."""
-    mon03 = load_tool_ops(Path("results/mon03-micro-perf-100k.json"))
+    mon03 = {}
+    for p in [
+        Path("results/mon03-micro-perf-100k.json"),
+        Path("results/mon03-micro-perf-100k-pp-sketchlib-k17,29.json"),
+        Path("results/mon03-micro-perf-100k-hypergen.json"),
+        Path("results/mon03-micro-perf-10k-cub-exact.json"),
+    ]:
+        mon03.update(load_tool_ops(p))
     gh200 = {}
     for p in [
         Path("results/gh200-micro-perf-100k-cuddl.json"),
         Path("results/gh200-micro-perf-100k-pp-sketchlib.json"),
         Path("results/gh200-micro-perf-100k-pp-sketchlib-k17,29.json"),
         Path("results/gh200-micro-perf-100k-hypergen.json"),
+        Path("results/gh200-micro-perf-10k-cub-exact.json"),
     ]:
         gh200.update(load_tool_ops(p))
+
+    def cub_exact(ops: dict) -> list[float | None]:
+        """cub-exact compares every pair of 10k genomes, scaled to 100k: SKETCH by the genome
+        ratio, COMPARE and the SEARCH that reuses it by the pair ratio."""
+        sketch = ops.get(("cub-exact:gpu-exact", "micro-sketch"))
+        compare = ops.get(("cub-exact:gpu-exact", "micro-compare"))
+        if sketch is None or compare is None:
+            return [None] * 5
+        genomes, pairs = 10.0, (100_000 * 99_999) / (10_000 * 9_999)
+        return [
+            sketch[0] * genomes,
+            compare[0] * pairs,
+            compare[0] * pairs,
+            None,
+            sketch[1] * genomes + compare[1] * pairs,
+        ]
 
     tools_list = [
         (
@@ -777,12 +801,32 @@ def micro_ops(runs: list[dict]) -> None:
             ],
         ),
         (
-            "pp-sketchlib 2k",
+            "pp-sketchlib 2k (Sys. A)",
             "#7f7f7f",
             [
-                gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-sketch"), (None,)
+                None,
+                mon03.get(
+                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (None,)
                 )[0],
+                mon03.get(
+                    ("pp-sketchlib:core-accessory-k17,29", "micro-search"), (None,)
+                )[0],
+                mon03.get(
+                    ("pp-sketchlib:core-accessory-k17,29", "micro-top-k"), (None,)
+                )[0],
+                mon03.get(
+                    ("pp-sketchlib:core-accessory-k17,29", "micro-sketch"), (0, 0)
+                )[1]
+                + mon03.get(
+                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (0, 0)
+                )[1],
+            ],
+        ),
+        (
+            "pp-sketchlib 2k (Sys. B)",
+            "#c7c7c7",
+            [
+                None,
                 gh200.get(
                     ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (None,)
                 )[0],
@@ -804,16 +848,29 @@ def micro_ops(runs: list[dict]) -> None:
             "HyperGen (CPU)",
             "#bcbd22",
             [
-                85.24,
-                3289.54,
-                3289.54,
+                mon03.get(("hypergen-cpu:hdc", "micro-sketch"), (None,))[0],
+                mon03.get(("hypergen-cpu:hdc", "micro-compare"), (None,))[0],
+                mon03.get(("hypergen-cpu:hdc", "micro-search"), (None,))[0],
                 None,
-                8484.10,
+                mon03.get(("hypergen-cpu:hdc", "micro-sketch"), (0, 0))[1]
+                + mon03.get(("hypergen-cpu:hdc", "micro-compare"), (0, 0))[1],
             ],
         ),
         (
-            "HyperGen (GPU)",
+            "HyperGen GPU (Sys. A)",
             "#dbdb8d",
+            [
+                mon03.get(("hypergen-gpu:hdc", "micro-sketch"), (None,))[0],
+                mon03.get(("hypergen-gpu:hdc", "micro-compare"), (None,))[0],
+                mon03.get(("hypergen-gpu:hdc", "micro-search"), (None,))[0],
+                None,
+                mon03.get(("hypergen-gpu:hdc", "micro-sketch"), (0, 0))[1]
+                + mon03.get(("hypergen-gpu:hdc", "micro-compare"), (0, 0))[1],
+            ],
+        ),
+        (
+            "HyperGen GPU (Sys. B)",
+            "#eeeec0",
             [
                 gh200.get(("hypergen-gpu:hdc", "micro-sketch"), (None,))[0],
                 gh200.get(("hypergen-gpu:hdc", "micro-compare"), (None,))[0],
@@ -823,6 +880,8 @@ def micro_ops(runs: list[dict]) -> None:
                 + gh200.get(("hypergen-gpu:hdc", "micro-compare"), (0, 0))[1],
             ],
         ),
+        ("cub-exact* (Sys. A)", "#252525", cub_exact(mon03)),
+        ("cub-exact* (Sys. B)", "#737373", cub_exact(gh200)),
     ]
 
     fig, ax = plt.subplots(figsize=(2.9, 2.2), dpi=300)
@@ -841,7 +900,8 @@ def micro_ops(runs: list[dict]) -> None:
         y_vals = [v if v is not None else np.nan for v in vals]
         ax.bar(x + off, y_vals, w, label=name, color=col)
     ax.set_yscale("log")
-    ax.set_ylim(1e-2, 1e7)
+    # Headroom above the cub-exact bars keeps the legend clear of them.
+    ax.set_ylim(1e-2, 1e10)
     ax.set_yticks([1e-2, 1e1, 1e4, 1e7])
     ax.set_ylabel("Execution time [s] (log)", fontsize=8.5)
     ax.set_xticks(x)
