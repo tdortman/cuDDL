@@ -751,7 +751,8 @@ def micro_ops(runs: list[dict]) -> None:
             "pp-sketchlib (Sys. A)",
             "#17becf",
             [
-                mon03.get(("pp-sketchlib:core-accessory", "micro-sketch"), (None,))[0],
+                # pp-sketchlib sketches assemblies on the CPU only; its E2E keeps that time.
+                None,
                 mon03.get(("pp-sketchlib:core-accessory", "micro-compare"), (None,))[0],
                 mon03.get(("pp-sketchlib:core-accessory", "micro-search"), (None,))[0],
                 mon03.get(("pp-sketchlib:core-accessory", "micro-top-k"), (None,))[0],
@@ -765,7 +766,7 @@ def micro_ops(runs: list[dict]) -> None:
             "pp-sketchlib (Sys. B)",
             "#9edae5",
             [
-                gh200.get(("pp-sketchlib:core-accessory", "micro-sketch"), (None,))[0],
+                None,
                 gh200.get(("pp-sketchlib:core-accessory", "micro-compare"), (None,))[0],
                 gh200.get(("pp-sketchlib:core-accessory", "micro-search"), (None,))[0],
                 gh200.get(("pp-sketchlib:core-accessory", "micro-top-k"), (None,))[0],
