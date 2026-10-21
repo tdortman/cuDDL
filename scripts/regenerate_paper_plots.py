@@ -1002,7 +1002,7 @@ def micro_energy(runs: list[dict]) -> None:
         ncol=1,
         frameon=False,
         loc="upper right",
-        bbox_to_anchor=(1.0, 1.0),
+        bbox_to_anchor=(1.1, 1.0),
         fontsize=5.2,
         borderpad=0.0,
         handlelength=0.6,
