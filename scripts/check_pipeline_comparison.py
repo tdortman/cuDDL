@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "typer"]
+# dependencies = ["fastjsonschema", "typer"]
 # ///
 """Check plot_pipeline_comparison via real CLI and run_pipeline_comparison budget selection."""
 

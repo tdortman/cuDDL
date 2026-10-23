@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
+# dependencies = ["fastjsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Plot 15-bit versus 16-bit indexes across actual RefSeq database sizes."""
 

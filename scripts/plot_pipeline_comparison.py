@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
+# dependencies = ["fastjsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Compare packed/sequence resident pipelines or legacy sequence application timings."""
 

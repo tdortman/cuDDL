@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "typer"]
+# dependencies = ["fastjsonschema", "typer"]
 # ///
 """Convert cuDDL search-decision NVBench samples into shared result JSON."""
 

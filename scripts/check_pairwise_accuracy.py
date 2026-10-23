@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "typer"]
+# dependencies = ["fastjsonschema", "typer"]
 # ///
 """Check four-way accuracy output against exact sets and pair orientation."""
 

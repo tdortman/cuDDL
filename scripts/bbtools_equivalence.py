@@ -4,7 +4,7 @@
 # dependencies = [
 #   "typer",
 #   "pandas",
-#   "jsonschema",
+#   "fastjsonschema",
 # ]
 # ///
 

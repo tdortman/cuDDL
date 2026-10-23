@@ -10,22 +10,20 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import jsonschema
+import fastjsonschema
 
 SCHEMA_NAME = "cuddl-benchmark/v1"
 SCHEMA_PATH = Path(__file__).parents[1] / "schemas/cuddl-benchmark-v1.schema.json"
-VALIDATOR = jsonschema.Draft202012Validator(json.loads(SCHEMA_PATH.read_text()))
+# Compiled to Python code: an order of magnitude faster than `jsonschema`, which a thousand-genome
+# accuracy run with millions of measurements needs.
+VALIDATE = fastjsonschema.compile(json.loads(SCHEMA_PATH.read_text()))
 
 
 def validate_result(result: Mapping[str, Any], operation: str | None = None) -> None:
-    errors = sorted(
-        VALIDATOR.iter_errors(result),
-        key=lambda error: tuple(map(str, error.absolute_path)),
-    )
-    if errors:
-        error = errors[0]
-        location = ".".join(map(str, error.absolute_path)) or "$"
-        raise ValueError(f"{location}: {error.message}")
+    try:
+        VALIDATE(result)
+    except fastjsonschema.JsonSchemaValueException as error:
+        raise ValueError(f"{error.name}: {error.message}") from error
     if operation is not None and result["operation"] != operation:
         raise ValueError(
             f"expected operation {operation!r}, got {result['operation']!r}"

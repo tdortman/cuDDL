@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["jsonschema", "matplotlib", "pandas", "typer"]
+# dependencies = ["fastjsonschema", "matplotlib", "pandas", "typer"]
 # ///
 """Speed-of-light figures from scripts/run_speed_of_light.py.
 
