@@ -465,6 +465,12 @@ void search(
             output->matches.insert(output->matches.end(), matches.begin(), matches.end());
         }
     };
+    // Exhaustive match counts restate `counts.equal`, and asking for them selects the counting
+    // kernel without near-duplicate deltas, so only full runs that keep them request them.
+    auto const matches =
+        indexed || (output && !opts.performance_only)
+            ? cuddl::device_span<uint32_t>{buffers.matches.data(), buffers.matches.size()}
+            : cuddl::device_span<uint32_t>{};
     auto const config = cuddl::search_options{.minimum_matches = opts.minimum_matches};
     if (all) {
         if (indexed) {
@@ -479,7 +485,7 @@ void search(
             ));
         } else {
             CUDDL_UNWRAP(db.search_all_to_all_async(
-                buffers.workspace, buffers.results, consume, buffers.matches, stream
+                buffers.workspace, buffers.results, consume, matches, stream
             ));
         }
     } else {
@@ -504,7 +510,7 @@ void search(
                 buffers.workspace,
                 buffers.results,
                 consume,
-                buffers.matches,
+                matches,
                 stream
             ));
         }
