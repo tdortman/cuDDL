@@ -3,21 +3,21 @@
 # requires-python = ">=3.12"
 # dependencies = ["matplotlib", "pandas", "tabulate", "typer"]
 # ///
-"""Ranks optimisations by what turning each off costs, from the JSON lines of ablation.py.
+"""Ranks optimisations by the speedup each brings, from the JSON lines of ablation.py.
 
-For every optimisation and machine, the slowdown without it is the median time of the
-configuration without it over the median time of the one it is compared with, measured on the
-stage it targets and end to end (the `e2e` suite's wall time). The stage is the first of: the
-`micro` suite (a host stage alone), the `build` suite (the build or its sketch kernels), the
-`search` suite (the search on resident sketches), and the `e2e` suite's time in the phase the
-optimisation targets (metrics `phase:NAME`).
+For every optimisation and machine, its speedup is the median time of the configuration without
+it over the median time of the one it is compared with, measured on the stage it targets and end
+to end (the `e2e` suite's wall time). The stage is the first of: the `micro` suite (a host stage
+alone), the `build` suite (the build or its sketch kernels), the `search` suite (the search on
+resident sketches), and the `e2e` suite's time in the phase the optimisation targets (metrics
+`phase:NAME`).
 
 Draws a figure one ACM column wide, set in Linux Libertine like acmart, to be included at 100%
 scale: a stage panel and an end-to-end panel share one row per optimisation, ranked by the
-largest end-to-end slowdown, with one marker per machine, labelled with its slowdown, and lines
-spanning the slowdowns of repetitions paired by index. A row's markers are centred on it, one
-lane per machine measured in that panel. Slowdowns past an axis's cap sit at the cap as an
-arrow. Prints every slowdown as a Markdown table, largest first.
+largest end-to-end speedup, with one marker per machine, labelled with its speedup, and lines
+spanning the speedups of repetitions paired by index. A row's markers are centred on it, one
+lane per machine measured in that panel. Speedups past an axis's cap sit at the cap as an
+arrow. Prints every speedup as a Markdown table, largest first.
 """
 
 import json
@@ -64,7 +64,7 @@ def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(runs), pd.DataFrame(ablations).drop_duplicates()
 
 
-def slowdowns(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
+def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for a in ablations.to_dict("records"):
         mine = runs[(runs.suite == a["suite"]) & (runs.label == a["label"])]
@@ -90,7 +90,7 @@ def slowdowns(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
                 "optimisation": a["optimisation"],
                 "with_s": reference.median(),
                 "without_s": without.median(),
-                "slowdown": without.median() / reference.median(),
+                "speedup": without.median() / reference.median(),
                 "low": paired.min() if not paired.empty else np.nan,
                 "high": paired.max() if not paired.empty else np.nan,
                 "reps": len(paired),
@@ -124,11 +124,11 @@ def main(
     top_n: Annotated[
         int,
         typer.Option(
-            "--top", help="Keep at most this many top optimisations by slowdown"
+            "--top", help="Keep at most this many top optimisations by speedup"
         ),
     ] = 9,
     stage_cap: Annotated[
-        float, typer.Option(help="Largest slowdown the stage axis shows")
+        float, typer.Option(help="Largest speedup the stage axis shows")
     ] = 12.0,
     names: Annotated[
         list[str] | None,
@@ -136,27 +136,27 @@ def main(
     ] = None,
 ) -> None:
     runs, ablations = load(results)
-    table = slowdowns(runs, ablations)
+    table = speedups(runs, ablations)
     if table.empty:
         raise typer.BadParameter("no ablation has both of its configurations measured")
     print(
-        table.sort_values("slowdown", ascending=False).to_markdown(
+        table.sort_values("speedup", ascending=False).to_markdown(
             index=False, floatfmt=".3f"
         )
     )
 
-    # Turning an optimisation off can also be faster, so the effect counts both ways.
-    table = table.assign(effect=np.abs(np.log(table.slowdown)))
+    # An optimisation can also make a run slower, so the effect counts both ways.
+    table = table.assign(effect=np.abs(np.log(table.speedup)))
     noteworthy = table[table.effect >= np.log(minimum)]
     table = table[
         table.optimisation.isin(noteworthy.optimisation)
         & table.label.isin(noteworthy.label)
     ]
     end_to_end = (
-        table[table.scope == "end to end"].groupby("optimisation").slowdown.max()
+        table[table.scope == "end to end"].groupby("optimisation").speedup.max()
     )
-    stage = table[table.scope == "stage"].groupby("optimisation").slowdown.max()
-    # Largest end-to-end slowdown on top; stage-only optimisations follow, by their stage slowdown.
+    stage = table[table.scope == "stage"].groupby("optimisation").speedup.max()
+    # Largest end-to-end speedup on top; stage-only optimisations follow, by their stage speedup.
     order = sorted(
         set(table.optimisation), key=lambda o: (end_to_end.get(o, 0), stage.get(o, 0))
     )
@@ -178,7 +178,7 @@ def main(
     )
     lane = LANE_INCHES / ROW_INCHES
     for ax, scope, title in zip(
-        axes, ("stage", "end to end"), ("stage slowdown", "end-to-end slowdown")
+        axes, ("stage", "end to end"), ("stage speedup", "end-to-end speedup")
     ):
         mine = table[table.scope == scope].copy()
         # Lanes from the top: the first machine sits highest in a row.
@@ -186,7 +186,7 @@ def main(
         index = rank.groupby(mine.optimisation).rank(method="first") - 1
         count = mine.groupby("optimisation").label.transform("size")
         mine["y"] = mine.optimisation.map(row) + ((count - 1) / 2 - index) * lane
-        values = mine[["low", "slowdown", "high"]].to_numpy()
+        values = mine[["low", "speedup", "high"]].to_numpy()
         top = np.nanmax(values) if values.size else 2.0
         cap = min(top, stage_cap) if scope == "stage" else top
         right = cap * 1.25
@@ -195,8 +195,8 @@ def main(
             if points.empty:
                 continue
             y = points.y.to_numpy()
-            clipped = points.slowdown > cap
-            x = points.slowdown.clip(upper=cap)
+            clipped = points.speedup > cap
+            x = points.speedup.clip(upper=cap)
             ax.hlines(
                 y,
                 points.low.clip(upper=cap),
@@ -213,7 +213,7 @@ def main(
             )
             ax.plot(x[clipped], y[clipped], ">", color=f"C{i}", ms=3)
             ends = np.fmax(points.high.clip(upper=cap), x)
-            for value, xi, yi, past in zip(points.slowdown, ends, y, clipped):
+            for value, xi, yi, past in zip(points.speedup, ends, y, clipped):
                 ax.annotate(
                     times(value),
                     (xi, yi),
@@ -232,9 +232,7 @@ def main(
         )
         # A tick within a fifth of the axis of 1x would print over it.
         gap = 0.2 * (right - left)
-        ax.set_xticks(
-            sorted({1.0, *(t for t in ticks if 1 + gap <= t <= right)})
-        )
+        ax.set_xticks(sorted({1.0, *(t for t in ticks if 1 + gap <= t <= right)}))
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$")
         )

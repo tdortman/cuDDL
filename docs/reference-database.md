@@ -723,7 +723,9 @@ Unpatched libdeflate needs its own build, from a source tree whose `subprojects/
 - `search` times `cuddl-multi-gpu-all-to-all-benchmark` on a resident database.
 - `e2e` times `cuddl-distributed-all-to-all-benchmark`, from genome files to written results.
 
-Each configuration runs next to the one it is compared with, interleaved over repetitions. `scripts/plot_ablation.py` takes the JSON lines, prints every slowdown as a table, and draws a figure one ACM column wide, set in Linux Libertine like `acmart`. A stage panel and an end-to-end panel share one row per optimisation, ranked by the end-to-end slowdown, with one labelled marker per machine on linear axes. Stage slowdowns past `--stage-cap` (12×) sit at the edge as an arrow. `--minimum` (1.1) drops optimisations, and machines, that change no time by that factor either way. Optimisations that only the end-to-end run can turn off get their stage slowdown from the phase they target, such as the time spent writing results.
+The `build` and `e2e` suites read every genome once before timing, so the runs read them from the page cache: the study shows how the pipeline behaves when storage keeps up. `build --uncached` evicts them before every run instead (`posix_fadvise(DONTNEED)`, which also works on Lustre).
+
+Each configuration runs next to the one it is compared with, interleaved over repetitions. `scripts/plot_ablation.py` takes the JSON lines, prints every optimisation's speedup (its median time disabled over its median time enabled) as a table, and draws a figure one ACM column wide, set in Linux Libertine like `acmart`. A stage panel and an end-to-end panel share one row per optimisation, ranked by the end-to-end speedup, with one labelled marker per machine on linear axes. Stage speedups past `--stage-cap` (12×) sit at the edge as an arrow. `--minimum` (1.15) drops optimisations, and machines, that change no time by that factor either way. Optimisations that only the end-to-end run can turn off get their stage speedup from the phase they target, such as the time spent writing results.
 
 Two drivers run the whole study:
 

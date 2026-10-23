@@ -47,9 +47,6 @@ if want micro; then
 fi
 if want build; then
   abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --label "$label"
-  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --uncached \
-    --reps 2 --label "$label, Lustre" --only "Read depth (gpu)" --only "Read depth (cpu)" \
-    --only "Probe depth" --only "GPU/host co-scheduling" --only "GPU decompression (nvCOMP)"
 fi
 if want search; then
   abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" --reps 2 \

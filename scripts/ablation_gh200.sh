@@ -29,9 +29,6 @@ abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/mai
 # per-rank GPU and pinned-pool choices have nothing to act on, so those ablations are left out.
 abl micro $scratch/genomes-1k --stock-build build/ablation/stock-build --label "$label"
 abl build "$genomes" --workers $workers --scratch $scratch --label "$label"
-abl build "$genomes" --workers $workers --scratch $scratch --uncached --reps 2 \
-  --label "$label, NVMe" --only "Read depth (gpu)" --only "Read depth (cpu)" \
-  --only "Probe depth" --only "GPU/host co-scheduling" --only "GPU decompression (nvCOMP)"
 abl search $scratch/db.cuddl --write-dir $scratch/out --launcher "mpirun -n 1" --reps 3 \
   --label "$label" \
   --only "Near-duplicate deltas" --only "Bit-sliced scores" --only "LOP3 plane kernel" \
