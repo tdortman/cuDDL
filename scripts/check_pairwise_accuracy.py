@@ -21,8 +21,17 @@ ROOT = Path(__file__).resolve().parent.parent
 # The runner's default --ani-min-aligned-fraction, restated so the checker can hold a result to
 # the contract its rows claim: below this aligned fraction a pair's ANI is not scored.
 ANI_ALIGNED_FLOOR = 0.15
-# Lanes that estimate ANI alone and emit one orientation-free row per ordered pair.
-ANI_ONLY = ("skani", "hypergen", "simdsketch", "sketchlib", "pp-sketchlib")
+# Lanes that estimate ANI alone: one orientation-free row per ordered pair, and the exact-set
+# formula lanes with one row per cuDDL case.
+EXACT_SET_LANES = ("exact-wkid-root", "exact-dice-root", "exact-poisson")
+ANI_ONLY = (
+    "skani",
+    "hypergen",
+    "simdsketch",
+    "sketchlib",
+    "pp-sketchlib",
+    *EXACT_SET_LANES,
+)
 
 
 def main(
@@ -71,6 +80,7 @@ def verify(output: Path) -> None:
     verify_summaries(
         rows, [row for row in flattened if row.get("measurement") == "error_summary"]
     )
+    verify_ani_formulas(rows)
     sources = {row.get("case_source", "synthetic") for row in rows}
     if sources == {"refseq"}:
         verify_genome(rows)
@@ -243,19 +253,57 @@ def verify(output: Path) -> None:
     )
 
 
+def verify_ani_formulas(rows: list[dict]) -> None:
+    """The sketch-only ANI error compares against the lane's formula over the exact sets. For
+    cub-exact, whose sketch is the exact set, that error vanishes, and its ANI is the exact-set
+    Mash Poisson lane's."""
+    poisson = {
+        (row["reference_sha256"], row["query_sha256"]): row["sketch_ani"]
+        for row in rows
+        if row["implementation"] == "exact-poisson"
+    }
+    assert poisson, "no exact-set lanes"
+    for row in rows:
+        if "ani_sketch_absolute_error" in row:
+            assert math.isclose(
+                row["ani_sketch_absolute_error"],
+                abs(row["sketch_ani"] - row["exact_formula_ani"]),
+                abs_tol=1e-12,
+            )
+        if row["implementation"] == "cub-exact" and "ani_sketch_absolute_error" in row:
+            assert row["ani_sketch_absolute_error"] < 1e-9, row
+            pair = (row["reference_sha256"], row["query_sha256"])
+            assert math.isclose(row["sketch_ani"], poisson[pair], abs_tol=1e-9), row
+
+
 def verify_summaries(rows: list[dict], summaries: list[dict]) -> None:
     """Each summary restates one implementation's absolute error over one metric: recomputed
-    here from the rows with the standard library, independently of the runner."""
-    errors: dict[tuple[str, str], list[float]] = defaultdict(list)
+    here from the rows with the standard library, independently of the runner. A value counts
+    once per genome for cardinality, per ordered pair for containment and completeness, and per
+    unordered pair otherwise, however many rows repeat it."""
+    errors: dict[tuple[str, str], dict[object, float]] = defaultdict(dict)
     for row in rows:
+        sides = (row["query_sha256"], row["reference_sha256"])
+        if row.get("orientation") == "reference_to_query":
+            sides = sides[::-1]
         for key, value in row.items():
             if key.endswith("_absolute_error"):
                 metric = key.removesuffix("_absolute_error")
-                errors[row["implementation"], metric].append(value)
+            elif key.endswith("_absolute_relative_error"):
+                metric = key.removesuffix("_absolute_relative_error") + "_relative"
+            else:
+                continue
+            if metric.startswith("cardinality"):
+                identity: object = sides[0]
+            elif metric in ("containment", "completeness"):
+                identity = sides
+            else:
+                identity = frozenset(sides)
+            errors[row["implementation"], metric].setdefault(identity, value)
     covered = {(summary["implementation"], summary["metric"]) for summary in summaries}
     assert covered == set(errors), covered ^ set(errors)
     for summary in summaries:
-        values = errors[summary["implementation"], summary["metric"]]
+        values = list(errors[summary["implementation"], summary["metric"]].values())
         assert summary["count"] == len(values), summary
         cuts = (
             statistics.quantiles(values, n=100, method="inclusive")
@@ -308,9 +356,9 @@ def verify_genome(rows: list[dict]) -> None:
                 key
             )
             scored = tuple(metric for metric in scored if metric != "ani")
-        if "skani_aligned_fraction" in row:
+        if "aligned_fraction" in row:
             assert row["ani_scored"] == (
-                row["skani_aligned_fraction"] >= ANI_ALIGNED_FLOOR
+                row["aligned_fraction"] >= ANI_ALIGNED_FLOOR
             ), key
         for metric in scored:
             exact, estimate = row[f"exact_{metric}"], row[f"sketch_{metric}"]
@@ -322,7 +370,7 @@ def verify_genome(rows: list[dict]) -> None:
                 row[f"{metric}_absolute_error"], abs(estimate - exact), abs_tol=1e-12
             )
         if row["implementation"] in ANI_ONLY:
-            assert math.isfinite(row.get("skani_aligned_fraction", float("nan")))
+            assert math.isfinite(row.get("aligned_fraction", float("nan")))
             continue
         if row["implementation"] == "cub-exact":
             for metric in ("cardinality", "containment", "completeness", "wkid"):

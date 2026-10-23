@@ -11,14 +11,17 @@ import io
 import math
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, TextIO
 
 import benchmark_schema
 import typer
+from anim import anim, plain_fasta, sequence_bases
 
 ROOT = Path(__file__).resolve().parent.parent
 UINT64_MASK = (1 << 64) - 1
@@ -83,6 +86,11 @@ CSV_FIELDS = (
     "cardinality_paper_absolute_error",
     "cardinality_paper_relative_error",
     "cardinality_paper_absolute_relative_error",
+    "sketch_cardinality_uncapped",
+    "cardinality_uncapped_signed_error",
+    "cardinality_uncapped_absolute_error",
+    "cardinality_uncapped_relative_error",
+    "cardinality_uncapped_absolute_relative_error",
     "exact_containment",
     "sketch_containment",
     "containment_signed_error",
@@ -100,7 +108,7 @@ CSV_FIELDS = (
     "sketch_ani",
     "ani_signed_error",
     "ani_absolute_error",
-    "skani_aligned_fraction",
+    "aligned_fraction",
 )
 PATH_FIELDS = {"reference_path", "query_path"}
 PUBLIC_FIELDS = tuple(field for field in CSV_FIELDS if field not in PATH_FIELDS)
@@ -162,6 +170,11 @@ FLOAT_FIELDS = {
     "cardinality_paper_absolute_error",
     "cardinality_paper_relative_error",
     "cardinality_paper_absolute_relative_error",
+    "sketch_cardinality_uncapped",
+    "cardinality_uncapped_signed_error",
+    "cardinality_uncapped_absolute_error",
+    "cardinality_uncapped_relative_error",
+    "cardinality_uncapped_absolute_relative_error",
     "exact_containment",
     "sketch_containment",
     "containment_signed_error",
@@ -178,7 +191,7 @@ FLOAT_FIELDS = {
     "sketch_ani",
     "ani_signed_error",
     "ani_absolute_error",
-    "skani_aligned_fraction",
+    "aligned_fraction",
 }
 COUNT_FIELDS = ("lower", "equal", "higher", "both_empty")
 app = typer.Typer(
@@ -286,31 +299,93 @@ def write_fasta(path: Path, name: str, sequence: bytes) -> None:
     path.write_bytes(b">" + name.encode("ascii") + b"\n" + sequence + b"\n")
 
 
-def skani_triangle(
-    skani_bin: Path, genomes: list[str], work: Path, threads: int
+# A pair aligned over the 15% floor at 75% identity still shares about 0.15 * 0.75**25 = 1.1e-4
+# of its 25-mers, while unrelated bacteria share almost none, so pairs below this exact
+# containment cannot be scored and are not aligned. On 100 RefSeq genomes it skips half of the
+# pairs, and every scored pair has a containment of at least 9.7e-3.
+MIN_ALIGNABLE_CONTAINMENT = 1e-4
+
+
+def anim_table(
+    nucmer: Path,
+    delta_filter: Path,
+    genomes: list[str],
+    digests: dict[str, str],
+    candidates: set[tuple[str, str]],
+    cache_path: Path,
+    work: Path,
+    threads: int,
 ) -> dict[tuple[str, str], tuple[float, float]]:
-    """Map (query, reference) path pair to (ANI fraction, aligned fraction)."""
-    out = work / "skani-tri.tsv"
-    proc = subprocess.run(
-        [str(skani_bin), "triangle", *genomes, "-o", str(out), "-t", str(threads)],
-        cwd=ROOT,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    _ = proc
-    rows = out.read_text().splitlines()
-    names = [rows[i].split("\t")[0] for i in range(1, len(rows))]
-    af_rows = (work / "skani-tri.tsv.af").read_text().splitlines()
-    table: dict[tuple[str, str], tuple[float, float]] = {}
-    for i in range(len(names)):
-        ani_vals = [float(x) for x in rows[1 + i].split("\t")[1:]]
-        af_vals = [float(x) for x in af_rows[1 + i].split("\t")[1:]]
+    """Map (query, reference) path pair to (ANIm fraction, aligned fraction), one nucmer
+    alignment per unordered pair in @p candidates, given as sorted path pairs. The aligned
+    fraction is the smaller of the two genomes' shares inside the 1-to-1 alignments, so a floor
+    on it holds for both. Pairs without alignments, or not in @p candidates, get ANI 0 and
+    align nothing, so the floor leaves them unscored. Each alignment is appended to
+    @p cache_path under the genomes' SHA-256 digests as it completes, and pairs found there
+    are not aligned again."""
+    cached: dict[tuple[str, str], tuple[float, float]] = {}
+    if cache_path.is_file():
+        for line in cache_path.read_text().splitlines():
+            first, second, ani, aligned = line.split("\t")
+            cached[(first, second)] = (float(ani), float(aligned))
+    fasta = work / "anim-fasta"
+    fasta.mkdir()
+    table: dict[tuple[str, str], tuple[float, float]] = {
+        (query, reference): (0.0, 0.0) for query in genomes for reference in genomes
+    }
+    pairs = []
+    for i in range(len(genomes)):
         for j in range(i):
-            left, right = names[i], names[j]
-            table[(left, right)] = (ani_vals[j] / 100.0, af_vals[j] / 100.0)
-            table[(right, left)] = table[(left, right)]
-    for name in names:
+            if tuple(sorted((genomes[i], genomes[j]))) not in candidates:
+                continue
+            value = cached.get(
+                tuple(sorted((digests[genomes[i]], digests[genomes[j]])))
+            )
+            if value is None:
+                pairs.append((i, j))
+            else:
+                table[(genomes[i], genomes[j])] = table[(genomes[j], genomes[i])] = (
+                    value
+                )
+    total = len(genomes) * (len(genomes) - 1) // 2
+    typer.echo(
+        f"ANIm truth: {len(candidates)} of {total} pairs share at least "
+        f"{MIN_ALIGNABLE_CONTAINMENT:g} of their k-mers, {len(candidates) - len(pairs)} are in "
+        f"{cache_path}, aligning {len(pairs)} on {threads} threads ..."
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(threads) as pool, cache_path.open("a") as cache:
+        plain = list(
+            pool.map(
+                lambda indexed: plain_fasta(ROOT / indexed[1], fasta, indexed[0]),
+                enumerate(genomes),
+            )
+        )
+        bases = list(pool.map(sequence_bases, plain))
+        alignments = pool.map(
+            lambda pair: anim(
+                nucmer, delta_filter, work, plain[pair[1]], plain[pair[0]]
+            ),
+            pairs,
+        )
+        for (query, reference), alignment in zip(pairs, alignments):
+            if alignment is None:
+                value = (0.0, 0.0)
+            else:
+                aligned = min(
+                    alignment.query_bases / bases[query],
+                    alignment.reference_bases / bases[reference],
+                )
+                value = (alignment.ani / 100.0, aligned)
+            table[(genomes[query], genomes[reference])] = value
+            table[(genomes[reference], genomes[query])] = value
+            first, second = sorted(
+                (digests[genomes[query]], digests[genomes[reference]])
+            )
+            cache.write(f"{first}\t{second}\t{value[0]!r}\t{value[1]!r}\n")
+            cache.flush()
+    shutil.rmtree(fasta)
+    for name in genomes:
         table[(name, name)] = (1.0, 1.0)
     return table
 
@@ -347,6 +422,9 @@ def write_genome_cases(
     ranked = sorted(genomes, key=lambda p: hashlib.blake2b(p.name.encode()).digest())
     sampled = sorted(str(p) for p in ranked[:count])
     bases = {path: base_count(path) for path in sampled}
+    digests = {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in sampled
+    }
     cases_csv = directory / "cases.csv"
     with cases_csv.open("w", newline="") as destination:
         writer = csv.DictWriter(destination, fieldnames=CASES_FIELDS)
@@ -366,12 +444,8 @@ def write_genome_cases(
                         "mutation_count": 0,
                         "reference_bases": bases[reference],
                         "query_bases": bases[query],
-                        "reference_sha256": hashlib.sha256(
-                            Path(reference).read_bytes()
-                        ).hexdigest(),
-                        "query_sha256": hashlib.sha256(
-                            Path(query).read_bytes()
-                        ).hexdigest(),
+                        "reference_sha256": digests[reference],
+                        "query_sha256": digests[query],
                         "reference_path": reference,
                         "query_path": query,
                     }
@@ -469,6 +543,8 @@ def write_cases(
 
 
 ERROR_SUFFIX = "_absolute_error"
+# Summarised as `<metric>_relative`: cardinality errors also scaled by the exact count.
+RELATIVE_ERROR_SUFFIX = "_absolute_relative_error"
 SUMMARY_QUANTILES = {"median": 0.5, "p90": 0.9, "p95": 0.95, "p99": 0.99}
 
 
@@ -480,15 +556,92 @@ def percentile(ordered: list[float], q: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def wkid_root_ani(intersection: int, left: int, right: int, k: int) -> float:
+    wkid = intersection / min(left, right)
+    return wkid ** (1.0 / k) if wkid > 0.0 else 0.0
+
+
+def dice_root_ani(intersection: int, left: int, right: int, k: int) -> float:
+    jaccard = intersection / (left + right - intersection)
+    return (2.0 * jaccard / (1.0 + jaccard)) ** (1.0 / k) if jaccard > 0.0 else 0.0
+
+
+def poisson_ani(intersection: int, left: int, right: int, k: int) -> float:
+    jaccard = intersection / (left + right - intersection)
+    if jaccard <= 0.0:
+        return 0.0
+    return max(0.0, 1.0 + math.log(2.0 * jaccard / (1.0 + jaccard)) / k)
+
+
+# The k-mer similarity to ANI conversion each lane applies to its sketch estimate. The same
+# formula over the exact k-mer sets separates the sketch's error (`ani_sketch`) from the
+# formula's own error against alignment ANI. skani aligns, so it has no exact-set counterpart.
+ANI_FORMULAS = {
+    **dict.fromkeys(
+        (
+            "cuddl",
+            "cuddl-bbtools",
+            "cuddl-paper",
+            "cuddl-uncapped",
+            "bbtools",
+            "dashing2",
+            "cuco_hll",
+        ),
+        wkid_root_ani,
+    ),
+    "rabbitsketch": dice_root_ani,
+    **dict.fromkeys(
+        ("simdsketch", "sketchlib", "pp-sketchlib", "hypergen", "cub-exact"),
+        poisson_ani,
+    ),
+}
+# Every formula over the exact k-mer sets, scored against the same ANI truth as the lanes.
+EXACT_SET_LANES = {
+    "exact-wkid-root": wkid_root_ani,
+    "exact-dice-root": dice_root_ani,
+    "exact-poisson": poisson_ani,
+}
+# Species-level comparisons sit at or above it, and the k-mer formulas drift below it.
+ANI_BIN_EDGE = 0.95
+
+
+def summary_key(case: dict, metric: str) -> tuple:
+    """What one summarised value describes, so pairs seen from both sides count once. Rows read
+    the pair from its left set: the query in `query_to_reference` and in the orientation-free
+    rows of the ANI-only lanes, the reference otherwise."""
+    reference, query = case["reference_sha256"], case["query_sha256"]
+    left, right = (
+        (reference, query)
+        if case.get("orientation") == "reference_to_query"
+        else (query, reference)
+    )
+    if metric.startswith("cardinality"):
+        return (left,)
+    if metric in ("containment", "completeness"):
+        return (left, right)
+    return tuple(sorted((left, right)))
+
+
 def error_summaries(measurements: list[dict]) -> list[dict]:
     """One measurement per implementation and metric: the distribution of its absolute error
-    over every row that scored it. Each row is one ordered pair in one orientation."""
+    with every value counted once, per genome for cardinality, per ordered pair for the
+    directional containment and completeness, and per unordered pair for the rest."""
     errors: dict[tuple[str, str], list[float]] = defaultdict(list)
+    seen: set[tuple] = set()
     for measurement in measurements:
         name = measurement["implementation"]["name"]
         for key, value in measurement["metrics"].items():
             if key.endswith(ERROR_SUFFIX):
-                errors[name, key.removesuffix(ERROR_SUFFIX)].append(value)
+                metric = key.removesuffix(ERROR_SUFFIX)
+            elif key.endswith(RELATIVE_ERROR_SUFFIX):
+                metric = key.removesuffix(RELATIVE_ERROR_SUFFIX) + "_relative"
+            else:
+                continue
+            identity = (name, metric, summary_key(measurement["case"], metric))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            errors[name, metric].append(value)
     summaries = []
     for (name, metric), values in errors.items():
         values.sort()
@@ -564,6 +717,14 @@ def main(
             "--trials, --seed) are rejected in this mode."
         ),
     ] = None,
+    anim_cache: Annotated[
+        Path,
+        typer.Option(
+            dir_okay=False,
+            help="Genome-dir mode only: ANIm results by genome SHA-256 pair, read before "
+            "aligning and appended to as alignments finish, so a rerun aligns only new pairs.",
+        ),
+    ] = Path("build/anim-cache.tsv"),
     genome_count: Annotated[
         int, typer.Option(min=2, help="Genomes to sample from genome-dir.")
     ] = 8,
@@ -718,31 +879,53 @@ def main(
             cuddl_json, operation="pairwise_accuracy"
         )
         aligned_fraction: dict[tuple[str, str], float] = {}
-        genome_tri: dict[tuple[str, str], tuple[float, float]] = {}
+        ani_truth: dict[tuple[str, str], tuple[float, float]] = {}
         if genome_mode:
-            skani_bin = build_dir / "subprojects/skani/skani"
-            if not skani_bin.is_file():
-                raise typer.BadParameter(f"skani binary was not built: {skani_bin}")
+            # ANI truth is ANIm, nucmer alignment of every pair that shares enough k-mers to
+            # be scored; cub-exact stays the oracle of the set metrics. Paths never reach the
+            # normalised case, so rows match on SHA-256 and look their paths up in the cases CSV.
+            run(["ninja", "-C", str(build_dir), "subprojects/mummer-4.0.1/nucmer"])
+            mummer = build_dir / "subprojects/mummer-4.0.1"
             with cases_csv.open(newline="") as handle:
                 case_rows = list(csv.DictReader(handle))
-            tri_genomes = sorted(
+            truth_genomes = sorted(
                 {r["reference_path"] for r in case_rows}
                 | {r["query_path"] for r in case_rows}
             )
-            genome_tri = skani_triangle(skani_bin, tri_genomes, temporary_dir, threads)
             reference_paths: dict[str, str] = {}
             query_paths: dict[str, str] = {}
             for r in case_rows:
                 reference_paths.setdefault(r["reference_sha256"], r["reference_path"])
                 query_paths.setdefault(r["query_sha256"], r["query_path"])
+            # cuDDL's rows carry the exact containment of both orientations.
+            candidates = {
+                tuple(
+                    sorted(
+                        (
+                            reference_paths[row["case"]["reference_sha256"]],
+                            query_paths[row["case"]["query_sha256"]],
+                        )
+                    )
+                )
+                for row in cuddl_result["measurements"]
+                if row["metrics"]["exact_containment"] >= MIN_ALIGNABLE_CONTAINMENT
+            }
+            digests = {path: sha for sha, path in reference_paths.items()}
+            ani_truth = anim_table(
+                mummer / "nucmer",
+                mummer / "delta-filter",
+                truth_genomes,
+                digests,
+                candidates,
+                project_path(anim_cache),
+                temporary_dir,
+                threads,
+            )
             for row in cuddl_result["measurements"]:
                 task = row["case"]
                 ref = reference_paths[task["reference_sha256"]]
                 qry = query_paths[task["query_sha256"]]
-                key = (qry, ref)
-                if key not in genome_tri:
-                    raise RuntimeError(f"skani triangle lacks pair {key}")
-                ani, af = genome_tri[key]
+                ani, af = ani_truth[(qry, ref)]
                 aligned_fraction[(task["reference_sha256"], task["query_sha256"])] = af
                 row["case"]["actual_ani"] = ani
                 row["case"]["requested_ani"] = ani
@@ -751,7 +934,7 @@ def main(
                 row["metrics"]["ani_absolute_error"] = abs(
                     row["metrics"]["ani_signed_error"]
                 )
-                row["metrics"]["skani_aligned_fraction"] = af
+                row["metrics"]["aligned_fraction"] = af
         hll_measurements = [
             row
             for row in cuddl_result["measurements"]
@@ -910,10 +1093,7 @@ def main(
                     "pairs below the detection floor"
                 )
             if genome_mode:
-                # Split truth: skani triangle is the ANI oracle on real
-                # genomes. cub-exact stays the set-metric oracle. Paths
-                # never reach the normalized case; match on sha256 and
-                # look up triangle paths from the cases CSV.
+                # Rows match their ANIm truth on SHA-256, as cuDDL's do.
                 with cases_csv.open(newline="") as handle:
                     sha_paths = {
                         (r["reference_sha256"], r["query_sha256"]): (
@@ -925,9 +1105,7 @@ def main(
                 for row in skani_result["measurements"]:
                     task = row["case"]
                     key = sha_paths[(task["reference_sha256"], task["query_sha256"])]
-                    if key not in genome_tri:
-                        raise RuntimeError(f"skani triangle lacks pair {key}")
-                    ani, af = genome_tri[key]
+                    ani, af = ani_truth[key]
                     row["metrics"]["exact_ani"] = ani
                     row["metrics"]["ani_signed_error"] = (
                         row["metrics"]["sketch_ani"] - ani
@@ -935,7 +1113,7 @@ def main(
                     row["metrics"]["ani_absolute_error"] = abs(
                         row["metrics"]["ani_signed_error"]
                     )
-                    row["metrics"]["skani_aligned_fraction"] = af
+                    row["metrics"]["aligned_fraction"] = af
                 skani_rows = benchmark_schema.flatten_measurements(skani_result)
         ani_lane_results: dict[str, dict] = {}
         ani_lane_rows: dict[str, list] = {}
@@ -1024,9 +1202,7 @@ def main(
                     key = ani_sha_paths[
                         (task["reference_sha256"], task["query_sha256"])
                     ]
-                    if key not in genome_tri:
-                        raise RuntimeError(f"skani triangle lacks pair {key}")
-                    ani, af = genome_tri[key]
+                    ani, af = ani_truth[key]
                     row["metrics"]["exact_ani"] = ani
                     row["metrics"]["ani_signed_error"] = (
                         row["metrics"]["sketch_ani"] - ani
@@ -1034,7 +1210,11 @@ def main(
                     row["metrics"]["ani_absolute_error"] = abs(
                         row["metrics"]["ani_signed_error"]
                     )
-                    row["metrics"]["skani_aligned_fraction"] = af
+                    row["metrics"]["aligned_fraction"] = af
+                    if "core_ani" in row["metrics"]:
+                        row["metrics"]["core_ani_absolute_error"] = abs(
+                            row["metrics"]["core_ani"] - ani
+                        )
             ani_lane_rows[lane] = benchmark_schema.flatten_measurements(lane_result)
         if "cub-exact" in selected:
             cub_bin = build_dir / "benchmarks/cub-exact-pairwise"
@@ -1110,6 +1290,15 @@ def main(
             "cardinality_paper_absolute_error",
             "cardinality_paper_relative_error",
             "cardinality_paper_absolute_relative_error",
+        ),
+        # Minimum MLE without the cap at the offered k-mer count, to show what the cap buys.
+        (
+            "cuddl-uncapped",
+            "sketch_cardinality_uncapped",
+            "cardinality_uncapped_signed_error",
+            "cardinality_uncapped_absolute_error",
+            "cardinality_uncapped_relative_error",
+            "cardinality_uncapped_absolute_relative_error",
         ),
     )
     result = benchmark_schema.make_result(
@@ -1201,6 +1390,45 @@ def main(
     for normalized, original in zip(normalized_hll, hll_measurements, strict=True):
         normalized["implementation"] = original["implementation"]
     result["measurements"].extend(normalized_hll)
+    # Exact k-mer set truth per pair, from cuDDL's rows, for the exact-set ANI of each formula.
+    exact_sets: dict[tuple[str, str], tuple[int, int, int, int]] = {}
+    for measurement in [*result["measurements"]]:
+        if measurement["implementation"]["name"] != "cuddl":
+            continue
+        case = measurement["case"]
+        exact_sets.setdefault(
+            (case["reference_sha256"], case["query_sha256"]),
+            (
+                case["intersection"],
+                case["left_cardinality"],
+                case["right_cardinality"],
+                case["k"],
+            ),
+        )
+        if case["orientation"] != "query_to_reference":
+            continue
+        for lane, formula in EXACT_SET_LANES.items():
+            ani = formula(*exact_sets[(case["reference_sha256"], case["query_sha256"])])
+            exact = measurement["metrics"]["exact_ani"]
+            # The case geometry and alignment that the cuDDL row carries among its metrics.
+            carried = {
+                key: measurement["metrics"][key]
+                for key in ("size_ratio", "aligned_fraction")
+                if key in measurement["metrics"]
+            }
+            result["measurements"].append(
+                {
+                    "implementation": {"name": lane},
+                    "case": dict(case),
+                    "metrics": {
+                        "exact_ani": exact,
+                        "sketch_ani": ani,
+                        "ani_signed_error": ani - exact,
+                        "ani_absolute_error": abs(ani - exact),
+                        **carried,
+                    },
+                }
+            )
     if genome_mode:
         # A set-derived ANI over a pair that barely aligns measures the k-th root's noise floor,
         # not identity. Those rows keep their estimates and lose their ANI error columns, so
@@ -1213,7 +1441,11 @@ def main(
             metrics["ani_scored"] = aligned >= ani_min_aligned_fraction
             if metrics["ani_scored"]:
                 continue
-            for field in ("ani_signed_error", "ani_absolute_error"):
+            for field in (
+                "ani_signed_error",
+                "ani_absolute_error",
+                "core_ani_absolute_error",
+            ):
                 metrics.pop(field, None)
         scored = sum(
             1
@@ -1224,6 +1456,22 @@ def main(
             f"ANI scored on {scored} of {len(result['measurements'])} rows; the rest are "
             f"below the {ani_min_aligned_fraction:.0%} aligned-fraction floor"
         )
+    # ANI errors only exist where ANI is scored. Each splits by the truth's ANI band, and each
+    # lane with a k-mer formula also reports its error against that formula over exact sets.
+    for measurement in result["measurements"]:
+        metrics = measurement["metrics"]
+        if "ani_absolute_error" not in metrics:
+            continue
+        band = "ge95" if metrics["exact_ani"] >= ANI_BIN_EDGE else "lt95"
+        metrics[f"ani_{band}_absolute_error"] = metrics["ani_absolute_error"]
+        formula = ANI_FORMULAS.get(measurement["implementation"]["name"])
+        if formula is None:
+            continue
+        case = measurement["case"]
+        exact = formula(*exact_sets[(case["reference_sha256"], case["query_sha256"])])
+        metrics["exact_formula_ani"] = exact
+        metrics["ani_sketch_signed_error"] = metrics["sketch_ani"] - exact
+        metrics["ani_sketch_absolute_error"] = abs(metrics["sketch_ani"] - exact)
     pairs = result["measurements"]
     summaries = error_summaries(pairs)
     result["measurements"] = [*pairs, *summaries] if pair_rows else summaries

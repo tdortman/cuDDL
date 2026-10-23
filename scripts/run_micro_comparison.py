@@ -113,6 +113,7 @@ from benchmark_schema import make_result, write_result
 from energy_meter import EnergyMeter, EnergySampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from anim import anim, plain_fasta
 from hypergen_pipeline import dataset_entries, summarize
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -550,45 +551,6 @@ def placement(threads: int, layout: list[tuple[list[int], int]]) -> list[str]:
     if shutil.which("numactl"):
         return [*prefix, "numactl", "--interleave=all"]
     return prefix
-
-
-def anim(
-    nucmer: Path, delta_filter: Path, work: Path, reference: Path, query: Path
-) -> float | None:
-    """Returns ANIm of @p query against @p reference in percent, or None without alignments.
-
-    nucmer aligns the pair and `delta-filter -1` keeps the 1-to-1 alignments. Identity is
-    1 - errors / aligned query bases summed over them, pyani's ANIm definition. nucmer runs
-    single-threaded; callers parallelise over pairs.
-    """
-    pair_dir = Path(tempfile.mkdtemp(dir=work, prefix="anim-"))
-    delta = pair_dir / "out.delta"
-    run(
-        [str(nucmer), "-t", "1", f"--delta={delta}", str(reference), str(query)],
-        quiet=True,
-        log_tail=True,
-    )
-    filtered = run([str(delta_filter), "-1", str(delta)], capture=True)
-    shutil.rmtree(pair_dir)
-    aligned = errors = 0
-    for line in filtered.splitlines():
-        fields = line.split()
-        # Alignment headers carry seven integers: the start and end in each sequence, then
-        # errors, similarity errors, and stop codons. Indel lines carry one.
-        if len(fields) == 7 and not line.startswith(">"):
-            aligned += abs(int(fields[3]) - int(fields[2])) + 1
-            errors += int(fields[4])
-    return 100 * (1 - errors / aligned) if aligned else None
-
-
-def plain_fasta(path: Path, cache: Path, index: int) -> Path:
-    """Returns @p path, or an uncompressed copy in @p cache for gzip input, which nucmer lacks."""
-    if path.suffix != ".gz":
-        return path
-    copy = cache / f"{index}.fna"
-    with gzip.open(path, "rb") as source, copy.open("wb") as target:
-        shutil.copyfileobj(source, target)
-    return copy
 
 
 def read_f32_pairs(
@@ -1600,10 +1562,10 @@ def main(
                     ),
                     sampled,
                 )
-                for (query, reference), value in zip(sampled, values):
-                    if value is not None:
-                        ani_oracle[(query, reference)] = value
-                        ani_oracle[(reference, query)] = value
+                for (query, reference), alignment in zip(sampled, values):
+                    if alignment is not None:
+                        ani_oracle[(query, reference)] = alignment.ani
+                        ani_oracle[(reference, query)] = alignment.ani
             shutil.rmtree(fasta_cache)
             typer.echo(
                 f"  ANIm truth: {len(ani_oracle) // 2} aligned pairs in "

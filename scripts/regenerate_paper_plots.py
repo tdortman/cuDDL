@@ -237,24 +237,32 @@ def cardinality_latency(hll_gh200: Path, hll_rtx5090: Path, hll_items: int) -> N
     plt.close(fig)
 
 
-# Pairwise accuracy tools, top to bottom, and the metrics drawn for each: implementation name ->
-# label. Tools that estimate only Jaccard similarity or core distance have no containment,
-# completeness or WKID.
+# Pairwise accuracy rows, top to bottom: implementation name -> label. Tools that estimate only
+# Jaccard similarity, core distance or alignment ANI have no containment, completeness or WKID.
+# The exact-set rows apply the two main k-mer formulas to the exact sets: their ANI error is the
+# formula's alone, the floor every sketch on that formula shares.
 PAIRWISE_TOOLS = {
     "cuddl": "cuDDL",
     "bbtools": "BBTools",
     "dashing2": "Dashing2",
     "rabbitsketch": "RabbitSketch",
+    "cuco_hll": "cuco HLL++",
     "simdsketch": "SimdSketch",
     "sketchlib": "sketchlib.rust",
     "pp-sketchlib": "pp-sketchlib",
-    "cuco_hll": "cuco HLL++",
+    "hypergen": "HyperGen",
+    "skani": "skani",
+    "exact-wkid-root": "Exact, WKID$^{1/k}$",
+    "exact-poisson": "Exact, Mash",
 }
+# `ani_sketch` scores each tool's ANI against its own formula over the exact k-mer sets, the
+# sketch's share of the error; `ani_ge95` scores it against ANIm on pairs of at least 95% ANI.
 PAIRWISE_METRICS = {
     "containment": ("Containment", "#2ca02c"),
     "completeness": ("Completeness", "#9467bd"),
     "wkid": ("WKID", "#5b9bd5"),
-    "ani": ("ANI", "#ff8c38"),
+    "ani_sketch": ("ANI, sketch", "#ff8c38"),
+    "ani_ge95": ("ANI, ≥95%", "#d62728"),
 }
 # Only DDL estimates completeness from the sketch comparison itself; the benchmark derives the
 # other tools' completeness from two cardinality estimates, so it is not drawn for them.
@@ -262,7 +270,7 @@ COMPLETENESS_TOOLS = {"cuddl", "bbtools"}
 
 
 def pairwise_error(path: Path) -> None:
-    """pairwise_error_refseq100.pdf (median and p95 absolute error per tool and metric)."""
+    """pairwise_error.pdf (median and p95 absolute error per tool and metric)."""
     summaries = {
         (m["implementation"]["name"], m["case"]["metric"]): m["metrics"]
         for m in json.loads(path.read_text())["measurements"]
@@ -274,7 +282,7 @@ def pairwise_error(path: Path) -> None:
         )
 
     fig, ax = plt.subplots(figsize=(2.3, 2.2), dpi=300)
-    h_bar = 0.2
+    h_bar = 0.16
     offsets = (
         np.arange(len(PAIRWISE_METRICS)) - (len(PAIRWISE_METRICS) - 1) / 2
     ) * h_bar
@@ -299,27 +307,36 @@ def pairwise_error(path: Path) -> None:
     ax.plot([], [], "o", color="black", ms=1.6, label="Median")
     ax.set_yticks(range(len(PAIRWISE_TOOLS)), PAIRWISE_TOOLS.values())
     ax.set_ylim(len(PAIRWISE_TOOLS) - 0.5, -0.5)
+    # Errors span four decades, from sketch-only ANI below 1% to sketches that miss divergent
+    # pairs entirely (ANI near 0, an 85% error).
+    ax.set_xscale("log")
+    ax.set_xlim(0.005, 200)
+    ax.set_xticks([0.01, 0.1, 1, 10, 100], ["0.01", "0.1", "1", "10", "100"])
     ax.set_xlabel("Abs. error, p95 (bars) [%]", fontsize=7.8)
     ax.tick_params(axis="x", labelsize=7.2)
     ax.tick_params(axis="y", labelsize=7.2, length=0)
     ax.grid(True, axis="x")
     ax.grid(False, axis="y")
-    ax.legend(
+    # Long bars reach into every corner, so the legend sits above the axes, centred on the
+    # figure because the tool labels push the axes right.
+    fig.legend(
+        *ax.get_legend_handles_labels(),
         frameon=False,
-        # The rows of the Jaccard-only tools leave this corner empty.
-        loc="upper right",
-        bbox_to_anchor=(1.02, 0.46),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncols=3,
         fontsize=6.0,
         handlelength=0.9,
         handletextpad=0.3,
+        columnspacing=0.6,
         labelspacing=0.15,
         borderpad=0.1,
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    plt.tight_layout(pad=0.2)
-    fig.savefig(out_dir / "pairwise_error_refseq100.pdf")
-    fig.savefig(out_dir / "pairwise_error_refseq100.png")
+    plt.tight_layout(pad=0.2, rect=(0, 0, 1, 0.88))
+    fig.savefig(out_dir / "pairwise_error.pdf")
+    fig.savefig(out_dir / "pairwise_error.png")
     plt.close(fig)
 
 
@@ -1045,7 +1062,7 @@ def main(
     ] = 1 << 28,
     pairwise_accuracy: Annotated[
         Path, typer.Option(exists=True, dir_okay=False)
-    ] = Path("results/pairwise-accuracy-refseq100-all.json"),
+    ] = Path("results/pairwise-accuracy-refseq1000.json"),
     ablation: Annotated[
         list[Path] | None,
         typer.Option(

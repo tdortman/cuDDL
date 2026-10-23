@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -326,6 +327,18 @@ void emit_variant_metric(json& output, char const* name, double estimate, size_t
     output[std::string{name} + "_absolute_relative_error"] = absolute_error / exact;
 }
 
+/// The Minimum MLE estimate of @p sketch without @ref cuddl::sketch::cardinality's cap at the
+/// k-mers the sketch was offered, to measure what the cap contributes.
+[[nodiscard]] double uncapped_cardinality(sketch_type const& sketch, cuda::stream_ref stream) {
+    auto empty = cuda::make_device_buffer<uint64_t>(stream, stream.device(), 1, cuda::no_init);
+    auto estimate = cuda::make_device_buffer<double>(stream, stream.device(), 1, cuda::no_init);
+    CUDDL_UNWRAP(sketch.cardinality_async(empty.data(), estimate.data(), stream));
+    double host = 0.0;
+    cuda::copy_bytes(stream, estimate, cuda::std::span{&host, size_t{1}});
+    stream.sync();
+    return host;
+}
+
 void emit_orientation(
     json& measurements,
     case_record const& input,
@@ -369,6 +382,9 @@ void emit_orientation(
     auto const hybrids = CUDDL_UNWRAP(left.hybrid_cardinality(stream));
     emit_variant_metric(output, "cardinality_bbtools", hybrids.bbtools, left_size);
     emit_variant_metric(output, "cardinality_paper", hybrids.paper, left_size);
+    emit_variant_metric(
+        output, "cardinality_uncapped", uncapped_cardinality(left, stream), left_size
+    );
     emit_metric(
         output, "containment", exact.values.containment, estimate.containment, errors.containment
     );
@@ -494,7 +510,7 @@ int main(int argc, char** argv) {
             }
             return it->second;
         };
-        size_t case_count = 0;
+        std::vector<case_record> inputs;
         for (size_t row = 2; std::getline(cases, line); ++row) {
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
@@ -503,14 +519,44 @@ int main(int argc, char** argv) {
                 continue;
             }
             auto input = parse_case(parse_csv_line(line), row);
-            auto& reference = prepare_cached(input.reference_path, input.reference_sha256);
-            auto& query = prepare_cached(input.query_path, input.query_sha256);
+            auto const& reference = prepare_cached(input.reference_path, input.reference_sha256);
+            auto const& query = prepare_cached(input.query_path, input.query_sha256);
             input.reference_bases = reference.bases;
             input.query_bases = query.bases;
             input.size_ratio = static_cast<uint32_t>(std::max(
                 uint64_t{1}, input.reference_bases / std::max(uint64_t{1}, input.query_bases)
             ));
-            auto const intersection = intersection_size(query.unique_kmers, reference.unique_kmers);
+            inputs.push_back(std::move(input));
+        }
+        if (inputs.empty()) {
+            throw std::runtime_error("cases CSV contains no data rows");
+        }
+
+        // One exact merge of two multi-million k-mer sets per case dominates at a thousand
+        // genomes, so the merges run on every host thread before the in-order GPU pass.
+        std::vector<size_t> intersections(inputs.size());
+        {
+            size_t const workers = std::max(1U, std::thread::hardware_concurrency());
+            std::vector<std::jthread> pool;
+            pool.reserve(workers);
+            for (size_t worker = 0; worker < workers; ++worker) {
+                pool.emplace_back([&, worker] {
+                    for (size_t index = worker; index < inputs.size(); index += workers) {
+                        intersections[index] = intersection_size(
+                            prepared.find(inputs[index].query_path)->second.unique_kmers,
+                            prepared.find(inputs[index].reference_path)->second.unique_kmers
+                        );
+                    }
+                });
+            }
+        }
+
+        size_t case_count = 0;
+        for (size_t index = 0; index < inputs.size(); ++index) {
+            auto const& input = inputs[index];
+            auto& reference = prepared.find(input.reference_path)->second;
+            auto& query = prepared.find(input.query_path)->second;
+            auto const intersection = intersections[index];
 
             auto const first_orientation = measurements.size();
             emit_orientation(
@@ -572,9 +618,6 @@ int main(int argc, char** argv) {
             if (case_count % 100 == 0) {
                 std::cerr << "cuddl-pairwise-accuracy: " << case_count << " cases\n";
             }
-        }
-        if (case_count == 0U) {
-            throw std::runtime_error("cases CSV contains no data rows");
         }
 
         std::cout << std::setprecision(8);

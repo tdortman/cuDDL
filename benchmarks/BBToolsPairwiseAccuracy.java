@@ -58,7 +58,7 @@ public final class BBToolsPairwiseAccuracy {
         "sketch_ani",
         "ani_signed_error",
         "ani_absolute_error",
-        "skani_aligned_fraction",
+        "aligned_fraction",
     };
 
     private BBToolsPairwiseAccuracy() {}
