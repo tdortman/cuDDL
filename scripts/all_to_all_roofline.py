@@ -29,6 +29,8 @@ GPUS = {
     # name: (SMs, sustained SM clock in GHz, ALU warp instructions per sub-partition per clock,
     # DRAM GB/s)
     "a40": (84, 1.74, 0.5, 696.0),
+    "a100": (108, 1.41, 0.5, 2039.0),
+    "gh200": (132, 1.98, 0.5, 4000.0),
     "rtx5070ti": (70, 2.63, 0.5, 896.0),
 }
 

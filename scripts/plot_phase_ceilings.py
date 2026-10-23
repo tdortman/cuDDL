@@ -71,10 +71,10 @@ def main(
         float,
         typer.Option(
             min=0.0,
-            help="ALU warp instructions per pair of the exhaustive search, from "
-            "scripts/all_to_all_roofline.py (59.9 on the 100k snapshot)",
+            help="ALU warp instructions per pair of the exhaustive search on Ampere (50.4 on "
+            "the 100k snapshot, docs/reference-database.md)",
         ),
-    ] = 59.9,
+    ] = 50.4,
     output_dir: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     rows = [
