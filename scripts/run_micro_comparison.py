@@ -3097,8 +3097,8 @@ def main(
 
             def search_pipeline(rep: Path, top_k: int) -> dict:
                 run_timed(
-                    f"cuddl search: index {len(search_references)} references, "
-                    f"query {len(search_queries)}"
+                    f"cuddl {'top-k' if top_k else 'search'}: index {len(search_references)} "
+                    f"references, query {len(search_queries)}"
                     + (f", top {top_k}" if top_k else ""),
                     [
                         str(pipeline_bin),

@@ -47,7 +47,7 @@ def main(
         for tool in tools
     }
     genomes = max(largest.values())
-    operations = ("sketch", "compare")
+    operations = ("sketch", "compare", "search", "top-k")
     kernels = sorted(
         (row for row in rows if row["genomes"] == largest[row["tool"]]),
         key=lambda row: (

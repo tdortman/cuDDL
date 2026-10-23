@@ -9,14 +9,15 @@ For every --reference-count and GPU tool, the tool's `run_micro_comparison.py --
 lane runs twice over:
 
 1. under Nsight Systems, for every kernel's share of its operation's GPU time and its launch
-   count. The runner announces each lane (`<tool> sketch: ...`, `<tool> compare: ...`) as it
-   starts it; a kernel belongs to the operation announced last before it ran. Comparison lanes
-   sketch their inputs again, so COMPARE keeps only the kernels the sketch lane never runs;
-   shares of COMPARE time are shares of those kernels' time;
-2. once per kernel that matters, for SKETCH and COMPARE alike (the largest ones up to --coverage
+   count. The runner announces each lane (`<tool> sketch: ...`, `<tool> compare: ...`,
+   `<tool> search: ...`, `<tool> top-k: ...`) as it starts it; a kernel belongs to the operation
+   announced last before it ran. Later lanes sketch their inputs again, so every other operation
+   keeps only the kernels the sketch lane never runs; shares of its time are shares of those
+   kernels' time;
+2. once per kernel that matters, for every operation alike (the largest ones up to --coverage
    of the operation's GPU time, at most --max-kernels each) under Nsight Compute, which records
    the speed-of-light throughputs below for --launches launches from the middle of the run, then
-   ends the run.
+   ends the run. A kernel that SEARCH and TOP-K share is profiled where it first runs.
 
 Each kernel becomes one line of OUTPUT_DIR/kernels.jsonl: its operation, its share of that
 operation's GPU time and the duration-weighted mean of each throughput, as a percentage of the
@@ -75,7 +76,7 @@ def csv_rows(text: str, first_column: str) -> list[dict[str, str]]:
 
 
 # A lane announcement of run_micro_comparison.py, such as "  cuddl compare: 1770 pairs ...".
-LANE = re.compile(r"^\s+\S+ (sketch|compare|search)\b")
+LANE = re.compile(r"^\s+\S+ (sketch|compare|search|top-k)\b")
 
 
 def tool_path(name: str) -> str:
@@ -155,10 +156,12 @@ def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list
         )
         entry["ns"] += end - start
         entry["launches"] += 1
-    # Comparison lanes sketch their inputs again; those kernels belong to SKETCH, which measures
-    # them already, so COMPARE keeps only the kernels the sketch lane never runs.
+    # Later lanes sketch their inputs again; those kernels belong to SKETCH, which measures them
+    # already, so every other operation keeps only the kernels the sketch lane never runs.
     for name in kernels.get("sketch", {}):
-        kernels.get("compare", {}).pop(name, None)
+        for operation, by_name in kernels.items():
+            if operation != "sketch":
+                by_name.pop(name, None)
     ranked: dict[str, list[dict]] = {}
     for operation, by_name in kernels.items():
         total = sum(k["ns"] for k in by_name.values())
@@ -173,38 +176,49 @@ def kernel_times(nsys: str, command: list[str], scratch: Path) -> dict[str, list
 def kernel_throughputs(
     ncu: str, command: list[str], kernel: dict, launches: int, scratch: Path
 ) -> tuple[int, dict[str, float]]:
-    """Profiled launches and the duration-weighted mean throughput per metric."""
+    """Profiled launches and the duration-weighted mean throughput per metric.
+
+    Kernel replay saves and restores the device memory a launch can touch between passes. The
+    indexed search leaves too little device memory free for that copy, so a kernel that kernel
+    replay cannot profile is profiled again with application replay, which reruns the lane once
+    per pass instead."""
     base = scratch / "kernel"
-    for stale in scratch.glob("kernel.ncu-rep*"):
-        stale.unlink()
     count = min(launches, kernel["launches"])
     # Launches from the middle of the run: the first ones often warm caches or size buffers.
     skip = min((kernel["launches"] - count) // 2, 20)
-    # --kill ends the run once the launches are profiled, so the lane reports a failure; only the
-    # report matters here.
-    subprocess.run(
-        [
-            ncu,
-            "--target-processes",
-            "all",
-            "--kernel-name",
-            f"regex:^{kernel['kernel']}$",
-            "--launch-skip",
-            str(skip),
-            "--launch-count",
-            str(count),
-            "--kill",
-            "yes",
-            "--metrics",
-            ",".join([DURATION, *METRICS.values()]),
-            "-o",
-            str(base),
-            *command,
-        ],
-        check=False,
-    )
-    # Recent Nsight Compute versions write compressed .ncu-repz reports.
-    report = next(scratch.glob("kernel.ncu-rep*"), None)
+    report = None
+    for replay in ("kernel", "application"):
+        for stale in scratch.glob("kernel.ncu-rep*"):
+            stale.unlink()
+        # --kill ends the run once the launches are profiled, so the lane reports a failure;
+        # only the report matters here.
+        subprocess.run(
+            [
+                ncu,
+                "--target-processes",
+                "all",
+                "--replay-mode",
+                replay,
+                "--kernel-name",
+                f"regex:^{kernel['kernel']}$",
+                "--launch-skip",
+                str(skip),
+                "--launch-count",
+                str(count),
+                "--kill",
+                "yes",
+                "--metrics",
+                ",".join([DURATION, *METRICS.values()]),
+                "-o",
+                str(base),
+                *command,
+            ],
+            check=False,
+        )
+        # Recent Nsight Compute versions write compressed .ncu-repz reports.
+        report = next(scratch.glob("kernel.ncu-rep*"), None)
+        if report is not None:
+            break
     if report is None:
         raise RuntimeError(f"Nsight Compute profiled no launch of {kernel['kernel']}")
     rows = csv_rows(
@@ -296,7 +310,7 @@ def main(
             ]
             with tempfile.TemporaryDirectory(prefix="ncu-sol-") as scratch:
                 ranked = kernel_times(nsys, command, Path(scratch))
-                for operation in ("sketch", "compare"):
+                for operation in ("sketch", "compare", "search", "top-k"):
                     covered = 0.0
                     for kernel in ranked.get(operation, [])[:max_kernels]:
                         if covered >= coverage:
