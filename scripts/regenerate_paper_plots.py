@@ -384,7 +384,7 @@ def b300_inflate(csv: Path) -> None:
     df_inf["gbps"] = df_inf["GlobalMem BW (bytes/sec)"] / 1e9
 
     fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
-    ax = fig.add_axes((0.18, 0.23, 0.78, 0.72))
+    ax = fig.add_axes((0.21, 0.23, 0.75, 0.72))
     # The CSV names each input by its staging path on the B300 host.
     inputs_order = ["genomes-10k-spread", "genomes-10k-spread-bgzf-zlib"]
     input_labels = ["Standard gzip\n($\\leq 4$ MiB)", "BGZF\n(bgzip)"]
