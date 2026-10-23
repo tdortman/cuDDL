@@ -57,7 +57,6 @@ TOOLS = {
     "dashing2": ("Dashing2", "#9467bd"),
     "sketchlib": ("sketchlib.rust", "#e377c2"),
     "pp-sketchlib": ("pp-sketchlib", "#17becf"),
-    "pp-sketchlib:core-accessory-k17,29": ("pp-sketchlib (2 k)", "#9edae5"),
     "cub-exact": ("cub-exact", "#7f7f7f"),
     "hypergen-cpu": ("HyperGen (CPU)", "#bcbd22"),
     "hypergen-gpu": ("HyperGen (GPU)", "#dbdb8d"),
@@ -534,11 +533,11 @@ def b300_build(log: Path, inputs: list[str], workers: int) -> None:
 
 
 def stage_runs(paths: list[Path]) -> list[dict]:
-    """Per tool: label, colour, resident seconds per op, and SKETCH/COMPARE energy in kJ.
+    """Per tool: label, colour, and SKETCH/COMPARE energy in kJ.
 
     Every run compares all pairs of its corpus. A tool run on fewer genomes than the largest
-    corpus is extrapolated to it and starred: SKETCH by the genome ratio, COMPARE and a SEARCH
-    that reuses it by the all-to-all pair ratio.
+    corpus is extrapolated to it and starred: SKETCH by the genome ratio, COMPARE by the
+    all-to-all pair ratio.
     """
     by_tool: dict[str, dict[str, dict]] = defaultdict(dict)
     for path in paths:
@@ -582,24 +581,6 @@ def stage_runs(paths: list[Path]) -> list[dict]:
             {
                 "label": label + ("*" if sampled else ""),
                 "color": color,
-                "seconds": [
-                    resident_seconds(ops[op], sketch_scale, compare_scale)
-                    if op in ops
-                    else float("nan")
-                    for op in (
-                        "micro-sketch",
-                        "micro-compare",
-                        "micro-search",
-                    )
-                ]
-                + [
-                    e2e_seconds(
-                        ops["micro-sketch"],
-                        ops["micro-compare"],
-                        sketch_scale,
-                        compare_scale,
-                    )
-                ],
                 "energy": (
                     sketch_cpu,
                     sketch_gpu,
@@ -610,31 +591,6 @@ def stage_runs(paths: list[Path]) -> list[dict]:
             }
         )
     return runs
-
-
-def resident_seconds(m: dict, sketch_scale: float, compare_scale: float) -> float:
-    """Resident median seconds, scaled to the target corpus: COMPARE and a SEARCH that reuses it
-    by the pair ratio, SKETCH by the genome ratio. A SEARCH of its own has no ratio to scale by,
-    so it has to come from the target corpus."""
-    op = m["case"]["measurement"]
-    seconds = m["timings"]["resident"]["median_ms"] / 1e3
-    if op == "micro-compare" or m["case"].get("resident_reuses_compare", False):
-        return seconds * compare_scale
-    if op == "micro-sketch":
-        return seconds * sketch_scale
-    if sketch_scale != 1:
-        name = m["implementation"]["name"]
-        raise typer.BadParameter(f"{name} {op} ran on a smaller corpus")
-    return seconds
-
-
-def e2e_seconds(
-    sk_m: dict, cmp_m: dict, sketch_scale: float, compare_scale: float
-) -> float:
-    """End-to-end wall time (sketch ingest wall + comparison wall), scaled to target."""
-    sk_wall = sk_m["timings"]["wall"]["median_ms"] / 1e3 * sketch_scale
-    cmp_wall = cmp_m["timings"]["wall"]["median_ms"] / 1e3 * compare_scale
-    return sk_wall + cmp_wall
 
 
 def stage_energy(m: dict, scale: float) -> tuple[float, float, float]:
@@ -667,13 +623,14 @@ def load_tool_ops(path: Path) -> dict[tuple[str, str], tuple[float, float]]:
     return res
 
 
-def micro_ops(runs: list[dict]) -> None:
+def micro_ops() -> None:
     """micro_ops_10k.pdf (100k RefSeq resident and E2E times across 5090 and GH200)."""
     mon03 = {}
     for p in [
         Path("results/mon03-micro-perf-100k.json"),
-        Path("results/mon03-micro-perf-100k-pp-sketchlib-k17,29.json"),
-        Path("results/mon03-micro-perf-100k-hypergen.json"),
+        # cuDDL again after `cuddl-pipeline-benchmark` stopped requesting match counts.
+        Path("results/mon03-micro-perf-100k-cuddl.json"),
+        Path("results/mon03-micro-perf-10k-hypergen-skani.json"),
         Path("results/mon03-micro-perf-10k-cub-exact.json"),
     ]:
         mon03.update(load_tool_ops(p))
@@ -681,32 +638,33 @@ def micro_ops(runs: list[dict]) -> None:
     for p in [
         Path("results/gh200-micro-perf-100k-cuddl.json"),
         Path("results/gh200-micro-perf-100k-pp-sketchlib.json"),
-        Path("results/gh200-micro-perf-100k-pp-sketchlib-k17,29.json"),
-        Path("results/gh200-micro-perf-100k-hypergen.json"),
+        Path("results/gh200-micro-perf-10k-hypergen.json"),
         Path("results/gh200-micro-perf-10k-cub-exact.json"),
     ]:
         gh200.update(load_tool_ops(p))
 
-    def cub_exact(ops: dict) -> list[float | None]:
-        """cub-exact compares every pair of 10k genomes, scaled to 100k: SKETCH by the genome
-        ratio, COMPARE and the SEARCH that reuses it by the pair ratio."""
-        sketch = ops.get(("cub-exact:gpu-exact", "micro-sketch"))
-        compare = ops.get(("cub-exact:gpu-exact", "micro-compare"))
+    def from_10k(ops: dict, key: str) -> list[float | None]:
+        """A tool run on every pair of 10k genomes, scaled to 100k as `stage_runs` scales its
+        energy: SKETCH by the genome ratio, every pairwise operation by the pair ratio."""
+        sketch = ops.get((key, "micro-sketch"))
+        compare = ops.get((key, "micro-compare"))
         if sketch is None or compare is None:
             return [None] * 5
         genomes, pairs = 10.0, (100_000 * 99_999) / (10_000 * 9_999)
+        search, top_k = (
+            ops.get((key, op), (None,))[0] for op in ("micro-search", "micro-top-k")
+        )
         return [
             sketch[0] * genomes,
             compare[0] * pairs,
-            compare[0] * pairs,
-            None,
+            search and search * pairs,
+            top_k and top_k * pairs,
             sketch[1] * genomes + compare[1] * pairs,
         ]
 
     tools_list = [
         (
             "cuDDL (Sys. A)",
-            "#1f77b4",
             [
                 mon03.get(("cuddl:reference-db", "micro-sketch"), (None,))[0],
                 mon03.get(("cuddl:gpu", "micro-compare"), (None,))[0],
@@ -718,7 +676,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "cuDDL (Sys. B)",
-            "#6baed6",
             [
                 gh200.get(("cuddl:reference-db", "micro-sketch"), (None,))[0],
                 gh200.get(("cuddl:gpu", "micro-compare"), (None,))[0],
@@ -730,7 +687,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "SimdSketch",
-            "#2ca02c",
             [
                 mon03.get(("simdsketch:bucket-b8", "micro-sketch"), (None,))[0],
                 mon03.get(("simdsketch:bucket-b8", "micro-compare"), (None,))[0],
@@ -742,7 +698,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "RabbitSketch",
-            "#8c564b",
             [
                 mon03.get(("rabbitsketch:FastKMV", "micro-sketch"), (None,))[0],
                 mon03.get(("rabbitsketch:FastKMV", "micro-compare"), (None,))[0],
@@ -754,7 +709,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "BBTools",
-            "#ff7f0e",
             [
                 mon03.get(("bbtools:ddl", "micro-sketch"), (None,))[0],
                 mon03.get(("bbtools:ddl", "micro-compare"), (None,))[0],
@@ -766,7 +720,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "Dashing2",
-            "#9467bd",
             [
                 mon03.get(("dashing2:SetSketch", "micro-sketch"), (None,))[0],
                 mon03.get(("dashing2:SetSketch", "micro-compare"), (None,))[0],
@@ -778,7 +731,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "sketchlib.rust",
-            "#e377c2",
             [
                 mon03.get(("sketchlib:one-perm-minhash", "micro-sketch"), (None,))[0],
                 mon03.get(("sketchlib:one-perm-minhash", "micro-compare"), (None,))[0],
@@ -790,7 +742,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "pp-sketchlib (Sys. A)",
-            "#17becf",
             [
                 # pp-sketchlib sketches assemblies on the CPU only; its E2E keeps that time.
                 None,
@@ -805,7 +756,6 @@ def micro_ops(runs: list[dict]) -> None:
         ),
         (
             "pp-sketchlib (Sys. B)",
-            "#9edae5",
             [
                 None,
                 gh200.get(("pp-sketchlib:core-accessory", "micro-compare"), (None,))[0],
@@ -817,133 +767,66 @@ def micro_ops(runs: list[dict]) -> None:
                 ],
             ],
         ),
-        (
-            "pp-sketchlib 2k (Sys. A)",
-            "#7f7f7f",
-            [
-                None,
-                mon03.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (None,)
-                )[0],
-                mon03.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-search"), (None,)
-                )[0],
-                mon03.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-top-k"), (None,)
-                )[0],
-                mon03.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-sketch"), (0, 0)
-                )[1]
-                + mon03.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (0, 0)
-                )[1],
-            ],
-        ),
-        (
-            "pp-sketchlib 2k (Sys. B)",
-            "#c7c7c7",
-            [
-                None,
-                gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (None,)
-                )[0],
-                gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-search"), (None,)
-                )[0],
-                gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-top-k"), (None,)
-                )[0],
-                gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-sketch"), (0, 0)
-                )[1]
-                + gh200.get(
-                    ("pp-sketchlib:core-accessory-k17,29", "micro-compare"), (0, 0)
-                )[1],
-            ],
-        ),
-        (
-            "HyperGen (CPU)",
-            "#bcbd22",
-            [
-                mon03.get(("hypergen-cpu:hdc", "micro-sketch"), (None,))[0],
-                mon03.get(("hypergen-cpu:hdc", "micro-compare"), (None,))[0],
-                mon03.get(("hypergen-cpu:hdc", "micro-search"), (None,))[0],
-                None,
-                mon03.get(("hypergen-cpu:hdc", "micro-sketch"), (0, 0))[1]
-                + mon03.get(("hypergen-cpu:hdc", "micro-compare"), (0, 0))[1],
-            ],
-        ),
-        (
-            "HyperGen GPU (Sys. A)",
-            "#dbdb8d",
-            [
-                mon03.get(("hypergen-gpu:hdc", "micro-sketch"), (None,))[0],
-                mon03.get(("hypergen-gpu:hdc", "micro-compare"), (None,))[0],
-                mon03.get(("hypergen-gpu:hdc", "micro-search"), (None,))[0],
-                None,
-                mon03.get(("hypergen-gpu:hdc", "micro-sketch"), (0, 0))[1]
-                + mon03.get(("hypergen-gpu:hdc", "micro-compare"), (0, 0))[1],
-            ],
-        ),
-        (
-            "HyperGen GPU (Sys. B)",
-            "#eeeec0",
-            [
-                gh200.get(("hypergen-gpu:hdc", "micro-sketch"), (None,))[0],
-                gh200.get(("hypergen-gpu:hdc", "micro-compare"), (None,))[0],
-                gh200.get(("hypergen-gpu:hdc", "micro-search"), (None,))[0],
-                None,
-                gh200.get(("hypergen-gpu:hdc", "micro-sketch"), (0, 0))[1]
-                + gh200.get(("hypergen-gpu:hdc", "micro-compare"), (0, 0))[1],
-            ],
-        ),
-        ("cub-exact* (Sys. A)", "#252525", cub_exact(mon03)),
-        ("cub-exact* (Sys. B)", "#737373", cub_exact(gh200)),
+        ("HyperGen (CPU)*", from_10k(mon03, "hypergen-cpu:hdc")),
+        ("HyperGen GPU* (Sys. A)", from_10k(mon03, "hypergen-gpu:hdc")),
+        ("HyperGen GPU* (Sys. B)", from_10k(gh200, "hypergen-gpu:hdc")),
+        ("skani*", from_10k(mon03, "skani:cpu")),
+        ("cub-exact* (Sys. A)", from_10k(mon03, "cub-exact:gpu-exact")),
+        ("cub-exact* (Sys. B)", from_10k(gh200, "cub-exact:gpu-exact")),
     ]
 
-    fig, ax = plt.subplots(figsize=(2.9, 2.2), dpi=300)
-    ops = [
-        "SKETCH",
-        "COMPARE",
-        "SEARCH",
-        "TOP-K",
-        "E2E",
+    ops = ["SKETCH", "COMPARE", "SEARCH", "TOP-K", "E2E"]
+    # E2E sums default absent stages to 0 s, so a zero marks a tool without results.
+    rows = [
+        (name.replace("Sys. ", ""), [v or np.nan for v in vals])
+        for name, vals in tools_list
+        if any(vals)
     ]
-    x = np.arange(len(ops))
-    n_tools = len(tools_list)
-    w = 0.058
-    offsets = (np.arange(n_tools) - (n_tools - 1) / 2) * w
-    for off, (name, col, vals) in zip(offsets, tools_list):
-        y_vals = [v if v is not None else np.nan for v in vals]
-        ax.bar(x + off, y_vals, w, label=name, color=col)
-    ax.set_yscale("log")
-    # Headroom above the cub-exact bars keeps the legend clear of them.
-    ax.set_ylim(1e-2, 1e10)
-    ax.set_yticks([1e-2, 1e1, 1e4, 1e7])
-    ax.set_ylabel("Execution time [s] (log)", fontsize=8.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels(ops)
-    ax.tick_params(axis="y", labelsize=7.5)
-    ax.tick_params(axis="x", labelsize=5.6)
-    ax.legend(
-        ncol=2,
-        frameon=False,
-        loc="upper left",
-        bbox_to_anchor=(0.015, 1.0),
-        fontsize=5.2,
-        borderpad=0.0,
-        handlelength=0.55,
-        handletextpad=0.15,
-        labelspacing=0.14,
-        columnspacing=0.20,
+    times = np.array([vals for _, vals in rows])
+    # Colour is the slowdown against the fastest tool of each operation, so every column spans
+    # its own range instead of sharing one log axis from milliseconds to days.
+    slowdown = np.log10(times / np.nanmin(times, axis=0))
+    fig, ax = plt.subplots(figsize=(2.9, 2.2), dpi=300)
+    ax.imshow(
+        np.ma.masked_invalid(slowdown), cmap="YlOrRd", vmin=0, vmax=5.5, aspect="auto"
     )
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    for (row, col), seconds in np.ndenumerate(times):
+        if np.isnan(seconds):
+            text, dark = "–", False
+        else:
+            text = (
+                f"{seconds:.2f}"
+                if seconds < 10
+                else f"{seconds:.0f}"
+                if seconds < 1e4
+                else f"{seconds / 1e3:.0f}k"
+            )
+            dark = slowdown[row, col] > 3.3
+        ax.text(
+            col,
+            row,
+            text,
+            ha="center",
+            va="center",
+            fontsize=5.4,
+            color="white" if dark else "black",
+        )
+    ax.set_xticks(range(len(ops)), ops, fontsize=5.0)
+    ax.xaxis.tick_top()
+    ax.set_yticks(range(len(rows)), [name for name, _ in rows], fontsize=5.6)
+    ax.tick_params(length=0, pad=1.5)
+    ax.set_xticks(np.arange(len(ops) + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(len(rows) + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6)
+    ax.grid(which="major", visible=False)
+    ax.tick_params(which="minor", length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     plt.tight_layout(pad=0.2)
     fig.savefig(out_dir / "micro_ops_10k.pdf")
     fig.savefig(out_dir / "micro_ops_10k.png")
     plt.close(fig)
-    for name, _, vals in tools_list:
+    for name, vals in tools_list:
         print(
             f"{name:22} "
             + "  ".join(f"{s:10.4g} s" if s is not None else "      None" for s in vals)
@@ -1087,8 +970,8 @@ def main(
         list[Path] | None,
         typer.Option(
             help="Micro comparison energy JSON files [default: "
-            "results/mogon-*-micro-energy-100k-*.json and "
-            "results/mogon-a100-micro-energy-10k-cub-exact-all-pairs.json]"
+            "results/mogon-*-micro-energy-10k-*.json and the "
+            "results/mogon-*-micro-energy-100k-*.json of every other tool]"
         ),
     ] = None,
 ) -> None:
@@ -1108,12 +991,16 @@ def main(
     stage = existing(
         stage
         or [
-            *map(Path, sorted(glob("results/mogon-*-micro-energy-100k-*.json"))),
-            # cub-exact runs every pair of 10k genomes and is extrapolated to 100k.
-            *map(
-                Path,
-                glob("results/mogon-a100-micro-energy-10k-cub-exact-all-pairs.json"),
+            # HyperGen, skani and cub-exact run every pair of 10k genomes and are
+            # extrapolated to 100k. pp-sketchlib runs at its five default k-mer lengths.
+            *(
+                Path(path)
+                for path in sorted(glob("results/mogon-*-micro-energy-100k-*.json"))
+                if not any(
+                    t in path for t in ("hypergen", "skani", "cub-exact", "k17,29")
+                )
             ),
+            *map(Path, sorted(glob("results/mogon-*-micro-energy-10k-*.json"))),
         ],
         "--stage",
     )
@@ -1126,7 +1013,7 @@ def main(
     b300_inflate(b300_csv)
     b300_build(b300_log, b300_input, b300_workers)
     io_backend_build(ablation)
-    micro_ops(runs)
+    micro_ops()
     micro_energy(runs)
     print(f"Regenerated all paper subfigures in {out_dir}.")
 
