@@ -145,7 +145,7 @@ def verify(output: Path) -> None:
                 assert row[f"sketch_{metric}"] == 1, (row["implementation"], metric)
         if row["implementation"] == "cuco_hll":
             assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
-            assert row["hll_precision"] == 11
+            assert row["hll_precision"] == 10
             left, right = row["sketch_cardinality"], row["sketch_right_cardinality"]
             assert row["sketch_intersection_raw"] == left + right - row["sketch_union"]
             assert 0 <= row["sketch_intersection"] <= min(left, right)
@@ -155,11 +155,12 @@ def verify(output: Path) -> None:
                 )  # The query is a subset of the reference.
         if row["implementation"] == "dashing2":
             assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
-            assert row["sketch_size"] == row["buckets"] == 2048
-            # FullSetSketch containment is a register estimate, not exact:
-            # identical sets land within ~10 percent at these sizes.
+            assert row["sketch_size"] == 512 and row["buckets"] == 2048
+            # FullSetSketch containment is a register estimate, not exact. Identical sets
+            # landed within 10 percent at 2,048 registers; the error scales as 1/sqrt(m), so
+            # within 25 percent at 512.
             if row["actual_ani"] == 1 and row["orientation"] == "query_to_reference":
-                assert math.isclose(row["sketch_containment"], 1.0, abs_tol=0.10), (
+                assert math.isclose(row["sketch_containment"], 1.0, abs_tol=0.25), (
                     key,
                     "containment",
                 )
@@ -185,9 +186,13 @@ def verify(output: Path) -> None:
                     assert row[field] == cuddl[field], (key, field)
         if row["implementation"] == "rabbitsketch":
             assert not {"lower", "equal", "higher", "both_empty"} & row.keys()
-            assert row["sketch_size"] == row["buckets"] == 2048
-            # Below capacity, FastKMV retains the entire set: no sampling error.
-            if max(row["left_cardinality"], row["right_cardinality"]) < 2048:
+            assert row["sketch_size"] == 512 and row["buckets"] == 2048
+            # With the union below capacity, FastKMV's bottom-k of the union is the whole union:
+            # no sampling error.
+            union = (
+                row["left_cardinality"] + row["right_cardinality"] - row["intersection"]
+            )
+            if union < 512:
                 for metric in ("cardinality", "containment", "completeness", "wkid"):
                     assert math.isclose(
                         row[f"sketch_{metric}"], row[f"exact_{metric}"], abs_tol=1e-12

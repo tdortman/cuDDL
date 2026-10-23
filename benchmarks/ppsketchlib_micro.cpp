@@ -46,7 +46,7 @@
 namespace {
 
 std::vector<size_t> const default_kmer_lengths{15, 19, 23, 27, 31};
-constexpr size_t sketch_bins = 2048;
+constexpr size_t default_sketch_bins = 2048;
 /// FASTX bytes on disk read per sketching batch, so reading stays outside the hashing time.
 constexpr uintmax_t batch_bytes = uintmax_t{1} << 30;
 
@@ -100,7 +100,8 @@ void sketch(
     std::filesystem::path const& list,
     std::string const& out,
     int threads,
-    std::vector<size_t> const& kmer_lengths
+    std::vector<size_t> const& kmer_lengths,
+    size_t sketch_bins
 ) {
     auto const files = read_lines(list);
     std::vector<std::string> names(files.size());
@@ -213,12 +214,17 @@ void knn(std::string const& references, int k, std::filesystem::path const& out,
 int main(int argc, char** argv) {
     std::vector<std::string> const args(argv + 1, argv + argc);
     try {
-        if ((args.size() == 4 || args.size() == 5) && args[0] == "sketch") {
+        if (args.size() >= 4 && args.size() <= 6 && args[0] == "sketch") {
+            auto const bins = args.size() == 6 ? std::stoul(args[5]) : default_sketch_bins;
+            if (bins == 0 || bins % 64 != 0) {
+                throw std::invalid_argument("BINS must be a positive multiple of 64");
+            }
             sketch(
                 args[1],
                 args[2],
                 std::stoi(args[3]),
-                args.size() == 5 ? parse_kmers(args[4]) : default_kmer_lengths
+                args.size() >= 5 ? parse_kmers(args[4]) : default_kmer_lengths,
+                bins
             );
         } else if (args.size() == 5 && args[0] == "compare") {
             compare(args[1], args[2], args[3], std::stoi(args[4]));
@@ -226,7 +232,8 @@ int main(int argc, char** argv) {
             knn(args[1], std::stoi(args[2]), args[3], std::stoi(args[4]));
         } else {
             std::cerr << "usage: " << argv[0]
-                      << " sketch LIST OUT THREADS [K,K...] | compare REFS QUERIES|- OUT THREADS"
+                      << " sketch LIST OUT THREADS [K,K... [BINS]] | compare REFS QUERIES|- OUT "
+                         "THREADS"
                          " | knn REFS K OUT THREADS\n";
             return 2;
         }

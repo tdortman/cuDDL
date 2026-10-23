@@ -34,7 +34,8 @@ int main(int argc, char** argv) try {
     config.aggregation = api::AggregationMode::OneSketchPerFile;
     config.ambiguous_policy = api::AmbiguousPolicy::SkipKmer;
     config.kmer_size = 25;
-    config.resolution = 2048;
+    // 512 64-bit hashes: the 4 KiB a 2,048-bucket DDL sketch stores.
+    config.resolution = 512;
     config.seed = 42;
     config.canonical = true;
     config.validate();

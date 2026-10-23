@@ -35,7 +35,9 @@ import sys
 from pathlib import Path
 
 K = 25
-SKETCH_SIZE = 2048
+# 512 `double` registers: the 4 KiB the 2,048 16-bit scores of a cuDDL case's sketch take.
+DDL_BUCKETS = 2048
+SKETCH_SIZE = 512
 METRIC_FLAGS = {
     "jaccard": [],
     "containment": ["--containment"],
@@ -111,7 +113,7 @@ def main(cases_path: str, truth_path: str, output_path: str, binary: str) -> Non
     if not rows:
         raise RuntimeError("no cuDDL rows to replay")
     for m in rows:
-        if m["case"].get("k") != K or m["case"].get("buckets") != SKETCH_SIZE:
+        if m["case"].get("k") != K or m["case"].get("buckets") != DDL_BUCKETS:
             raise RuntimeError("expected cuDDL cases with k=25 and 2048 buckets")
 
     work = Path(output_path).parent / "dashing2-work"

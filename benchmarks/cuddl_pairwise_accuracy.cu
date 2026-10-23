@@ -26,8 +26,11 @@ namespace {
 
 constexpr uint32_t k_kmer_length = 25;
 constexpr size_t k_bucket_count = 2048;
+// 1,024 `int32_t` registers: the 4 KiB a DDL sketch stores as 2,048 16-bit scores.
+constexpr int32_t k_hll_precision = 10;
 
-using sketch_type = cuddl::sketch<k_kmer_length, k_bucket_count>;
+// DDL's genome-to-genome layout, the one the pipeline and search benchmarks use.
+using sketch_type = cuddl::sketch<k_kmer_length, k_bucket_count, cuddl::register_layout<5, 11>>;
 
 constexpr std::array<std::string_view, 13> k_case_header{
     "generator_seed",
@@ -221,7 +224,7 @@ void require_header(std::vector<std::string> const& fields) {
 
     std::optional<cuco::hyperloglog<uint64_t>> hll;
     if (with_hll) {
-        hll.emplace(cuco::hyperloglog<uint64_t>{cuco::precision{11}, {}, {}, stream});
+        hll.emplace(cuco::hyperloglog<uint64_t>{cuco::precision{k_hll_precision}, {}, {}, stream});
         hll->add(device.data(), device.data() + parsed.kmers.size(), stream);
     }
     std::sort(parsed.kmers.begin(), parsed.kmers.end());
@@ -433,7 +436,7 @@ void emit_hll(json& measurements, json row, double left, double right, double un
     output["pair_estimator"] = "clamp(A+B-union, 0, min(A,B))";
     output["ani_estimator"] = "(intersection/min(A,B))^(1/k)";
     row["implementation"] = {{"name", "cuco_hll"}, {"variant", "inclusion-exclusion"}};
-    row["case"]["hll_precision"] = 11;
+    row["case"]["hll_precision"] = k_hll_precision;
     measurements.push_back(std::move(row));
 }
 
@@ -542,7 +545,9 @@ int main(int argc, char** argv) {
                 if (query_size <= 0.0 || reference_size <= 0.0) {
                     throw std::runtime_error("HLL estimated zero cardinality for nonempty input");
                 }
-                cuco::hyperloglog<uint64_t> combined(cuco::precision{11}, {}, {}, stream);
+                cuco::hyperloglog<uint64_t> combined(
+                    cuco::precision{k_hll_precision}, {}, {}, stream
+                );
                 combined.merge(*query.hll, stream);
                 combined.merge(*reference.hll, stream);
                 double const union_size = combined.estimate(stream);

@@ -14,9 +14,10 @@ native per-base identity. Every genome is sketched once and compared all-to-all 
 three are symmetric, so each pair yields one row, as for the other ANI-only lanes.
 
 Usage: jaccard_pairwise_accuracy.py TOOL CASES TRUTH OUTPUT BINARY THREADS
-TOOL is simdsketch (the `simdsketch-benchmark` harness, bucket sketch, s=2048, b=8), sketchlib
-(`sketchlib`, s=2048 64-bit bins), or pp-sketchlib (the `ppsketchlib-micro` harness, 2048
-14-bit bins at k = 15, 19, 23, 27, 31, distances on GPU 0).
+TOOL is simdsketch (the `simdsketch-benchmark` harness, bucket sketch, s=4096, b=8), sketchlib
+(`sketchlib`, s=2048 16-bit bins), or pp-sketchlib (the `ppsketchlib-micro` harness, 448
+14-bit bins at each of k = 15, 19, 23, 27, 31, distances on GPU 0). Every sketch takes the 4 KiB
+of a 2,048-bucket cuDDL sketch, pp-sketchlib's 3,920 bytes because its bins come in sets of 64.
 """
 
 import csv
@@ -29,6 +30,8 @@ from pathlib import Path
 
 K = 25
 SKETCH_SIZE = 2048
+SIMDSKETCH_BUCKETS = 4096
+PPSKETCHLIB_BINS = 448
 CASE_KEYS = (
     "generator_seed",
     "power",
@@ -61,7 +64,19 @@ def simdsketch_jaccard(
     listing = work / "genomes.txt"
     listing.write_text("".join(f"{path}\n" for path in genomes))
     sketches, out = work / "sketches.bin", work / "jaccard.f32"
-    run([binary, "-j", threads, "sketch", "--output", str(sketches), str(listing)])
+    run(
+        [
+            binary,
+            "-j",
+            threads,
+            "sketch",
+            "-s",
+            str(SIMDSKETCH_BUCKETS),
+            "--output",
+            str(sketches),
+            str(listing),
+        ]
+    )
     run(
         [
             binary,
@@ -153,14 +168,26 @@ def ppsketchlib_estimates(
     listing = work / "genomes.txt"
     listing.write_text("".join(f"{path}\n" for path in genomes))
     prefix, out = work / "sketches", work / "jaccard.f32"
-    run([binary, "sketch", str(listing), str(prefix), threads])
+    kmers = "15,19,23,27,31"
+    run(
+        [
+            binary,
+            "sketch",
+            str(listing),
+            str(prefix),
+            threads,
+            kmers,
+            str(PPSKETCHLIB_BINS),
+        ]
+    )
     run([binary, "compare", str(prefix), "-", str(out), threads])
     jaccard = struct.iter_unpack("<f", out.read_bytes())
     core = struct.iter_unpack("<f", Path(f"{out}.core").read_bytes())
     # The harness writes the strict upper triangle row by row.
     pairs = [(i, j) for i in range(len(genomes)) for j in range(i + 1, len(genomes))]
     return {
-        pair: (j[0], 1.0 - c[0]) for pair, j, c in zip(pairs, jaccard, core, strict=True)
+        pair: (j[0], 1.0 - c[0])
+        for pair, j, c in zip(pairs, jaccard, core, strict=True)
     }
 
 

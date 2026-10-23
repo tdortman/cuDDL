@@ -266,7 +266,8 @@ public final class BBToolsPairwiseAccuracy {
             throw new IllegalArgumentException("THREADS must be positive");
         }
 
-        DynamicDemiLog.setExponent(6);
+        // The 5-bit exponent and 11-bit mantissa of cuDDL's accuracy sketches.
+        DynamicDemiLog.setExponent(5);
         final Map<Path, DDLRecord> cache = new HashMap<>();
         try (BufferedReader reader = Files.newBufferedReader(csv)) {
             final String headerLine = reader.readLine();

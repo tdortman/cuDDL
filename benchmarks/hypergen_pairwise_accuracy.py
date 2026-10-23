@@ -20,6 +20,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# k = 25 as for every other k-mer lane, not hyper-gen's default of 21.
+K = 25
+# hyper-gen compresses its hypervector to about 9 bits per dimension: 3,584 dimensions store the
+# 4 KiB of a 2,048-bucket cuDDL sketch (4,046 bytes per RefSeq genome).
+HV_DIMENSION = 3584
+
 
 def run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -43,7 +49,22 @@ def all_pairs_ani(
         link.symlink_to(Path(src).resolve())
         links[str(link)] = src
     ref_sk, qry_sk, out = work / "r.sk", work / "q.sk", work / "dist.tsv"
-    run([binary, "sketch", "-p", str(farm), "-o", str(ref_sk), "-t", threads])
+    run(
+        [
+            binary,
+            "sketch",
+            "-p",
+            str(farm),
+            "-o",
+            str(ref_sk),
+            "-t",
+            threads,
+            "-k",
+            str(K),
+            "-d",
+            str(HV_DIMENSION),
+        ]
+    )
     shutil.copyfile(ref_sk, qry_sk)
     run(
         [
