@@ -17,10 +17,10 @@ import statistics
 import subprocess
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Annotated
 
-import tomllib
 import typer
 from benchmark_schema import make_result, write_result
 

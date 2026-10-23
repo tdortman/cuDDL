@@ -9,7 +9,7 @@ import json
 import math
 import shlex
 import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -435,7 +435,7 @@ def main(
             row: dict[str, Any] = {
                 "schema_version": 3,
                 "timestamp_utc": datetime.fromtimestamp(
-                    input_path.stat().st_mtime, timezone.utc
+                    input_path.stat().st_mtime, UTC
                 ).isoformat(),
                 "benchmark_command": shlex.join(document["meta"]["argv"]),
                 "nvbench_version": document["meta"]["version"]["nvbench"]["string"],
@@ -638,7 +638,7 @@ def main(
         row: dict[str, Any] = {
             "schema_version": 3,
             "timestamp_utc": datetime.fromtimestamp(
-                input_path.stat().st_mtime, timezone.utc
+                input_path.stat().st_mtime, UTC
             ).isoformat(),
             "benchmark_command": shlex.join(document["meta"]["argv"]),
             "nvbench_version": document["meta"]["version"]["nvbench"]["string"],
