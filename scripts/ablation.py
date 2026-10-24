@@ -581,6 +581,7 @@ def e2e(
         ("Inverted index", ["inverted-index"], "threshold"),
         ("Posting bitmaps", ["posting-bitmaps"], "threshold"),
         ("Index fallback to planes", ["index-fallback"], "threshold"),
+        ("Direct result writes", ["direct-io"], "every"),
     ]:
         add(optimisation, ablate, base)
     add("UCX registration cache off", [], "threshold", {"UCX_RCACHE_ENABLE": "y"})
@@ -605,6 +606,7 @@ def e2e(
         Ablation("Index filtering on the GPU", "every", "threshold", "phase:search"),
         Ablation("Parallel result streams", "every one-stream", "every"),
         Ablation("Parallel result streams", "every one-stream", "every", "phase:write"),
+        Ablation("Direct result writes", "every direct-io", "every", "phase:write"),
     ]
     if stock_build is not None:
         check_build(stock_build)
