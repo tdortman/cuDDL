@@ -24,6 +24,10 @@ fi
 for entry in meson.build meson.options include benchmarks examples; do
   rsync -a --delete "$entry" "$stock/"
 done
+# Subprojects added since the copy was made; libdeflate is already there and stays unpatched.
+for entry in subprojects/*; do
+  [ -e "$stock/$entry" ] || cp -al "$entry" "$stock/$entry"
+done
 # A build left by a job on another GPU model takes this run's options, its -gencode among them.
 setup() { # BUILD_DIR SOURCE_DIR
   if [ -d "$1" ]; then
