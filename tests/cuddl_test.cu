@@ -1,5 +1,6 @@
 #include <cuddl/a48.hpp>
 #include <cuddl/cuddl.cuh>
+#include <cuddl/detail/file_writer.hpp>
 #include <cuddl/fastx.hpp>
 #include <cuddl/reference_database_file.cuh>
 #include <cuddl/refseq_parity.hpp>
@@ -5232,6 +5233,58 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     for (auto const& path : paths) {
         std::filesystem::remove(path);
     }
+}
+
+TEST(FileWriterTest, AppendsArriveInOrderOnEveryFileSystem) {
+    // Direct writes (with io_uring where the kernel allows it) in the build tree and on tmpfs
+    // must reproduce every byte, including a tail shorter than a sector, whether appended,
+    // produced in place or larger than the queued limit. A writer that need not be durable
+    // times one window of each route, so direct and page-cache writes share the file.
+    std::string bytes(size_t{32} << 20, '\0');
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<char>(cuddl::detail::splitmix64(i));
+    }
+    std::vector<size_t> const sizes{
+        1, 4095, (size_t{3} << 20) + 7, size_t{9} << 20, 0, 513, (size_t{8} << 20) - 1
+    };
+    for (auto const& directory :
+         {std::filesystem::current_path(), std::filesystem::path("/dev/shm")}) {
+        SCOPED_TRACE(directory.string());
+        auto const path = directory / "cuddl_file_writer_test.bin";
+        std::string_view rest = bytes;
+        {
+            cuddl::detail::file_writer writer(path, false, size_t{8} << 20);
+            for (auto size : sizes) {
+                writer.append(std::span{rest.data(), size});
+                rest.remove_prefix(size);
+            }
+            // Two chunks appended together, then whatever is left.
+            writer.append(
+                {std::span{rest.data(), size_t{100}}, std::span{rest.data() + 100, size_t{77}}}
+            );
+            rest.remove_prefix(177);
+            auto const in_place = writer.reserve((size_t{1} << 20) + 3);
+            std::memcpy(in_place.data(), rest.data(), in_place.size());
+            writer.commit();
+            rest.remove_prefix(in_place.size());
+            writer.append(std::span{rest.data(), rest.size() - 5});
+            writer.finish();
+        }
+        std::ifstream input(path, std::ios::binary);
+        std::string const written{std::istreambuf_iterator<char>{input}, {}};
+        EXPECT_EQ(written.size(), bytes.size() - 5);
+        EXPECT_TRUE(written == std::string_view(bytes).substr(0, bytes.size() - 5));
+
+        cuddl::detail::file_writer empty(path, true);
+        empty.finish();
+        EXPECT_EQ(std::filesystem::file_size(path), 0U);
+        std::filesystem::remove(path);
+    }
+
+    // A full device must surface as an error, not as a silently short file.
+    cuddl::detail::file_writer full("/dev/full", true);
+    full.append(std::span{bytes.data(), size_t{9} << 20});
+    EXPECT_THROW(full.finish(), std::system_error);
 }
 
 TEST(ReferenceDatabaseFileTest, PlainFastaSkipsPageableStaging) {

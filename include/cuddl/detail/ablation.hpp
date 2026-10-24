@@ -16,7 +16,7 @@ namespace cuddl::detail {
 ///
 /// They exist to measure what each optimisation contributes (`scripts/ablation.py`); results
 /// are the same either way. Other builds compile every switch out.
-inline constexpr std::array<std::string_view, 19> ablations{
+inline constexpr std::array<std::string_view, 22> ablations{
     "co-scheduling",       // nvCOMP claims a batch only if it finishes before the host loaders
     "read-depth",          // readers keep parallel_read_depth reads in flight, not one per loader
     "probe-depth",         // 4 * parallel_read_depth gzip probes in flight, not parallel_read_depth
@@ -36,6 +36,9 @@ inline constexpr std::array<std::string_view, 19> ablations{
     "posting-bitmaps",     // long posting lists of the inverted index are kept as bitmaps
     "index-fallback",      // an index whose lists cover too many pairs is bypassed
     "inverted-index",      // threshold searches use an inverted index (benchmarks only)
+    "direct-io",           // result files are written with O_DIRECT, not through the page cache
+    "io-uring",            // direct result writes keep several blocks in flight with io_uring
+    "write-probe",         // writers that need not be durable use the page cache while it is faster
 };
 
 #if CUDDL_ABLATIONS

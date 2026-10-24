@@ -4,16 +4,13 @@
 #include <mpi.h>
 #include <nvml.h>
 #include <cuddl/cuddl.cuh>
+#include <cuddl/detail/file_writer.hpp>
 #include <cuddl/distributed.cuh>
 #include <nlohmann/json.hpp>
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
@@ -169,7 +166,7 @@ result_files(std::filesystem::path const& path, unsigned streams) {
 /// A shared file system gives its bandwidth only to many streams, and on MOGON's Lustre several
 /// threads writing one file were far slower than one. Four ranks on an A100 node wrote 20 GB in
 /// 9.1 s with one synchronous stream each, in 5.8 s with two files each, and in 150 s with four
-/// threads into each rank's one file; the node's NVMe took 18.7 s however it was written.
+/// threads into each rank's one file. Each stream is a cuddl::detail::file_writer.
 class parallel_writer {
    public:
     /// @param streams Files written in parallel.
@@ -178,47 +175,20 @@ class parallel_writer {
         std::filesystem::path const& path,
         unsigned streams,
         size_t queued_limit = size_t{1} << 30
-    )
-        : queued_limit_(queued_limit), streams_(std::max(1U, streams)) {
+    ) {
         auto const files = result_files(path, streams);
-        for (size_t s = 0; s < streams_.size(); ++s) {
-            streams_[s].fd = ::open(files[s].c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (streams_[s].fd == -1) {
-                close();
-                throw std::runtime_error("cannot write " + files[s].string());
-            }
+        for (auto const& file : files) {
+            streams_.push_back(
+                std::make_unique<cuddl::detail::file_writer>(
+                    file, true, queued_limit / files.size()
+                )
+            );
         }
-        for (auto& stream : streams_) {
-            stream.thread = std::thread([this, &stream] { work(stream); });
-        }
-    }
-    parallel_writer(parallel_writer const&) = delete;
-    parallel_writer& operator=(parallel_writer const&) = delete;
-    ~parallel_writer() {
-        stop();
-        close();
     }
 
     /// Queues a copy of @p chunks, written together; waits while too many bytes are queued.
     void append(std::initializer_list<std::span<char const>> chunks) {
-        size_t bytes = 0;
-        for (auto const& chunk : chunks) bytes += chunk.size();
-        if (bytes == 0) return;
-        std::unique_lock lock(mutex_);
-        space_.wait(lock, [&] {
-            return failed_ || queued_ == 0 || queued_ + bytes <= queued_limit_;
-        });
-        if (failed_) throw std::runtime_error("cannot write the result files");
-        queued_ += bytes;
-        auto& stream = streams_[next_++ % streams_.size()];
-        lock.unlock();
-        std::vector<char> copy;
-        copy.reserve(bytes);
-        for (auto const& chunk : chunks) copy.insert(copy.end(), chunk.begin(), chunk.end());
-        lock.lock();
-        stream.queue.push_back(std::move(copy));
-        lock.unlock();
-        ready_.notify_all();
+        streams_[next_++ % streams_.size()]->append(chunks);
     }
 
     void append(void const* data, size_t bytes) {
@@ -227,70 +197,12 @@ class parallel_writer {
 
     /// Waits for every write, then flushes the files to storage and closes them.
     void finish() {
-        {
-            std::unique_lock lock(mutex_);
-            space_.wait(lock, [&] { return failed_ || queued_ == 0; });
-        }
-        stop();
-        bool synced = !failed_;
-        for (auto& stream : streams_) synced = synced && ::fsync(stream.fd) == 0;
-        close();
-        if (!synced) throw std::runtime_error("cannot write the result files");
+        for (auto& stream : streams_) stream->finish();
     }
 
    private:
-    struct stream_state {
-        int fd = -1;
-        std::deque<std::vector<char>> queue;
-        std::thread thread;
-    };
-
-    void stop() {
-        {
-            std::lock_guard lock(mutex_);
-            stopping_ = true;
-        }
-        ready_.notify_all();
-        for (auto& stream : streams_) {
-            if (stream.thread.joinable()) stream.thread.join();
-        }
-    }
-
-    void close() {
-        for (auto& stream : streams_) {
-            if (stream.fd != -1) ::close(stream.fd);
-            stream.fd = -1;
-        }
-    }
-
-    void work(stream_state& stream) {
-        while (true) {
-            std::unique_lock lock(mutex_);
-            ready_.wait(lock, [&] { return stopping_ || !stream.queue.empty(); });
-            if (stream.queue.empty()) return;
-            auto next = std::move(stream.queue.front());
-            stream.queue.pop_front();
-            lock.unlock();
-            size_t done = 0;
-            while (done < next.size()) {
-                auto const wrote = ::write(stream.fd, next.data() + done, next.size() - done);
-                if (wrote <= 0) break;
-                done += static_cast<size_t>(wrote);
-            }
-            lock.lock();
-            if (done != next.size()) failed_ = true;
-            queued_ -= next.size();
-            lock.unlock();
-            space_.notify_all();
-        }
-    }
-
-    size_t queued_limit_;
-    std::vector<stream_state> streams_;
-    std::mutex mutex_;
-    std::condition_variable ready_, space_;
-    size_t queued_ = 0, next_ = 0;
-    bool stopping_ = false, failed_ = false;
+    std::vector<std::unique_ptr<cuddl::detail::file_writer>> streams_;
+    std::atomic<size_t> next_ = 0;
 };
 
 /// The ranks of @p comm sharing one search: each claims tiles until none are left, so a faster

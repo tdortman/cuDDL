@@ -1,5 +1,6 @@
 #include <CLI/CLI.hpp>
 
+#include <cuddl/detail/file_writer.hpp>
 #include <cuddl/detail/worker_pool.hpp>
 #include <cuddl/query_sketch.cuh>
 #include <cuddl/reference_index_file.cuh>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -49,17 +51,16 @@ class result_writer {
             std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
             return;
         }
-        binary_.open(output, std::ios::binary | std::ios::trunc);
-        if (!binary_) throw std::runtime_error("cannot open " + output.string());
+        binary_.emplace(output, false);
     }
 
     /// Writes the passing results of a downloaded tile. Binary records are expanded from the
     /// packed results by a pool of threads that lives as long as the writer, each taking runs of
-    /// query rows, into one buffer reused across tiles, so neither one thread nor first-touch
-    /// page faults bound the output.
+    /// query rows, straight into the file writer's memory, so neither one thread nor a copy
+    /// bounds the output.
     void write(cuddl::host_batch_results const& host) {
         auto const tile = host.tile();
-        if (!binary_.is_open()) {
+        if (!binary_) {
             tile.for_each_passing([](cuddl::batch_search_result const& result) {
                 auto const& counts = result.counts;
                 std::cout << result.query_id << '\t' << result.reference_id << '\t' << counts.lower
@@ -69,10 +70,8 @@ class result_writer {
             return;
         }
         auto const total = tile.count();
-        if (total > capacity_) {
-            records_ = std::make_unique_for_overwrite<cuddl::batch_search_result[]>(total);
-            capacity_ = total;
-        }
+        // Records start wherever the file's last sector ends, so they may be unaligned.
+        auto* const records = binary_->reserve(total * sizeof(cuddl::batch_search_result)).data();
         // Row runs of about equal result counts, several per thread for upper-triangle tiles.
         auto const runs = std::min<uint64_t>(uint64_t{threads} * 8U, tile.query_count);
         bounds_.assign(runs + 1U, tile.query_count);
@@ -83,26 +82,22 @@ class result_writer {
             });
         }
         pool_.for_each(runs, [&](size_t r) {
-            auto* out = records_.get() + tile.passing_before(bounds_[r]);
+            auto* out =
+                records + tile.passing_before(bounds_[r]) * sizeof(cuddl::batch_search_result);
             tile.for_each_passing(
                 bounds_[r], bounds_[r + 1U], [&](cuddl::batch_search_result const& result) {
-                    *out++ = result;
+                    std::memcpy(out, &result, sizeof(result));
+                    out += sizeof(result);
                 }
             );
         });
-        binary_.write(
-            reinterpret_cast<char const*>(records_.get()),
-            static_cast<std::streamsize>(total * sizeof(cuddl::batch_search_result))
-        );
+        binary_->commit();
     }
 
     /// Writes result rows already expanded on the host, such as each genome's top-k neighbours.
     void write(std::span<cuddl::batch_search_result const> rows) {
-        if (binary_.is_open()) {
-            binary_.write(
-                reinterpret_cast<char const*>(rows.data()),
-                static_cast<std::streamsize>(rows.size_bytes())
-            );
+        if (binary_) {
+            binary_->append({reinterpret_cast<char const*>(rows.data()), rows.size_bytes()});
             return;
         }
         for (auto const& result : rows) {
@@ -114,16 +109,16 @@ class result_writer {
     }
 
     void finish() {
-        if (binary_.is_open() ? !binary_.flush() : !std::cout) {
+        if (binary_) {
+            binary_->finish();
+        } else if (!std::cout.flush()) {
             throw std::runtime_error("cannot write search results");
         }
     }
 
    private:
     unsigned const threads = std::max(1U, std::thread::hardware_concurrency());
-    std::ofstream binary_;
-    std::unique_ptr<cuddl::batch_search_result[]> records_;
-    uint64_t capacity_ = 0;
+    std::optional<cuddl::detail::file_writer> binary_;
     std::vector<uint32_t> bounds_;
     cuddl::detail::worker_pool pool_{threads};
 };
