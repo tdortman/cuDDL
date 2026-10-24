@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -69,7 +70,10 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     try {
-        auto paths = CUDDL_UNWRAP(cuddl::genome_paths(folder));
+        // Listing 115,223 genomes and initialising CUDA took 0.3 s each, one after the other.
+        auto listing = std::async(std::launch::async, [&] { return cuddl::genome_paths(folder); });
+        cuda::stream stream{cuda::devices[0]};
+        auto paths = CUDDL_UNWRAP(listing.get());
         if (!blacklist_path.empty()) {
             std::erase_if(paths, [&](auto const& path) {
                 return std::filesystem::equivalent(path, blacklist_path);
@@ -95,7 +99,6 @@ int main(int argc, char** argv) {
         if (paths.empty()) {
             throw std::invalid_argument("folder contains no supported FASTA/FASTQ files");
         }
-        cuda::stream stream{cuda::devices[0]};
         std::optional<cuddl::device_blacklist> blacklist;
         if (!blacklist_path.empty()) {
             if (std::filesystem::exists(output) &&
