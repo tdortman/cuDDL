@@ -24,9 +24,17 @@ fi
 for entry in meson.build meson.options include benchmarks examples; do
   rsync -a --delete "$entry" "$stock/"
 done
-[ -d build/ablation/main-build ] || meson setup build/ablation/main-build -Dablations=true "$@"
-[ -d build/ablation/stock-build ] ||
-  (cd $stock && meson setup "$root/build/ablation/stock-build" -Dablations=true "$@")
+# A build left by a job on another GPU model takes this run's options, its -gencode among them.
+setup() { # BUILD_DIR SOURCE_DIR
+  if [ -d "$1" ]; then
+    meson configure "$1" -Dablations=true "${options[@]}"
+  else
+    (cd "$2" && meson setup "$root/$1" -Dablations=true "${options[@]}")
+  fi
+}
+options=("$@")
+setup build/ablation/main-build .
+setup build/ablation/stock-build $stock
 for b in build/ablation/main-build build/ablation/stock-build; do
   ninja -C $b build.ninja
   meson compile -C $b -j "$jobs" "${targets[@]}"
