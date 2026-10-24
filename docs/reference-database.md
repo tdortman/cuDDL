@@ -44,6 +44,8 @@ Loaders don't read their own files. Reader threads read whole files ahead of the
 
 Before it reads anything, the `gpu` backend probes every file's gzip header and trailer. A probe is two small reads, so it waits on latency and moves almost no data, and 256 probes run at once. On an A100 node, 20,000 uncached genomes built in 13.9–15.6 s with 16 loaders and 64 probes in flight, and in 9.6–10.5 s with 256. Raising the whole-file read depth from 64 to 128 for the nvCOMP batches alone changed nothing (14.2–14.6 s).
 
+`direct_reads = true`, or `--direct-reads` in the CLI and `cuddl-distributed-all-to-all-benchmark`, reads every file larger than 256 KiB with `O_DIRECT`. On Lustre, what limits a cold build is the kernel time page-cache reads cost, not the reads in flight. With all 100,000 genomes (124 GB) evicted from an A100 node, 64 threads read them through the page cache at 3.4 GB/s with 120 s of system time, and 256 threads at 6.6 GB/s with 134 s. Direct reads took 32 and 27 s of system time at 4.3 and 6.5 GB/s. 32 loaders built the genomes in 36.3–40.4 s through the page cache, whether 64 or 256 reads were in flight, and in 33.4–36.2 s with direct reads; with the genomes cached, the build took 29.7–32.7 s. Direct reads neither fill nor use the page cache, so a second build over the same genomes on that node took 43.9 s instead of 29.7 s. Use it for inputs a node reads once.
+
 ### Reconstruct a RabbitTClust-style bacterial dataset
 
 `scripts/reconstruct_refseq211.py` takes a directory, downloads missing NCBI current

@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     std::string blacklist_path;
     unsigned workers = cuddl::default_parser_workers();
     auto decompression = cuddl::decompression_backend::automatic;
+    bool direct_reads = false;
     CLI::App app{
         "Build one reference sketch per FASTA/FASTQ file in a folder, recursing into "
         "subdirectories. "
@@ -59,6 +60,12 @@ int main(int argc, char** argv) {
             )
         )
         ->default_str("automatic");
+    app.add_flag(
+        "--direct-reads",
+        direct_reads,
+        "Read genomes with O_DIRECT: less kernel time on cold Lustre reads, but nothing stays "
+        "cached for the next run"
+    );
     CLI11_PARSE(app, argc, argv);
 
     try {
@@ -113,6 +120,7 @@ int main(int argc, char** argv) {
                 {.statistics = &statistics,
                  .parser_workers = workers,
                  .decompression = decompression,
+                 .direct_reads = direct_reads,
                  .blacklist = blacklist ? std::optional{std::cref(*blacklist)} : std::nullopt}
             ))
         );

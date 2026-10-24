@@ -843,12 +843,14 @@ class device_fasta_pipeline {
     /// Every id must be a device candidate that fits one lane on its own. Plain files skip
     /// nvCOMP: they lead the lane's slots and reach them as read.
     /// Files with extra member signatures reach @ref finish without device inflation.
+    /// @param direct_reads reads the files with `O_DIRECT`, as @ref read_whole_file does.
     /// @return How many ids the batch took: @ref batch_files of them.
     [[nodiscard]] Result<size_t> submit(
         size_t lane_index,
         std::span<size_t const> ids,
         std::span<std::filesystem::path const> paths,
-        std::span<gzip_file_probe const> probes
+        std::span<gzip_file_probe const> probes,
+        bool direct_reads
     ) {
         auto& lane = lanes_[lane_index];
         CUDDL_TRY(cuda_try([&] { allocate(lane); }));
@@ -883,17 +885,10 @@ class device_fasta_pipeline {
             auto* const out = lane.pinned->data() + table.compressed_offsets[file];
             auto const bytes = table.compressed_bytes[file];
             int const fd = ::open(path, O_RDONLY);
-            size_t done = 0;
-            if (fd != -1) {
-                while (done < bytes) {
-                    auto const got =
-                        ::pread(fd, out + done, bytes - done, static_cast<off_t>(done));
-                    if (got <= 0) break;
-                    done += static_cast<size_t>(got);
-                }
-                ::close(fd);
-            }
-            if (done != bytes) failed = true;
+            // Files lie back to back in the lane, so a direct read goes through a bounce buffer.
+            bool const read = fd != -1 && read_whole_file(fd, out, bytes, direct_reads);
+            auto const done = read ? bytes : 0;
+            if (!read) failed = true;
             // A matching trailer cannot distinguish repeated first and last members.
             // A signature inside compressed data is ambiguous too, so use the host parser.
             // BGZF names every member in its block headers.

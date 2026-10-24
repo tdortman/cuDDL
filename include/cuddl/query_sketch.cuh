@@ -80,6 +80,7 @@ class query_sketch_batch {
                 options.parser_workers,
                 options.transfer,
                 options.decompression,
+                options.direct_reads,
                 options.statistics,
                 batch.reduce_rows(stream),
                 options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt

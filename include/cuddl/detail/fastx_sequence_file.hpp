@@ -7,6 +7,7 @@
 #include <bit>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -196,9 +197,46 @@ static const fastx_line_end_fn line_end = resolve_fastx_line_end();
 }
 
 #if defined(__linux__)
-/// @brief Reads @p size bytes of @p fd into @p out, then closes it. False on a short read.
-[[nodiscard]] inline bool read_whole_file(int fd, char* out, size_t size) noexcept {
+/// @brief Reads @p size bytes of @p fd into @p out, which holds @p capacity bytes, then closes
+/// it. False on a short read.
+///
+/// With @p direct, a file over 256 KiB is read with `O_DIRECT`: straight into @p out if it is
+/// page-aligned with room for the last whole page, else through a bounce buffer. Such reads skip
+/// the page cache, so they leave nothing cached for the next run. On Lustre they cost a quarter
+/// of the kernel time: 64 threads read 124 GB of uncached RefSeq gzip with 120 s of system time
+/// through the page cache and 32 s direct, at the same or a higher rate. A file system that
+/// refuses `O_DIRECT` reads through the page cache.
+[[nodiscard]] inline bool
+read_whole_file(int fd, char* out, size_t size, bool direct = false, size_t capacity = 0) noexcept {
+    constexpr size_t page = 4096;
     size_t done = 0;
+    int const flags = direct && size > 64 * page ? ::fcntl(fd, F_GETFL) : -1;
+    if (flags != -1 && ::fcntl(fd, F_SETFL, flags | O_DIRECT) == 0) {
+        auto const whole = (size + page - 1) / page * page;
+        if (reinterpret_cast<uintptr_t>(out) % page == 0) {
+            // Whole pages straight into out; the last partial page too if out has room for it.
+            auto const direct_end = capacity >= whole ? whole : size / page * page;
+            while (done < direct_end && done < size) {
+                auto const got =
+                    ::pread(fd, out + done, direct_end - done, static_cast<off_t>(done));
+                if (got <= 0) break;
+                done = std::min(size, done + static_cast<size_t>(got));
+            }
+        }
+        constexpr size_t bounce_bytes = size_t{8} << 20;
+        static thread_local std::unique_ptr<char, decltype(&std::free)> bounce{
+            static_cast<char*>(std::aligned_alloc(page, bounce_bytes)), &std::free
+        };
+        while (bounce && done < size && done % page == 0) {
+            auto const wanted = std::min(bounce_bytes, (size - done + page - 1) / page * page);
+            auto const got = ::pread(fd, bounce.get(), wanted, static_cast<off_t>(done));
+            if (got <= 0) break;
+            auto const used = std::min(size - done, static_cast<size_t>(got));
+            std::memcpy(out + done, bounce.get(), used);
+            done += used;
+        }
+        if (done < size) ::fcntl(fd, F_SETFL, flags);
+    }
     while (done < size) {
         auto const got = ::pread(fd, out + done, size - done, static_cast<off_t>(done));
         if (got <= 0) break;
@@ -253,11 +291,12 @@ class fastx_mapped_file {
      *             space and shoots down TLBs on every core, which serialises a consumer that
      *             frees files loaded by dozens of threads; a single thread mapping ahead of
      *             others is better off mapping.
+     * @param direct Read with `O_DIRECT`, as @ref read_whole_file does.
      */
     [[nodiscard]] static Result<std::unique_ptr<fastx_mapped_file>>
-    load(std::string const& path, bool read = false) {
+    load(std::string const& path, bool read = false, bool direct = false) {
         auto buffer = std::make_unique<fastx_mapped_file>();
-        auto loaded = buffer->load_from_path(path, read);
+        auto loaded = buffer->load_from_path(path, read, direct);
         if (!loaded) return Err(loaded.error());
         return buffer;
     }
@@ -265,9 +304,9 @@ class fastx_mapped_file {
 #if defined(__linux__)
     /// @brief @ref load for a descriptor already open on a file of @p size bytes. Closes it.
     [[nodiscard]] static Result<std::unique_ptr<fastx_mapped_file>>
-    adopt(int fd, size_t size, std::string const& path, bool read) {
+    adopt(int fd, size_t size, std::string const& path, bool read, bool direct = false) {
         auto buffer = std::make_unique<fastx_mapped_file>();
-        auto loaded = buffer->load_from_descriptor(fd, size, path, read);
+        auto loaded = buffer->load_from_descriptor(fd, size, path, read, direct);
         if (!loaded) return Err(loaded.error());
         return buffer;
     }
@@ -284,7 +323,22 @@ class fastx_mapped_file {
     }
 
    private:
-    std::unique_ptr<char[]> owned_storage_;
+    struct free_deleter {
+        void operator()(char* data) const noexcept {
+            std::free(data);
+        }
+    };
+    /// Page-aligned and rounded up to whole pages, so a direct read can fill it.
+    std::unique_ptr<char, free_deleter> owned_storage_;
+
+    [[nodiscard]] static size_t page_rounded(size_t size) noexcept {
+        return (std::max<size_t>(size, 1) + 4095) / 4096 * 4096;
+    }
+
+    void allocate(size_t size) {
+        owned_storage_.reset(static_cast<char*>(std::aligned_alloc(4096, page_rounded(size))));
+        if (!owned_storage_) throw std::bad_alloc();
+    }
     char const* data_{nullptr};
     size_t size_{0};
 
@@ -306,7 +360,11 @@ class fastx_mapped_file {
         size_ = 0;
     }
 
-    [[nodiscard]] Result<void> load_from_path(std::string const& path, [[maybe_unused]] bool read) {
+    [[nodiscard]] Result<void> load_from_path(
+        std::string const& path,
+        [[maybe_unused]] bool read,
+        [[maybe_unused]] bool direct
+    ) {
 #if defined(__linux__)
         int const fd = ::open(path.c_str(), O_RDONLY);
         if (fd == -1) {
@@ -318,7 +376,9 @@ class fastx_mapped_file {
             ::close(fd);
             return Err(Error::invalid_argument("Failed to stat FASTA/FASTQ file: " + path));
         }
-        return load_from_descriptor(fd, static_cast<size_t>(file_status.st_size), path, read);
+        return load_from_descriptor(
+            fd, static_cast<size_t>(file_status.st_size), path, read, direct
+        );
 #else
         std::ifstream input(path, std::ios::binary);
         if (!input.is_open()) {
@@ -329,7 +389,7 @@ class fastx_mapped_file {
         if (file_size < 0) {
             return Err(Error::invalid_argument("Failed to size FASTA/FASTQ file: " + path));
         }
-        owned_storage_.reset(new char[static_cast<size_t>(file_size)]);
+        allocate(static_cast<size_t>(file_size));
         input.seekg(0, std::ios::beg);
         if (file_size > 0) {
             input.read(owned_storage_.get(), static_cast<std::streamsize>(file_size));
@@ -345,7 +405,7 @@ class fastx_mapped_file {
 
 #if defined(__linux__)
     [[nodiscard]] Result<void>
-    load_from_descriptor(int fd, size_t size, std::string const& path, bool read) {
+    load_from_descriptor(int fd, size_t size, std::string const& path, bool read, bool direct) {
         if (size == 0) {
             ::close(fd);
             return Ok();
@@ -362,8 +422,8 @@ class fastx_mapped_file {
             size_ = size;
             return Ok();
         }
-        owned_storage_.reset(new char[size]);
-        if (!read_whole_file(fd, owned_storage_.get(), size)) {
+        allocate(size);
+        if (!read_whole_file(fd, owned_storage_.get(), size, direct, page_rounded(size))) {
             owned_storage_.reset();
             return Err(Error::invalid_argument("Failed to read FASTA/FASTQ file: " + path));
         }
@@ -752,6 +812,8 @@ struct decompression_target {
 struct decompression_source {
     decompression_target (*acquire)(void* context, size_t bytes) = nullptr;
     void* context = nullptr;
+    /// Read files with `O_DIRECT`, as @ref read_whole_file does.
+    bool direct_reads = false;
 
     [[nodiscard]] decompression_target request(size_t bytes) const {
         return acquire != nullptr ? acquire(context, bytes) : decompression_target{};
@@ -1696,11 +1758,11 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
         // compacts them in place and the stager reads them without another copy.
         auto target = gzip ? decompression_target{} : source.request(size);
         if (target.data == nullptr) {
-            auto file = fastx_mapped_file::adopt(fd, size, path, read);
+            auto file = fastx_mapped_file::adopt(fd, size, path, read, source.direct_reads);
             if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
             return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
         }
-        if (!read_whole_file(fd, target.data, size)) {
+        if (!read_whole_file(fd, target.data, size, source.direct_reads, target.capacity)) {
             return Err(Error::invalid_argument("cannot open FASTX file: " + path));
         }
         auto result = std::make_unique<fastx_sequence_file>();
@@ -1712,7 +1774,7 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
         );
     }
 #endif
-    auto file = fastx_mapped_file::load(path, read);
+    auto file = fastx_mapped_file::load(path, read, source.direct_reads);
     if (!file) return Err(Error::invalid_argument("cannot open FASTX file: " + path));
     return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
 }
@@ -1879,7 +1941,8 @@ class fastx_load_pool {
             mapped_input input;
             input.id = id;
             try {
-                input.file = fastx_mapped_file::load(paths_[id].string(), true);
+                input.file =
+                    fastx_mapped_file::load(paths_[id].string(), true, source_.direct_reads);
             } catch (...) {
                 input.error = std::current_exception();
             }

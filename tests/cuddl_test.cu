@@ -5235,6 +5235,66 @@ TEST(ReferenceDatabaseFileTest, GzipBuildMatchesHostLoaderAcrossFallbacks) {
     }
 }
 
+TEST(ReferenceDatabaseFileTest, DirectReadsBuildMatchesPageCacheBuild) {
+    // Direct reads fill whole pages straight into aligned buffers, or go through a bounce buffer
+    // into the nvCOMP lanes' packed bytes; files that end inside a page must still sketch
+    // exactly as page-cache reads do, on every backend. The files live in the build tree,
+    // because tmpfs refuses O_DIRECT.
+    cuda::stream stream{cuda::devices[0]};
+    constexpr size_t buckets = 2048;
+    auto const bases = [](size_t count, uint64_t seed) {
+        std::string out;
+        for (size_t i = 0; i < count; ++i) {
+            out.push_back("ACGT"[cuddl::detail::splitmix64(seed + i) & 3U]);
+            if (i % 80 == 79) out.push_back('\n');
+        }
+        return out + "\n";
+    };
+    auto const directory = std::filesystem::current_path() / "cuddl_direct_reads_test";
+    std::filesystem::create_directories(directory);
+    std::vector<std::filesystem::path> paths;
+    auto const place = [&](std::string const& from) {
+        auto const to = directory / std::filesystem::path(from).filename();
+        std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::remove(from);
+        paths.push_back(to);
+    };
+    for (uint64_t id = 0; id < 6; ++id) {
+        auto const genome = ">g" + std::to_string(id) + "\n" + bases(300'000 + id * 99'991, id);
+        place(id % 2 == 0 ? write_tmp_gzip(genome) : write_tmp_fasta(genome));
+    }
+    place(write_tmp_fasta(">small\n" + bases(5'000, 99)));
+    auto const reference = cuddl::reference_database_file::build<25, buckets>(
+        paths, stream, {.decompression = cuddl::decompression_backend::cpu}
+    );
+    ASSERT_TRUE(reference) << reference.error().message();
+    for (auto backend :
+         {cuddl::decompression_backend::cpu,
+          cuddl::decompression_backend::gpu,
+          cuddl::decompression_backend::hybrid}) {
+        if (!CUDDL_HAS_NVCOMP && backend != cuddl::decompression_backend::cpu) continue;
+        for (auto transfer : {cuddl::transfer_mode::staged, cuddl::transfer_mode::pinned}) {
+            for (unsigned workers : {1U, 4U}) {
+                SCOPED_TRACE(
+                    std::to_string(static_cast<int>(backend)) + "/" +
+                    std::to_string(static_cast<int>(transfer)) + "/" + std::to_string(workers)
+                );
+                auto const built = cuddl::reference_database_file::build<25, buckets>(
+                    paths,
+                    stream,
+                    {.parser_workers = workers,
+                     .transfer = transfer,
+                     .decompression = backend,
+                     .direct_reads = true}
+                );
+                ASSERT_TRUE(built) << built.error().message();
+                EXPECT_TRUE(std::ranges::equal(reference->rows(), built->rows()));
+            }
+        }
+    }
+    std::filesystem::remove_all(directory);
+}
+
 TEST(FileWriterTest, AppendsArriveInOrderOnEveryFileSystem) {
     // Direct writes (with io_uring where the kernel allows it) in the build tree and on tmpfs
     // must reproduce every byte, including a tail shorter than a sector, whether appended,

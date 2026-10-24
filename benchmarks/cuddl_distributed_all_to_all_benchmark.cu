@@ -86,6 +86,7 @@ int run(int argc, char** argv, ranks const& r) {
     uint32_t minimum_matches = 0;
     unsigned workers = default_workers(r);
     bool keep_output = false;
+    bool direct_reads = false;
     unsigned write_streams = 2;
     std::string records = "similarity";
     app.add_option("--records", records, "Result records: similarity or raw bucket counts")
@@ -107,6 +108,7 @@ int run(int argc, char** argv, ranks const& r) {
     std::string decompression_name = "automatic";
     app.add_option("--decompression", decompression_name, "Decompression backend")
         ->check(CLI::IsMember(backends));
+    app.add_flag("--direct-reads", direct_reads, "Read genomes with O_DIRECT, past the page cache");
     app.add_option("--output-dir", output_dir, "Directory for the per-rank result files")
         ->required();
     app.add_flag("--keep-output", keep_output, "Keep the result files instead of deleting them");
@@ -139,7 +141,11 @@ int run(int argc, char** argv, ranks const& r) {
     std::optional<cuddl::reference_database_file> sketches;
     meter.run("sketch", [&] {
         sketches.emplace(CUDDL_UNWRAP((cuddl::reference_database_file::build<k, buckets, layout>(
-            slice->mine(), stream, {.parser_workers = workers, .decompression = decompression}
+            slice->mine(),
+            stream,
+            {.parser_workers = workers,
+             .decompression = decompression,
+             .direct_reads = direct_reads}
         ))));
     });
 

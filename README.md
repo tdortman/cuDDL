@@ -93,6 +93,7 @@ The host loader checks the gzip structure and the uncompressed length, but not t
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workers`       | Concurrent genome loaders, defaults to the number of logical cores. Use 1 to reduce host RAM usage.                                                           |
 | `--decompression` | `automatic` (default), `cpu`, `gpu`, or `hybrid`. `cpu` inflates and parses every input with the host loaders, `gpu` sends eligible gzip inputs to nvCOMP and copies plain FASTA to the GPU unchanged, and `hybrid` inflates on the host loaders and strips FASTA headers and line breaks on the GPU. `gpu` and `hybrid` need nvCOMP. On discrete GPUs, `automatic` picks `cpu` with 48 or more loaders and `gpu` with fewer; with few cores per GPU, `hybrid` can be faster. |
+| `--direct-reads`  | Read genomes with `O_DIRECT`, past the page cache. On Lustre this cut a cold 100,000-genome build from 36.3–40.4 s to 33.4–36.2 s, but nothing stays cached, so a second run reads from storage again. See [input and reference IDs](docs/reference-database.md#input-and-reference-ids). |
 
 ### 2. Search without an index
 

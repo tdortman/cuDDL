@@ -184,6 +184,11 @@ struct path_build_options {
     /// actually took, and `device_files` how many files the `gpu` backend loaded on the device.
     transfer_mode transfer = transfer_mode::automatic;
     decompression_backend decompression = decompression_backend::automatic;
+    /// Read the files with `O_DIRECT`, past the page cache. On Lustre that costs a quarter of
+    /// the kernel time: on an A100 node with 32 loaders, 100,000 uncached genomes built in
+    /// 33.4-36.2 s instead of 36.3-40.4 s. The files stay uncached, so running again over them
+    /// reads them from storage again: 43.9 s instead of 29.7 s with page-cache reads.
+    bool direct_reads = false;
     /// Reusable lookup; keep alive through this synchronous build.
     std::optional<std::reference_wrapper<device_blacklist const>> blacklist = std::nullopt;
 };
@@ -307,6 +312,7 @@ class reference_database_file {
                 options.parser_workers,
                 options.transfer,
                 options.decompression,
+                options.direct_reads,
                 options.statistics,
                 result.download_rows<BucketCount>(stream),
                 options.blacklist ? options.blacklist->get().view() : cuda::std::nullopt
@@ -680,6 +686,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             options.parser_workers,
             options.transfer,
             options.decompression,
+            options.direct_reads,
             options.statistics,
             [&](device_span<uint32_t const> group, size_t base, size_t count) -> Result<void> {
                 CUDDL_CUDA_TRY(

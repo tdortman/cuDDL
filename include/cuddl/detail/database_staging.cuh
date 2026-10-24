@@ -1026,13 +1026,15 @@ class path_loaders {
     /// @param in_place says the stager's kernels read the loaders' buffers themselves.
     /// @param pack_k packs FASTA into two-bit words for k-mers this long, a quarter of the bytes
     ///               to stage, as @ref pack_fastx_sequence_file does.
+    /// @param direct_reads reads files with `O_DIRECT`, as @ref read_whole_file does.
     path_loaders(
         cuda::stream_ref stream,
         std::span<std::filesystem::path const> paths,
         unsigned parser_workers,
         bool page_locked,
         bool in_place,
-        uint32_t pack_k
+        uint32_t pack_k,
+        bool direct_reads
     )
         : workers_(worker_count(paths.size(), parser_workers)),
           buffers_(stream, workers_, size_t{32} << 20, page_locked, in_place),
@@ -1045,7 +1047,7 @@ class path_loaders {
         buffers_.set_capacity(
             window + stager_hold_slots + 2, pack_k != 0 ? packed_buffer_bytes : 0
         );
-        source_ = {acquire_sequence_target, &buffers_};
+        source_ = {acquire_sequence_target, &buffers_, direct_reads};
         if (workers_ > 1) pool_.emplace(paths, workers_, source_, window, false, false, pack_k);
     }
 
@@ -1141,14 +1143,17 @@ template <uint32_t K, size_t BucketCount, typename Layout>
     size_t base,
     size_t workers,
     sequence_buffer_pool& buffers,
-    bool page_locked
+    bool page_locked,
+    bool direct_reads
 ) {
     if (ids.empty()) return Ok();
     workers = std::min(workers, ids.size());
     std::vector<std::filesystem::path> subset;
     subset.reserve(ids.size());
     for (auto const id : ids) subset.push_back(paths[id]);
-    fastx_load_pool pool(subset, workers, {acquire_sequence_target, &buffers}, workers * 4);
+    fastx_load_pool pool(
+        subset, workers, {acquire_sequence_target, &buffers, direct_reads}, workers * 4
+    );
     for (size_t index = 0; index < ids.size(); ++index) {
         auto sequence = CUDDL_TRY(pool.take(index));
         auto const& extents = sequence->extents;
@@ -1169,6 +1174,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
     transfer_mode transfer,
+    bool direct_reads,
     reference_build_statistics* statistics,
     Sink&& sink,
     cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
@@ -1206,7 +1212,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         fastx_load_pool pool(
             paths.subspan(base, count),
             workers,
-            {acquire_sequence_target, &buffers},
+            {acquire_sequence_target, &buffers, direct_reads},
             window,
             true,
             true
@@ -1325,6 +1331,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     std::optional<size_t> staging_bytes,
     unsigned parser_workers,
     transfer_mode transfer,
+    bool direct_reads,
     bool hardware_inflate,
     reference_build_statistics* statistics,
     Sink&& sink,
@@ -1460,7 +1467,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             fastx_load_pool host_pool(
                 host_paths,
                 std::min(workers, host_paths.size()),
-                decompression_source{acquire_sequence_target, &host_buffers},
+                decompression_source{acquire_sequence_target, &host_buffers, direct_reads},
                 workers * 4,
                 false,
                 true,
@@ -1544,9 +1551,9 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
                                 lane_bytes[lane] += probes[id].compressed;
                             }
                             device_queued += lane_bytes[lane];
-                            next += CUDDL_TRY(
-                                inflater->submit(lane, remaining.first(files), paths, probes)
-                            );
+                            next += CUDDL_TRY(inflater->submit(
+                                lane, remaining.first(files), paths, probes, direct_reads
+                            ));
                             busy[lane] = true;
                         }
                     } else if (std::ranges::none_of(busy, [](bool value) { return value; })) {
@@ -1574,7 +1581,7 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             CUDDL_TRY(host_staged.get());
             // ponytail: one fallback pool per group; pipeline it if fallback-heavy inputs dominate.
             return stage_host_loaded<K, BucketCount, Layout>(
-                stager, paths, handed_back, base, workers, host_buffers, page_locked
+                stager, paths, handed_back, base, workers, host_buffers, page_locked, direct_reads
             );
         },
         sink,
@@ -1607,6 +1614,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     unsigned parser_workers,
     transfer_mode transfer,
     decompression_backend decompression,
+    bool direct_reads,
     reference_build_statistics* statistics,
     Sink&& sink,
     cuda::std::optional<blacklist_view> blacklist = cuda::std::nullopt
@@ -1657,6 +1665,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             staging_bytes,
             parser_workers,
             transfer,
+            direct_reads,
             statistics,
             std::forward<Sink>(sink),
             blacklist
@@ -1669,6 +1678,7 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
             staging_bytes,
             parser_workers,
             transfer,
+            direct_reads,
             decompression == decompression_backend::gpu,
             statistics,
             std::forward<Sink>(sink),
@@ -1689,7 +1699,8 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         parser_workers,
         page_locked,
         in_place,
-        in_place || ablated("base-packing") ? 0 : K
+        in_place || ablated("base-packing") ? 0 : K,
+        direct_reads
     );
     // The corpus size only bounds a default arena, and only below its ceiling, so probing stops
     // there: a corpus of any size then costs at most a few dozen file opens here.
