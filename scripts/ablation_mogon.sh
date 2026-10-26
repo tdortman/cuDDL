@@ -54,6 +54,6 @@ if want search; then
 fi
 if want e2e; then
   abl e2e $mgpu/genomes-100k --output-dir "$S/out" --launcher "$launcher" \
-    --workers "$SLURM_CPUS_PER_TASK" --decompression hybrid --stock-build build/ablation/stock-build \
-    --reps 2 --label "$label"
+    --workers "$SLURM_CPUS_PER_TASK" --stock-build build/ablation/stock-build --reps 2 \
+    --label "$label"
 fi
