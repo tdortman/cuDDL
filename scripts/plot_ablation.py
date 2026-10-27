@@ -35,10 +35,10 @@ import typer
 SCOPES = {"micro": "stage", "build": "stage", "search": "stage", "e2e": "end to end"}
 SUITE_ORDER = {"micro": 0, "build": 1, "search": 2, "e2e": 3}
 COLUMN_INCHES = 3.33  # an ACM two-column layout's column width
-ROW_INCHES = 0.16
-LANE_INCHES = 0.065  # two value labels this far apart do not touch
-FONT = 6.5
-VALUE_FONT = 5.2
+ROW_INCHES = 0.22
+LANE_INCHES = 0.085  # two value labels this far apart do not touch
+FONT = 7.2
+VALUE_FONT = 6.0
 MARKERS = "osD^v"
 
 # acmart sets text in Linux Libertine. Computer Modern at these sizes switches to its wide
@@ -62,6 +62,32 @@ def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
                 phases = entry.pop("phases_s", None) or {}
                 runs.append(entry | {f"phase:{k}": v for k, v in phases.items()})
     return pd.DataFrame(runs), pd.DataFrame(ablations).drop_duplicates()
+
+
+def target_stage(suite: str, metric: str, reference: str, optimisation: str) -> str:
+    if metric == "phase:write" or any(
+        word in optimisation for word in ("pools", "streams", "writes")
+    ):
+        return "Output"
+    if metric == "phase:search" or reference.startswith("threshold"):
+        return "Filter"
+    if suite == "search":
+        return "Compare"
+    if (
+        metric in ("kernel_seconds", "pack_seconds")
+        or "packing" in optimisation
+        or "parsing" in optimisation
+    ):
+        return "Sketch"
+    if (
+        metric == "inflate_seconds"
+        or "decompression" in optimisation
+        or "libdeflate" in optimisation
+        or "lanes" in optimisation
+        or "co-scheduling" in optimisation
+    ):
+        return "Inflate"
+    return "I/O"
 
 
 def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
@@ -88,6 +114,9 @@ def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
                 "suite": a["suite"],
                 "metric": a["metric"],
                 "optimisation": a["optimisation"],
+                "stage": target_stage(
+                    a["suite"], a["metric"], a["reference"], a["optimisation"]
+                ),
                 "with_s": reference.median(),
                 "without_s": without.median(),
                 "speedup": without.median() / reference.median(),
@@ -106,7 +135,7 @@ def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
 
 
 def times(value: float) -> str:
-    digits = 2 if value < 2 else 1 if value < 10 else 0
+    digits = 2 if value < 2 else 1
     return f"{value:.{digits}f}" + r"$\times$"
 
 
@@ -126,7 +155,7 @@ def main(
         typer.Option(
             "--top", help="Keep at most this many top optimisations by speedup"
         ),
-    ] = 9,
+    ] = 0,
     stage_cap: Annotated[
         float, typer.Option(help="Largest speedup the stage axis shows")
     ] = 12.0,
@@ -145,6 +174,10 @@ def main(
         )
     )
 
+    legend = dict(n.split("=", 1) for n in names or [])
+    if legend:
+        table = table[table.label.isin(legend)]
+
     # An optimisation can also make a run slower, so the effect counts both ways.
     table = table.assign(effect=np.abs(np.log(table.speedup)))
     noteworthy = table[table.effect >= np.log(minimum)]
@@ -156,25 +189,48 @@ def main(
         table[table.scope == "end to end"].groupby("optimisation").speedup.max()
     )
     stage = table[table.scope == "stage"].groupby("optimisation").speedup.max()
-    # Largest end-to-end speedup on top; stage-only optimisations follow, by their stage speedup.
-    order = sorted(
+    # Select top_n optimisations by (end-to-end, stage) speedup, then group by pipeline stage.
+    selected = sorted(
         set(table.optimisation), key=lambda o: (end_to_end.get(o, 0), stage.get(o, 0))
     )
-    if top_n > 0 and len(order) > top_n:
-        order = order[-top_n:]
-        table = table[table.optimisation.isin(order)]
+    if top_n > 0 and len(selected) > top_n:
+        selected = selected[-top_n:]
+        table = table[table.optimisation.isin(selected)]
+    stage_of = (
+        table[table.scope == "stage"]
+        .drop_duplicates("optimisation")
+        .set_index("optimisation")["stage"]
+        .to_dict()
+    )
+    for o in selected:
+        stage_of.setdefault(o, table[table.optimisation == o]["stage"].iloc[0])
+    stage_rank = {
+        st: max(
+            (end_to_end.get(o, 0.0), stage.get(o, 0.0))
+            for o in selected
+            if stage_of[o] == st
+        )
+        for st in set(stage_of.values())
+    }
+    order = sorted(
+        selected,
+        key=lambda o: (
+            stage_rank[stage_of[o]],
+            end_to_end.get(o, 0.0) if end_to_end.get(o, 0.0) >= minimum else 0.0,
+            stage.get(o, 0.0),
+        ),
+    )
     row = {name: i for i, name in enumerate(order)}
     machines = {label: i for i, label in enumerate(dict.fromkeys(table.label))}
-    legend = dict(n.split("=", 1) for n in names or [])
 
     rows_inches = ROW_INCHES * len(order)
     fig, axes = plt.subplots(
         1,
         2,
         sharey=True,
-        figsize=(COLUMN_INCHES, 0.42 + rows_inches),
+        figsize=(COLUMN_INCHES, 0.45 + rows_inches),
         layout="constrained",
-        gridspec_kw={"wspace": 0.04},
+        gridspec_kw={"wspace": 0.05, "width_ratios": [1.15, 0.85]},
     )
     lane = LANE_INCHES / ROW_INCHES
     for ax, scope, title in zip(
@@ -189,7 +245,13 @@ def main(
         values = mine[["low", "speedup", "high"]].to_numpy()
         top = np.nanmax(values) if values.size else 2.0
         cap = min(top, stage_cap) if scope == "stage" else top
-        right = cap * 1.25
+        right = cap * (
+            1.03
+            if (scope == "stage" and top > stage_cap)
+            else 1.32
+            if scope == "stage"
+            else 1.48
+        )
         for label, i in machines.items():
             points = mine[mine.label == label]
             if points.empty:
@@ -202,16 +264,18 @@ def main(
                 points.low.clip(upper=cap),
                 points.high.clip(upper=cap),
                 color=f"C{i}",
-                lw=0.7,
+                lw=0.8,
+                zorder=3,
             )
             ax.plot(
                 x[~clipped],
                 y[~clipped],
                 MARKERS[i % len(MARKERS)],
                 color=f"C{i}",
-                ms=2.8,
+                ms=3.2,
+                zorder=4,
             )
-            ax.plot(x[clipped], y[clipped], ">", color=f"C{i}", ms=3)
+            ax.plot(x[clipped], y[clipped], ">", color=f"C{i}", ms=3.4, zorder=4)
             ends = np.fmax(points.high.clip(upper=cap), x)
             for value, xi, yi, past in zip(points.speedup, ends, y, clipped):
                 ax.annotate(
@@ -224,26 +288,47 @@ def main(
                     fontsize=VALUE_FONT,
                     color=f"C{i}",
                 )
-        ax.axvline(1, color="black", lw=0.5)
+        ax.axvline(1, color="black", lw=0.55, zorder=2)
         left = min(0.8, np.nanmin(values) * 0.95) if values.size else 0.8
         ax.set_xlim(left, right)
         ticks = mpl.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
             left, right
         )
         # A tick within a fifth of the axis of 1x would print over it.
-        gap = 0.2 * (right - left)
+        gap = 0.24 * (right - left)
         ax.set_xticks(sorted({1.0, *(t for t in ticks if 1 + gap <= t <= right)}))
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$")
         )
-        ax.tick_params(labelsize=FONT, length=2, pad=1)
-        ax.grid(True, axis="x", lw=0.3, alpha=0.5)
-        ax.set_xlabel(title, fontsize=FONT + 0.5, labelpad=1)
+        ax.tick_params(labelsize=FONT, length=2, pad=1.5)
+        ax.grid(True, axis="x", lw=0.3, alpha=0.5, zorder=1)
+        ax.set_xlabel(title, fontsize=FONT + 0.4, labelpad=1.5)
     axes[0].set_yticks(
         range(len(order)), [pu.paper_text(o) for o in order], fontsize=FONT
     )
     axes[0].tick_params(axis="y", length=0)
     axes[0].set_ylim(-0.55, len(order) - 0.45)
+    spans: list[tuple[int, int, str]] = []
+    start = 0
+    for idx in range(len(order)):
+        if idx == len(order) - 1 or stage_of[order[idx]] != stage_of[order[idx + 1]]:
+            spans.append((start, idx, stage_of[order[start]]))
+            if idx < len(order) - 1:
+                for ax in axes:
+                    ax.axhline(idx + 0.5, color="#9ca3af", lw=0.6, ls="--", zorder=2)
+            start = idx + 1
+    for b_idx, (s_i, e_i, _) in enumerate(spans):
+        if b_idx % 2 == 1:
+            for ax in axes:
+                ax.axhspan(s_i - 0.5, e_i + 0.5, color="#f3f4f6", zorder=0, lw=0)
+    ax_r = axes[1].twinx()
+    ax_r.set_ylim(-0.55, len(order) - 0.45)
+    ax_r.set_yticks(
+        [(s_i + e_i) / 2 for s_i, e_i, _ in spans],
+        [r"\textit{" + pu.paper_text(st) + r"}" for _, _, st in spans],
+        fontsize=FONT,
+    )
+    ax_r.tick_params(axis="y", length=0, pad=3.5)
     if len(machines) > 1:
         handles = [
             mpl.lines.Line2D(
