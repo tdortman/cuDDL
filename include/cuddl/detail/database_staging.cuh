@@ -1644,19 +1644,16 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         );
     }
     if (paths.empty()) return Ok();
-    // Which backend is fastest depends on the GPU and the cores per GPU. With 100,000 genomes,
-    // 8 ranks of 16 loaders on an A40 node sketched in 13.4 s with hybrid, 15.1-15.6 s with cpu
-    // and 16-25 s with gpu; 3,000 genomes on an RTX 5070 Ti with 24 loaders took 2.5-2.8 s with
-    // gpu and 3.0-3.4 s with hybrid. A coherent GPU reads the loaders' buffers in place. On an
-    // A100, 10,000 genomes took 2.2, 1.5, 1.3 and 1.5 s with gpu at 16, 32, 64 and 112 loaders,
-    // and 3.5, 1.75, 1.1 and 1.1 s with cpu.
+    // A coherent GPU reads the loaders' buffers in place, so CPU inflation feeds it best.
+    // Elsewhere nvCOMP wins: 100,000 genomes on an RTX 5090 with 120 loaders built in 7.4 s with
+    // gpu and 10.2 s with cpu, and the CPU-inflating backends kept the GPU 60% idle.
     if (decompression == decompression_backend::automatic) {
-        auto const loaders = path_loaders::worker_count(paths.size(), parser_workers);
         if (device_reads_pageable_memory(stream.device())) {
-            decompression =
-                loaders > 1 ? decompression_backend::hybrid : decompression_backend::cpu;
+            decompression = path_loaders::worker_count(paths.size(), parser_workers) > 1
+                                ? decompression_backend::hybrid
+                                : decompression_backend::cpu;
         } else {
-            decompression = loaders >= 48 ? decompression_backend::cpu : decompression_backend::gpu;
+            decompression = decompression_backend::gpu;
         }
     }
 #if CUDDL_HAS_NVCOMP
