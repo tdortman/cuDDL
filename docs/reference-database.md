@@ -179,8 +179,8 @@ and the production launch policy, 200 samples per timing gave:
 
 | Input               | No blacklist [ms] | BBTools blacklist [ms] | Time ratio |
 | ------------------- | ----------------- | ---------------------- | ---------- |
-| WBcel235            |            0.3983 |                 0.4229 |       1.06 |
-| Human chromosome 14 |            0.3948 |                 0.4273 |       1.08 |
+| WBcel235            | 0.3983            | 0.4229                 | 1.06       |
+| Human chromosome 14 | 0.3948            | 0.4273                 | 1.08       |
 
 Both paths encode four ASCII bases at a time with CUDA bytewise comparisons and
 integer dot products. They skip score calculations for hashes that cannot improve a
@@ -234,6 +234,36 @@ These measurements exclude parsing, upload, and database serialization.
   -a Blacklist=subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz \
   --no-batch --stopping-criterion sample-count --min-samples 30 --target-samples 30
 ```
+
+### Measure the cost on a whole database
+
+Building a database is where the blacklist matters. There a genome gets at most two CTAs per
+SM, so each CTA sketches only a few tiles of it, and about a third of all windows beat their
+CTA's register and reach the lookup. With the 100,000-genome hash-sampled RefSeq snapshot,
+a warm page cache, automatic decompression and five samples per median,
+`cuddl-reference-build-benchmark` reported, in seconds:
+
+| Blacklist                                          | 25-mers | GH200 build | GH200 GPU | RTX 5090 build | RTX 5090 GPU |
+| -------------------------------------------------- | ------- | ----------- | --------- | -------------- | ------------ |
+| none                                               | 0       | 6.64        | 1.72      | 7.37           | 3.63         |
+| `genomeDDLBlacklist_k25e5b4096.fa.gz`              | 1,651   | 6.53        | 2.03      | 7.90           | 4.63         |
+| `refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz` | 5,944   | 6.53        | 2.09      | 8.10           | 4.96         |
+| `genomeDDLBlacklist.fa.gz`                         | 80,392  | 6.53        | 2.37      | 9.36           | 6.81         |
+
+The GH200 ran 64 loaders and inflated on its CPU, so the build hides the lookup; its build
+time varies by about 0.1 s between runs. The RTX 5090 ran 120 loaders on a Xeon w9-3595X and
+inflated with nvCOMP on the SMs that also sketch, so the lookup lengthens the build. GPU is
+the `resident` time: row resets and sketch kernels, without transfers. On the RTX 5090 it is
+longer than with `cpu` decompression (1.55 s without a blacklist), because the inflation
+kernels share the SMs.
+
+```sh
+./build/benchmarks/cuddl-reference-build-benchmark --config genomes-100k.toml \
+  --database /tmp/bl100k.cuddl --workers 64 --samples 5 \
+  --blacklist subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz
+```
+
+`genomes-100k.toml` holds `reference = [...]` with one path per genome.
 
 ## Choose a decompression backend
 
