@@ -40,12 +40,7 @@ __device__ __forceinline__ uint32_t load_shared_relaxed(uint32_t const* address)
 /// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads reuse
 /// neighboring words to construct eight overlapping windows on both strands. @p Naive instead
 /// builds every window base by base with a branch per base, for ablation studies only.
-template <
-    size_t BucketCount,
-    typename Layout,
-    bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist,
-    bool Naive = false>
+template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
     uint32_t windows,
@@ -62,7 +57,6 @@ __device__ __forceinline__ void add_sequence_windows(
     for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
         local[i] = 0;
     }
-    uint32_t floor = 0;
     uint32_t hash_ceiling = UINT32_MAX;
     size_t tiles = 0;
     auto const mask = (uint64_t{1} << (2 * k)) - 1;
@@ -115,10 +109,9 @@ __device__ __forceinline__ void add_sequence_windows(
                 if (static_cast<uint32_t>(hash >> 32) > hash_ceiling) continue;
                 auto const incoming = score<Layout>(hash);
                 auto const bucket = bucket_of<BucketCount>(hash);
-                if (UseFloor && incoming <= floor) continue;
                 if constexpr (HasBlacklist) {
                     if (incoming > load_shared_relaxed(&local[bucket]) &&
-                        !blacklist.contains(word, bucket)) {
+                        !blacklist.contains(word, hash, bucket)) {
                         atomicMax(&local[bucket], incoming);
                     }
                 } else {
@@ -205,21 +198,23 @@ __device__ __forceinline__ void add_sequence_windows(
                 auto const end = (bad & valid_mask & ~uint64_t{0x7F}) == 0
                                      ? cuda::std::min(8U, count - start)
                                      : 0U;
-                _Pragma("unroll")
-                for (uint32_t i = 0; i < end; ++i) {
-                    if ((bad & valid_mask) == 0) {
-                        auto const forward = high >> (64 - 2 * k);
-                        auto const reverse = reverse_high & mask;
-                        auto const word = forward > reverse ? forward : reverse;
-                        auto const hash = hash_kmer(word);
-                        if (static_cast<uint32_t>(hash >> 32) <= hash_ceiling) {
-                            auto const incoming = score<Layout>(hash);
-                            auto const bucket = bucket_of<BucketCount>(hash);
-                            if (!UseFloor || incoming > floor) {
+                // Specialising on k > 25 keeps the slide branch-free; the compiler does not
+                // unswitch it once the blacklist lookup is present.
+                auto slide = [&]<bool Long>() {
+                    _Pragma("unroll")
+                    for (uint32_t i = 0; i < end; ++i) {
+                        if ((bad & valid_mask) == 0) {
+                            auto const forward = high >> (64 - 2 * k);
+                            auto const reverse = reverse_high & mask;
+                            auto const word = forward > reverse ? forward : reverse;
+                            auto const hash = hash_kmer(word);
+                            if (static_cast<uint32_t>(hash >> 32) <= hash_ceiling) {
+                                auto const incoming = score<Layout>(hash);
+                                auto const bucket = bucket_of<BucketCount>(hash);
                                 // Look up only scores that can still raise the CTA's register.
                                 if constexpr (HasBlacklist) {
-                                    auto const current = load_shared_relaxed(&local[bucket]);
-                                    if (incoming > current && !blacklist.contains(word, bucket)) {
+                                    if (incoming > load_shared_relaxed(&local[bucket]) &&
+                                        !blacklist.contains(word, hash, bucket)) {
                                         atomicMax(&local[bucket], incoming);
                                     }
                                 } else {
@@ -227,104 +222,58 @@ __device__ __forceinline__ void add_sequence_windows(
                                 }
                             }
                         }
+                        // Eight overlapping windows fit in one 32-base word when k <= 25.
+                        if constexpr (Long) {
+                            high = (high << 2) | (low >> 62);
+                            low <<= 2;
+                            reverse_high = (reverse_high >> 2) | (reverse_low << 62);
+                            reverse_low >>= 2;
+                        } else {
+                            high <<= 2;
+                            reverse_high >>= 2;
+                        }
+                        bad >>= 1;
                     }
-                    // Eight overlapping windows fit in one 32-base word when k <= 25.
-                    if (k <= 25) {
-                        high <<= 2;
-                        reverse_high >>= 2;
-                    } else {
-                        high = (high << 2) | (low >> 62);
-                        low <<= 2;
-                        reverse_high = (reverse_high >> 2) | (reverse_low << 62);
-                        reverse_low >>= 2;
-                    }
-                    bad >>= 1;
+                };
+                if (k > 25) {
+                    slide.template operator()<true>();
+                } else {
+                    slide.template operator()<false>();
                 }
             }
         }
         __syncthreads();
-        if constexpr (UseFloor) {
-            // Warm up with 16 windows per bucket; a single tile leaves the minimum at zero.
-            if (++tiles == (16 * BucketCount + tile_size - 1) / tile_size &&
-                tile + tile_stride < windows) {
-                using reduce = cub::BlockReduce<uint32_t, 256>;
-                __shared__ typename reduce::TempStorage scratch;
-                __shared__ uint32_t minimum;
-                uint32_t value = 0xffffU;
-                for (uint32_t b = threadIdx.x; b < BucketCount; b += blockDim.x) {
-                    value = cuda::std::min(value, local[b]);
-                }
-                auto const result = reduce(scratch).Reduce(value, cuda::minimum<>{});
-                if (threadIdx.x == 0) minimum = result;
-                __syncthreads();
-                floor = minimum;
-                hash_ceiling = floor == 0 ? UINT32_MAX : uint32_t(restore<Layout>(floor) >> 32);
+        // Share accepted winners across CTAs before processing the remaining tiles.
+        if ((++tiles == 4 || tiles % 16 == 0) && tile + tile_stride < windows) {
+            using reduce = cub::BlockReduce<uint32_t, 256>;
+            __shared__ typename reduce::TempStorage exchange_scratch;
+            __shared__ uint32_t exchange_ceiling;
+            uint32_t minimum = 0xffffU;
+            // Each thread owns its buckets here, so the merged value feeds the floor directly.
+            for (uint32_t b = threadIdx.x; b < BucketCount; b += blockDim.x) {
+                auto const value = local[b];
+                auto global =
+                    cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{registers[b]}.load(
+                        cuda::memory_order_relaxed
+                    );
+                if (value > global) global = cuda::std::max(value, atomicMax(&registers[b], value));
+                local[b] = global;
+                minimum = cuda::std::min(minimum, global);
             }
-        }
-        if constexpr (!UseFloor) {
-            // Share accepted winners across CTAs before processing the remaining tiles.
-            if ((++tiles == 4 || tiles % 16 == 0) && tile + tile_stride < windows) {
-                using reduce = cub::BlockReduce<uint32_t, 256>;
-                __shared__ typename reduce::TempStorage exchange_scratch;
-                __shared__ uint32_t exchange_ceiling;
-                uint32_t minimum = 0xffffU;
-                // Each thread owns its buckets here, so the merged value feeds the floor directly.
-                for (uint32_t b = threadIdx.x; b < BucketCount; b += blockDim.x) {
-                    auto const value = local[b];
-                    auto global =
-                        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{registers[b]}.load(
-                            cuda::memory_order_relaxed
-                        );
-                    if (value > global)
-                        global = cuda::std::max(value, atomicMax(&registers[b], value));
-                    local[b] = global;
-                    minimum = cuda::std::min(minimum, global);
-                }
-                auto const result = reduce(exchange_scratch).Reduce(minimum, cuda::minimum<>{});
-                if (threadIdx.x == 0) {
-                    // An inclusive high-word cutoff admits ties for exact per-bucket pruning.
-                    exchange_ceiling =
-                        result == 0 ? UINT32_MAX : uint32_t(restore<Layout>(result) >> 32);
-                }
-                __syncthreads();
-                hash_ceiling = exchange_ceiling;
+            auto const result = reduce(exchange_scratch).Reduce(minimum, cuda::minimum<>{});
+            if (threadIdx.x == 0) {
+                // An inclusive high-word cutoff admits ties for exact per-bucket pruning.
+                exchange_ceiling =
+                    result == 0 ? UINT32_MAX : uint32_t(restore<Layout>(result) >> 32);
             }
+            __syncthreads();
+            hash_ceiling = exchange_ceiling;
         }
     }
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < BucketCount; i += blockDim.x) {
         if (local[i] != 0U) atomicMax(&registers[i], local[i]);
     }
-}
-
-/// @brief Tile kernel for one staged file-builder chunk, carrying K-1 bases across tiles.
-template <
-    size_t BucketCount,
-    typename Layout,
-    bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist>
-__global__ void add_sequence_tile_kernel(
-    char const* sequence,
-    uint32_t const* window_count,
-    char* carry,
-    uint32_t k,
-    uint32_t* registers,
-    blacklist_view blacklist = {}
-) {
-    auto const windows = *window_count;
-    if (blockIdx.x == 0 && threadIdx.x < k - 1) {
-        carry[threadIdx.x] = sequence[windows + threadIdx.x];
-    }
-    add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
-        sequence,
-        windows,
-        size_t{blockIdx.x} * 2048,
-        size_t{gridDim.x} * 2048,
-        k,
-        registers,
-        false,
-        blacklist
-    );
 }
 
 /// @brief One piece of sequence of one genome, and where its bytes are.
@@ -339,14 +288,20 @@ struct sequence_batch_chunk {
     uint32_t packed;  // nonzero: @p bases holds two-bit words, not ASCII
 };
 
+// On sm_90 the unfiltered encoder fits in 32 registers and the cap keeps the filtered one at
+// full occupancy. Other architectures showed no gain (sm_120) or need more registers (sm_8x).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    #define CUDDL_SEQUENCE_BATCH_REGISTER_CAP __maxnreg__(32)
+#else
+    #define CUDDL_SEQUENCE_BATCH_REGISTER_CAP
+#endif
+
 /// @brief Batch kernel covering every staged chunk in one launch, including short records.
-template <
-    size_t BucketCount,
-    typename Layout,
-    bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist,
-    bool Naive = false>
-__global__ void add_sequence_batch_kernel(
+///
+/// The register cap keeps the blacklist lookup from costing resident blocks: at 43 registers,
+/// a GH200 SM held five blocks instead of eight.
+template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false>
+__global__ CUDDL_SEQUENCE_BATCH_REGISTER_CAP void add_sequence_batch_kernel(
     sequence_batch_chunk const* chunks,
     size_t chunk_count,
     size_t block_count,
@@ -372,7 +327,7 @@ __global__ void add_sequence_batch_kernel(
         }
         __syncthreads();
         auto* target = registers + size_t{chunk.genome} * BucketCount;
-        add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor, Naive>(
+        add_sequence_windows<BucketCount, Layout, HasBlacklist, Naive>(
             chunk.bases,
             chunk.windows,
             (block - first_block) * 2048,
@@ -386,15 +341,12 @@ __global__ void add_sequence_batch_kernel(
     }
 }
 
+#undef CUDDL_SEQUENCE_BATCH_REGISTER_CAP
+
 /// @brief Single-sequence kernel for the public raw-ASCII API.
 ///
-/// Unlike the file-builder tile path, there is no cross-chunk carry: the caller supplies any
-/// K-1 overlap explicitly.
-template <
-    size_t BucketCount,
-    typename Layout,
-    bool HasBlacklist = false,
-    bool UseFloor = HasBlacklist>
+/// There is no cross-chunk carry: the caller supplies any K-1 overlap explicitly.
+template <size_t BucketCount, typename Layout, bool HasBlacklist = false>
 __global__ __launch_bounds__(256, 6) void add_sequence_single_kernel(
     char const* sequence,
     uint32_t windows,
@@ -402,7 +354,7 @@ __global__ __launch_bounds__(256, 6) void add_sequence_single_kernel(
     uint32_t* registers,
     blacklist_view blacklist = {}
 ) {
-    add_sequence_windows<BucketCount, Layout, HasBlacklist, UseFloor>(
+    add_sequence_windows<BucketCount, Layout, HasBlacklist>(
         sequence,
         windows,
         size_t{blockIdx.x} * 2048,
@@ -419,7 +371,7 @@ __global__ __launch_bounds__(256, 6) void add_sequence_single_kernel(
 /// Windows derive as size >= k ? size - k + 1 : 0; short input is a no-op. Window counts above
 /// UINT32_MAX are rejected instead of narrowing, so size must not exceed UINT32_MAX + k - 1.
 /// No hidden carry: the caller supplies any K-1 overlap explicitly.
-template <size_t BucketCount, typename Layout = default_register_layout, bool UseFloor = true>
+template <size_t BucketCount, typename Layout = default_register_layout>
 __host__ inline Result<void> launch_sequence_add(
     device_span<char const> sequence,
     uint32_t k,
@@ -441,39 +393,29 @@ __host__ inline Result<void> launch_sequence_add(
     auto const windows = static_cast<uint32_t>(windows_size);
     auto launch = [&]<bool Filter>() -> Result<void> {
         return cuda_try([&] {
+            auto const kernel = add_sequence_single_kernel<BucketCount, Layout, Filter>;
             auto const multiprocessors =
                 stream.device().attribute(cuda::device_attributes::multiprocessor_count);
             // Fill one resident wave, accounting for the GPU and this sketch's shared memory.
             if constexpr (Filter) {
                 // Leave L1 room for the blacklist presence map; the default favors shared memory.
                 auto const carveout = cudaFuncSetAttribute(
-                    add_sequence_single_kernel<BucketCount, Layout, Filter, false>,
-                    cudaFuncAttributePreferredSharedMemoryCarveout,
-                    50
+                    kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 50
                 );
                 if (carveout != cudaSuccess) return carveout;
             }
             int blocks_per_sm = 0;
-            auto const occupancy = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &blocks_per_sm,
-                add_sequence_single_kernel<BucketCount, Layout, Filter, false>,
-                256,
-                0
-            );
+            auto const occupancy =
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, 256, 0);
             if (occupancy != cudaSuccess) return occupancy;
             size_t const need = (static_cast<size_t>(windows) + 2047) / 2048;
             size_t const capacity = static_cast<size_t>(multiprocessors) * blocks_per_sm;
             size_t const blocks_size =
                 capacity == 0 ? size_t{1} : (capacity < need ? capacity : need);
             auto const blocks = static_cast<uint32_t>(blocks_size);
-            add_sequence_single_kernel<BucketCount, Layout, Filter, false>
-                <<<blocks, 256, 0, stream.get()>>>(
-                    sequence.data(),
-                    windows,
-                    k,
-                    registers.data(),
-                    blacklist.value_or(blacklist_view{})
-                );
+            kernel<<<blocks, 256, 0, stream.get()>>>(
+                sequence.data(), windows, k, registers.data(), blacklist.value_or(blacklist_view{})
+            );
             return cudaGetLastError();
         });
     };

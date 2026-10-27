@@ -26,25 +26,30 @@ namespace cuddl {
 namespace detail {
 /// @brief Exact membership within the candidate's destination bucket.
 ///
-/// A one-bit-per-slot presence map, indexed independently of the bucket, rejects most absent keys
-/// with a single load before the bucket's sorted keys are searched.
+/// Three filters run from cheapest to most selective. Each bucket has a 64-bit mask with one bit
+/// per 6-bit hash fingerprint of its keys, 16 KiB for 2,048 buckets; one load rejects keys whose
+/// bit is clear. A one-bit-per-slot presence map sized to the key count then rejects most of the
+/// rest before the bucket's sorted keys are searched.
 struct blacklist_view {
-    static constexpr uint32_t presence_bits = 19;
-
     uint64_t const* keys = nullptr;
     uint32_t const* offsets = nullptr;
     uint32_t const* presence = nullptr;
-    uint32_t const* minimum_hash = nullptr;
+    uint64_t const* fingerprints = nullptr;
+    uint32_t presence_bits = 0;
 
-    __host__ __device__ static uint32_t presence_slot(uint64_t key) noexcept {
-        return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ULL) >> (64 - presence_bits));
+    /// Bits 13-18 sit above every supported bucket index and below the scored high word.
+    __host__ __device__ static uint32_t fingerprint(uint64_t hash) noexcept {
+        return static_cast<uint32_t>(hash >> 13) & 63U;
     }
 
-    __device__ bool contains(uint64_t key, size_t bucket) const noexcept {
-        if (static_cast<uint32_t>(hash_kmer(key) >> 32) < __ldg(minimum_hash + bucket)) {
-            return false;
-        }
-        auto const slot = presence_slot(key);
+    __host__ __device__ static uint32_t presence_slot(uint64_t key, uint32_t bits) noexcept {
+        return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ULL) >> (64 - bits));
+    }
+
+    /// @p hash must be `hash_kmer(key)`; construction already holds it.
+    __device__ bool contains(uint64_t key, uint64_t hash, size_t bucket) const noexcept {
+        if ((__ldg(fingerprints + bucket) >> fingerprint(hash) & 1U) == 0) return false;
+        auto const slot = presence_slot(key, presence_bits);
         if ((__ldg(presence + slot / 32) >> (slot % 32) & 1U) == 0) return false;
         return search(key, bucket);
     }
@@ -204,13 +209,13 @@ class device_blacklist {
         if (source_.keys().empty()) return;
 
         std::vector<uint32_t> offsets(buckets + 1, 0);
-        std::vector<uint32_t> minimum_hash(buckets, UINT32_MAX);
+        std::vector<uint64_t> fingerprints(buckets, 0);
 
         for (auto key : source_.keys()) {
             auto const hash = detail::hash_kmer(key);
             auto const bucket = hash & (buckets - 1);
             ++offsets[bucket + 1];
-            minimum_hash[bucket] = std::min(minimum_hash[bucket], uint32_t(hash >> 32));
+            fingerprints[bucket] |= uint64_t{1} << detail::blacklist_view::fingerprint(hash);
         }
 
         for (size_t b = 1; b <= buckets; ++b) {
@@ -222,17 +227,21 @@ class device_blacklist {
         for (auto key : source_.keys()) {
             keys[cursor[detail::hash_kmer(key) & (buckets - 1)]++] = key;
         }
-        std::vector<uint32_t> presence((size_t{1} << detail::blacklist_view::presence_bits) / 32);
+        // 32 to 64 map bits per key hold false positives to 1.5-3% at any list size.
+        auto const presence_bits =
+            std::max(10U, static_cast<uint32_t>(std::bit_width(keys.size())) + 5U);
+        std::vector<uint32_t> presence((size_t{1} << presence_bits) / 32);
         for (auto key : keys) {
-            auto const slot = detail::blacklist_view::presence_slot(key);
+            auto const slot = detail::blacklist_view::presence_slot(key, presence_bits);
             presence[slot / 32] |= uint32_t{1} << (slot % 32);
         }
+        presence_bits_ = presence_bits;
 
         keys_.emplace(cuda::make_device_buffer<uint64_t>(stream, stream.device(), keys));
         offsets_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), offsets));
         presence_.emplace(cuda::make_device_buffer<uint32_t>(stream, stream.device(), presence));
-        minimum_hash_.emplace(
-            cuda::make_device_buffer<uint32_t>(stream, stream.device(), minimum_hash)
+        fingerprints_.emplace(
+            cuda::make_device_buffer<uint64_t>(stream, stream.device(), fingerprints)
         );
         stream.sync();
     }
@@ -247,7 +256,11 @@ class device_blacklist {
     [[nodiscard]] cuda::std::optional<detail::blacklist_view> view() const noexcept {
         if (!keys_) return cuda::std::nullopt;
         return detail::blacklist_view{
-            keys_->data(), offsets_->data(), presence_->data(), minimum_hash_->data()
+            keys_->data(),
+            offsets_->data(),
+            presence_->data(),
+            fingerprints_->data(),
+            presence_bits_
         };
     }
     [[nodiscard]] Result<void> validate(uint32_t k, size_t buckets, cuda::stream_ref stream) const {
@@ -264,10 +277,11 @@ class device_blacklist {
     kmer_blacklist source_;
     size_t buckets_;
     int device_;
+    uint32_t presence_bits_ = 0;
     std::optional<cuda::device_buffer<uint64_t>> keys_;
     std::optional<cuda::device_buffer<uint32_t>> offsets_;
     std::optional<cuda::device_buffer<uint32_t>> presence_;
-    std::optional<cuda::device_buffer<uint32_t>> minimum_hash_;
+    std::optional<cuda::device_buffer<uint64_t>> fingerprints_;
 };
 
 }  // namespace cuddl

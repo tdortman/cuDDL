@@ -33,7 +33,7 @@ __host__ inline Result<void> launch_construction(
         auto const blocks =
             static_cast<uint32_t>(cuda::std::min<size_t>(multiprocessors * 2U, needed));
         auto launch = [&]<bool Filter>() {
-            add_shared_kernel<BucketCount, Layout, 1U, Filter>
+            add_shared_kernel<BucketCount, Layout, Filter>
                 <<<blocks, shared_construction_block_size, 0, stream.get()>>>(
                     input.data(),
                     input.size(),

@@ -15,27 +15,11 @@ import typer
 
 
 class Suite(str, Enum):
-    all = "all"
-    checks = "checks"
-    construction = "construction"
-    genome_sizes = "genome-sizes"
-    size_controls = "size-controls"
-    floor_sweep = "floor-sweep"
     blacklist = "blacklist"
 
 
-def parse_sizes(value: str) -> list[int]:
-    try:
-        sizes = [int(n) for n in value.split(",")]
-    except ValueError as error:
-        raise typer.BadParameter("Sizes must be comma-separated integers") from error
-    if any(n < 0 for n in sizes) or len(set(sizes)) != len(sizes):
-        raise typer.BadParameter("Sizes must be nonnegative and unique")
-    return sizes
-
-
 def main(
-    suite: Annotated[Suite, typer.Argument()] = Suite.all,
+    suite: Annotated[Suite, typer.Argument()] = Suite.blacklist,
     samples: Annotated[int, typer.Option(min=1)] = 300,
     timeout: Annotated[
         float,
@@ -52,38 +36,13 @@ def main(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="FASTA/FASTQ file; repeat for multiple inputs. Replaces built-in sweep inputs.",
+            help="FASTA/FASTQ file; repeat for multiple inputs. Replaces the bundled genomes.",
         ),
     ] = None,
     label: Annotated[
         list[str] | None,
         typer.Option(
             help="Plot label for each --fastx, in the same order; repeat per input."
-        ),
-    ] = None,
-    random: Annotated[
-        bool,
-        typer.Option(
-            "--random", help="Include random input alongside the FASTX files."
-        ),
-    ] = False,
-    items: Annotated[
-        list[int] | None,
-        typer.Option(
-            min=0,
-            help="K-mer count; repeat for a size sweep. Zero uses the full genome.",
-        ),
-    ] = None,
-    fastx_items: Annotated[
-        list[str] | None,
-        typer.Option(
-            help="Comma-separated sizes per --fastx, in file order; overrides --items."
-        ),
-    ] = None,
-    random_items: Annotated[
-        str | None,
-        typer.Option(
-            help="Comma-separated positive sizes for random input; enables --random and overrides --items."
         ),
     ] = None,
     blacklist: Annotated[
@@ -100,88 +59,39 @@ def main(
         "build/benchmarks/cuddl-efficiency-benchmark"
     ),
 ) -> None:
-    if (genome or label) and suite not in (Suite.floor_sweep, Suite.blacklist):
+    genome = genome or [
+        Path("data/genomes") / name
+        for name in ("ecoli_k12_mg1655.fna", "WBcel235.fna", "chr14.fna")
+    ]
+    blacklist = blacklist or Path(
+        "subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz"
+    )
+    if not blacklist.is_file() or any(not p.is_file() for p in genome):
         raise typer.BadParameter(
-            "Input and label options require floor-sweep or blacklist"
+            "Missing input: supply --fastx and --blacklist or fetch the bundled data"
         )
-    if (items or random or fastx_items or random_items) and suite != Suite.floor_sweep:
-        raise typer.BadParameter("Size and random-input options require floor-sweep")
-    if blacklist is not None and suite != Suite.blacklist:
-        raise typer.BadParameter("--blacklist requires the blacklist suite")
-    if suite == Suite.blacklist:
-        genome = genome or [
-            Path("data/genomes") / name
-            for name in ("ecoli_k12_mg1655.fna", "WBcel235.fna", "chr14.fna")
-        ]
-        blacklist = blacklist or Path(
-            "subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz"
+    if any(c in str(blacklist) for c in ",[]:\n\r"):
+        raise typer.BadParameter(
+            "Blacklist path cannot contain commas, brackets, colons, or newlines"
         )
-        if not blacklist.is_file() or any(not p.is_file() for p in genome):
-            raise typer.BadParameter(
-                "Missing input: supply --fastx and --blacklist or fetch the bundled data"
-            )
-        if any(c in str(blacklist) for c in ",[]:\n\r"):
-            raise typer.BadParameter(
-                "Blacklist path cannot contain commas, brackets, colons, or newlines"
-            )
-        if any(output.glob("blacklist-*")):
-            raise typer.BadParameter(
-                "Output already contains a blacklist comparison; choose a fresh --output"
-            )
+    if any(output.glob("blacklist-*")):
+        raise typer.BadParameter(
+            "Output already contains a blacklist comparison; choose a fresh --output"
+        )
     if label is not None and (
-        len(label) != len(genome or []) or any(not x.strip() for x in label)
+        len(label) != len(genome) or any(not x.strip() for x in label)
     ):
         raise typer.BadParameter("Provide one nonempty --label per --fastx")
-    paths = [p.resolve() for p in genome or []]
+    paths = [p.resolve() for p in genome]
     if len(set(paths)) != len(paths):
         raise typer.BadParameter("Duplicate genome paths")
     if any(any(c in str(p) for c in ",[]:\n\r") for p in paths):
         raise typer.BadParameter(
             "Genome paths cannot contain commas, brackets, colons, or newlines"
         )
-    sizes = (
-        items
-        if items is not None
-        else [
-            65536,
-            262144,
-            1048576,
-            4194304,
-            8388608,
-            16777216,
-            25165824,
-            33554432,
-            67108864,
-        ]
-    )
-    if len(set(sizes)) != len(sizes):
-        raise typer.BadParameter("Duplicate --items values")
-    if fastx_items is not None and len(fastx_items) != len(paths):
-        raise typer.BadParameter("Provide one --fastx-items list per --fastx")
-    genome_sizes = (
-        [parse_sizes(value) for value in fastx_items]
-        if fastx_items is not None
-        else [sizes] * len(paths)
-    )
-    random_sizes = (
-        parse_sizes(random_items)
-        if random_items is not None
-        else [n for n in sizes if n > 0]
-    )
-    random = random or random_items is not None
-    if random and (not random_sizes or 0 in random_sizes):
-        raise typer.BadParameter("Random input requires positive sizes")
-    if 0 in sizes and not paths:
-        raise typer.BadParameter("--items 0 requires --genome")
-    if suite == Suite.floor_sweep and any(output.glob("floor-sweep-*")):
-        raise typer.BadParameter(
-            "Output already contains a sweep; choose a fresh --output directory"
-        )
     output.mkdir(parents=True, exist_ok=True)
 
-    def run(
-        name: str, benchmark: str, axes: dict[str, str], count: int = samples
-    ) -> None:
+    def run(name: str, benchmark: str, axes: dict[str, str]) -> None:
         command = [
             str(binary),
             "--devices",
@@ -191,14 +101,13 @@ def main(
             "--stopping-criterion",
             "sample-count",
             "--target-samples",
-            str(count),
+            str(samples),
             "--min-samples",
-            str(count),
+            str(samples),
             "--timeout",
             str(timeout),
+            "--no-batch",
         ]
-        if suite == Suite.blacklist:
-            command += ["--no-batch"]
         for key, value in axes.items():
             command += ["--axis", f"{key}={value}"]
         report = output / f"{name}.json"
@@ -218,143 +127,45 @@ def main(
             flush=True,
         )
 
-    if suite == Suite.blacklist:
-        assert blacklist is not None  # the blacklist suite defaults it above
-        variants = [("unfiltered", None), ("bbtools", str(blacklist.resolve()))]
-        reports = []
-        for order in ("forward", "reverse"):
-            for i, (path, name) in enumerate(
-                zip(paths, label or [p.name for p in paths])
-            ):
-                for variant, source in variants:
-                    report_name = f"blacklist-{order}-{i}-{variant}"
-                    run(
-                        report_name,
-                        "sequence_construction",
-                        {
-                            "Path": str(path),
-                            "K": "25",
-                            "Offset": "0",
-                            "Floor": "1",
-                            "BlocksPerSM": "0",
-                            **({"Blacklist": source} if source is not None else {}),
-                        },
-                    )
-                    reports.append(
-                        {
-                            "label": name,
-                            "path": str(path),
-                            "variant": variant,
-                            "order": order,
-                            "report": report_name + ".csv",
-                        }
-                    )
-            variants.reverse()
-        (output / "blacklist-comparison.json").write_text(
-            json.dumps(
-                {
-                    "blacklist": str(blacklist.resolve()),
-                    "samples": samples,
-                    "scope": "resident GPU sequence construction; excludes parsing and upload",
-                    "reports": reports,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-
-    if suite == Suite.floor_sweep:
-        (output / "floor-sweep-labels.json").write_text(
-            json.dumps(
-                {
-                    f"fasta={path}": name
-                    for path, name in zip(paths, label or [p.name for p in paths])
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        rounds = [0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
-        inputs_to_run = [
-            (f"genome-{i}", f"fasta={path}", "[0,50,100]", input_sizes)
-            for i, (path, input_sizes) in enumerate(zip(paths, genome_sizes))
-        ]
-        if not paths and not random:
-            inputs_to_run = [
-                ("random", "random", "0", random_sizes),
-                ("genomes", "[worm,chr14]", "[0,50,100]", sizes),
-            ]
-        if random:
-            inputs_to_run.append(("random", "random", "0", random_sizes))
-        for order in ("forward", "reverse"):
-            for name, inputs, windows, input_sizes in inputs_to_run:
+    variants = [("unfiltered", None), ("bbtools", str(blacklist.resolve()))]
+    reports = []
+    for order in ("forward", "reverse"):
+        for i, (path, name) in enumerate(zip(paths, label or [p.name for p in paths])):
+            for variant, source in variants:
+                report_name = f"blacklist-{order}-{i}-{variant}"
                 run(
-                    f"floor-sweep-{order}-{name}",
-                    "construction_efficiency",
+                    report_name,
+                    "sequence_construction",
                     {
-                        "Buckets": "2048",
-                        "Items": "[" + ",".join(map(str, input_sizes)) + "]",
-                        "Input": inputs,
-                        "StartPercent": windows,
-                        "FloorRounds": "[" + ",".join(map(str, rounds)) + "]",
+                        "Path": str(path),
+                        "K": "25",
+                        "Offset": "0",
+                        "BlocksPerSM": "0",
+                        **({"Blacklist": source} if source is not None else {}),
                     },
                 )
-            rounds.reverse()
-
-    if suite in (Suite.all, Suite.checks):
-        run(
-            "check-construction",
-            "construction_efficiency",
+                reports.append(
+                    {
+                        "label": name,
+                        "path": str(path),
+                        "variant": variant,
+                        "order": order,
+                        "report": report_name + ".csv",
+                    }
+                )
+        variants.reverse()
+    (output / "blacklist-comparison.json").write_text(
+        json.dumps(
             {
-                "Buckets": "[2048,8192]",
-                "Items": "[0,7,3073,65535,65536]",
-                "Input": "[random,repeated]",
-                "FloorRounds": "[0,1,2,4,8,12,16,24,32,48,64,96,128]",
-                "Misaligned": "1",
+                "blacklist": str(blacklist.resolve()),
+                "samples": samples,
+                "scope": "resident GPU sequence construction; excludes parsing and upload",
+                "reports": reports,
             },
-            1,
+            indent=2,
         )
-    if suite == Suite.genome_sizes:
-        for name, rounds in (("forward", "[0,32]"), ("reverse", "[32,0]")):
-            run(
-                f"genome-sizes-{name}",
-                "construction_efficiency",
-                {
-                    "Input": "[worm,chr14]",
-                    "Items": "[1048576,4194304,8388608,12582912,16777216,25165824,33554432,50331648,67108864]",
-                    "StartPercent": "[0,50,100]",
-                    "FloorRounds": rounds,
-                },
-            )
-    if suite == Suite.size_controls:
-        for name, rounds in (("forward", "[0,32]"), ("reverse", "[32,0]")):
-            run(
-                f"size-controls-{name}",
-                "construction_efficiency",
-                {
-                    "Input": "[random,duplicates]",
-                    "Items": "[25165824,33554432,50331648]",
-                    "FloorRounds": rounds,
-                },
-            )
-    if suite in (Suite.all, Suite.construction):
-        run("construction-random", "construction_efficiency", {"Input": "random"})
-        run(
-            "construction-duplicates",
-            "construction_efficiency",
-            {
-                "Input": "duplicates",
-                "Items": "[1048576,16777216]",
-            },
-        )
-        run(
-            "construction-fasta",
-            "construction_efficiency",
-            {
-                "Input": "[ecoli,worm,chr14]",
-                "Items": "0",
-            },
-        )
+        + "\n"
+    )
 
 
 if __name__ == "__main__":

@@ -43,8 +43,7 @@ def load(directory: Path) -> tuple[dict, list[dict]]:
             or row["Skipped"] != "No"
             or row["Path"] != entry["path"]
             or row["Blacklist"] != expected_blacklist
-            or (row["K"], row["Offset"], row["Floor"], row["BlocksPerSM"])
-            != ("25", "0", "1", "0")
+            or (row["K"], row["Offset"], row["BlocksPerSM"]) != ("25", "0", "0")
             or int(row["Samples"]) != manifest["samples"]
         ):
             raise ValueError(

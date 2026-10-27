@@ -696,8 +696,10 @@ class database_stager {
         auto const grid = std::min(block_end_, max_grid_);
         if (grid != 0) {
             auto const resident = CUDDL_TRY(begin_resident(kernel_stream_));
+            // The kernel keeps the default carveout: a 50% L1 split sped up filtered sketching on
+            // an RTX 5090, but made `gpu`-backend builds 2.6 times slower beside nvCOMP's kernels.
             auto launch = [&]<bool Filter, bool Naive>() {
-                add_sequence_batch_kernel<BucketCount, Layout, Filter, Filter, Naive>
+                add_sequence_batch_kernel<BucketCount, Layout, Filter, Naive>
                     <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
                         descriptors_.data(),
                         copied_chunks_.size(),

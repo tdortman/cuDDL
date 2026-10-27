@@ -148,10 +148,8 @@ cannot establish their own provenance. `sketch::assign_async` likewise requires 
 blacklist after its stream argument and rejects a different policy.
 
 Filtering precedes register updates, so excluding a winner lets the next eligible k-mer
-win. Both packed and raw-sequence construction skip membership checks when a score cannot
-beat the CTA-local floor. Filtered raw-sequence construction computes that floor after 16
-windows per bucket per CTA, and only when another tile remains. Short sequences avoid the
-reduction. Unfiltered raw-sequence construction omits both the lookup and the floor.
+win. Raw-sequence construction looks a key up only when its score beats both the shared
+ceiling described below and its CTA's register for that bucket.
 
 ### Compare cuDDL with and without the BBTools blacklist
 
@@ -200,28 +198,31 @@ floor. The floor becomes a conservative upper bound on the hash magnitude. Compa
 the upper 32 bits rejects windows before score calculation or a
 shared-memory load. Ties proceed to scoring. With a blacklist, a k-mer is looked up only
 if its score also exceeds its bucket's current value. Only accepted keys reach the
-registers, so pruning cannot discard a winner.
+registers, so pruning cannot discard a winner. Packed k-mers skip the pruning: every one is
+looked up when a blacklist is set, and each accepted one costs a shared `atomicMax`.
 
-The lookup rejects most absent keys before it searches. A key whose hash is below the
-smallest blacklisted hash in its bucket cannot be listed. A 2^19-bit presence map, indexed
-by a second hash of the key, rejects most of the rest with one load. The remaining keys
-go through a binary search of their bucket's sorted keys.
+The lookup rejects most absent keys before it searches. Each bucket has a 64-bit mask with
+one bit per 6-bit fingerprint (hash bits 13-18) of its keys, 16 KiB for 2,048 buckets. A key
+whose fingerprint bit is clear cannot be listed. A presence map with 32 to 64 bits per key,
+indexed by a second hash of the key, rejects most of the rest with one load, at about 2%
+false positives for any list size. The remaining keys go through a binary search of their
+bucket's sorted keys. On sm_90 the batch encoder is capped at 32 registers, which the
+unfiltered encoder needs anyway, so the lookup does not cost resident blocks.
 
 The efficiency benchmark checks register equality before timing sequence construction.
 `Blacklist` loads a list once, outside the timed region. `BlocksPerSM=0` uses the
-production launch policy. The `Floor` axis only changes fixed-grid launches with
-`BlocksPerSM` above zero.
+production launch policy.
 
 `blacklist_lookup` compares the bucketed lookup with a binary search of the whole sorted
 list. It uses 1,651 and 23,020 keys, 0% or 50% hits, and 1,048,576 probes. On an RTX
 5070 Ti, 30-sample GPU means were:
 
-|   Keys | Hits | Bucketed [µs] | Whole-list search [µs] |
+| Keys   | Hits | Bucketed [µs] | Whole-list search [µs] |
 | ------ | ---- | ------------- | ---------------------- |
-|  1,651 |   0% |          22.6 |                   28.7 |
-|  1,651 |  50% |          26.6 |                   28.7 |
-| 23,020 |   0% |          31.5 |                   73.1 |
-| 23,020 |  50% |          48.0 |                   72.8 |
+| 1,651  | 0%   | 22.1          | 28.7                   |
+| 1,651  | 50%  | 24.6          | 28.8                   |
+| 23,020 | 0%   | 28.9          | 75.9                   |
+| 23,020 | 50%  | 43.6          | 73.1                   |
 
 These measurements exclude parsing, upload, and database serialization.
 
@@ -229,7 +230,7 @@ These measurements exclude parsing, upload, and database serialization.
 ./build/benchmarks/cuddl-efficiency-benchmark -b blacklist_lookup --no-batch \
   --stopping-criterion sample-count --min-samples 30 --target-samples 30
 ./build/benchmarks/cuddl-efficiency-benchmark -b sequence_construction \
-  -a Path=data/genomes/WBcel235.fna -a Floor=1 \
+  -a Path=data/genomes/WBcel235.fna \
   -a Blacklist=subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz \
   --no-batch --stopping-criterion sample-count --min-samples 30 --target-samples 30
 ```

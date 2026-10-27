@@ -289,7 +289,7 @@ TEST(Blacklist, BBToolsFastaAndFusedGzipProduceTheSameLiteralSet) {
     EXPECT_EQ(decoded.identity(), expected.identity());
 }
 
-TEST(Blacklist, LongSequenceFloorPreservesFilteredAndUnfilteredWinners) {
+TEST(Blacklist, LongSequencePruningPreservesFilteredAndUnfilteredWinners) {
     cuda::stream stream{cuda::devices[0]};
     std::mt19937_64 random(715);
     std::string bases(32 * 1024 * 1024, 'A');
@@ -323,18 +323,6 @@ TEST(Blacklist, LongSequenceFloorPreservesFilteredAndUnfilteredWinners) {
             auto& winner = expected[cuddl::detail::bucket_of<buckets>(hash)];
             winner = std::max(winner, uint32_t{cuddl::detail::score(hash)});
         }
-        auto baseline =
-            cuda::make_device_buffer<uint32_t>(stream, stream.device(), buckets, uint32_t{0});
-        CUDDL_UNWRAP(
-            (cuddl::detail::launch_sequence_add<buckets, cuddl::default_register_layout, false>(
-                ascii,
-                k,
-                {baseline.data(), buckets},
-                stream,
-                filtered ? lookup->view() : cuda::std::nullopt
-            ))
-        );
-        EXPECT_EQ(download(baseline.data(), buckets, stream), expected);
         cuddl::sketch<k, buckets> sketch(
             stream,
             filtered ? std::optional<std::shared_ptr<cuddl::device_blacklist const>>{lookup}
