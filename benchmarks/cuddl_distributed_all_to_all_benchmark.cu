@@ -4,20 +4,18 @@
 // Each phase is one library step: `list` is cuddl::slice_genomes, `sketch` builds this rank's
 // slice, `allgather` is cuddl::gather_sketches, `build` uploads the gathered file to this
 // rank's GPU, `index` builds the index for a threshold search, and `search` is
-// cuddl::search_all_to_all across the ranks, appending this rank's tiles to `rank-<r>.bin`.
-// `download` is the part of the search spent turning finished tiles into records on the host,
-// and `write` the part spent handing records to the writer: copying them into its queue,
-// waiting while too much is queued, and flushing at the end. The writer's threads write while
-// the search continues. With `--write-streams S` above 1, stream s writes `rank-<r>.bin.<s>`,
-// and each tile goes whole to the next stream in turn.
+// cuddl::search_all_to_all across the ranks, writing this rank's tiles through a
+// cuddl::result_file to `rank-<r>.bin`. `download` is the part of the search spent copying
+// finished tiles to the host, converting them on the GPU first for similarity records, and
+// `write` the part spent waiting for the file: for a free host buffer while earlier tiles are
+// written, and for the flush at the end. The file's threads expand and write records while the
+// search continues. With `--write-streams S` above 1, stream s writes `rank-<r>.bin.<s>`, and
+// each tile goes whole to the next stream in turn.
 //
-// `--records similarity` (the default) stores each pair's weighted k-mer identity as a 4-byte
-// float. An exhaustive tile is converted on the GPU and written as its first query and query
-// count (two uint32) followed by one float per pair of its rows, in query-major, reference
-// order over references after each query. A threshold tile is written as 12-byte records of
-// query ID, reference ID and float. `--records counts` writes 24-byte cuddl::batch_search_result
-// records with the raw bucket counts. Phases are separated by barriers; each rank records its
-// own time per phase.
+// `--records similarity` (the default) writes cuddl::result_format::similarity, each pair's
+// weighted k-mer identity as a 4-byte float, and `--records counts` the 24-byte
+// cuddl::batch_search_result records with the raw bucket counts. Phases are separated by
+// barriers; each rank records its own time per phase.
 
 #include "multi_gpu.cuh"
 
@@ -164,90 +162,22 @@ int run(int argc, char** argv, ranks const& r) {
     }
 
     auto const path = fs::path(output_dir) / ("rank-" + std::to_string(r.rank) + ".bin");
-    uint64_t pairs = 0;
-    uint64_t bytes_written = 0;
-    double write_ms = 0;
-    double download_ms = 0;
-    // Reused across tiles; they grow only when a tile needs more.
-    using pinned_floats =
-        cuda::buffer<float, cuda::mr::host_accessible, cuda::mr::device_accessible>;
-    auto const pinned =
-        cuddl::detail::device_pinned_pool(device, cuddl::detail::pinned_placement::device_node);
-    auto device_similarity = cuda::make_device_buffer<float>(stream, device, 0, cuda::no_init);
-    pinned_floats host_similarity(stream, pinned, 0, cuda::no_init);
-    struct similarity_record {
-        uint32_t query_id, reference_id;
-        float similarity;
-    };
-    std::vector<similarity_record> passing_similarity;
+    cuddl::result_file_statistics written;
     meter.run("search", [&] {
-        parallel_writer file(path, write_streams);
-        auto const write = [&](std::initializer_list<std::span<char const>> chunks) {
-            auto const start = wall_clock::now();
-            file.append(chunks);
-            write_ms += ms_since(start);
-            for (auto const& chunk : chunks) bytes_written += chunk.size();
-        };
-        auto const bytes = [](auto const* data, size_t count) {
-            return std::span{reinterpret_cast<char const*>(data), count * sizeof(*data)};
-        };
+        auto file = CUDDL_UNWRAP(
+            cuddl::result_file::open(
+                path,
+                {.format = records == "counts" ? cuddl::result_format::counts
+                                               : cuddl::result_format::similarity,
+                 .streams = write_streams,
+                 .durable = true,
+                 .threads = workers}
+            )
+        );
         auto const on_tile = [&](cuddl::replica_tile const& tile) {
             // Waiting for the tile's search first keeps that wait out of the download time.
             tile.stream.sync();
-            auto const fetched = wall_clock::now();
-            if (records == "counts") {
-                auto const passing = CUDDL_UNWRAP(tile.download())->passing();
-                download_ms += ms_since(fetched);
-                write({bytes(passing.data(), passing.size())});
-                pairs += passing.size();
-                return;
-            }
-            auto const& t = tile.tile;
-            if (t.pass_bits == nullptr) {
-                auto const slots = static_cast<size_t>(t.slot_count());
-                if (device_similarity.size() < slots) {
-                    device_similarity =
-                        cuda::make_device_buffer<float>(tile.stream, device, slots, cuda::no_init);
-                    host_similarity = pinned_floats(tile.stream, pinned, slots, cuda::no_init);
-                }
-                if (slots != 0U) {
-                    CUDDL_CUDA_CALL(
-                        cub::DeviceTransform::Transform(
-                            t.results,
-                            device_similarity.data(),
-                            slots,
-                            [bucket_count =
-                                 t.bucket_count] __device__(cuddl::packed_pairwise_counts packed) {
-                                return cuddl::weighted_kmer_identity(packed.unpack(bucket_count));
-                            },
-                            tile.stream.get()
-                        )
-                    );
-                    cuda::copy_bytes(
-                        tile.stream,
-                        cuda::std::span{device_similarity.data(), slots},
-                        cuda::std::span{host_similarity.data(), slots}
-                    );
-                }
-                tile.stream.sync();
-                download_ms += ms_since(fetched);
-                std::array const header{t.first_query_id, t.query_count};
-                write({bytes(header.data(), header.size()), bytes(host_similarity.data(), slots)});
-                pairs += slots;
-                return;
-            }
-            auto const* host = CUDDL_UNWRAP(tile.download());
-            passing_similarity.clear();
-            host->tile().for_each_passing([&](cuddl::batch_search_result const& result) {
-                passing_similarity.push_back(
-                    {result.query_id,
-                     result.reference_id,
-                     cuddl::weighted_kmer_identity(result.counts)}
-                );
-            });
-            download_ms += ms_since(fetched);
-            write({bytes(passing_similarity.data(), passing_similarity.size())});
-            pairs += passing_similarity.size();
+            CUDDL_UNWRAP(file.write(tile));
         };
         if (minimum_matches == 0) {
             CUDDL_UNWRAP(cuddl::search_all_to_all(*group, on_tile, MPI_COMM_WORLD));
@@ -258,13 +188,12 @@ int run(int argc, char** argv, ranks const& r) {
                 )
             );
         }
-        auto const start = wall_clock::now();
-        file.finish();
-        write_ms += ms_since(start);
+        CUDDL_UNWRAP(file.finish());
+        written = file.statistics();
     });
     auto const wall_ms = meter.total_ms();
     if (!keep_output) {
-        for (auto const& file : result_files(path, write_streams)) fs::remove(file);
+        for (auto const& file : cuddl::result_file::files(path, write_streams)) fs::remove(file);
     }
 
     char host[256] = {};
@@ -275,10 +204,10 @@ int run(int argc, char** argv, ranks const& r) {
         {"gpu_index", device.get()},
         {"files", slice->last - slice->first},
         {"input_bytes", slice_bytes},
-        {"download_ms", download_ms},
-        {"write_ms", write_ms},
-        {"pairs", pairs},
-        {"bytes_written", bytes_written},
+        {"download_ms", written.download_seconds * 1e3},
+        {"write_ms", written.stall_seconds * 1e3},
+        {"pairs", written.pairs},
+        {"bytes_written", written.bytes},
     };
     for (auto const& [name, ms] : meter.ms()) mine[name + "_ms"] = ms;
     auto detail = gather_json(mine, MPI_COMM_WORLD);

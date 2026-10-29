@@ -4,7 +4,6 @@
 #include <mpi.h>
 #include <nvml.h>
 #include <cuddl/cuddl.cuh>
-#include <cuddl/detail/file_writer.hpp>
 #include <cuddl/distributed.cuh>
 #include <nlohmann/json.hpp>
 
@@ -149,61 +148,6 @@ inline json gather_json(json const& mine, MPI_Comm comm) {
     }
     return gathered;
 }
-
-/// The files a @ref parallel_writer with @p streams streams writes for @p path.
-inline std::vector<std::filesystem::path>
-result_files(std::filesystem::path const& path, unsigned streams) {
-    if (streams <= 1) return {path};
-    std::vector<std::filesystem::path> files;
-    for (unsigned s = 0; s < streams; ++s)
-        files.emplace_back(path.string() + "." + std::to_string(s));
-    return files;
-}
-
-/// Writes records to storage on its own threads, so the caller produces the next records while
-/// earlier ones are written. With one stream, @p path holds the records in order. With more,
-/// stream s writes `<path>.<s>`, and each @ref append goes whole to the next stream in turn.
-/// A shared file system gives its bandwidth only to many streams, and on MOGON's Lustre several
-/// threads writing one file were far slower than one. Four ranks on an A100 node wrote 20 GB in
-/// 9.1 s with one synchronous stream each, in 5.8 s with two files each, and in 150 s with four
-/// threads into each rank's one file. Each stream is a cuddl::detail::file_writer.
-class parallel_writer {
-   public:
-    /// @param streams Files written in parallel.
-    /// @param queued_limit Bytes appended but not yet written before @ref append waits.
-    parallel_writer(
-        std::filesystem::path const& path,
-        unsigned streams,
-        size_t queued_limit = size_t{1} << 30
-    ) {
-        auto const files = result_files(path, streams);
-        for (auto const& file : files) {
-            streams_.push_back(
-                std::make_unique<cuddl::detail::file_writer>(
-                    file, true, queued_limit / files.size()
-                )
-            );
-        }
-    }
-
-    /// Queues a copy of @p chunks, written together; waits while too many bytes are queued.
-    void append(std::initializer_list<std::span<char const>> chunks) {
-        streams_[next_++ % streams_.size()]->append(chunks);
-    }
-
-    void append(void const* data, size_t bytes) {
-        append({std::span{static_cast<char const*>(data), bytes}});
-    }
-
-    /// Waits for every write, then flushes the files to storage and closes them.
-    void finish() {
-        for (auto& stream : streams_) stream->finish();
-    }
-
-   private:
-    std::vector<std::unique_ptr<cuddl::detail::file_writer>> streams_;
-    std::atomic<size_t> next_ = 0;
-};
 
 /// The ranks of @p comm sharing one search: each claims tiles until none are left, so a faster
 /// rank searches more of the pairs. With CUDDL_ABLATE=tile-queue each keeps the tiles its shard

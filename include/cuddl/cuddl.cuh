@@ -13,5 +13,6 @@
 #include <cuddl/reference_index.cuh>
 #include <cuddl/reference_index_file.cuh>
 #include <cuddl/replicated_database.cuh>
+#include <cuddl/result_file.cuh>
 #include <cuddl/sketch.cuh>
 #include <cuddl/top_k.cuh>

@@ -62,7 +62,8 @@ class node_window {
    public:
     node_window() = default;
     explicit node_window(MPI_Win window) : window_(window) {}
-    node_window(node_window&& other) noexcept : window_(std::exchange(other.window_, MPI_WIN_NULL)) {}
+    node_window(node_window&& other) noexcept
+        : window_(std::exchange(other.window_, MPI_WIN_NULL)) {}
     node_window& operator=(node_window&&) = delete;
     ~node_window() {
         if (window_ != MPI_WIN_NULL) MPI_Win_free(&window_);
@@ -474,39 +475,32 @@ void search_threshold(
 }
 
 /// One instrumented threshold search that downloads every passing pair and writes it to
-/// @p path as raw 24-byte records, flushed to the device before the clock stops. The writer's
-/// thread writes while the search continues; node-local NVMe gains nothing from more files.
+/// @p path as raw 24-byte records on @p threads threads, flushed to the device before the clock
+/// stops. The file's threads write while the search continues; node-local NVMe gains nothing
+/// from more files.
 json rank_output(
     group_type& group,
     tile_claims& claims,
     uint32_t minimum_matches,
     std::filesystem::path const& path,
+    unsigned threads,
     MPI_Comm comm
 ) {
-    parallel_writer file(path, 1);
-    double download_ms = 0, write_ms = 0;
-    uint64_t pairs = 0;
+    auto file = CUDDL_UNWRAP(cuddl::result_file::open(path, {.durable = true, .threads = threads}));
     auto split = claims.next();
     mpi_check(MPI_Barrier(comm));
     auto const start = wall_clock::now();
     search_threshold(
         group, std::move(split), minimum_matches, [&](cuddl::replica_tile const& tile) {
-            auto const begin = wall_clock::now();
-            auto const rows = CUDDL_UNWRAP(tile.download())->passing();
-            auto const downloaded = wall_clock::now();
-            download_ms += std::chrono::duration<double, std::milli>(downloaded - begin).count();
-            file.append(rows.data(), rows.size() * sizeof(rows[0]));
-            write_ms += ms_since(downloaded);
-            pairs += rows.size();
+            CUDDL_UNWRAP(file.write(tile));
         }
     );
-    auto const flush = wall_clock::now();
-    file.finish();
-    write_ms += ms_since(flush);
+    CUDDL_UNWRAP(file.finish());
+    auto const written = file.statistics();
     json result{
-        {"pairs", pairs},
-        {"download_ms", download_ms},
-        {"write_ms", write_ms},
+        {"pairs", written.pairs},
+        {"download_ms", written.download_seconds * 1e3},
+        {"write_ms", written.stall_seconds * 1e3},
         {"total_ms", ms_since(start)},
     };
     std::filesystem::remove(path);
@@ -773,8 +767,11 @@ int run(int argc, char** argv, ranks const& r) {
                             group, claims.next(), minimum, [](cuddl::replica_tile const&) {}
                         );
                     });
+                auto const threads = std::max(
+                    1U, std::thread::hardware_concurrency() / static_cast<unsigned>(r.local_size)
+                );
                 auto const outputs =
-                    gather_json(rank_output(group, claims, minimum, path, comm), comm);
+                    gather_json(rank_output(group, claims, minimum, path, threads, comm), comm);
                 if (r.rank == 0) {
                     uint64_t emitted = 0;
                     double download_ms = 0, write_ms = 0, total_ms = 0;
