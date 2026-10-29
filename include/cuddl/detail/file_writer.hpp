@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -232,11 +233,18 @@ class file_writer {
                 std::erase_if(extents_, [&](auto const& e) { return e.get() == smallest; });
             }
             auto fresh = std::make_unique<extent>();
-            // O_DIRECT needs memory aligned to the logical sector, 4096 bytes at most.
+            // O_DIRECT needs memory aligned to the logical sector, 4096 bytes at most; madvise
+            // needs whole pages, which are larger on some systems.
+            static size_t const alignment =
+                std::max<size_t>(4096, static_cast<size_t>(::sysconf(_SC_PAGESIZE)));
             fresh->capacity =
                 (std::max<size_t>(bytes, 1) + block_bytes - 1) / block_bytes * block_bytes;
-            fresh->data.reset(static_cast<char*>(std::aligned_alloc(4096, fresh->capacity)));
+            fresh->data.reset(static_cast<char*>(std::aligned_alloc(alignment, fresh->capacity)));
             if (!fresh->data) throw std::bad_alloc();
+            // glibc backs large allocations with transparent huge pages, 512 MiB on a 64 KiB-page
+            // kernel. With 72 threads filling them, a GH200 CLI search writing 120 GB took 15 s
+            // of kernel time and 1.38 s against 1.15 s on small pages. The advice is only a hint.
+            static_cast<void>(::madvise(fresh->data.get(), fresh->capacity, MADV_NOHUGEPAGE));
             chosen = extents_.emplace_back(std::move(fresh)).get();
         }
         queued_ += chosen->capacity;
