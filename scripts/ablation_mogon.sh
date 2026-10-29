@@ -41,18 +41,24 @@ done | paste -sd,)
 export UCX_NET_DEVICES
 launcher="mpirun -n $ranks --bind-to none -x LD_LIBRARY_PATH -x PATH -x UCX_RCACHE_ENABLE -x UCX_NET_DEVICES"
 abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/main-build -o $out; }
+# The micro and build suites run one process. It sees only the first GPU CUDA can use: every
+# visible GPU slows sketching, and a GPU in MIG mode without instances is unusable.
+one_gpu=$(nvidia-smi --query-gpu=uuid,mig.mode.current --format=csv,noheader |
+  awk -F', ' '$2 != "Enabled" { print $1; exit }')
 
 if want micro; then
-  abl micro $mgpu/genomes-1k-sample --stock-build build/ablation/stock-build --label "$label"
+  CUDA_VISIBLE_DEVICES=$one_gpu abl micro $mgpu/genomes-1k-sample \
+    --stock-build build/ablation/stock-build --label "$label"
 fi
 # A build is one process, so it gets the whole node.
 if want build; then
-  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" --scratch "$S" --label "$label"
+  CUDA_VISIBLE_DEVICES=$one_gpu abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" \
+    --scratch "$S" --label "$label"
   # The same builds reading every genome from Lustre.
-  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" --scratch "$S" \
-    --label "$label, Lustre" --uncached --reps 2 --only "GPU decompression (nvCOMP)" \
-    --only "GPU/host co-scheduling" --only "Read depth (gpu)" --only "Read depth (cpu)" \
-    --only "Probe depth"
+  CUDA_VISIBLE_DEVICES=$one_gpu abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" \
+    --scratch "$S" --label "$label, Lustre" --uncached --reps 2 \
+    --only "GPU decompression (nvCOMP)" --only "GPU/host co-scheduling" \
+    --only "Read depth (gpu)" --only "Read depth (cpu)" --only "Probe depth"
 fi
 if want search; then
   abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" --reps 2 \

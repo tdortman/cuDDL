@@ -28,9 +28,12 @@ done
 for entry in subprojects/*; do
   [ -e "$stock/$entry" ] || cp -al "$entry" "$stock/$entry"
 done
-[ -d build/ablation/main-build ] || meson setup build/ablation/main-build -Dablations=true "$@"
-[ -d build/ablation/stock-build ] ||
-  (cd $stock && meson setup "$root/build/ablation/stock-build" -Dablations=true "$@")
+# Existing builds are reconfigured too, so they take this call's options, such as the GPU
+# architecture of the node a job landed on.
+reconfigure() { [ -d "$1" ] && echo --reconfigure || true; }
+meson setup $(reconfigure build/ablation/main-build) build/ablation/main-build -Dablations=true "$@"
+(cd $stock && meson setup $(reconfigure "$root/build/ablation/stock-build") \
+  "$root/build/ablation/stock-build" -Dablations=true "$@")
 for b in build/ablation/main-build build/ablation/stock-build; do
   ninja -C $b build.ninja
   meson compile -C $b -j "$jobs" "${targets[@]}"
