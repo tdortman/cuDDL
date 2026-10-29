@@ -85,7 +85,7 @@ int run(int argc, char** argv, ranks const& r) {
     unsigned workers = default_workers(r);
     bool keep_output = false;
     bool direct_reads = false;
-    unsigned write_streams = 2;
+    unsigned write_streams = 3;
     std::string records = "similarity";
     app.add_option("--records", records, "Result records: similarity or raw bucket counts")
         ->check(CLI::IsMember({"similarity", "counts"}));
