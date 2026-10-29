@@ -435,14 +435,14 @@ def io_backend_build(ablation: list[Path]) -> None:
 
     fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
     ax = fig.add_axes((0.18, 0.23, 0.78, 0.72))
-    x = np.arange(len(categories)) * 1.12
-    width = 0.36
+    x = np.arange(len(categories)) * 1.2
+    width = 0.46
 
     rects1 = ax.bar(
-        x - 0.20, cpu_vals, width, label="cpu (libdeflate)", color="#2ca02c"
+        x - 0.26, cpu_vals, width, label="cpu (libdeflate)", color="#2ca02c"
     )
     rects2 = ax.bar(
-        x + 0.20, gpu_vals, width, label="gpu (nvCOMP)", color="#1f77b4"
+        x + 0.26, gpu_vals, width, label="gpu (nvCOMP)", color="#1f77b4"
     )
     ax.bar_label(rects1, fmt="%.1f", padding=2, fontsize=5.8)
     ax.bar_label(rects2, fmt="%.1f", padding=2, fontsize=5.8)
