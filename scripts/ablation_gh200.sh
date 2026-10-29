@@ -45,4 +45,4 @@ abl e2e "$genomes" --output-dir $scratch/out --launcher "mpirun -n 1" --own-gpu 
   --only "LOP3 plane kernel" --only "Inverted index" --only "Posting bitmaps" \
   --only "Index fallback to planes" --only "Low-plane match filter" \
   --only "Similarity records on the GPU" --only "Parallel result streams" \
-  --only "DNA-tuned libdeflate"
+  --only "Direct result writes" --only "DNA-tuned libdeflate"
