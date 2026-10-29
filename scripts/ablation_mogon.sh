@@ -64,8 +64,11 @@ if want search; then
   abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" --reps 2 \
     --label "$label"
 fi
+# The ranks of a node share all of its cores: one per GPU need not divide them, so each rank's
+# loader count rounds up and no core stays idle.
 if want e2e; then
+  rank_workers=$(((SLURM_CPUS_ON_NODE + SLURM_NTASKS_PER_NODE - 1) / SLURM_NTASKS_PER_NODE))
   abl e2e $mgpu/genomes-100k --output-dir "$S/out" --launcher "$launcher" \
-    --workers "$SLURM_CPUS_PER_TASK" --stock-build build/ablation/stock-build --reps 2 \
+    --workers "$rank_workers" --stock-build build/ablation/stock-build --reps 2 \
     --label "$label"
 fi
