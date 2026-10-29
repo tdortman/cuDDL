@@ -14,7 +14,7 @@ shift
 scratch=build/ablation/scratch
 out=results/ablation-gh200.jsonl
 label="GH200"
-workers=64
+workers=$(nproc)
 mkdir -p $scratch/out results
 
 scripts/ablation_builds.sh "$(nproc)" "$@"
@@ -29,6 +29,10 @@ abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/mai
 # per-rank GPU and pinned-pool choices have nothing to act on, so those ablations are left out.
 abl micro $scratch/genomes-1k --stock-build build/ablation/stock-build --label "$label"
 abl build "$genomes" --workers $workers --scratch $scratch --label "$label"
+# The same builds reading every genome from the drive.
+abl build "$genomes" --workers $workers --scratch $scratch --label "$label, NVMe" --uncached \
+  --reps 2 --only "GPU decompression (nvCOMP)" --only "GPU/host co-scheduling" \
+  --only "Read depth (gpu)" --only "Read depth (cpu)" --only "Probe depth"
 abl search $scratch/db.cuddl --write-dir $scratch/out --launcher "mpirun -n 1" --reps 3 \
   --label "$label" \
   --only "Near-duplicate deltas" --only "Bit-sliced scores" --only "LOP3 plane kernel" \

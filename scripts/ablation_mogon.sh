@@ -45,8 +45,14 @@ abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/mai
 if want micro; then
   abl micro $mgpu/genomes-1k-sample --stock-build build/ablation/stock-build --label "$label"
 fi
+# A build is one process, so it gets the whole node.
 if want build; then
-  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_PER_TASK" --scratch "$S" --label "$label"
+  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" --scratch "$S" --label "$label"
+  # The same builds reading every genome from Lustre.
+  abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" --scratch "$S" \
+    --label "$label, Lustre" --uncached --reps 2 --only "GPU decompression (nvCOMP)" \
+    --only "GPU/host co-scheduling" --only "Read depth (gpu)" --only "Read depth (cpu)" \
+    --only "Probe depth"
 fi
 if want search; then
   abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" --reps 2 \
