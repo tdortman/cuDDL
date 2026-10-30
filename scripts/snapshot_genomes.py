@@ -60,7 +60,8 @@ def main(
             (staging / name).symlink_to(source / name)
     # Rename last, so an interrupted run never leaves a short snapshot under OUTPUT.
     staging.rename(output)
-    typer.echo(f"linked {count} of {len(complete)} completed genomes into {output}")
+    verb = "listed" if as_list else "linked"
+    typer.echo(f"{verb} {count} of {len(complete)} completed genomes in {output}")
 
 
 if __name__ == "__main__":
