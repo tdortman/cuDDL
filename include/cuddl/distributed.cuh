@@ -84,20 +84,6 @@ namespace detail {
     return Err(Error::resource("rank " + std::to_string(failed) + " failed"));
 }
 
-/// Paths from a directory (see @ref genome_paths) or from a text file with one path per line.
-[[nodiscard]] inline Result<std::vector<std::filesystem::path>> list_genomes(
-    std::filesystem::path const& input
-) {
-    if (std::filesystem::is_directory(input)) return genome_paths(input);
-    std::ifstream list(input);
-    if (!list) return Err(Error::resource("cannot read genome list " + input.string()));
-    std::vector<std::filesystem::path> paths;
-    for (std::string line; std::getline(list, line);) {
-        if (!line.empty()) paths.emplace_back(line);
-    }
-    return paths;
-}
-
 /// Rank 0's listing of @p input on every rank.
 [[nodiscard]] inline Result<std::vector<std::filesystem::path>>
 share_listing(std::filesystem::path const& input, int rank, MPI_Comm comm) {

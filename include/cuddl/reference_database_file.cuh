@@ -239,6 +239,21 @@ struct sequence_build_options {
     return Err(Error::resource(error.what()));
 }
 
+/// Paths from a directory (see @ref genome_paths) or from a text file with one path per line,
+/// in the file's order.
+[[nodiscard]] inline Result<std::vector<std::filesystem::path>> list_genomes(
+    std::filesystem::path const& input
+) {
+    if (std::filesystem::is_directory(input)) return genome_paths(input);
+    std::ifstream list(input);
+    if (!list) return Err(Error::resource("cannot read genome list " + input.string()));
+    std::vector<std::filesystem::path> paths;
+    for (std::string line; std::getline(list, line);) {
+        if (!line.empty()) paths.emplace_back(line);
+    }
+    return paths;
+}
+
 namespace detail { struct reference_file_assembly; }  // namespace detail
 
 /**

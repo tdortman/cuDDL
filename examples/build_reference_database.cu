@@ -32,7 +32,9 @@ int main(int argc, char** argv) {
         std::to_string(cli::exponent_bits) +
         " exponent bits, set by the cli_* Meson options at build time."
     };
-    app.add_option("folder", folder, "Genome folder")->required()->check(CLI::ExistingDirectory);
+    app.add_option("folder", folder, "Genome folder, or a file listing one genome path per line")
+        ->required()
+        ->check(CLI::ExistingPath);
     app.add_option(
            "--blacklist",
            blacklist_path,
@@ -71,7 +73,7 @@ int main(int argc, char** argv) {
 
     try {
         // Listing 115,223 genomes and initialising CUDA took 0.3 s each, one after the other.
-        auto listing = std::async(std::launch::async, [&] { return cuddl::genome_paths(folder); });
+        auto listing = std::async(std::launch::async, [&] { return cuddl::list_genomes(folder); });
         cuda::stream stream{cuda::devices[0]};
         auto paths = CUDDL_UNWRAP(listing.get());
         if (!blacklist_path.empty()) {
