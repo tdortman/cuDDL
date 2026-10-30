@@ -107,7 +107,11 @@ int run(int argc, char** argv, ranks const& r) {
     app.add_option("--decompression", decompression_name, "Decompression backend")
         ->check(CLI::IsMember(backends));
     app.add_flag("--direct-reads", direct_reads, "Read genomes with O_DIRECT, past the page cache");
-    app.add_option("--output-dir", output_dir, "Directory for the per-rank result files")
+    app.add_option(
+           "--output-dir",
+           output_dir,
+           "Directory for the per-rank result files; /dev/null discards the results"
+    )
         ->required();
     app.add_flag("--keep-output", keep_output, "Keep the result files instead of deleting them");
     app.add_option(
@@ -161,7 +165,12 @@ int run(int argc, char** argv, ranks const& r) {
         meter.run("index", [&] { CUDDL_UNWRAP(group->build_index()); });
     }
 
-    auto const path = fs::path(output_dir) / ("rank-" + std::to_string(r.rank) + ".bin");
+    // Discarded results still pass through the result file, expanded and written, only into one
+    // stream to /dev/null, which takes neither several files nor a flush.
+    bool const discard = fs::path(output_dir) == "/dev/null";
+    if (discard) write_streams = 1;
+    auto const path = discard ? fs::path(output_dir)
+                              : fs::path(output_dir) / ("rank-" + std::to_string(r.rank) + ".bin");
     cuddl::result_file_statistics written;
     meter.run("search", [&] {
         auto file = CUDDL_UNWRAP(
@@ -170,7 +179,7 @@ int run(int argc, char** argv, ranks const& r) {
                 {.format = records == "counts" ? cuddl::result_format::counts
                                                : cuddl::result_format::similarity,
                  .streams = write_streams,
-                 .durable = true,
+                 .durable = !discard,
                  .threads = workers}
             )
         );
@@ -192,7 +201,7 @@ int run(int argc, char** argv, ranks const& r) {
         written = file.statistics();
     });
     auto const wall_ms = meter.total_ms();
-    if (!keep_output) {
+    if (!keep_output && !discard) {
         for (auto const& file : cuddl::result_file::files(path, write_streams)) fs::remove(file);
     }
 
