@@ -29,12 +29,12 @@ import matplotlib.pyplot as plt
 import plot_utils as pu
 import typer
 
+# acmart sets text in Linux Libertine. plot_utils renders text with LaTeX, whose Computer
+# Modern switches to its wide small-size designs at these sizes.
 mpl.rcParams.update(
     {
-        "font.family": "serif",
-        "font.serif": ["Linux Libertine O", "Linux Libertine", "DejaVu Serif"],
         "font.size": 7,
-        "pdf.fonttype": 42,
+        "text.latex.preamble": r"\usepackage{libertine}\usepackage[libertine]{newtxmath}",
     }
 )
 SIZE = re.compile(r"-(\d+)k-")
@@ -160,7 +160,7 @@ def main(
     ax.set_ylabel(f"Share of ceiling [{pct}]")
     ax.legend(
         frameon=False,
-        fontsize=5.5,
+        fontsize=6.2,
         loc="lower left",
         bbox_to_anchor=(0.0, 1.0),
         ncol=2,
@@ -198,7 +198,7 @@ def main(
     ax.set_ylabel("Speedup over 1 GPU")
     ax.legend(
         frameon=False,
-        fontsize=5,
+        fontsize=6,
         ncol=2,
         loc="upper left",
         handlelength=1.0,
@@ -235,7 +235,7 @@ def main(
     ax.set_yscale("log")
     ax.set_xlabel("Genomes")
     ax.set_ylabel("FASTA to results [s]")
-    ax.legend(frameon=False, fontsize=5, loc="upper left", handlelength=1.6)
+    ax.legend(frameon=False, fontsize=6, loc="upper left", handlelength=1.6)
     finish(ax, fig, out / "grid_e2e.pdf")
     for label, series in walls.items():
         for count in shown:
