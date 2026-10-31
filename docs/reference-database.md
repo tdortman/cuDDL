@@ -245,12 +245,12 @@ a warm page cache, automatic decompression and five samples per median,
 
 | Blacklist                                          | 25-mers | GH200 build | GH200 GPU | RTX 5090 build | RTX 5090 GPU |
 | -------------------------------------------------- | ------- | ----------- | --------- | -------------- | ------------ |
-| none                                               | 0       | 6.64        | 1.72      | 7.37           | 3.63         |
-| `genomeDDLBlacklist_k25e5b4096.fa.gz`              | 1,651   | 6.53        | 2.03      | 7.90           | 4.63         |
-| `refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz` | 5,944   | 6.53        | 2.09      | 8.10           | 4.96         |
-| `genomeDDLBlacklist.fa.gz`                         | 80,392  | 6.53        | 2.37      | 9.36           | 6.81         |
+| none                                               | 0       | 6.51        | 1.72      | 7.37           | 3.63         |
+| `genomeDDLBlacklist_k25e5b4096.fa.gz`              | 1,651   | 6.55        | 2.03      | 7.90           | 4.63         |
+| `refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz` | 5,944   | 6.42        | 2.09      | 8.10           | 4.96         |
+| `genomeDDLBlacklist.fa.gz`                         | 80,392  | 6.45        | 2.37      | 9.36           | 6.81         |
 
-The GH200 ran 64 loaders and inflated on its CPU, so the build hides the lookup; its build
+The GH200 ran 72 loaders and inflated on its CPU, so the build hides the lookup; its build
 time varies by about 0.1 s between runs. The RTX 5090 ran 120 loaders on a Xeon w9-3595X and
 inflated with nvCOMP on the SMs that also sketch, so the lookup lengthens the build. GPU is
 the `resident` time: row resets and sketch kernels, without transfers. On the RTX 5090 it is
@@ -259,7 +259,7 @@ kernels share the SMs.
 
 ```sh
 ./build/benchmarks/cuddl-reference-build-benchmark --config genomes-100k.toml \
-  --database /tmp/bl100k.cuddl --workers 64 --samples 5 \
+  --database /tmp/bl100k.cuddl --workers 72 --samples 5 \
   --blacklist subprojects/bbmap/resources/refseqGenomeDDLBlacklist_k25e5b65536_fused.fa.gz
 ```
 
