@@ -205,7 +205,9 @@ def inflate_files(library: Path, paths: list[Path], processes: int) -> float:
 def main(
     genomes: Annotated[
         Path,
-        typer.Argument(exists=True, file_okay=False, help="Genome snapshot directory"),
+        typer.Argument(
+            exists=True, help="Genome snapshot directory, or a file listing their paths"
+        ),
     ] = MGPU / "genomes-30k",
     local: Annotated[
         Path | None,

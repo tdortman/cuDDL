@@ -113,6 +113,9 @@ def gpu_tag(name: str) -> str:
 
 
 def genome_files(genomes: Path) -> list[Path]:
+    """The files of directory GENOMES, or the paths a file GENOMES lists one per line."""
+    if genomes.is_file():
+        return sorted(Path(line) for line in genomes.read_text().splitlines() if line)
     return sorted(genomes.iterdir())
 
 
