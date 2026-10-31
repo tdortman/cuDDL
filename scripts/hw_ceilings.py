@@ -15,10 +15,14 @@ Appends one JSON line per measurement to OUTPUT:
 - CPU inflation with libdeflate, the library and patches the loaders use, built from
   subprojects/libdeflate;
 - the search's integer-ALU ceiling under the power limit (alu-power-ceiling);
+- copy-engine bandwidth between pinned host memory and the GPUs with NVIDIA's nvbandwidth, each
+  GPU alone and all at once, as a node's ranks share its PCIe switches: rows
+  host_to_device_per_gpu, device_to_host_per_gpu, host_to_all_per_gpu and all_to_host_per_gpu
+  (the mean over GPUs), and host_to_all_total and all_to_host_total (their sum);
 - one rank sketching the snapshot with each --decompression backend on one GPU.
 
-Host-to-device bandwidth is not measured: one A40 sketches about 1.3 GB/s of gzip, an order of
-magnitude below a PCIe 4 x16 link.
+nvbandwidth is built outside Meson from its release source, e.g.
+cmake -S nvbandwidth-0.10.0 -B build/nvbandwidth && cmake --build build/nvbandwidth.
 
 Run on a whole node, e.g. on MOGON:
 
@@ -34,6 +38,7 @@ import multiprocessing
 import os
 import shutil
 import socket
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -229,6 +234,9 @@ def main(
     streams: Annotated[int, typer.Option(help="Parallel files in the stream test")] = 8,
     stream_gib: Annotated[int, typer.Option(help="GiB per stream file")] = 4,
     alu_seconds: Annotated[int, typer.Option(help="alu-power-ceiling run time")] = 60,
+    nvbandwidth: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False, help="nvbandwidth executable")
+    ] = Path("build/nvbandwidth/nvbandwidth"),
 ) -> None:
     name = usable_gpus()[0].name  # the GPU own_gpu.py gives the only rank
     tag = gpu_tag(name)
@@ -300,6 +308,39 @@ def main(
         f"results/mogon-{tag}-alu-power-ceiling.json",
         env=own_gpu,
     )
+
+    copies = subprocess.run(
+        [
+            nvbandwidth,
+            "--format",
+            "json",
+            "-t",
+            "host_to_device_memcpy_ce",
+            "device_to_host_memcpy_ce",
+            "host_to_all_memcpy_ce",
+            "all_to_host_memcpy_ce",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    for case in json.loads(copies)["nvbandwidth"]["testcases"]:
+        if case["status"] != "Passed":
+            raise RuntimeError(f"nvbandwidth {case['name']}: {case['status']}")
+        test = case["name"].removesuffix("_memcpy_ce")
+        rates = [(f"{test}_per_gpu", case["average"])]
+        if test.endswith("_all"):
+            rates.append((f"{test}_total", case["sum"]))
+        for phase, gbps in rates:
+            row = {
+                "host": socket.gethostname(),
+                "gpu": name,
+                "phase": phase,
+                "gbps": gbps,
+            }
+            print(json.dumps(row), flush=True)
+            with output.open("a") as f:
+                f.write(json.dumps(row) + "\n")
 
     # One rank per backend; --minimum-matches 20 keeps search and output small next to sketching.
     for backend in ["cpu", "gpu", "hybrid"]:
