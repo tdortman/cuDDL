@@ -23,10 +23,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import typer
 
+# acmart sets the paper in Linux Libertine. LaTeX renders the text with the class's own
+# packages, so labels and math match the body text.
 mpl.rcParams.update(
     {
+        "text.usetex": True,
+        "text.latex.preamble": r"\usepackage[T1]{fontenc}\usepackage{libertine}"
+        r"\usepackage[libertine]{newtxmath}",
         "font.family": "serif",
-        "font.serif": ["Linux Libertine O", "Linux Libertine", "DejaVu Serif"],
         "font.size": 9,
         "axes.labelsize": 10,
         "axes.titlesize": 10,
@@ -34,8 +38,7 @@ mpl.rcParams.update(
         "ytick.labelsize": 8.5,
         "legend.fontsize": 8,
         "figure.titlesize": 10,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
+        "pdf.use14corefonts": True,
         "grid.alpha": 0.4,
         "grid.linestyle": "--",
         "axes.grid": True,
@@ -138,7 +141,7 @@ def cardinality_accuracy(hll_accuracy: Path, bbtools_accuracy: Path) -> None:
         label="cuco HLL++",
     )
     ax.set_xlabel(r"Input cardinality ($\log_2 N$)", fontsize=7.8)
-    ax.set_ylabel("Mean abs. error [%]", fontsize=7.8)
+    ax.set_ylabel(r"Mean abs. error [\%]", fontsize=7.8)
     ax.set_xticks([8, 12, 16, 20, 24])
     ax.tick_params(axis="both", labelsize=7.2)
     ax.set_ylim(-0.05, 3.1)
@@ -261,7 +264,7 @@ PAIRWISE_METRICS = {
     "completeness": ("Completeness", "#9467bd"),
     "wkid": ("WKID", "#5b9bd5"),
     "ani_sketch": ("ANI, sketch", "#ff8c38"),
-    "ani_ge95": ("ANI, ≥95%", "#d62728"),
+    "ani_ge95": (r"ANI, $\geq$95\%", "#d62728"),
 }
 # Only DDL estimates completeness from the sketch comparison itself; the benchmark derives the
 # other tools' completeness from two cardinality estimates, so it is not drawn for them.
@@ -311,7 +314,7 @@ def pairwise_error(path: Path) -> None:
     ax.set_xscale("log")
     ax.set_xlim(0.005, 200)
     ax.set_xticks([0.01, 0.1, 1, 10, 100], ["0.01", "0.1", "1", "10", "100"])
-    ax.set_xlabel("Abs. error, p95 (bars) [%]", fontsize=7.8)
+    ax.set_xlabel(r"Abs. error, p95 (bars) [\%]", fontsize=7.8)
     ax.tick_params(axis="x", labelsize=7.2)
     ax.tick_params(axis="y", labelsize=7.2, length=0)
     ax.grid(True, axis="x")
@@ -441,9 +444,7 @@ def io_backend_build(ablation: list[Path]) -> None:
     rects1 = ax.bar(
         x - 0.26, cpu_vals, width, label="cpu (libdeflate)", color="#2ca02c"
     )
-    rects2 = ax.bar(
-        x + 0.26, gpu_vals, width, label="gpu (nvCOMP)", color="#1f77b4"
-    )
+    rects2 = ax.bar(x + 0.26, gpu_vals, width, label="gpu (nvCOMP)", color="#1f77b4")
     ax.bar_label(rects1, fmt="%.1f", padding=2, fontsize=5.8)
     ax.bar_label(rects2, fmt="%.1f", padding=2, fontsize=5.8)
 
@@ -877,11 +878,10 @@ def micro_energy(runs: list[dict]) -> None:
             ax.text(
                 cap - 6,
                 yi,
-                f"→ {dyn_tot / 1e3:.0f}/{tot / 1e3:.0f} MJ*",
+                rf"\textbf{{$\rightarrow$ {dyn_tot / 1e3:.0f}/{tot / 1e3:.0f} MJ*}}",
                 va="center",
                 ha="right",
                 fontsize=5.8,
-                fontweight="bold",
                 color="#222222",
             )
         else:
