@@ -87,8 +87,17 @@ def main(
         if line.strip()
         for row in [json.loads(line)]
     }
-    alu = json.loads((results / f"mogon-{gpu}-alu-power-ceiling.json").read_text())
-    pairs_ceiling = alu["alu_warp_instructions_per_second"] / alu_per_pair
+    # A40 ceilings were measured per GPU (-gpu0, -gpu7), A100 for the node: take the slowest GPU.
+    alu_files = sorted(results.glob(f"mogon-{gpu}-alu-power-ceiling*.json"))
+    if not alu_files:
+        raise typer.BadParameter(f"no mogon-{gpu}-alu-power-ceiling*.json in {results}")
+    pairs_ceiling = (
+        min(
+            json.loads(p.read_text())["alu_warp_instructions_per_second"]
+            for p in alu_files
+        )
+        / alu_per_pair
+    )
     searches = {
         size_of(p): json.loads(p.read_text())
         for p in results.glob(f"mogon-{gpu}-grid-search-*.json")
