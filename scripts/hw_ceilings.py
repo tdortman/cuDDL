@@ -330,8 +330,12 @@ def main(
         if case["status"] != "Passed":
             raise RuntimeError(f"nvbandwidth {case['name']}: {case['status']}")
         test = case["name"].removesuffix("_memcpy_ce")
-        rates = [(f"{test}_per_gpu", case["average"])]
-        if test.endswith("_all"):
+        # nvbandwidth writes "average" only with --verbose; "sum" and the matrix always.
+        cells = [
+            float(v) for row in case["bandwidth_matrix"] for v in row if v != "N/A"
+        ]
+        rates = [(f"{test}_per_gpu", case["sum"] / len(cells))]
+        if test.startswith("all_") or test.endswith("_all"):
             rates.append((f"{test}_total", case["sum"]))
         for phase, gbps in rates:
             row = {
