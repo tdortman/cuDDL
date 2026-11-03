@@ -40,6 +40,7 @@
     #include <fcntl.h>
     #include <sys/mman.h>
     #include <sys/stat.h>
+    #include <sys/vfs.h>
     #include <unistd.h>
 #endif
 
@@ -1779,9 +1780,26 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
     return decode_fastx_sequence_file(std::move(*file), path, source, defer_fasta, pack_k);
 }
 
-/// Reads a parallel file system needs in flight to give one node its bandwidth: on MOGON's
-/// Lustre, 16 threads read 2.9 GB/s of ~1 MB files and 64 threads 6.7 GB/s.
+/// Reads every pool keeps in flight, however few its loaders: a file system serves a node's
+/// bandwidth only to many reads at once.
 inline constexpr size_t parallel_read_depth = 64;
+
+/// Reads in flight on Lustre, which gives one node more of its bandwidth the more reads it has
+/// outstanding: an A40 and an A100 node on MOGON read 100,000 RefSeq genomes with O_DIRECT at
+/// 3.8-4.0 GB/s with 128 reads in flight and at 5.3 GB/s with 256.
+inline constexpr size_t lustre_read_depth = 256;
+
+/// @brief Reads to keep in flight for files under @p path: more on Lustre than elsewhere.
+inline size_t read_depth(std::filesystem::path const& path) {
+#if defined(__linux__)
+    constexpr long lustre_super_magic = 0x0BD00BD0;
+    struct statfs status{};
+    if (::statfs(path.c_str(), &status) == 0 && status.f_type == lustre_super_magic) {
+        return lustre_read_depth;
+    }
+#endif
+    return parallel_read_depth;
+}
 
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
 // per genome costs tens of microseconds and dominates at high file counts. Readers pull
@@ -1827,10 +1845,10 @@ class fastx_load_pool {
         threads_.reserve(workers_);
         if (defer_fasta_) retirer_ = std::thread([this] { retire_files(); });
         // A reader spends most of its time waiting on storage, so there are as many as the reads
-        // a parallel file system needs in flight, however few the loaders.
+        // the file system needs in flight, however few the loaders.
+        auto const depth = paths.empty() ? parallel_read_depth : read_depth(paths.front());
         auto const readers =
-            ablated("read-depth") ? workers_
-                                  : std::min(window_, std::max(workers_, parallel_read_depth));
+            ablated("read-depth") ? workers_ : std::min(window_, std::max(workers_, depth));
         readers_.reserve(readers);
         for (size_t i = 0; i < readers; ++i) {
             readers_.emplace_back([this] { read_files(); });

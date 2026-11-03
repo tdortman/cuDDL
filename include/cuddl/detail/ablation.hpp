@@ -18,7 +18,7 @@ namespace cuddl::detail {
 /// are the same either way. Other builds compile every switch out.
 inline constexpr std::array<std::string_view, 22> ablations{
     "co-scheduling",       // nvCOMP claims a batch only if it finishes before the host loaders
-    "read-depth",          // readers keep parallel_read_depth reads in flight, not one per loader
+    "read-depth",          // readers keep read_depth reads in flight, not one per loader
     "probe-depth",         // 4 * parallel_read_depth gzip probes in flight, not parallel_read_depth
     "pinned-pool",         // device-only pinned pools that keep their pages, not CCCL-like ones
     "numa-pool",           // device-written pinned buffers on the device's host NUMA node

@@ -1398,7 +1398,12 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         );
         return cuda_try([&] {
             inflater.emplace(
-                stream, std::min(room, slots), compressed_capacity, workers, hardware_inflate
+                stream,
+                std::min(room, slots),
+                compressed_capacity,
+                workers,
+                hardware_inflate,
+                paths.empty() ? parallel_read_depth : read_depth(paths.front())
             );
         });
     };

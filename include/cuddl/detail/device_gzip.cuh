@@ -722,14 +722,18 @@ class device_fasta_pipeline {
     /// @param compressed_capacity Compressed bytes per lane; zero selects decoded input.
     /// @param hardware_inflate Whether nvCOMP may use the device's decompression engine; without
     /// it, nvCOMP inflates on the SMs from ordinary device memory.
+    /// @param reads_in_flight Lane reads kept in flight: @ref read_depth of the inputs.
     device_fasta_pipeline(
         cuda::stream_ref stream,
         size_t slot_capacity,
         size_t compressed_capacity,
         size_t workers,
-        bool hardware_inflate
+        bool hardware_inflate,
+        size_t reads_in_flight = parallel_read_depth
     )
         : workers_(std::max<size_t>(1, workers)),
+          // Lane reads wait on storage, so they keep the file system's depth in flight.
+          readers_(ablated("read-depth") ? workers_ : std::max(workers_, reads_in_flight)),
           compressed_capacity_(compressed_capacity),
           slot_capacity_(slot_capacity),
           header_capacity_(
@@ -1447,10 +1451,7 @@ class device_fasta_pipeline {
     }
 
     size_t workers_;
-    // Lane reads wait on storage, so they keep a parallel file system's depth in flight.
-    worker_pool readers_{
-        ablated("read-depth") ? workers_ : std::max(workers_, parallel_read_depth)
-    };
+    worker_pool readers_;
     size_t compressed_capacity_ = 0, slot_capacity_ = 0, streaming_window_ = 0;
     size_t hardware_limit_ = 0;  // device_gzip::hardware_inflate_limit of the stream's device
     PFN_cuMemBatchDecompressAsync_v12060 batch_decompress_ = nullptr;
