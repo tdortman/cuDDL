@@ -23,7 +23,7 @@ inline constexpr std::array<std::string_view, 22> ablations{
     "pinned-pool",         // device-only pinned pools that keep their pages, not CCCL-like ones
     "numa-pool",           // device-written pinned buffers on the device's host NUMA node
     "pinned-reservation",  // packed-word buffers pinned before the loaders start
-    "input-lanes",         // GPU lanes sized from the input, not a fixed 1 GiB
+    "input-lanes",         // lanes on engine-equipped GPUs sized from the input, not 1 GiB
     "simd-parsing",        // AVX2/AVX-512/NEON line scans, compaction, packing and gzip scans
     "base-packing",        // the CPU path packs bases into two-bit words before copying them
     "kmer-encoding",       // the GPU builds eight windows per thread from shared SWAR-packed tiles

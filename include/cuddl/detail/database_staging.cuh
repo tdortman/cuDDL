@@ -1373,13 +1373,16 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         // six lanes pinned 48 GB in 17 s, and 10,000 genomes made only three batches. Smaller
         // lanes also let the host loaders take a fairer share: on an A100, 10,000 genomes took
         // 1.79 s with 2 GiB lanes and 1.53 s with 1 GiB at 112 loaders, and 2.12-2.17 s with
-        // either at 16; 512 MiB lanes took 2.48 s at 16. Large inputs need larger batches,
-        // though: nvCOMP inflates one file per thread block, so a batch fills the SMs only with
-        // enough files. On a B300 with 16 loaders, all 115,223 genomes built in 24.7-24.9 s with
-        // 1 GiB lanes and 16.7-17.6 s with 4 GiB, so a lane takes a 64th of the input. Their BGZF
-        // copy took 16.6-17.8 s with 1 GiB and 14.7-17.2 s with 4 GiB.
+        // either at 16; 512 MiB lanes took 2.48 s at 16. A Blackwell data-centre GPU, the kind with
+        // a decompression engine, needs larger batches on large inputs, though, engine or SMs:
+        // on a B300 with 16 loaders, all 115,223 genomes built in 24.7-24.9 s with 1 GiB lanes and
+        // 16.7-17.6 s with 4 GiB, so there a lane takes a 64th of the input. Their BGZF copy took
+        // 16.6-17.8 s with 1 GiB and 14.7-17.2 s with 4 GiB. Smaller GPUs fall behind with 4 GiB
+        // lanes: at 128 loaders, 100,000 genomes built in 23.5 s with them and 18.0 s with 1 GiB on
+        // an A40, and in 16.5 and 15.6 s on an A100.
+        bool const engine = device_gzip::hardware_inflate_limit(stream.device().get()) != 0;
         auto const lane_bytes =
-            ablated("input-lanes")
+            ablated("input-lanes") || !engine
                 ? size_t{1} << 30
                 : std::clamp((slots + compressed) / 64, size_t{1} << 30, size_t{4} << 30);
         auto const usable = std::min(budget > overhead ? budget - overhead : 0, lane_bytes);
