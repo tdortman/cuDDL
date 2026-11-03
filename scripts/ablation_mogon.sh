@@ -42,9 +42,10 @@ export UCX_NET_DEVICES
 launcher="mpirun -n $ranks --bind-to none -x LD_LIBRARY_PATH -x PATH -x UCX_RCACHE_ENABLE -x UCX_NET_DEVICES"
 abl() { uv run --offline scripts/ablation.py "$@" --build-dir build/ablation/main-build -o $out; }
 # The micro and build suites run one process. It sees only the first GPU CUDA can use: every
-# visible GPU slows sketching, and a GPU in MIG mode without instances is unusable.
+# visible GPU slows sketching, and a GPU in MIG mode without instances is unusable. awk reads
+# every line: exiting early would end nvidia-smi with SIGPIPE, which pipefail turns into a failure.
 one_gpu=$(nvidia-smi --query-gpu=uuid,mig.mode.current --format=csv,noheader |
-  awk -F', ' '$2 != "Enabled" { print $1; exit }')
+  awk -F', ' '$2 != "Enabled" && !found++ { print $1 }')
 
 if want micro; then
   CUDA_VISIBLE_DEVICES=$one_gpu abl micro $mgpu/genomes-1k-sample \
