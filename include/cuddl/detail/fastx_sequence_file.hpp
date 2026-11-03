@@ -589,7 +589,8 @@ struct fastx_sequence_file {
 ///
 /// Codes are those of @ref encode_base. A byte that is not a base gets a meaningless code.
 /// @return A mask with bit @c j set when byte @c j is not a base, or is past @p count.
-[[nodiscard]] inline uint32_t pack_bases16_portable(char const* bases, size_t count, uint32_t& word) {
+[[nodiscard]] inline uint32_t
+pack_bases16_portable(char const* bases, size_t count, uint32_t& word) {
     if (count < 16) {
         uint32_t bad = 0;
         word = 0;
@@ -607,11 +608,13 @@ struct fastx_sequence_file {
         std::memcpy(&x, bases + 8 * half, sizeof(x));
         constexpr uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL;
         // High bit of each byte of v that is zero, without carries between bytes.
-        auto const zero = [](uint64_t v) { return ~(((v & low7) + low7) | v | low7); };
+        auto const zero = [](uint64_t v) {
+            return ~(((v & low7) + low7) | v | low7);
+        };
         auto const upper = x & 0xDFDFDFDFDFDFDFDFULL;
-        auto const valid = zero(upper ^ 0x4141414141414141ULL) |
-                           zero(upper ^ 0x4343434343434343ULL) |
-                           zero(upper ^ 0x4747474747474747ULL) | zero(upper ^ 0x5454545454545454ULL);
+        auto const valid =
+            zero(upper ^ 0x4141414141414141ULL) | zero(upper ^ 0x4343434343434343ULL) |
+            zero(upper ^ 0x4747474747474747ULL) | zero(upper ^ 0x5454545454545454ULL);
         auto codes = (x >> 1) & 0x0303030303030303ULL;
         codes = (codes | (codes >> 6)) & 0x000F000F000F000FULL;
         codes = (codes | (codes >> 12)) & 0x000000FF000000FFULL;
@@ -631,7 +634,8 @@ inline uint64_t pack_bases_pieces(char const* bases, size_t count, uint32_t* wor
     uint64_t bad = 0;
     for (size_t piece = 0; piece < width / 16; ++piece) {
         auto const left = count > 16 * piece ? count - 16 * piece : 0;
-        bad |= uint64_t{pack_bases16_portable(bases + 16 * piece, left, words[piece])} << (16 * piece);
+        bad |= uint64_t{pack_bases16_portable(bases + 16 * piece, left, words[piece])}
+               << (16 * piece);
     }
     return bad;
 }
@@ -662,11 +666,15 @@ pack_bases_avx2(char const* bases, size_t count, uint32_t* words) {
     auto const pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0401));
     auto const quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x00100001));
     // Each lane's four bytes, then both lanes into one quadword.
+    //
+    // clang-format off
     auto const gathered = _mm256_shuffle_epi8(
         quads, _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                 0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
     );
-    auto const both = _mm256_permutevar8x32_epi32(gathered, _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0));
+    // clang-format on
+    auto const both =
+        _mm256_permutevar8x32_epi32(gathered, _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0));
     _mm_storel_epi64(reinterpret_cast<__m128i*>(words), _mm256_castsi256_si128(both));
     return ~static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(valid))) &
            0xFFFFFFFFULL;
@@ -720,7 +728,8 @@ inline uint64_t pack_bases_neon(char const* bases, size_t count, uint32_t* words
         auto const pairs = vpaddq_u8(codes, codes);
         words[piece] = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(pairs, pairs)), 0);
         if (invalid != 0) {
-            return ~uint64_t{0} << (16 * piece + static_cast<size_t>(std::countr_zero(invalid)) / 4);
+            return ~uint64_t{0}
+                   << (16 * piece + static_cast<size_t>(std::countr_zero(invalid)) / 4);
         }
     }
     return 0;
@@ -1151,8 +1160,8 @@ compact_sequence_whitespace_avx2(char const* first, char const* last, char* out)
 static bool const simd_compaction = !ablated("simd-parsing");
 
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-static bool const compact_avx512 = simd_compaction && __builtin_cpu_supports("avx512bw") &&
-                                   __builtin_cpu_supports("avx512vbmi2");
+static bool const compact_avx512 =
+    simd_compaction && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi2");
 static bool const compact_avx2 = simd_compaction && __builtin_cpu_supports("avx2");
 
 __attribute__((target("avx512f,avx512bw,avx512vbmi2,popcnt"))) inline char*
