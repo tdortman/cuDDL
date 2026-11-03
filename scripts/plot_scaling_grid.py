@@ -72,7 +72,7 @@ def main(
     results: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path(
         "results"
     ),
-    gpu: Annotated[str, typer.Option(help="GPU tag in the result names")] = "a40",
+    gpu: Annotated[str, typer.Option(help="GPU tag in the result names")] = "a100",
     alu_per_pair: Annotated[
         float, typer.Option(help="ALU warp instructions per pair (Nsight Compute)")
     ] = 50.4,
@@ -200,7 +200,7 @@ def main(
         )
     ax.set_xscale("log", base=2)
     ax.set_yscale("log", base=2)
-    ticks = [r for r in (1, 2, 4, 8, 16, 32, 64) if r <= most]
+    ticks = sorted({r for r in (1, 2, 4, 8, 16, 32, 64, most) if r <= most})
     ax.set_xticks(ticks, [str(t) for t in ticks])
     ax.set_yticks(ticks, [str(t) for t in ticks])
     ax.set_xlabel("GPUs")
