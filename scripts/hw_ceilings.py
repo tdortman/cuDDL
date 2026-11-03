@@ -7,9 +7,11 @@
 
 Appends one JSON line per measurement to OUTPUT:
 
-- reading the genome snapshot with the pipeline's pattern of many ~1 MB gzip files, first with
-  O_DIRECT (bypassing the client page cache, so from the filesystem), then buffered after
-  evicting them (as the pipeline reads), then from the page cache;
+- reading the genome snapshot with the pipeline's pattern of many ~1 MB gzip files, with O_DIRECT
+  (bypassing the client page cache) and buffered (as the pipeline reads), each from storage at
+  every --read-threads count: rows filesystem_read_<mode>_<n>_threads, and
+  filesystem_read_direct and filesystem_read_buffered for the fastest count, the ceiling the
+  file system actually delivers to one node. Then from the page cache;
 - sequential write (buffered, as the pipeline writes its results, then fsync) and O_DIRECT read
   on the node-local scratch and on the shared filesystem;
 - CPU inflation with libdeflate, the library and patches the loaders use, built from
@@ -236,6 +238,12 @@ def main(
     streams: Annotated[int, typer.Option(help="Parallel files in the stream test")] = 8,
     stream_gib: Annotated[int, typer.Option(help="GiB per stream file")] = 4,
     alu_seconds: Annotated[int, typer.Option(help="alu-power-ceiling run time")] = 60,
+    read_threads: Annotated[
+        list[int] | None,
+        typer.Option(
+            help="Concurrent file reads to try [default: 64 128 256 512 1024]"
+        ),
+    ] = None,
     nvbandwidth: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="nvbandwidth executable")
     ] = Path("build/nvbandwidth/nvbandwidth"),
@@ -247,11 +255,11 @@ def main(
     paths = genome_files(genomes)
     gzip_bytes = sum(p.stat().st_size for p in paths)
 
-    def record(phase: str, size: int, seconds: float) -> None:
+    def record(phase: str, size: int, seconds: float, count: int = threads) -> None:
         row = {
             "host": socket.gethostname(),
             "gpu": name,
-            "threads": threads,
+            "threads": count,
             "phase": phase,
             "bytes": size,
             "seconds": round(seconds, 3),
@@ -279,11 +287,22 @@ def main(
     )
     libdeflate = build_libdeflate(build)
 
-    # Direct reads come first: the page-cache pass afterwards would otherwise warm nothing new.
-    # The buffered cold read is how the pipeline reads, through the client page cache.
-    timed("filesystem_read_direct", gzip_bytes, read_files, paths, threads, True)
-    evict_files(paths, threads)
-    timed("filesystem_read_buffered", gzip_bytes, read_files, paths, threads, False)
+    # The file system's ceiling is the best any plain reader gets, not the network's line rate:
+    # each mode is read at several concurrencies, each from storage, and the fastest is kept.
+    # Buffered reads go through the client page cache, as the pipeline reads.
+    for mode, direct in [("direct", True), ("buffered", False)]:
+        best = None
+        for count in read_threads or [64, 128, 256, 512, 1024]:
+            evict_files(paths, threads)
+            start = time.perf_counter()
+            read_files(paths, count, direct)
+            seconds = time.perf_counter() - start
+            record(
+                f"filesystem_read_{mode}_{count}_threads", gzip_bytes, seconds, count
+            )
+            best = min(best or (seconds, count), (seconds, count))
+        record(f"filesystem_read_{mode}", gzip_bytes, *best)
+    # The last buffered pass left every file cached.
     timed("page_cache_read", gzip_bytes, read_files, paths, threads, False)
 
     stream_bytes = streams * (stream_gib << 30)
