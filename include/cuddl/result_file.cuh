@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuddl/detail/file_writer.hpp>
+#include <cuddl/detail/uplink_lock.hpp>
 #include <cuddl/detail/worker_pool.hpp>
 #include <cuddl/error.hpp>
 #include <cuddl/pairwise_counts.cuh>
@@ -295,6 +296,7 @@ class result_file {
                     );
                 }));
             }
+            detail::uplink_lock const uplink(stream.device().get());
             if (pairs != 0U) {
                 CUDDL_CUDA_TRY(
                     cub::DeviceTransform::Transform(

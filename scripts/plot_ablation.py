@@ -66,7 +66,7 @@ def load(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def target_stage(suite: str, metric: str, reference: str, optimisation: str) -> str:
     if metric == "phase:write" or any(
-        word in optimisation for word in ("pools", "streams", "writes")
+        word in optimisation for word in ("pools", "streams", "writes", "downloads")
     ):
         return "Output"
     if metric == "phase:search" or reference.startswith("threshold"):

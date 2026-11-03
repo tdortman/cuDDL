@@ -38,6 +38,7 @@
 #include <cuddl/detail/pinned_pool.cuh>
 #include <cuddl/detail/reference_deltas.cuh>
 #include <cuddl/detail/register.cuh>
+#include <cuddl/detail/uplink_lock.hpp>
 #include <cuddl/device_span.cuh>
 #include <cuddl/error.hpp>
 #include <cuddl/pairwise_counts.cuh>
@@ -433,6 +434,8 @@ download(batch_result_tile const& tile, cuda::stream_ref stream, host_batch_resu
         auto const slots = static_cast<size_t>(tile.slot_count());
         host.count_ = slots;
         host.reserve(host.results_, slots, stream);
+        if (host.has_match_counts_) host.reserve(host.match_counts_, slots, stream);
+        detail::uplink_lock const uplink(stream.device().get());
         if (slots != 0U) {
             CUDDL_CUDA_TRY(
                 cuda::copy_bytes(
@@ -441,10 +444,7 @@ download(batch_result_tile const& tile, cuda::stream_ref stream, host_batch_resu
                     cuda::std::span{host.results_.data(), slots}
                 )
             );
-        }
-        if (host.has_match_counts_) {
-            host.reserve(host.match_counts_, slots, stream);
-            if (slots != 0U) {
+            if (host.has_match_counts_) {
                 CUDDL_CUDA_TRY(
                     cuda::copy_bytes(
                         stream,
@@ -526,6 +526,7 @@ download(batch_result_tile const& tile, cuda::stream_ref stream, host_batch_resu
                             ? detail::gather_passing_kernel<true, packed_pairwise_counts>
                             : detail::gather_passing_kernel<false, packed_pairwise_counts>;
     auto const* offsets = host.word_offsets_.data();
+    detail::uplink_lock const uplink(stream.device().get());
     for (size_t first_word = 0U; first_word < words;) {
         auto const base = offsets[first_word];
         // The last word whose results all fit the staging buffer ends the chunk.

@@ -418,6 +418,9 @@ def search(
         Config("downloads", args=downloads, own_gpu=False),
         Config("downloads numa-pool", ["numa-pool"], downloads, own_gpu=False),
         Config("downloads pinned-pool", ["pinned-pool"], downloads, own_gpu=False),
+        Config(
+            "downloads switch-downloads", ["switch-downloads"], downloads, own_gpu=False
+        ),
         Config("threshold", args=threshold, own_gpu=False),
         Config(
             "threshold inverted-index", ["inverted-index"], threshold, own_gpu=False
@@ -446,6 +449,9 @@ def search(
         Ablation("Replicated database", "chunked", "exhaustive"),
         Ablation("NUMA-local download pools", "downloads numa-pool", "downloads"),
         Ablation("Device-only pinned pools", "downloads pinned-pool", "downloads"),
+        Ablation(
+            "Switch-serialised downloads", "downloads switch-downloads", "downloads"
+        ),
         Ablation("Inverted index", "threshold inverted-index", "threshold"),
         Ablation("Posting bitmaps", "threshold posting-bitmaps", "threshold"),
         Ablation("Index fallback to planes", "threshold index-fallback", "threshold"),
@@ -573,6 +579,7 @@ def e2e(
         ("Branchless k-mer encoding (cpu)", ["kmer-encoding"], "cpu"),
         ("Device-only pinned pools", ["pinned-pool"], "all-gpus"),
         ("NUMA-local download pools", ["numa-pool"], "every"),
+        ("Switch-serialised downloads", ["switch-downloads"], "every"),
         ("Near-duplicate deltas", ["deltas"], "every"),
         ("Bit-sliced scores", ["bit-slicing"], "every"),
         ("LOP3 plane kernel", ["lop3-kernel"], "every"),

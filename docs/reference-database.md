@@ -599,6 +599,8 @@ If one rank fails inside `slice_genomes` or `gather_sketches`, it returns its er
 
 Each rank holds a one-device `replicated_database` and searches its shard. Ranks on one node take GPUs farthest-first by NVML topology, so runs with fewer ranks than GPUs use separate PCIe switches. CPU binding is left to the launcher.
 
+GPUs behind one PCIe root port take turns downloading results: `download`, and result files, hold an `flock` on a file in `/dev/shm` named after the root port while their copies run, so the turns hold across threads and ranks. On an 8-GPU A100 node, where pairs of GPUs share four switches, two GPUs downloading at once behind one switch moved 12.0 GB/s together, less than the 25.9 GB/s of one alone. Taking turns, the pair moved 25.4–25.8 GB/s and all eight GPUs 101.7–103.3 GB/s, against 45.5–50.9 GB/s at once. On an A40 node, two GPUs behind one switch shared it fairly at 26.4 GB/s, so turns cost nothing there. `CUDDL_ABLATE=switch-downloads` turns them off in ablation builds.
+
 ```sh
 mpirun -n 8 build/benchmarks/cuddl-multi-gpu-all-to-all-benchmark references.cuddl \
   --ranks 1 2 4 8 --samples 5 -o all-to-all.json
