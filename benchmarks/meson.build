@@ -116,7 +116,7 @@ executable(
 
 # SimdSketch has no C ABI; this cargo crate drives its Rust library. Its SIMD paths are chosen
 # at compile time, so it builds for the host CPU like RabbitSketch.
-simdsketch_bin = custom_target(
+custom_target(
     'simdsketch-benchmark',
     output: 'simdsketch-benchmark',
     command: [
@@ -248,8 +248,21 @@ executable(
     install: false,
 )
 
-# Both define main; nvbench_main stays for its driver and NVML link dependencies.
-multi_gpu_deps = [cuddl_distributed_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep]
+# These benchmarks call NVML themselves. libnvbench.so links it as well, but passes it on to
+# executables only with the toolkit's stub, not with a driver_library_dir.
+nvml_dep = driver_library_dir == '' ? [] : cuda_compiler.find_library(
+    'nvidia-ml',
+    dirs: driver_library_dir,
+)
+# Both define main; nvbench_main stays for its driver link dependencies.
+multi_gpu_deps = [
+    cuddl_distributed_dep,
+    cli11_dep,
+    nvbench_dep,
+    nvbench_main,
+    nlohmann_json_dep,
+    nvml_dep,
+]
 # Exhaustive all-to-all with one MPI rank per GPU, on one node or many: MPI broadcasts the
 # database rows, every rank searches the tiles it claims, and each rank count is verified, then
 # timed.
@@ -270,11 +283,11 @@ executable(
 )
 # Integer-ALU rate one GPU sustains under its power limit: the numerator of a pairs/s ceiling
 # for the exhaustive search that accounts for the power limit. Defines main; nvbench_main stays
-# for NVML.
+# for its driver link dependencies.
 executable(
     'alu-power-ceiling',
     'alu_power_ceiling.cu',
-    dependencies: [cuddl_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep],
+    dependencies: [cuddl_dep, cli11_dep, nvbench_dep, nvbench_main, nlohmann_json_dep, nvml_dep],
     cuda_args: cuda_args,
     install: false,
 )
