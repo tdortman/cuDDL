@@ -3,6 +3,7 @@
 import mmap
 import os
 import re
+import resource
 import shlex
 import subprocess
 import sys
@@ -121,6 +122,10 @@ def genome_files(genomes: Path) -> list[Path]:
 
 def read_files(paths: list[Path], threads: int, direct: bool = False) -> None:
     """Read every file once; with DIRECT, through O_DIRECT, bypassing the page cache."""
+    # The default soft limit of 1,024 open files is too few for 1,024 reader threads.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < threads + 256:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, threads + 256), hard))
     flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
     local = threading.local()
 
