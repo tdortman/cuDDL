@@ -1016,9 +1016,11 @@ class sequence_buffer_pool {
 /// @brief Loader state a build fed by paths keeps for its whole run.
 ///
 /// Reused decompression buffers avoid repeated allocations, and can be page-locked for DMA.
-/// The pool hands out load results a few files ahead of the consumer, which takes them in order.
-/// A window of one worker-worth leaves the consumer waiting on a straggler while every other
-/// loader sits idle.
+/// The pool hands out files as they finish loading, up to a window ahead of the consumer. Cold
+/// reads on Lustre have a long tail: with 256 in flight on an A100 node, p50 took 28 ms, p99
+/// 0.83 s and the slowest 4.4 s. Taken in ID order, one such file held up the consumer while
+/// the window filled behind it, and 100,000 genomes built in 32.0-43.1 s. Taken as they finish,
+/// they built in 26.8-28.7 s, against 27.0 s for reading the files alone.
 class path_loaders {
    public:
     /// @param stream Stream owning the loader buffers.
@@ -1050,7 +1052,7 @@ class path_loaders {
             window + stager_hold_slots + 2, pack_k != 0 ? packed_buffer_bytes : 0
         );
         source_ = {acquire_sequence_target, &buffers_, direct_reads};
-        if (workers_ > 1) pool_.emplace(paths, workers_, source_, window, false, false, pack_k);
+        if (workers_ > 1) pool_.emplace(paths, workers_, source_, window, false, true, pack_k);
     }
 
     /// @brief Loaders this build runs.
@@ -1065,13 +1067,36 @@ class path_loaders {
         return page_locked_ ? buffers_.buffers() : 0;
     }
 
-    /// @brief Loads genome @p id, through the pool when the build runs more than one loader.
-    [[nodiscard]] Result<std::unique_ptr<fastx_sequence_file>>
-    take(std::span<std::filesystem::path const> paths, size_t id) {
-        if (pool_.has_value()) return pool_->take(id);
-        auto loaded = load_fastx_sequence_file(paths[id].string(), source_, false, false, pack_k_);
-        if (pack_k_ != 0 && loaded) pack_fastx_sequence_file(**loaded, pack_k_);
-        return loaded;
+    /// @brief Loads the next genome of group [@p base, @p base + @p count), whichever finishes
+    /// first, with its ID; @p taken genomes of the group came before it.
+    ///
+    /// Files of later groups that finish first wait until their group's turn.
+    [[nodiscard]] Result<std::pair<size_t, std::unique_ptr<fastx_sequence_file>>>
+    take(std::span<std::filesystem::path const> paths, size_t base, size_t count, size_t taken) {
+        using loaded_file = std::pair<size_t, std::unique_ptr<fastx_sequence_file>>;
+        if (!pool_.has_value()) {
+            auto const id = base + taken;
+            auto loaded =
+                load_fastx_sequence_file(paths[id].string(), source_, false, false, pack_k_);
+            if (!loaded) return Err(loaded.error());
+            if (pack_k_ != 0) pack_fastx_sequence_file(**loaded, pack_k_);
+            return Result<loaded_file>::ok(loaded_file{id, std::move(*loaded)});
+        }
+        auto const in_group = [&](size_t id) {
+            return id >= base && id < base + count;
+        };
+        auto const early =
+            std::ranges::find_if(early_, [&](auto const& f) { return in_group(f.first); });
+        if (early != early_.end()) {
+            auto file = std::move(*early);
+            early_.erase(early);
+            return Result<loaded_file>::ok(std::move(file));
+        }
+        while (true) {
+            auto file = CUDDL_TRY(pool_->take_ready());
+            if (in_group(file.first)) return Result<loaded_file>::ok(std::move(file));
+            early_.push_back(std::move(file));
+        }
     }
 
     /// @brief Joins the loaders. They hold leases, so pool state is only readable after this.
@@ -1094,6 +1119,7 @@ class path_loaders {
     uint32_t pack_k_ = 0;
     decompression_source source_{};
     std::optional<fastx_load_pool> pool_;
+    std::vector<std::pair<size_t, std::unique_ptr<fastx_sequence_file>>> early_;
 };
 
 /// @brief Runs the staging loop over a collection, filling one group at a time.
@@ -1731,8 +1757,10 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
         statistics,
         [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
             -> Result<void> {
-            for (size_t id = base; id < base + count; ++id) {
-                auto sequence = CUDDL_TRY(loaders.take(paths, id));
+            for (size_t taken = 0; taken < count; ++taken) {
+                auto loaded = CUDDL_TRY(loaders.take(paths, base, count, taken));
+                auto const id = loaded.first;
+                auto sequence = std::move(loaded.second);
                 // Read the loaded file's parts before the move below: argument order is
                 // unspecified, so a moved-from Result must not be dereferenced.
                 auto const* const pinned_base =
