@@ -16,10 +16,11 @@ namespace cuddl::detail {
 ///
 /// They exist to measure what each optimisation contributes (`scripts/ablation.py`); results
 /// are the same either way. Other builds compile every switch out.
-inline constexpr std::array<std::string_view, 23> ablations{
+inline constexpr std::array<std::string_view, 24> ablations{
     "co-scheduling",       // nvCOMP claims a batch only if it finishes before the host loaders
     "read-depth",          // readers keep read_depth reads in flight, not one per loader
     "probe-depth",         // 4 * parallel_read_depth gzip probes in flight, not parallel_read_depth
+    "streamed-probes",     // gzip probes run a few chunks ahead of staging, not all before it
     "pinned-pool",         // device-only pinned pools that keep their pages, not CCCL-like ones
     "numa-pool",           // device-written pinned buffers on the device's host NUMA node
     "switch-downloads",    // GPUs behind one PCIe root port download one at a time

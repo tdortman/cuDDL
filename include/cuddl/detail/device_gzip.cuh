@@ -132,13 +132,25 @@ walk_bgzf(unsigned char const* bytes, uint64_t size, Block&& block) {
 /// with a non-empty block, or an uncompressed file that opens with a FASTA header, any of them
 /// with a name that does not mark it FASTQ. For gzip without FEXTRA, additional member signatures
 /// are checked after reading the compressed bytes, before accepting the device output.
-[[nodiscard]] inline gzip_file_probe probe_gzip_file(std::filesystem::path const& path) {
+/// @param whole reads the whole file first, leaving it in the page cache for whoever reads it
+/// next: where a header and trailer cost as many storage requests as the whole file.
+[[nodiscard]] inline gzip_file_probe
+probe_gzip_file(std::filesystem::path const& path, bool whole = false) {
     gzip_file_probe probe;
     int const fd = ::open(path.c_str(), O_RDONLY);
     if (fd == -1) return probe;
     struct stat status{};
     unsigned char header[18] = {};
     unsigned char trailer[8 + 18] = {};  // a member's trailer, and the next BGZF header
+    if (whole && ::fstat(fd, &status) == 0) {
+        constexpr size_t scratch_bytes = size_t{4} << 20;
+        static thread_local std::unique_ptr<char[]> const scratch(new char[scratch_bytes]);
+        for (off_t at = 0; at < status.st_size;) {
+            auto const got = ::pread(fd, scratch.get(), scratch_bytes, at);
+            if (got <= 0) break;
+            at += got;
+        }
+    }
     if (::fstat(fd, &status) == 0 && status.st_size >= 4 &&
         ::pread(fd, header, sizeof(header), 0) >= 4) {
         auto const size = static_cast<uint64_t>(status.st_size);
@@ -196,20 +208,6 @@ walk_bgzf(unsigned char const* bytes, uint64_t size, Block&& block) {
     }
     ::close(fd);
     return probe;
-}
-
-/// @brief Runs @p work(index) for every index below @p count on @p workers threads.
-template <typename Work>
-void parallel_for(size_t count, size_t workers, Work&& work) {
-    std::atomic<size_t> next{0};
-    auto run = [&] {
-        for (size_t index = next++; index < count; index = next++) work(index);
-    };
-    std::vector<std::jthread> threads;
-    auto const helpers = std::min(workers, count) > 0 ? std::min(workers, count) - 1 : 0;
-    threads.reserve(helpers);
-    for (size_t thread = 0; thread < helpers; ++thread) threads.emplace_back(run);
-    run();
 }
 
 /// @brief True when @p data holds what could start another gzip member: 1f 8b 08, then a flag

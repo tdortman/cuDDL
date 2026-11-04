@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -1346,6 +1347,85 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     return Ok();
 }
 
+/// Files the gpu backend stages at a time, and how many its probes may run past the files
+/// staging waits for. Where probes read whole files, that is up to about 30 GB of RefSeq genomes
+/// in the page cache; three chunks keep storage busy while one slow file holds up the next chunk.
+inline constexpr size_t probe_chunk = 8192;
+inline constexpr size_t probe_ahead = 3 * probe_chunk;
+
+/// @brief Probes files in ID order on background threads, at most @p ahead files past the end
+/// the consumer last waited for.
+class gzip_probe_stream {
+   public:
+    /// @param whole reads each whole file, as @ref probe_gzip_file does with it.
+    gzip_probe_stream(
+        std::span<std::filesystem::path const> paths,
+        size_t threads,
+        size_t ahead,
+        bool whole
+    )
+        : paths_(paths), probes_(paths.size()), done_(paths.size()), ahead_(ahead), whole_(whole) {
+        auto const count = std::min(threads, paths.size());
+        threads_.reserve(count);
+        for (size_t thread = 0; thread < count; ++thread) threads_.emplace_back([this] { run(); });
+    }
+
+    gzip_probe_stream(gzip_probe_stream const&) = delete;
+    gzip_probe_stream& operator=(gzip_probe_stream const&) = delete;
+
+    ~gzip_probe_stream() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        claimable_.notify_all();
+        for (auto& thread : threads_) thread.join();
+    }
+
+    /// @brief Waits until every file before @p end is probed. Probes past that may still change.
+    std::span<gzip_file_probe const> wait(size_t end) {
+        std::unique_lock lock(mutex_);
+        if (end > wanted_) {
+            wanted_ = end;
+            claimable_.notify_all();
+        }
+        probed_.wait(lock, [&] { return frontier_ >= end; });
+        return probes_;
+    }
+
+   private:
+    void run() {
+        while (true) {
+            size_t id = 0;
+            {
+                std::unique_lock lock(mutex_);
+                claimable_.wait(lock, [&] {
+                    return stop_ || next_ >= paths_.size() || next_ < wanted_ + ahead_;
+                });
+                if (stop_ || next_ >= paths_.size()) return;
+                id = next_++;
+            }
+            probes_[id] = probe_gzip_file(paths_[id], whole_);
+            std::lock_guard lock(mutex_);
+            done_[id] = 1;
+            auto const before = frontier_;
+            while (frontier_ < done_.size() && done_[frontier_] != 0) ++frontier_;
+            if (frontier_ != before) probed_.notify_all();
+        }
+    }
+
+    std::span<std::filesystem::path const> paths_;
+    std::vector<gzip_file_probe> probes_;
+    std::vector<uint8_t> done_;
+    size_t ahead_;
+    bool whole_;
+    std::mutex mutex_;
+    std::condition_variable claimable_, probed_;
+    size_t next_ = 0, frontier_ = 0, wanted_ = 0;
+    bool stop_ = false;
+    std::vector<std::thread> threads_;
+};
+
 /// @brief @ref stage_paths with gzip FASTA inflated, and plain FASTA copied as read, then both
 /// compacted on the device.
 ///
@@ -1368,14 +1448,21 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
     auto const workers = path_loaders::worker_count(paths.size(), parser_workers);
     bool const in_place = stages_in_place(transfer, stream.device());
     bool const page_locked = pages_locked(transfer, stream.device());
-    std::vector<gzip_file_probe> probes(paths.size());
     // Each probe reads a file's header and trailer, two waits on a parallel file system, and
     // moves almost no bytes, so it keeps more in flight than whole-file reads: 20,000 genomes no
     // A100 node had cached built in 13.9-15.6 s with 64 probes in flight and 9.6-10.5 s with 256.
     auto const probe_depth = ablated("probe-depth") ? parallel_read_depth : 4 * parallel_read_depth;
-    parallel_for(paths.size(), std::max(workers, probe_depth), [&](size_t id) {
-        probes[id] = probe_gzip_file(paths[id]);
-    });
+    // On Lustre a probe costs as many storage requests as reading the whole file, so there it
+    // reads the whole file into the page cache, where the lane or host loader finds it, and the
+    // probes run a few chunks ahead of staging instead of all before it. Elsewhere they run first:
+    // each chunk drains the lanes and loaders, and on an RTX 5090 node with local NVMe, 115,223
+    // genomes built in 9.2-9.3 s cached and 14.2-14.4 s uncached with every file probed first,
+    // and in 10.6-10.7 s and 14.5-14.6 s in chunks.
+    bool const streamed = !direct_reads && !ablated("streamed-probes") && on_lustre(paths.front());
+    gzip_probe_stream probing(
+        paths, std::max(workers, probe_depth), streamed ? probe_ahead : paths.size(), streamed
+    );
+    auto const probes = probing.wait(streamed ? 0 : paths.size());
     std::optional<device_fasta_pipeline> inflater;
     sequence_buffer_pool host_buffers(stream, workers, size_t{32} << 20, page_locked, in_place);
     host_buffers.set_capacity(workers * 4 + stager_hold_slots + 2, packed_buffer_bytes);
@@ -1383,29 +1470,36 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         return probe.device && probe.isize + size_t{1} <= inflater->slot_capacity() &&
                probe.host_bytes() <= inflater->compressed_capacity();
     };
-    // Sized once the stager holds its rows and arena, from what is left and what the inputs need.
-    auto const make_inflater = [&]() -> Result<void> {
+    // Sized once the stager holds its rows and arena, from what is left and what the inputs
+    // need. With streamed probes, the files probed so far stand in for all of them.
+    auto const make_inflater = [&](size_t probed) -> Result<void> {
         size_t slots = 0, compressed = 0;
-        for (auto const& probe : probes) {
+        for (auto const& probe : probes.first(probed)) {
             if (!probe.device) continue;
             slots += probe.isize + size_t{1};
             compressed += probe.host_bytes();
         }
+        if (probed != 0 && probed < paths.size()) {
+            slots = static_cast<size_t>(static_cast<double>(slots) * paths.size() / probed);
+            compressed =
+                static_cast<size_t>(static_cast<double>(compressed) * paths.size() / probed);
+        }
         auto const available = CUDDL_TRY(available_device_bytes(stream));
         auto const budget = (available - available / 5) / device_fasta_pipeline::lane_count;
         auto const overhead = device_fasta_pipeline::lane_overhead(budget);
-        // A lane holds one batch, not a share of the device: its compressed bytes are page-locked
-        // host memory, which pins at about 2.7 GB/s on one thread. Sized from a B300's 275 GB,
-        // six lanes pinned 48 GB in 17 s, and 10,000 genomes made only three batches. Smaller
-        // lanes also let the host loaders take a fairer share: on an A100, 10,000 genomes took
-        // 1.79 s with 2 GiB lanes and 1.53 s with 1 GiB at 112 loaders, and 2.12-2.17 s with
-        // either at 16; 512 MiB lanes took 2.48 s at 16. A Blackwell data-centre GPU, the kind with
-        // a decompression engine, needs larger batches on large inputs, though, engine or SMs:
-        // on a B300 with 16 loaders, all 115,223 genomes built in 24.7-24.9 s with 1 GiB lanes and
-        // 16.7-17.6 s with 4 GiB, so there a lane takes a 64th of the input. Their BGZF copy took
-        // 16.6-17.8 s with 1 GiB and 14.7-17.2 s with 4 GiB. Smaller GPUs fall behind with 4 GiB
-        // lanes: at 128 loaders, 100,000 genomes built in 23.5 s with them and 18.0 s with 1 GiB on
-        // an A40, and in 16.5 and 15.6 s on an A100.
+        // A lane holds one batch, not a share of the device: its compressed bytes are
+        // page-locked host memory, which pins at about 2.7 GB/s on one thread. Sized from a
+        // B300's 275 GB, six lanes pinned 48 GB in 17 s, and 10,000 genomes made only three
+        // batches. Smaller lanes also let the host loaders take a fairer share: on an A100,
+        // 10,000 genomes took 1.79 s with 2 GiB lanes and 1.53 s with 1 GiB at 112 loaders,
+        // and 2.12-2.17 s with either at 16; 512 MiB lanes took 2.48 s at 16. A Blackwell
+        // data-centre GPU, the kind with a decompression engine, needs larger batches on large
+        // inputs, though, engine or SMs: on a B300 with 16 loaders, all 115,223 genomes built
+        // in 24.7-24.9 s with 1 GiB lanes and 16.7-17.6 s with 4 GiB, so there a lane takes a
+        // 64th of the input. Their BGZF copy took 16.6-17.8 s with 1 GiB and 14.7-17.2 s with 4
+        // GiB. Smaller GPUs fall behind with 4 GiB lanes: at 128 loaders, 100,000 genomes built
+        // in 23.5 s with them and 18.0 s with 1 GiB on an A40, and in 16.5 and 15.6 s on an
+        // A100.
         bool const engine = device_gzip::hardware_inflate_limit(stream.device().get()) != 0;
         auto const lane_bytes =
             ablated("input-lanes") || !engine
@@ -1436,6 +1530,182 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
             );
         });
     };
+    auto const stage_range = [&](database_stager<K, BucketCount, Layout>& stager,
+                                 size_t base,
+                                 size_t first,
+                                 size_t last) -> Result<void> {
+        // Host loaders take `order` from the front: files the device cannot hold, then the
+        // device candidates from the back. nvCOMP takes candidates from the front and caps
+        // the loaders before each batch, so whichever side is faster on this host takes more.
+        // Candidates run smallest first: one thread block inflates a whole file, so large
+        // files suit the CPU, and a batch of similar sizes has no straggler holding it open.
+        std::vector<size_t> device_ids, order, handed_back;
+        for (size_t id = first; id < last; ++id) {
+            (fits(probes[id]) ? device_ids : order).push_back(id);
+        }
+        std::ranges::stable_sort(device_ids, {}, [&](size_t id) { return probes[id].compressed; });
+        // With a decompression engine, whole batches for the engine alternate with whole
+        // batches of larger files in proportion to their gzip bytes, so the engine and the
+        // SMs inflate at the same time in different lanes. Smallest first overall would run
+        // every engine batch before any SM batch; mixing within a batch leaves too few large
+        // files per launch to fill the SMs, since nvCOMP inflates one file per thread block.
+        if (auto const limit = inflater->hardware_limit(); limit != 0) {
+            auto const larger = std::ranges::stable_partition(device_ids, [&](size_t id) {
+                return probes[id].bgzf || probes[id].isize <= limit;
+            });
+            std::vector<size_t> const engine(device_ids.begin(), larger.begin());
+            std::vector<size_t> const cores(larger.begin(), larger.end());
+            auto const bytes = [&](std::span<size_t const> ids) {
+                long double total = 0;
+                for (auto id : ids) total += static_cast<long double>(probes[id].compressed);
+                return total;
+            };
+            auto const engine_total = bytes(engine), cores_total = bytes(cores);
+            long double engine_taken = 0, cores_taken = 0;
+            std::span<size_t const> engine_left{engine}, cores_left{cores};
+            device_ids.clear();
+            while (!engine_left.empty() || !cores_left.empty()) {
+                bool const take_engine = cores_left.empty() ||
+                                         (!engine_left.empty() &&
+                                          engine_taken * cores_total <= cores_taken * engine_total);
+                auto& left = take_engine ? engine_left : cores_left;
+                auto const batch =
+                    left.first(std::max<size_t>(1, inflater->batch_files(left, probes)));
+                device_ids.insert(device_ids.end(), batch.begin(), batch.end());
+                (take_engine ? engine_taken : cores_taken) += bytes(batch);
+                left = left.subspan(batch.size());
+            }
+        }
+        order.insert(order.end(), device_ids.rbegin(), device_ids.rend());
+        std::vector<std::filesystem::path> host_paths;
+        host_paths.reserve(order.size());
+        for (auto id : order) host_paths.push_back(paths[id]);
+        // Gzip bytes of the first n files of `order`, to tell how much the host has left.
+        std::vector<uint64_t> order_bytes(order.size() + 1);
+        for (size_t index = 0; index < order.size(); ++index) {
+            order_bytes[index + 1] = order_bytes[index] + probes[order[index]].compressed;
+        }
+        auto const started = std::chrono::steady_clock::now();
+        std::atomic<uint64_t> host_done{0};
+        fastx_load_pool host_pool(
+            host_paths,
+            std::min(workers, host_paths.size()),
+            decompression_source{acquire_sequence_target, &host_buffers, direct_reads},
+            workers * 4,
+            false,
+            true,
+            K
+        );
+        // The host path stages on its own thread: it waits on copies over the bus, which
+        // must not hold up the nvCOMP lanes this thread drives. The stager is shared.
+        std::mutex staging;
+        auto host_staged = std::async(std::launch::async, [&]() -> Result<void> {
+            CUDDL_CUDA_TRY(cudaSetDevice(stream.device().get()));
+            while (true) {
+                auto loaded = CUDDL_TRY(host_pool.take_ready_until_limit());
+                if (!loaded) return Ok();
+                auto& [index, sequence] = *loaded;
+                auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
+                auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
+                auto const genome = order[index] - base;
+                host_done += probes[order[index]].compressed;
+                stager.wait_hold_slot();
+                std::lock_guard lock(staging);
+                if (sequence->words != nullptr) {
+                    CUDDL_TRY(stager.add_packed_genome(
+                        genome, std::move(sequence), pinned_base, pinned_size
+                    ));
+                    continue;
+                }
+                auto const& extents = sequence->extents;
+                CUDDL_TRY(stager.add_genome(
+                    genome, extents, pinned_base, pinned_size, std::move(sequence)
+                ));
+            }
+        });
+        // On an early return, stop the loaders at what they claimed so the host thread ends.
+        struct stop_loaders {
+            fastx_load_pool& pool;
+            ~stop_loaders() {
+                pool.cap(0);
+            }
+        } stop{host_pool};
+        std::vector<inflated_genome> genomes;
+        std::array<bool, device_fasta_pipeline::lane_count> busy{};
+        std::array<uint64_t, device_fasta_pipeline::lane_count> lane_bytes{};
+        size_t next = 0, lane = 0;
+        uint64_t device_done = 0, device_queued = 0;
+        std::chrono::steady_clock::time_point device_started;
+        bool device_open = !device_ids.empty();
+        // Whether the device, at the rate it has inflated so far, finishes what it holds plus
+        // @p batch before the host loaders, at theirs, finish everything else. Each lane holds
+        // hundreds of megabytes, so claiming whenever a lane was free left nvCOMP 70% of the
+        // files on an A100 with 112 loaders: 1.9 s, while the loaders alone took 1.3 s.
+        auto const device_keeps_up = [&](std::span<size_t const> batch) {
+            if (ablated("co-scheduling") || device_done == 0 || host_done == 0) return true;
+            uint64_t bytes = 0;
+            for (auto id : batch) bytes += probes[id].compressed;
+            auto const now = std::chrono::steady_clock::now();
+            auto const host_rate = static_cast<double>(host_done) /
+                                   std::chrono::duration<double>(now - started).count();
+            auto const device_rate = static_cast<double>(device_done) /
+                                     std::chrono::duration<double>(now - device_started).count();
+            auto const host_left = static_cast<double>(order_bytes[order.size() - next]) -
+                                   static_cast<double>(host_done + bytes);
+            return static_cast<double>(device_queued + bytes) / device_rate <=
+                   host_left / host_rate;
+        };
+        // Cycle through lanes, submitting a batch before consuming the oldest one.
+        while (device_open || std::ranges::any_of(busy, [](bool value) { return value; })) {
+            if (device_open && !busy[lane]) {
+                auto const remaining = std::span{device_ids}.subspan(next);
+                auto const wanted = inflater->batch_files(remaining, probes);
+                if (device_keeps_up(remaining.first(wanted))) {
+                    auto const limit = host_pool.cap(order.size() - next - wanted);
+                    auto const files = order.size() - next - limit;
+                    device_open = files == wanted && next + files < device_ids.size();
+                    if (files != 0) {
+                        if (device_queued == 0 && device_done == 0) {
+                            device_started = std::chrono::steady_clock::now();
+                        }
+                        lane_bytes[lane] = 0;
+                        for (auto id : remaining.first(files)) {
+                            lane_bytes[lane] += probes[id].compressed;
+                        }
+                        device_queued += lane_bytes[lane];
+                        next += CUDDL_TRY(inflater->submit(
+                            lane, remaining.first(files), paths, probes, direct_reads
+                        ));
+                        busy[lane] = true;
+                    }
+                } else if (std::ranges::none_of(busy, [](bool value) { return value; })) {
+                    // The loaders, which may take every file the device has not, finish first.
+                    device_open = false;
+                }
+            }
+            auto const other = (lane + 1) % busy.size();
+            if (busy[other]) {
+                genomes.clear();
+                CUDDL_TRY(inflater->finish(other, probes, genomes, handed_back));
+                std::lock_guard lock(staging);
+                for (auto const& genome : genomes) {
+                    CUDDL_TRY(stager.add_resident(genome.id - base, genome.bases, genome.size));
+                }
+                if (statistics != nullptr) statistics->device_files += genomes.size();
+                CUDDL_TRY(stager.flush());
+                CUDDL_TRY(inflater->release(other, stream));
+                busy[other] = false;
+                device_done += lane_bytes[other];
+                device_queued -= lane_bytes[other];
+            }
+            lane = other;
+        }
+        CUDDL_TRY(host_staged.get());
+        // ponytail: one fallback pool per group; pipeline it if fallback-heavy inputs dominate.
+        return stage_host_loaded<K, BucketCount, Layout>(
+            stager, paths, handed_back, base, workers, host_buffers, page_locked, direct_reads
+        );
+    };
     CUDDL_TRY((stage_groups<K, BucketCount, Layout>(
         paths.size(),
         default_arena_ceiling,
@@ -1444,181 +1714,15 @@ template <uint32_t K, size_t BucketCount, typename Layout, typename Sink>
         statistics,
         [&](database_stager<K, BucketCount, Layout>& stager, size_t base, size_t count)
             -> Result<void> {
-            if (!inflater) CUDDL_TRY(make_inflater());
-            // Host loaders take `order` from the front: files the device cannot hold, then the
-            // device candidates from the back. nvCOMP takes candidates from the front and caps
-            // the loaders before each batch, so whichever side is faster on this host takes more.
-            // Candidates run smallest first: one thread block inflates a whole file, so large
-            // files suit the CPU, and a batch of similar sizes has no straggler holding it open.
-            std::vector<size_t> device_ids, order, handed_back;
-            for (size_t id = base; id < base + count; ++id) {
-                (fits(probes[id]) ? device_ids : order).push_back(id);
+            for (size_t first = base; first < base + count;) {
+                auto const last =
+                    streamed ? std::min(base + count, first + probe_chunk) : base + count;
+                probing.wait(last);
+                if (!inflater) CUDDL_TRY(make_inflater(streamed ? last : paths.size()));
+                CUDDL_TRY(stage_range(stager, base, first, last));
+                first = last;
             }
-            std::ranges::stable_sort(device_ids, {}, [&](size_t id) {
-                return probes[id].compressed;
-            });
-            // With a decompression engine, whole batches for the engine alternate with whole
-            // batches of larger files in proportion to their gzip bytes, so the engine and the
-            // SMs inflate at the same time in different lanes. Smallest first overall would run
-            // every engine batch before any SM batch; mixing within a batch leaves too few large
-            // files per launch to fill the SMs, since nvCOMP inflates one file per thread block.
-            if (auto const limit = inflater->hardware_limit(); limit != 0) {
-                auto const larger = std::ranges::stable_partition(device_ids, [&](size_t id) {
-                    return probes[id].bgzf || probes[id].isize <= limit;
-                });
-                std::vector<size_t> const engine(device_ids.begin(), larger.begin());
-                std::vector<size_t> const cores(larger.begin(), larger.end());
-                auto const bytes = [&](std::span<size_t const> ids) {
-                    long double total = 0;
-                    for (auto id : ids) total += static_cast<long double>(probes[id].compressed);
-                    return total;
-                };
-                auto const engine_total = bytes(engine), cores_total = bytes(cores);
-                long double engine_taken = 0, cores_taken = 0;
-                std::span<size_t const> engine_left{engine}, cores_left{cores};
-                device_ids.clear();
-                while (!engine_left.empty() || !cores_left.empty()) {
-                    bool const take_engine = cores_left.empty() || (!engine_left.empty() &&
-                                                                    engine_taken * cores_total <=
-                                                                        cores_taken * engine_total);
-                    auto& left = take_engine ? engine_left : cores_left;
-                    auto const batch =
-                        left.first(std::max<size_t>(1, inflater->batch_files(left, probes)));
-                    device_ids.insert(device_ids.end(), batch.begin(), batch.end());
-                    (take_engine ? engine_taken : cores_taken) += bytes(batch);
-                    left = left.subspan(batch.size());
-                }
-            }
-            order.insert(order.end(), device_ids.rbegin(), device_ids.rend());
-            std::vector<std::filesystem::path> host_paths;
-            host_paths.reserve(order.size());
-            for (auto id : order) host_paths.push_back(paths[id]);
-            // Gzip bytes of the first n files of `order`, to tell how much the host has left.
-            std::vector<uint64_t> order_bytes(order.size() + 1);
-            for (size_t index = 0; index < order.size(); ++index) {
-                order_bytes[index + 1] = order_bytes[index] + probes[order[index]].compressed;
-            }
-            auto const started = std::chrono::steady_clock::now();
-            std::atomic<uint64_t> host_done{0};
-            fastx_load_pool host_pool(
-                host_paths,
-                std::min(workers, host_paths.size()),
-                decompression_source{acquire_sequence_target, &host_buffers, direct_reads},
-                workers * 4,
-                false,
-                true,
-                K
-            );
-            // The host path stages on its own thread: it waits on copies over the bus, which
-            // must not hold up the nvCOMP lanes this thread drives. The stager is shared.
-            std::mutex staging;
-            auto host_staged = std::async(std::launch::async, [&]() -> Result<void> {
-                CUDDL_CUDA_TRY(cudaSetDevice(stream.device().get()));
-                while (true) {
-                    auto loaded = CUDDL_TRY(host_pool.take_ready_until_limit());
-                    if (!loaded) return Ok();
-                    auto& [index, sequence] = *loaded;
-                    auto const* pinned_base = page_locked ? sequence->decompressed_target : nullptr;
-                    auto const pinned_size = page_locked ? sequence->decompressed_size : 0;
-                    auto const genome = order[index] - base;
-                    host_done += probes[order[index]].compressed;
-                    stager.wait_hold_slot();
-                    std::lock_guard lock(staging);
-                    if (sequence->words != nullptr) {
-                        CUDDL_TRY(stager.add_packed_genome(
-                            genome, std::move(sequence), pinned_base, pinned_size
-                        ));
-                        continue;
-                    }
-                    auto const& extents = sequence->extents;
-                    CUDDL_TRY(stager.add_genome(
-                        genome, extents, pinned_base, pinned_size, std::move(sequence)
-                    ));
-                }
-            });
-            // On an early return, stop the loaders at what they claimed so the host thread ends.
-            struct stop_loaders {
-                fastx_load_pool& pool;
-                ~stop_loaders() {
-                    pool.cap(0);
-                }
-            } stop{host_pool};
-            std::vector<inflated_genome> genomes;
-            std::array<bool, device_fasta_pipeline::lane_count> busy{};
-            std::array<uint64_t, device_fasta_pipeline::lane_count> lane_bytes{};
-            size_t next = 0, lane = 0;
-            uint64_t device_done = 0, device_queued = 0;
-            std::chrono::steady_clock::time_point device_started;
-            bool device_open = !device_ids.empty();
-            // Whether the device, at the rate it has inflated so far, finishes what it holds plus
-            // @p batch before the host loaders, at theirs, finish everything else. Each lane holds
-            // hundreds of megabytes, so claiming whenever a lane was free left nvCOMP 70% of the
-            // files on an A100 with 112 loaders: 1.9 s, while the loaders alone took 1.3 s.
-            auto const device_keeps_up = [&](std::span<size_t const> batch) {
-                if (ablated("co-scheduling") || device_done == 0 || host_done == 0) return true;
-                uint64_t bytes = 0;
-                for (auto id : batch) bytes += probes[id].compressed;
-                auto const now = std::chrono::steady_clock::now();
-                auto const host_rate = static_cast<double>(host_done) /
-                                       std::chrono::duration<double>(now - started).count();
-                auto const device_rate =
-                    static_cast<double>(device_done) /
-                    std::chrono::duration<double>(now - device_started).count();
-                auto const host_left = static_cast<double>(order_bytes[order.size() - next]) -
-                                       static_cast<double>(host_done + bytes);
-                return static_cast<double>(device_queued + bytes) / device_rate <=
-                       host_left / host_rate;
-            };
-            // Cycle through lanes, submitting a batch before consuming the oldest one.
-            while (device_open || std::ranges::any_of(busy, [](bool value) { return value; })) {
-                if (device_open && !busy[lane]) {
-                    auto const remaining = std::span{device_ids}.subspan(next);
-                    auto const wanted = inflater->batch_files(remaining, probes);
-                    if (device_keeps_up(remaining.first(wanted))) {
-                        auto const limit = host_pool.cap(order.size() - next - wanted);
-                        auto const files = order.size() - next - limit;
-                        device_open = files == wanted && next + files < device_ids.size();
-                        if (files != 0) {
-                            if (device_queued == 0 && device_done == 0) {
-                                device_started = std::chrono::steady_clock::now();
-                            }
-                            lane_bytes[lane] = 0;
-                            for (auto id : remaining.first(files)) {
-                                lane_bytes[lane] += probes[id].compressed;
-                            }
-                            device_queued += lane_bytes[lane];
-                            next += CUDDL_TRY(inflater->submit(
-                                lane, remaining.first(files), paths, probes, direct_reads
-                            ));
-                            busy[lane] = true;
-                        }
-                    } else if (std::ranges::none_of(busy, [](bool value) { return value; })) {
-                        // The loaders, which may take every file the device has not, finish first.
-                        device_open = false;
-                    }
-                }
-                auto const other = (lane + 1) % busy.size();
-                if (busy[other]) {
-                    genomes.clear();
-                    CUDDL_TRY(inflater->finish(other, probes, genomes, handed_back));
-                    std::lock_guard lock(staging);
-                    for (auto const& genome : genomes) {
-                        CUDDL_TRY(stager.add_resident(genome.id - base, genome.bases, genome.size));
-                    }
-                    if (statistics != nullptr) statistics->device_files += genomes.size();
-                    CUDDL_TRY(stager.flush());
-                    CUDDL_TRY(inflater->release(other, stream));
-                    busy[other] = false;
-                    device_done += lane_bytes[other];
-                    device_queued -= lane_bytes[other];
-                }
-                lane = other;
-            }
-            CUDDL_TRY(host_staged.get());
-            // ponytail: one fallback pool per group; pipeline it if fallback-heavy inputs dominate.
-            return stage_host_loaded<K, BucketCount, Layout>(
-                stager, paths, handed_back, base, workers, host_buffers, page_locked, direct_reads
-            );
+            return Ok();
         },
         sink,
         in_place,
@@ -1681,10 +1785,9 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     // A coherent GPU reads the loaders' buffers in place, so CPU inflation feeds it best.
     // Elsewhere nvCOMP wins: 100,000 genomes on an RTX 5090 with 120 loaders built in 7.4 s with
     // gpu and 10.2 s with cpu, and the CPU-inflating backends kept the GPU 60% idle. Not on
-    // Lustre, though: gpu first reads each file's size, header and trailer, which costs as many
-    // requests to the storage servers as reading the whole ~1 MB genome, so a cold build reads
-    // twice. On an A100 node, 100,000 uncached genomes built in 55.2-56.3 s with gpu and
-    // 26.8-28.7 s with cpu, and cached ones in 15.9-16.6 s and 16.8-18.4 s.
+    // Lustre, though, where gpu's probes read each whole file before a lane reads it again from
+    // the page cache: on an A100 node, 100,000 uncached genomes built in 26.4-27.3 s with gpu and
+    // 23.6-24.6 s with cpu, and cached ones in 18.8-19.1 s and 17.2-17.6 s.
     if (decompression == decompression_backend::automatic) {
         if (device_reads_pageable_memory(stream.device())) {
             decompression = path_loaders::worker_count(paths.size(), parser_workers) > 1
