@@ -1680,12 +1680,18 @@ template <uint32_t K, size_t BucketCount, typename Layout = default_register_lay
     if (paths.empty()) return Ok();
     // A coherent GPU reads the loaders' buffers in place, so CPU inflation feeds it best.
     // Elsewhere nvCOMP wins: 100,000 genomes on an RTX 5090 with 120 loaders built in 7.4 s with
-    // gpu and 10.2 s with cpu, and the CPU-inflating backends kept the GPU 60% idle.
+    // gpu and 10.2 s with cpu, and the CPU-inflating backends kept the GPU 60% idle. Not on
+    // Lustre, though: gpu first reads each file's size, header and trailer, which costs as many
+    // requests to the storage servers as reading the whole ~1 MB genome, so a cold build reads
+    // twice. On an A100 node, 100,000 uncached genomes built in 55.2-56.3 s with gpu and
+    // 26.8-28.7 s with cpu, and cached ones in 15.9-16.6 s and 16.8-18.4 s.
     if (decompression == decompression_backend::automatic) {
         if (device_reads_pageable_memory(stream.device())) {
             decompression = path_loaders::worker_count(paths.size(), parser_workers) > 1
                                 ? decompression_backend::hybrid
                                 : decompression_backend::cpu;
+        } else if (on_lustre(paths.front())) {
+            decompression = decompression_backend::cpu;
         } else {
             decompression = decompression_backend::gpu;
         }

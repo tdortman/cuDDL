@@ -1794,20 +1794,25 @@ inline Result<std::unique_ptr<fastx_sequence_file>> load_fastx_sequence_file(
 inline constexpr size_t parallel_read_depth = 64;
 
 /// Reads in flight on Lustre, which gives one node more of its bandwidth the more reads it has
-/// outstanding: an A40 and an A100 node on MOGON read 100,000 RefSeq genomes with O_DIRECT at
-/// 3.8-4.0 GB/s with 128 reads in flight and at 5.3 GB/s with 256.
+/// outstanding: an A40 and an A100 node read 100,000 RefSeq genomes with O_DIRECT at 3.8-4.0
+/// GB/s with 128 reads in flight and at 5.3 GB/s with 256.
 inline constexpr size_t lustre_read_depth = 256;
 
-/// @brief Reads to keep in flight for files under @p path: more on Lustre than elsewhere.
-inline size_t read_depth(std::filesystem::path const& path) {
+/// @brief Whether @p path lies on a Lustre file system.
+inline bool on_lustre(std::filesystem::path const& path) {
 #if defined(__linux__)
     constexpr long lustre_super_magic = 0x0BD00BD0;
     struct statfs status{};
-    if (::statfs(path.c_str(), &status) == 0 && status.f_type == lustre_super_magic) {
-        return lustre_read_depth;
-    }
+    return ::statfs(path.c_str(), &status) == 0 && status.f_type == lustre_super_magic;
+#else
+    static_cast<void>(path);
+    return false;
 #endif
-    return parallel_read_depth;
+}
+
+/// @brief Reads to keep in flight for files under @p path: more on Lustre than elsewhere.
+inline size_t read_depth(std::filesystem::path const& path) {
+    return on_lustre(path) ? lustre_read_depth : parallel_read_depth;
 }
 
 // Fixed worker pool loading FASTX files ahead of the GPU loop. A pthread spawn and join
