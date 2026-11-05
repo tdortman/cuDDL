@@ -469,61 +469,65 @@ def io_backend_build(ablation: list[Path]) -> None:
     plt.close(fig)
 
 
-def b200_build(log: Path, inputs: list[str], workers: int) -> None:
-    """b200_build_100k.pdf (B200 build time per backend on standard gzip and BGZF)."""
-    seconds: dict[tuple[str, str], list[float]] = defaultdict(list)
+def b200_build(log: Path, inputs: list[str]) -> None:
+    """b200_build_100k.pdf (B200 build time per backend against host workers, gzip and BGZF)."""
+    seconds: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for line in log.read_text().splitlines():
         if line.startswith("RESULT "):
             f = dict(field.split("=", 1) for field in line.split()[1:])
-            if int(f["workers"]) == workers:
-                seconds[(f["input"], f["backend"])].append(float(f["seconds"]))
-    backends = ["cpu", "hybrid", "gpu-cores", "gpu"]
-    missing = [(i, b) for i in inputs for b in backends if (i, b) not in seconds]
-    if missing:
-        raise typer.BadParameter(f"{log} has no {workers}-worker RESULT for {missing}")
-    cpu, hybrid, gpu_cores, gpu_de = (
-        [median(seconds[(i, b)]) for i in inputs] for b in backends
-    )
+            seconds[(f["input"], f["backend"], int(f["workers"]))].append(
+                float(f["seconds"])
+            )
+    gzip, bgzf = inputs
+    # (input, backend, label, colour, line style)
+    lines = [
+        (gzip, "cpu", "cpu", "#2ca02c", "-"),
+        (gzip, "hybrid", "hybrid", "#9467bd", "-"),
+        (gzip, "gpu-cores", "gpu-cores", "#ff7f0e", "-"),
+        (gzip, "gpu", "gpu (DE)", "#1f77b4", "-"),
+        (bgzf, "gpu", "gpu (DE), BGZF", "#1f77b4", "--"),
+    ]
+    # Worker counts with a single repetition are too noisy to plot.
+    points = {
+        (i, b): sorted(
+            w for (si, sb, w), s in seconds.items() if (si, sb) == (i, b) and len(s) > 1
+        )
+        for i, b, *_ in lines
+    }
+    empty = [key for key, workers in points.items() if not workers]
+    if empty:
+        raise typer.BadParameter(f"{log} has no repeated RESULT for {empty}")
+    workers = sorted({w for ws in points.values() for w in ws})
 
     fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
     ax = fig.add_axes((0.18, 0.23, 0.78, 0.72))
-    categories = ["Standard\ngzip", "BGZF\n(bgzip)"]
-    x = np.array([0.0, 1.10])
-    w = 0.22
-
-    b1 = ax.bar(x - 1.5 * w, cpu, w, label="cpu", color="#2ca02c")
-    b2 = ax.bar(x - 0.5 * w, hybrid, w, label="hybrid", color="#9467bd")
-    b3 = ax.bar(x + 0.5 * w, gpu_cores, w, label="gpu-cores", color="#ff7f0e")
-    b4 = ax.bar(x + 1.5 * w, gpu_de, w, label="gpu (DE)", color="#1f77b4")
-
-    for b in (b1, b2, b3, b4):
-        for bar in b:
-            val = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                val + 0.8,
-                f"{val:.1f}",
-                ha="center",
-                va="bottom",
-                fontsize=5.0,
-            )
-
+    for i, b, label, colour, style in lines:
+        ax.plot(
+            points[(i, b)],
+            [median(seconds[(i, b, w)]) for w in points[(i, b)]],
+            style,
+            marker="o",
+            markersize=2.5,
+            linewidth=1.1,
+            color=colour,
+            label=label,
+        )
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(workers)
+    ax.set_xticklabels([str(w) for w in workers])
+    ax.minorticks_off()
+    ax.set_xlabel("Host workers", fontsize=8.2)
     ax.set_ylabel("Build time [s]", fontsize=8.2)
-    ax.set_xticks(x)
-    ax.set_xticklabels(categories, fontsize=7.5)
-    ax.set_ylim(0, 48)
-    ax.set_xlim(-0.60, 1.70)
+    ax.set_ylim(0, None)
     ax.tick_params(axis="both", labelsize=7.5)
     ax.legend(
-        ncol=2,
         frameon=False,
-        loc="upper left",
-        fontsize=6.5,
+        loc="upper right",
+        fontsize=6.0,
         borderpad=0.1,
-        handlelength=1.0,
+        handlelength=1.6,
         handletextpad=0.3,
         labelspacing=0.15,
-        columnspacing=0.5,
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -965,7 +969,6 @@ def main(
             help="Standard gzip and BGZF inputs [default: genomes-100k genomes-100k-bgzf-zlib]"
         ),
     ] = None,
-    b200_workers: Annotated[int, typer.Option()] = 64,
     stage: Annotated[
         list[Path] | None,
         typer.Option(
@@ -1011,7 +1014,7 @@ def main(
     cardinality_latency(hll_gh200, hll_rtx5090, hll_items)
     pairwise_error(pairwise_accuracy)
     b200_inflate(b200_csv)
-    b200_build(b200_log, b200_input, b200_workers)
+    b200_build(b200_log, b200_input)
     io_backend_build(ablation)
     micro_ops()
     micro_energy(runs)
