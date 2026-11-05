@@ -379,8 +379,8 @@ def build_medians(paths: list[Path]) -> list[tuple[str, float, float]]:
     )
 
 
-def b300_inflate(csv: Path) -> None:
-    """b300_inflate.pdf (B300 hardware DE vs. SM nvCOMP isolated inflation throughput)."""
+def b200_inflate(csv: Path) -> None:
+    """b200_inflate.pdf (B200 hardware DE vs. SM nvCOMP isolated inflation throughput)."""
     import pandas as pd
 
     df_inf = pd.read_csv(csv)
@@ -388,7 +388,7 @@ def b300_inflate(csv: Path) -> None:
 
     fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
     ax = fig.add_axes((0.21, 0.23, 0.75, 0.72))
-    # The CSV names each input by its staging path on the B300 host.
+    # The CSV names each input by its staging path on the B200 host.
     inputs_order = ["genomes-10k-spread", "genomes-10k-spread-bgzf-zlib"]
     input_labels = ["Standard gzip\n($\\leq 4$ MiB)", "BGZF\n(bgzip)"]
     x = np.arange(len(inputs_order))
@@ -424,8 +424,8 @@ def b300_inflate(csv: Path) -> None:
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.savefig(out_dir / "b300_inflate.pdf")
-    fig.savefig(out_dir / "b300_inflate.png")
+    fig.savefig(out_dir / "b200_inflate.pdf")
+    fig.savefig(out_dir / "b200_inflate.png")
     plt.close(fig)
 
 
@@ -469,8 +469,8 @@ def io_backend_build(ablation: list[Path]) -> None:
     plt.close(fig)
 
 
-def b300_build(log: Path, inputs: list[str], workers: int) -> None:
-    """b300_build_100k.pdf (B300 build time per backend on standard gzip and BGZF)."""
+def b200_build(log: Path, inputs: list[str], workers: int) -> None:
+    """b200_build_100k.pdf (B200 build time per backend on standard gzip and BGZF)."""
     seconds: dict[tuple[str, str], list[float]] = defaultdict(list)
     for line in log.read_text().splitlines():
         if line.startswith("RESULT "):
@@ -528,8 +528,8 @@ def b300_build(log: Path, inputs: list[str], workers: int) -> None:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    fig.savefig(out_dir / "b300_build_100k.pdf")
-    fig.savefig(out_dir / "b300_build_100k.png")
+    fig.savefig(out_dir / "b200_build_100k.pdf")
+    fig.savefig(out_dir / "b200_build_100k.png")
     plt.close(fig)
 
 
@@ -953,19 +953,19 @@ def main(
             "results/ablation-mogon-*.jsonl]"
         ),
     ] = None,
-    b300_csv: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path(
-        "results/b300-inflate-10k.csv"
+    b200_csv: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path(
+        "results/b200-inflate-10k.csv"
     ),
-    b300_log: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path(
-        "results/b300-build-100k.log"
+    b200_log: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path(
+        "results/b200-build-100k.log"
     ),
-    b300_input: Annotated[
+    b200_input: Annotated[
         list[str] | None,
         typer.Option(
             help="Standard gzip and BGZF inputs [default: genomes-100k genomes-100k-bgzf-zlib]"
         ),
     ] = None,
-    b300_workers: Annotated[int, typer.Option()] = 48,
+    b200_workers: Annotated[int, typer.Option()] = 64,
     stage: Annotated[
         list[Path] | None,
         typer.Option(
@@ -983,10 +983,10 @@ def main(
         ],
         "--ablation",
     )
-    b300_input = b300_input or ["genomes-100k", "genomes-100k-bgzf-zlib"]
-    if len(b300_input) != 2:
+    b200_input = b200_input or ["genomes-100k", "genomes-100k-bgzf-zlib"]
+    if len(b200_input) != 2:
         raise typer.BadParameter(
-            "give the standard gzip and the BGZF input", param_hint="--b300-input"
+            "give the standard gzip and the BGZF input", param_hint="--b200-input"
         )
     stage = existing(
         stage
@@ -1010,8 +1010,8 @@ def main(
     cardinality_accuracy(hll_accuracy, bbtools_accuracy)
     cardinality_latency(hll_gh200, hll_rtx5090, hll_items)
     pairwise_error(pairwise_accuracy)
-    b300_inflate(b300_csv)
-    b300_build(b300_log, b300_input, b300_workers)
+    b200_inflate(b200_csv)
+    b200_build(b200_log, b200_input, b200_workers)
     io_backend_build(ablation)
     micro_ops()
     micro_energy(runs)
