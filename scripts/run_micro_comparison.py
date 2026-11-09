@@ -16,7 +16,7 @@ Every wall is a whole process, timed from spawn to exit, one operation per proce
   `--sketch-only`.
 - COMPARE: pairs to similarity rows in one batched invocation per tool:
   cuDDL's wall is its search CLI without an index (load the reference database,
-  sketch FASTX queries, compare, download results to the host and discard them);
+  sketch FASTX queries, compare, and write one binary similarity per pair);
   RabbitSketch's wall loads its reference sketch file and sketches FASTX
   queries; SimdSketch's wall loads its reference sketch file, sketches batch FASTX
   queries, and writes one binary similarity per pair; cub-exact keeps no sketch file, so its
@@ -310,10 +310,9 @@ def cuddl_search_command(
 
     FASTX @p queries are sketched and searched against every reference; None searches the
     database rows against each other, each unordered pair once. Results are each pair's
-    weighted k-mer identity, the similarity the other tools report, and go to `/dev/null`:
-    every row still reaches the host, but a full corpus would otherwise spend the wall writing
-    tens of gigabytes to disk. A nonzero @p top_k keeps each genome's best @p top_k neighbours
-    on the device and writes only those.
+    weighted k-mer identity, the similarity the other tools report, written to
+    `<work>/<name>.bin` as the other tools write theirs into @p work. A nonzero @p top_k keeps
+    each genome's best @p top_k neighbours on the device and writes only those.
     """
     # --config belongs to the top-level app, --all-to-all to the search subcommand.
     before, after = [], ["--all-to-all"]
@@ -331,7 +330,7 @@ def cuddl_search_command(
         *after,
         *(["--index", str(index)] if index else []),
         "--output",
-        os.devnull,
+        str(work / f"{name}.bin"),
         "--records",
         "similarity",
         "--minimum-matches",
@@ -2730,7 +2729,7 @@ def main(
                 f"{_CUDDL_DEVICE_PHASES[topology]}_exhaustive"
             ]
             # Wall is the CLI: load the database, sketch FASTX queries (batch) or reuse its
-            # rows (all-to-all, unique pairs only), compare, and discard the binary results.
+            # rows (all-to-all, unique pairs only), compare, and write the binary similarities.
             cuddl_db = cuddl_reference_database(references, "cuddl-compare")
             typer.echo(f"  cuddl compare: CLI wall ({topology})")
             marks = wall_of(
@@ -3149,8 +3148,8 @@ def main(
             search_phases["cuddl"] = phases
             resident_timings[("cuddl", "search")] = pipe["timings"][device_phase]
             # Wall is the CLI: load the database and the saved index, sketch FASTX queries
-            # (batch) or reuse its rows (all-to-all, unique pairs only), search, and discard
-            # the binary results.
+            # (batch) or reuse its rows (all-to-all, unique pairs only), search, and write the
+            # binary similarities.
             # Index construction is timed separately as index_build.
             search_db = cuddl_reference_database(search_references, "cuddl-search")
             search_index_file = search_db.with_suffix(f".{cuddl_index}.index")
@@ -3214,7 +3213,6 @@ def main(
                     search_index_file,
                     top_k,
                 )
-                command[command.index(os.devnull)] = str(out)
                 run_timed(f"{name}: passing pairs for accuracy", command)
                 # Searches with an index, threshold or top-k write 12-byte similarity records:
                 # query_id, reference_id and a float.
