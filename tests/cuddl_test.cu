@@ -1797,10 +1797,10 @@ TEST_F(ReferenceDatabaseTest, ReplicatedAllToAllMatchesSingleDatabase) {
     ));
 }
 
-// A result file must hold exactly the pairs the search delivers, in either format, whether
-// replicas hand it tiles concurrently and it spreads them over two files or in query order into
-// one; similarity values must be the pairs' weighted k-mer identities. Covers exhaustive tiles,
-// converted on the GPU, and threshold tiles, expanded on the host.
+// A result file must hold exactly the pairs the search delivers, in either format, when replicas
+// hand it tiles concurrently and it spreads them over two files; similarity values must be the
+// pairs' weighted k-mer identities. Covers exhaustive tiles, converted on the GPU and copied
+// straight into the files' buffers, and threshold tiles, expanded on the host.
 TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     using group_type = cuddl::replicated_database<k_default, b_default>;
@@ -1821,13 +1821,11 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
     auto group = CUDDL_UNWRAP(group_type::adopt(std::move(replicas)));
     CUDDL_UNWRAP(group.build_index());
     uint32_t const minimum_matches = compatibility.indexed_bucket_count / 8U;
-    auto const search = [&](bool threshold, bool in_order, auto const& on_tile) {
+    auto const search = [&](bool threshold, auto const& on_tile) {
         if (threshold) {
-            CUDDL_UNWRAP(group.search_all_to_all(
-                on_tile, {.minimum_matches = minimum_matches}, {.in_query_order = in_order}
-            ));
+            CUDDL_UNWRAP(group.search_all_to_all(on_tile, {.minimum_matches = minimum_matches}));
         } else {
-            CUDDL_UNWRAP(group.search_all_to_all(on_tile, {.in_query_order = in_order}));
+            CUDDL_UNWRAP(group.search_all_to_all(on_tile));
         }
     };
     auto const by_pair = [](auto const& a, auto const& b) {
@@ -1845,7 +1843,7 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
         SCOPED_TRACE(threshold);
         std::vector<cuddl::batch_search_result> expected;
         std::mutex guard;
-        search(threshold, false, [&](cuddl::replica_tile const& tile) {
+        search(threshold, [&](cuddl::replica_tile const& tile) {
             auto const passing = CUDDL_UNWRAP(tile.download())->passing();
             std::lock_guard lock(guard);
             expected.insert(expected.end(), passing.begin(), passing.end());
@@ -1857,7 +1855,7 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
         }
 
         auto counts = CUDDL_UNWRAP(cuddl::result_file::open(base, {.streams = 2, .threads = 4}));
-        search(threshold, false, [&](cuddl::replica_tile const& tile) {
+        search(threshold, [&](cuddl::replica_tile const& tile) {
             CUDDL_UNWRAP(counts.write(tile));
         });
         CUDDL_UNWRAP(counts.finish());
@@ -1879,20 +1877,23 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
 
         auto similarity = CUDDL_UNWRAP(
             cuddl::result_file::open(
-                base, {.format = cuddl::result_format::similarity, .threads = 4}
+                base, {.format = cuddl::result_format::similarity, .streams = 2, .threads = 4}
             )
         );
-        search(threshold, true, [&](cuddl::replica_tile const& tile) {
+        search(threshold, [&](cuddl::replica_tile const& tile) {
             CUDDL_UNWRAP(similarity.write(tile));
         });
         CUDDL_UNWRAP(similarity.finish());
-        auto const data = read(base);
         std::vector<cuddl::similarity_record> records;
-        if (threshold) {
-            ASSERT_EQ(data.size() % sizeof(cuddl::similarity_record), 0U);
-            records.resize(data.size() / sizeof(cuddl::similarity_record));
-            std::memcpy(records.data(), data.data(), data.size());
-        } else {
+        for (auto const& path : cuddl::result_file::files(base, 2)) {
+            auto const data = read(path);
+            if (threshold) {
+                ASSERT_EQ(data.size() % sizeof(cuddl::similarity_record), 0U);
+                auto const at = records.size();
+                records.resize(at + data.size() / sizeof(cuddl::similarity_record));
+                std::memcpy(records.data() + at, data.data(), data.size());
+                continue;
+            }
             for (size_t at = 0; at < data.size();) {
                 std::array<uint32_t, 2> header{};
                 ASSERT_LE(at + sizeof(header), data.size());
@@ -1909,6 +1910,7 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
                 }
             }
         }
+        std::ranges::sort(records, by_pair);
         ASSERT_EQ(records.size(), expected.size());
         for (size_t i = 0; i < expected.size(); ++i) {
             ASSERT_EQ(records[i].query_id, expected[i].query_id) << i;

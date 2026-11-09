@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -94,13 +95,15 @@ struct packed_identity {
  * @brief Writes search results to files while the GPUs search on.
  *
  * Pass every tile a search delivers to @ref write, from its `on_tile` callback. A write copies
- * the tile to pinned host memory, or in @ref result_format::similarity converts it on the GPU
- * first, and returns; a thread of the file's expands it into records on every core and writes
- * them, bypassing the page cache where the file system allows. Each stream that delivers tiles
- * gets two host buffers, so its next tile downloads while the last one is written; a write
- * waits only when both are still being written. Tiles reach the file in the order their writes
- * finish downloading, which is the search order when callbacks run one at a time. The buffers
- * are freed on those streams, so call @ref finish, or destroy the file, while they live.
+ * the tile to pinned host memory and returns; a thread of the file's expands it into records on
+ * every core and writes them, bypassing the page cache where the file system allows. Each stream
+ * that delivers tiles gets two host buffers, so its next tile downloads while the last one is
+ * written; a write waits only when both are still being written. In
+ * @ref result_format::similarity, a tile that holds every pair is converted on the GPU and
+ * copied straight into the file's page-locked write buffer instead. Tiles reach the file in the
+ * order their writes finish downloading, which is the search order when callbacks run one at a
+ * time. The buffers are freed on those streams, so call @ref finish, or destroy the file, while
+ * they live.
  *
  * @code
  * auto file = CUDDL_TRY(cuddl::result_file::open("pairs.bin"));
@@ -167,19 +170,10 @@ class result_file {
 
    private:
     using clock = std::chrono::steady_clock;
-    using pinned_floats =
-        cuda::buffer<float, cuda::mr::host_accessible, cuda::mr::device_accessible>;
 
     /// One tile on its way to the file.
     struct slot {
         std::optional<host_batch_results> host;
-        // A tile holding every pair, in the similarity format, converted on the GPU.
-        std::optional<cuda::device_buffer<float>> device;
-        std::optional<pinned_floats> floats;
-        bool converted = false;
-        uint32_t first_query_id = 0;
-        uint32_t query_count = 0;
-        uint64_t pairs = 0;
         bool queued = false;
     };
 
@@ -202,10 +196,20 @@ class result_file {
               ),
               pool(threads) {
             auto const paths = files(path, options.streams);
+            detail::file_extent_hooks hooks;
+            if (format == result_format::similarity) {
+                // write_converted copies from the GPU straight into the files' memory.
+                hooks.allocated = [](char* data, size_t bytes) {
+                    CUDDL_CUDA_CALL(cudaHostRegister(data, bytes, cudaHostRegisterPortable));
+                };
+                hooks.freeing = [](char* data) {
+                    static_cast<void>(cudaHostUnregister(data));
+                };
+            }
             for (auto const& file : paths) {
                 streams.push_back(
                     std::make_unique<detail::file_writer>(
-                        file, options.durable, (size_t{1} << 30) / paths.size()
+                        file, options.durable, (size_t{1} << 30) / paths.size(), hooks
                     )
                 );
             }
@@ -218,6 +222,9 @@ class result_file {
         }
 
         Result<void> write(batch_result_tile const& tile, cuda::stream_ref stream) {
+            if (format == result_format::similarity && tile.pass_bits == nullptr) {
+                return write_converted(tile, stream);
+            }
             slot* free = nullptr;
             {
                 std::unique_lock lock(mutex);
@@ -257,6 +264,7 @@ class result_file {
             auto const start = clock::now();
             stop();
             slots.clear();
+            converted.clear();
             if (failure) return Err(error_of(failure));
             try {
                 for (auto& file : streams) file->finish();
@@ -268,57 +276,83 @@ class result_file {
             return Ok();
         }
 
-        /// Copies @p tile into @p into, converting it on the GPU first in the similarity format
-        /// when it holds every pair; synchronises @p stream.
-        Result<void>
-        download(batch_result_tile const& tile, cuda::stream_ref stream, slot& into) const {
-            into.converted = format == result_format::similarity && tile.pass_bits == nullptr;
-            if (!into.converted) {
-                if (!into.host) CUDDL_TRY(cuda_try([&] { into.host.emplace(stream); }));
-                return cuddl::download(tile, stream, *into.host);
+        /// Copies @p tile into @p into; synchronises @p stream.
+        static Result<void>
+        download(batch_result_tile const& tile, cuda::stream_ref stream, slot& into) {
+            if (!into.host) CUDDL_TRY(cuda_try([&] { into.host.emplace(stream); }));
+            return cuddl::download(tile, stream, *into.host);
+        }
+
+        /// Converts @p tile, which holds every pair, to similarities on the GPU and copies them
+        /// straight into the bytes a file reserves. Host threads copying a tile out of a download
+        /// buffer would compete with the next download for memory bandwidth: on an RTX PRO 6000
+        /// node, 40,000 genomes searched and downloaded in 465-487 ms this way and in 812-844 ms
+        /// with that copy. Synchronises @p stream.
+        Result<void> write_converted(batch_result_tile const& tile, cuda::stream_ref stream) {
+            std::optional<cuda::device_buffer<float>>* scratch = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (failure) return Err(error_of(failure));
+                if (done) return Err(Error::invalid_argument("the result file is finished"));
+                scratch = &converted[stream.get()];
             }
             detail::device_scope const scope{stream};
             auto const pairs = static_cast<size_t>(tile.slot_count());
-            if (!into.device || into.device->size() < pairs) {
+            if (!*scratch || (*scratch)->size() < pairs) {
                 CUDDL_TRY(cuda_try([&] {
-                    into.device.emplace(
+                    scratch->emplace(
                         cuda::make_device_buffer<float>(
                             stream, stream.device(), pairs, cuda::no_init
                         )
                     );
-                    into.floats.emplace(
-                        stream,
-                        detail::device_pinned_pool(
-                            stream.device(), detail::pinned_placement::device_node
-                        ),
-                        pairs,
-                        cuda::no_init
-                    );
                 }));
             }
-            detail::uplink_lock const uplink(stream.device().get());
-            if (pairs != 0U) {
-                CUDDL_CUDA_TRY(
-                    cub::DeviceTransform::Transform(
-                        tile.results,
-                        into.device->data(),
-                        pairs,
-                        detail::packed_identity{tile.bucket_count},
-                        stream.get()
-                    )
-                );
-                CUDDL_CUDA_TRY(
-                    cuda::copy_bytes(
-                        stream,
-                        cuda::std::span{into.device->data(), pairs},
-                        cuda::std::span{into.floats->data(), pairs}
-                    )
-                );
+            auto& file = next_stream();
+            std::array const header{tile.first_query_id, tile.query_count};
+            auto const waiting = clock::now();
+            std::span<char> out;
+            try {
+                out = file.reserve(sizeof(header) + pairs * sizeof(float));
+            } catch (std::exception const& error) {
+                return Err(Error::resource(error.what()));
             }
-            CUDDL_CUDA_TRY(stream.sync());
-            into.first_query_id = tile.first_query_id;
-            into.query_count = tile.query_count;
-            into.pairs = pairs;
+            auto const start = clock::now();
+            std::memcpy(out.data(), header.data(), sizeof(header));
+            // Records and headers are whole 4-byte words, so the floats start word-aligned.
+            auto* const floats = reinterpret_cast<float*>(out.data() + sizeof(header));
+            auto const copied = [&]() -> Result<void> {
+                detail::uplink_lock const uplink(stream.device().get());
+                if (pairs != 0U) {
+                    CUDDL_CUDA_TRY(
+                        cub::DeviceTransform::Transform(
+                            tile.results,
+                            (*scratch)->data(),
+                            pairs,
+                            detail::packed_identity{tile.bucket_count},
+                            stream.get()
+                        )
+                    );
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            cuda::std::span{(*scratch)->data(), pairs},
+                            cuda::std::span{floats, pairs}
+                        )
+                    );
+                }
+                CUDDL_CUDA_TRY(stream.sync());
+                return Ok();
+            }();
+            if (!copied) {
+                file.abandon();
+                return copied;
+            }
+            file.commit();
+            std::lock_guard lock(mutex);
+            statistics.stall_seconds += std::chrono::duration<double>(start - waiting).count();
+            statistics.download_seconds += seconds_since(start);
+            statistics.pairs += pairs;
+            statistics.bytes += out.size();
             return Ok();
         }
 
@@ -372,7 +406,7 @@ class result_file {
         }
 
         detail::file_writer& next_stream() {
-            return *streams[next_file++ % streams.size()];
+            return *streams[next_file.fetch_add(1) % streams.size()];
         }
 
         void count(uint64_t pairs, uint64_t bytes) {
@@ -382,25 +416,6 @@ class result_file {
         }
 
         void write_tile(slot const& tile) {
-            if (tile.converted) {
-                auto& file = next_stream();
-                auto const bytes = tile.pairs * sizeof(float);
-                auto const out = file.reserve(2 * sizeof(uint32_t) + bytes);
-                std::array const header{tile.first_query_id, tile.query_count};
-                std::memcpy(out.data(), header.data(), sizeof(header));
-                // A tile can hold gigabytes, more than one core copies in time.
-                constexpr size_t piece = size_t{8} << 20;
-                auto const* source = reinterpret_cast<char const*>(tile.floats->data());
-                pool.for_each((bytes + piece - 1) / piece, [&](size_t p) {
-                    auto const at = p * piece;
-                    std::memcpy(
-                        out.data() + sizeof(header) + at, source + at, std::min(piece, bytes - at)
-                    );
-                });
-                file.commit();
-                count(tile.pairs, out.size());
-                return;
-            }
             auto const results = tile.host->tile();
             if (format == result_format::counts) {
                 expand(results, [](batch_search_result const& result) { return result; });
@@ -474,11 +489,13 @@ class result_file {
 
         result_format format;
         std::vector<std::unique_ptr<detail::file_writer>> streams;
-        size_t next_file = 0;
+        std::atomic<size_t> next_file = 0;
         size_t threads;
         detail::worker_pool pool;
         std::vector<uint32_t> bounds;
         std::map<cudaStream_t, std::pair<std::array<slot, 2>, unsigned>> slots;
+        /// Per stream, the GPU-side similarities of the last tile write_converted converted.
+        std::map<cudaStream_t, std::optional<cuda::device_buffer<float>>> converted;
         std::deque<job> queue;
         std::mutex mutex;
         std::condition_variable queued, written;

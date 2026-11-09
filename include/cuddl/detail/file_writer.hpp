@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,15 @@
 #include <cuddl/detail/io_ring.hpp>
 
 namespace cuddl::detail {
+
+/// @brief Called with a @ref file_writer extent's memory once after allocating it and once
+/// before freeing it, for example to page-lock it so a GPU copies straight into a reservation.
+struct file_extent_hooks {
+    std::function<void(char*, size_t)> allocated = [](char*, size_t) {
+    };
+    std::function<void(char*)> freeing = [](char*) {
+    };
+};
 
 /// @brief Writes a file from a thread of its own, so the caller produces the next bytes while
 /// earlier ones reach storage.
@@ -61,9 +71,10 @@ class file_writer {
     file_writer(
         std::filesystem::path const& path,
         bool durable,
-        size_t queued_limit = size_t{1} << 30
+        size_t queued_limit = size_t{1} << 30,
+        file_extent_hooks hooks = {}
     )
-        : path_(path), queued_limit_(queued_limit), durable_(durable) {
+        : path_(path), queued_limit_(queued_limit), durable_(durable), hooks_(std::move(hooks)) {
         int const flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
         fd_ = ablated("direct-io") ? -1 : ::open(path.c_str(), flags | O_DIRECT, 0644);
         direct_ = fd_ != -1;
@@ -106,6 +117,9 @@ class file_writer {
         stop();
         if (fd_ != -1) ::close(fd_);
         if (buffered_fd_ != -1) ::close(buffered_fd_);
+        for (auto const& extent : extents_) {
+            if (extent->data) hooks_.freeing(extent->data.get());
+        }
     }
 
     /// @brief Space for the next @p bytes of the file, for the caller to fill and then hand
@@ -126,6 +140,13 @@ class file_writer {
     void commit() {
         queue_current(false);
         reservation_.unlock();
+    }
+
+    /// @brief Drops the last @ref reserve without writing its bytes, as if it had reserved
+    /// none.
+    void abandon() {
+        reserved_ = 0;
+        commit();
     }
 
     /// @brief Copies @p chunks, which reach the file together and in order; waits while the
@@ -230,6 +251,7 @@ class file_writer {
             if (!free_.empty()) {
                 auto* const smallest = free_.front();
                 free_.erase(free_.begin());
+                hooks_.freeing(smallest->data.get());
                 std::erase_if(extents_, [&](auto const& e) { return e.get() == smallest; });
             }
             auto fresh = std::make_unique<extent>();
@@ -245,6 +267,7 @@ class file_writer {
             // kernel. With 72 threads filling them, a GH200 CLI search writing 120 GB took 15 s
             // of kernel time and 1.38 s against 1.15 s on small pages. The advice is only a hint.
             static_cast<void>(::madvise(fresh->data.get(), fresh->capacity, MADV_NOHUGEPAGE));
+            hooks_.allocated(fresh->data.get(), fresh->capacity);
             chosen = extents_.emplace_back(std::move(fresh)).get();
         }
         queued_ += chosen->capacity;
@@ -456,6 +479,7 @@ class file_writer {
     /// The same file without O_DIRECT, for a writer that need not be durable.
     int buffered_fd_ = -1;
     bool direct_ = false;
+    file_extent_hooks hooks_;
     std::unique_ptr<io_ring> ring_;
 
     // Producer state, guarded by append_mutex_, which a reservation holds until its commit.
