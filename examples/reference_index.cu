@@ -21,7 +21,7 @@
 
 namespace {
 
-// Binary output is cuddl::result_file's counts format, documented in README.md.
+// Binary output is cuddl::result_file's counts or similarity format, documented in README.md.
 
 /// Query genomes sketched per batch; each batch then runs as one batched search.
 constexpr size_t query_batch_size = 4096;
@@ -35,12 +35,12 @@ using replicated_type = cuddl::replicated_database<cli::kmer_length, cli::bucket
 /// `cuddl::result_file`, which writes while the search goes on.
 class result_writer {
    public:
-    explicit result_writer(std::filesystem::path const& output) {
+    result_writer(std::filesystem::path const& output, cuddl::result_format records) {
         if (output.empty()) {
             std::cout << "query_id\treference_id\tlower\tequal\thigher\tboth_empty\n";
             return;
         }
-        binary_.emplace(CUDDL_UNWRAP(cuddl::result_file::open(output)));
+        binary_.emplace(CUDDL_UNWRAP(cuddl::result_file::open(output, {.format = records})));
     }
 
     /// Writes the passing results of a device tile before its storage is reused.
@@ -175,6 +175,7 @@ void search_all_to_all(
     cuddl::reference_database_file const& file,
     std::filesystem::path const& index_path,
     std::filesystem::path const& output,
+    cuddl::result_format records,
     uint32_t minimum_matches,
     uint32_t top_k,
     std::span<cuda::device_ref const> devices
@@ -182,7 +183,7 @@ void search_all_to_all(
     auto group = CUDDL_UNWRAP(replicated_type::upload(file, devices));
     if (!index_path.empty()) CUDDL_UNWRAP(group.load_index(index_path));
     // Destroyed before the replicas' streams, on which it frees its download buffers.
-    result_writer writer(output);
+    result_writer writer(output, records);
     auto run = [&](auto const& on_tile, const cuddl::replica_search& split) {
         // Without an index or a threshold every pair is reported, so the exhaustive search runs.
         if (index_path.empty() && minimum_matches == 0) {
@@ -307,6 +308,24 @@ int main(int argc, char** argv) {
         output,
         "Write binary result records here instead of TSV on standard output (replaces file)"
     );
+    auto records = cuddl::result_format::counts;
+    query
+        ->add_option(
+            "--records",
+            records,
+            "Binary records: counts (24-byte bucket counts) or similarity (weighted k-mer "
+            "identity as a 4-byte float)"
+        )
+        ->needs(query->get_option("--output"))
+        ->transform(
+            CLI::CheckedTransformer(
+                std::map<std::string, cuddl::result_format>{
+                    {"counts", cuddl::result_format::counts},
+                    {"similarity", cuddl::result_format::similarity}
+                }
+            )
+        )
+        ->default_str("counts");
     query->add_option("--workers", workers, "Concurrent query genome loaders")
         ->check(CLI::PositiveNumber);
     (*query)
@@ -363,7 +382,7 @@ int main(int argc, char** argv) {
                 }
                 devices.push_back(cuda::devices[id]);
             }
-            search_all_to_all(file, index_path, output, minimum_matches, top_k, devices);
+            search_all_to_all(file, index_path, output, records, minimum_matches, top_k, devices);
             return 0;
         }
         cuda::stream stream{cuda::devices[0]};
@@ -387,7 +406,7 @@ int main(int argc, char** argv) {
         if (!file.blacklist().keys().empty()) {
             blacklist.emplace(file.blacklist(), cli::buckets, stream);
         }
-        result_writer writer(output);
+        result_writer writer(output, records);
         search(
             database,
             index ? &*index : nullptr,

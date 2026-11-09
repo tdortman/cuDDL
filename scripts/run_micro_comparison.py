@@ -309,10 +309,11 @@ def cuddl_search_command(
     """Returns a CLI search that loads @p database (and @p index).
 
     FASTX @p queries are sketched and searched against every reference; None searches the
-    database rows against each other, each unordered pair once. Binary results go to
-    `/dev/null`: every row still reaches the host, but a full corpus would otherwise spend the
-    wall writing tens of gigabytes to disk. A nonzero @p top_k keeps each genome's best
-    @p top_k neighbours on the device and writes only those.
+    database rows against each other, each unordered pair once. Results are each pair's
+    weighted k-mer identity, the similarity the other tools report, and go to `/dev/null`:
+    every row still reaches the host, but a full corpus would otherwise spend the wall writing
+    tens of gigabytes to disk. A nonzero @p top_k keeps each genome's best @p top_k neighbours
+    on the device and writes only those.
     """
     # --config belongs to the top-level app, --all-to-all to the search subcommand.
     before, after = [], ["--all-to-all"]
@@ -331,6 +332,8 @@ def cuddl_search_command(
         *(["--index", str(index)] if index else []),
         "--output",
         os.devnull,
+        "--records",
+        "similarity",
         "--minimum-matches",
         str(minimum_matches),
         "--workers",
@@ -3213,11 +3216,12 @@ def main(
                 )
                 command[command.index(os.devnull)] = str(out)
                 run_timed(f"{name}: passing pairs for accuracy", command)
-                # Each record is query_id, reference_id and four uint32 counts.
+                # Searches with an index, threshold or top-k write 12-byte similarity records:
+                # query_id, reference_id and a float.
                 ids = array.array("I", out.read_bytes())
                 out.unlink()
                 scores = {}
-                for query_id, reference_id in zip(ids[0::6], ids[1::6]):
+                for query_id, reference_id in zip(ids[0::3], ids[1::3]):
                     query = str(cli_queries[query_id])
                     reference = str(search_references[reference_id])
                     ani = compare_ani.get(
