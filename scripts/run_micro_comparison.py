@@ -406,6 +406,17 @@ def energy_metrics(marks: list[float], unit: str, count: int) -> dict:
     return metrics
 
 
+def output_files(root: Path) -> dict[str, tuple[int, int]]:
+    """Every file under @p root, by path, with its modification time and size."""
+    found = {}
+    for directory, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(directory, name)
+            status = os.lstat(path)
+            found[path] = (status.st_mtime_ns, status.st_size)
+    return found
+
+
 def wall_of(
     command: list[str] | list[list[str]],
     samples: int,
@@ -414,20 +425,35 @@ def wall_of(
     prepare: Callable[[], None] | None = None,
     resident_skip: int = 0,
     log_tail: bool = False,
+    fresh: Path | None = None,
+    before: dict[str, tuple[int, int]] | None = None,
 ) -> Marks:
     """Times @p command, a command or a group run back to back, per rep.
 
     @p prepare runs untimed before each rep. Resident timings sum over the group, except its
     first @p resident_skip commands, which count toward wall time only.
+
+    Files under @p fresh that differ from @p before (default: their state when the call starts)
+    are deleted before every rep, so every rep writes new files, as a single run does; the last
+    rep's stay. On ext4, closing a rewritten truncated file writes its dirty pages back to the
+    drive (`auto_da_alloc`): on a PM9A3, 7.2 GB of cuDDL results took 1.4 s into a new file
+    and 5.8-6.1 s over the last one.
     """
     groups: list[list[str]] = (
         [list(item) for item in command]
         if command and isinstance(command[0], list)
         else [[str(arg) for arg in command]]
     )
+
+    if fresh is not None and before is None:
+        before = output_files(fresh)
     marks = Marks()
     marks.energy = []
     for rep in range(warmups + samples):
+        if fresh is not None:
+            for path, state in output_files(fresh).items():
+                if before.get(path) != state:
+                    os.unlink(path)
         if prepare is not None:
             prepare()
         resident_parts: list[dict] = []
@@ -1196,6 +1222,7 @@ def main(
             f"  {tool} {operation}: timing at {', '.join(map(str, thread_counts))} threads"
         )
         best: tuple[list[float], list[dict], int] | None = None
+        before = output_files(work)
         for count in thread_counts:
             built = command(count)
             groups: list[list[str]] = (
@@ -1209,6 +1236,8 @@ def main(
                 samples,
                 warmups,
                 resident=records if resident is not None else None,
+                fresh=work,
+                before=before,
                 **options,
             )
             if best is None or statistics.median(marks) < statistics.median(best[0]):
@@ -1800,6 +1829,7 @@ def main(
                 warmups,
                 resident=cuddl_resident,
                 log_tail=True,
+                fresh=work,
             )
             record_native_resident("cuddl", "sketch", cuddl_resident)
             sketch_times["cuddl"] = marks
@@ -2271,6 +2301,7 @@ def main(
                 samples,
                 warmups,
                 log_tail=True,
+                fresh=work,
             )
             cub_compare_marks = wall_of(
                 [
@@ -2285,6 +2316,7 @@ def main(
                 samples,
                 warmups,
                 log_tail=True,
+                fresh=work,
             )
             sketch_times["cub-exact"] = cub_sketch_marks
             resident_timings[("cub-exact", "sketch")] = payload["phases_ms"][
@@ -2745,6 +2777,7 @@ def main(
                 ),
                 samples,
                 warmups,
+                fresh=work,
             )
             native_timings[("cuddl", "compare")] = {"wall": summarize(marks)}
             record_compare(
@@ -3180,6 +3213,7 @@ def main(
                 ),
                 samples,
                 warmups,
+                fresh=work,
             )
             native_timings[("cuddl", "search")] = {
                 "query": summarize(marks),
@@ -3264,6 +3298,7 @@ def main(
                     ),
                     samples,
                     warmups,
+                    fresh=work,
                 )
                 native_timings[("cuddl", "top-k")] = {
                     "query": summarize(top_marks),
