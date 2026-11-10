@@ -149,7 +149,7 @@ def main(
         typer.Option(
             help="Leave out optimisations, and machines, within this factor of 1 everywhere"
         ),
-    ] = 1.15,
+    ] = 1.25,
     top_n: Annotated[
         int,
         typer.Option(
@@ -180,10 +180,35 @@ def main(
 
     # An optimisation can also make a run slower, so the effect counts both ways.
     table = table.assign(effect=np.abs(np.log(table.speedup)))
-    noteworthy = table[table.effect >= np.log(minimum)]
+    e2e_labels = set(table[table.scope == "end to end"].label)
+    e2e_noteworthy = set(
+        table[
+            (table.scope == "end to end") & (table.effect >= np.log(1.15))
+        ].optimisation
+    )
+    stage_rows = table[table.scope == "stage"].groupby("optimisation")
+    stage_all = set(
+        stage_rows.filter(
+            lambda g: (
+                len(set(g.label) & e2e_labels) == len(e2e_labels)
+                and g.effect.min() >= np.log(minimum)
+            )
+        ).optimisation
+    )
+    noteworthy = table[table.optimisation.isin(e2e_noteworthy | stage_all)]
+    if "Index filtering on the GPU" in set(noteworthy.optimisation):
+        noteworthy = noteworthy[
+            ~noteworthy.optimisation.isin({"Low-plane match filter", "Inverted index"})
+        ]
+    paired_opts = (
+        set(table[table.scope == "stage"].optimisation)
+        & set(table[table.scope == "end to end"].optimisation)
+        if e2e_labels
+        else set(table.optimisation)
+    )
     table = table[
-        table.optimisation.isin(noteworthy.optimisation)
-        & table.label.isin(noteworthy.label)
+        table.optimisation.isin(set(noteworthy.optimisation) & paired_opts)
+        & table.label.isin(table[table.effect >= np.log(minimum)].label)
     ]
     end_to_end = (
         table[table.scope == "end to end"].groupby("optimisation").speedup.max()
@@ -216,7 +241,7 @@ def main(
         selected,
         key=lambda o: (
             stage_rank[stage_of[o]],
-            end_to_end.get(o, 0.0) if end_to_end.get(o, 0.0) >= minimum else 0.0,
+            end_to_end.get(o, 0.0) if end_to_end.get(o, 0.0) >= 1.15 else 0.0,
             stage.get(o, 0.0),
         ),
     )
