@@ -659,6 +659,8 @@ def e2e(
                 "bytes_written": report["bytes_written_total"],
             }
 
+        if configs:
+            run(configs[0])
         run_suite("e2e", label, output, configs, ablations, reps, run)
 
 
