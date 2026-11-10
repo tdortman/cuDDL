@@ -10,12 +10,13 @@ logs/ceilings.sh run. Writes three panels into OUTPUT_DIR:
   that bounds it, against the genome count. Compare: device-resident pairs per second against
   the ALU ceiling (alu-power-ceiling over the search's ALU warp instructions per pair). Download:
   the 8-byte packed counts of every pair copied to the host, against one GPU's device-to-host
-  bandwidth (nvbandwidth). End-to-end results: the 4-byte similarities of the m0 pipeline's
-  search phase, against the same bandwidth. Cold read: the pipeline's gzip input over its first
-  sketch phase after an eviction (r0, m20), against buffered reads from the file system;
+  bandwidth (nvbandwidth). End-to-end results: the 4-byte similarities of the m0 pipeline over
+  the time its search spent downloading them, against the same bandwidth. Cold read: the
+  pipeline's gzip input over its first sketch phase after an eviction (r0, m20), against
+  buffered reads from the file system;
 - grid_strong.pdf: device-resident speedup over one GPU for every genome count;
 - grid_e2e.pdf: FASTA-to-results wall time against the genome count on one node and on the
-  most nodes, for cuDDL at --minimum-matches 20 and 0 (warm, median of r1-r3) and SimdSketch.
+  most nodes, for cuDDL (exhaustive all-to-all, median of r1-r3) and SimdSketch.
 """
 
 import json
@@ -120,7 +121,7 @@ def main(
     cold = median_by(runs(20, "0"), lambda r: r["input_bytes"] / phase_s(r, "sketch"))
     results_rate = median_by(
         runs(0, "123"),
-        lambda r: r["pairs_total"] * SIMILARITY_BYTES / phase_s(r, "search"),
+        lambda r: r["pairs_total"] * SIMILARITY_BYTES / phase_s(r, "download"),
     )
     stages = [
         (
@@ -218,13 +219,10 @@ def main(
     # (c) End-to-end time against the genome count, on one node and on the most nodes.
     simd = sorted(results.glob("mogon-epyc-grid-simdsketch-*.json"))
     walls = {
-        "cuDDL $m_{\\min}=20$": median_by(
-            runs(20, "123"), lambda r: r["wall_ms"] / 1e3
-        ),
-        "cuDDL $m_{\\min}=0$": median_by(runs(0, "123"), lambda r: r["wall_ms"] / 1e3),
+        "cuDDL": median_by(runs(0, "123"), lambda r: r["wall_ms"] / 1e3),
         "SimdSketch": median_by(simd, lambda r: r["wall_s"]) if simd else {},
     }
-    nodes = sorted({k[1] for k in walls["cuDDL $m_{\\min}=0$"]})
+    nodes = sorted({k[1] for k in walls["cuDDL"]})
     shown = [nodes[0], nodes[-1]] if len(nodes) > 1 else nodes
     fig, ax = plt.subplots(figsize=(2.35, 1.6))
     for (label, series), color in zip(walls.items(), ["#2E86AB", "#6A4C93", "#E76F51"]):
