@@ -116,7 +116,7 @@ def cardinality_accuracy(hll_accuracy: Path, bbtools_accuracy: Path) -> None:
     cuddl_acc, cuco_acc = ours["cuddl"], ours["cuco_hll"]
     if not len(cuddl_acc) == len(bbtools_acc) == len(cuco_acc) == 17:
         raise typer.BadParameter("expected 17 set sizes (2^8 .. 2^24) in each series")
-    fig = plt.figure(figsize=(2.3, 1.7), dpi=300)
+    fig = plt.figure(figsize=(2.05, 1.34), dpi=300)
     ax = fig.add_axes((0.19, 0.22, 0.77, 0.73))
     powers = np.arange(8, 25)
     ax.plot(
@@ -154,8 +154,12 @@ def cardinality_accuracy(hll_accuracy: Path, bbtools_accuracy: Path) -> None:
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.savefig(out_dir / "cardinality_accuracy.pdf")
-    fig.savefig(out_dir / "cardinality_accuracy.png")
+    fig.savefig(
+        out_dir / "cardinality_accuracy.pdf", bbox_inches="tight", pad_inches=0.02
+    )
+    fig.savefig(
+        out_dir / "cardinality_accuracy.png", bbox_inches="tight", pad_inches=0.02
+    )
     plt.close(fig)
     print(
         "mean abs. error: "
@@ -198,7 +202,7 @@ def cardinality_latency(hll_gh200: Path, hll_rtx5090: Path, hll_items: int) -> N
         for p in phases
     ]
 
-    fig = plt.figure(figsize=(2.3, 1.7), dpi=300)
+    fig = plt.figure(figsize=(2.05, 1.34), dpi=300)
     ax = fig.add_axes((0.34, 0.22, 0.63, 0.73))
     y_pos = np.arange(len(phases))
     h_bar = 0.32
@@ -234,8 +238,12 @@ def cardinality_latency(hll_gh200: Path, hll_rtx5090: Path, hll_items: int) -> N
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.savefig(out_dir / "cardinality_latency.pdf")
-    fig.savefig(out_dir / "cardinality_latency.png")
+    fig.savefig(
+        out_dir / "cardinality_latency.pdf", bbox_inches="tight", pad_inches=0.02
+    )
+    fig.savefig(
+        out_dir / "cardinality_latency.png", bbox_inches="tight", pad_inches=0.02
+    )
     plt.close(fig)
 
 
@@ -283,7 +291,7 @@ def pairwise_error(path: Path) -> None:
             f"{path} has no error summaries, rerun scripts/run_pairwise_accuracy.py"
         )
 
-    fig, ax = plt.subplots(figsize=(2.3, 2.2), dpi=300)
+    fig, ax = plt.subplots(figsize=(2.15, 1.75), dpi=300)
     h_bar = 0.16
     offsets = (
         np.arange(len(PAIRWISE_METRICS)) - (len(PAIRWISE_METRICS) - 1) / 2
@@ -337,8 +345,8 @@ def pairwise_error(path: Path) -> None:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     plt.tight_layout(pad=0.2, rect=(0, 0, 1, 0.88))
-    fig.savefig(out_dir / "pairwise_error.pdf")
-    fig.savefig(out_dir / "pairwise_error.png")
+    fig.savefig(out_dir / "pairwise_error.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "pairwise_error.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -386,7 +394,7 @@ def b200_inflate(csv: Path) -> None:
     df_inf = pd.read_csv(csv)
     df_inf["gbps"] = df_inf["GlobalMem BW (bytes/sec)"] / 1e9
 
-    fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
+    fig = plt.figure(figsize=(2.40, 1.50), dpi=300)
     ax = fig.add_axes((0.21, 0.23, 0.75, 0.72))
     # The CSV names each input by its staging path on the B200 host.
     inputs_order = ["genomes-10k-spread", "genomes-10k-spread-bgzf-zlib"]
@@ -424,8 +432,8 @@ def b200_inflate(csv: Path) -> None:
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.savefig(out_dir / "b200_inflate.pdf")
-    fig.savefig(out_dir / "b200_inflate.png")
+    fig.savefig(out_dir / "b200_inflate.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "b200_inflate.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -436,7 +444,7 @@ def io_backend_build(ablation: list[Path]) -> None:
     cpu_vals = [bar[1] for bar in bars]
     gpu_vals = [bar[2] for bar in bars]
 
-    fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
+    fig = plt.figure(figsize=(2.40, 1.50), dpi=300)
     ax = fig.add_axes((0.18, 0.23, 0.78, 0.72))
     x = np.arange(len(categories)) * 1.2
     width = 0.46
@@ -464,8 +472,8 @@ def io_backend_build(ablation: list[Path]) -> None:
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.savefig(out_dir / "io_backend_build.pdf")
-    fig.savefig(out_dir / "io_backend_build.png")
+    fig.savefig(out_dir / "io_backend_build.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "io_backend_build.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -479,13 +487,13 @@ def b200_build(log: Path, inputs: list[str]) -> None:
                 float(f["seconds"])
             )
     gzip, bgzf = inputs
-    # (input, backend, label, colour, line style)
+    # (input, backend, label, colour, line style, marker)
     lines = [
-        (gzip, "cpu", "cpu", "#2ca02c", "-"),
-        (gzip, "hybrid", "hybrid", "#9467bd", "-"),
-        (gzip, "gpu-cores", "gpu-cores", "#ff7f0e", "-"),
-        (gzip, "gpu", "gpu (DE)", "#1f77b4", "-"),
-        (bgzf, "gpu", "gpu (DE), BGZF", "#1f77b4", "--"),
+        (gzip, "cpu", "cpu", "#2ca02c", "-", "o"),
+        (gzip, "hybrid", "hybrid", "#9467bd", "-", "^"),
+        (gzip, "gpu-cores", "gpu-cores", "#ff7f0e", "-", "D"),
+        (gzip, "gpu", "gpu (DE)", "#1f77b4", "-", "o"),
+        (bgzf, "gpu", "gpu (DE), BGZF", "#1f77b4", (0, (2.2, 1.2)), "s"),
     ]
     # Worker counts with a single repetition are too noisy to plot.
     points = {
@@ -499,14 +507,14 @@ def b200_build(log: Path, inputs: list[str]) -> None:
         raise typer.BadParameter(f"{log} has no repeated RESULT for {empty}")
     workers = sorted({w for ws in points.values() for w in ws})
 
-    fig = plt.figure(figsize=(2.45, 1.8), dpi=300)
+    fig = plt.figure(figsize=(2.40, 1.50), dpi=300)
     ax = fig.add_axes((0.18, 0.23, 0.78, 0.72))
-    for i, b, label, colour, style in lines:
+    for i, b, label, colour, style, marker in lines:
         ax.plot(
             points[(i, b)],
             [median(seconds[(i, b, w)]) for w in points[(i, b)]],
-            style,
-            marker="o",
+            linestyle=style,
+            marker=marker,
             markersize=2.5,
             linewidth=1.1,
             color=colour,
@@ -525,15 +533,15 @@ def b200_build(log: Path, inputs: list[str]) -> None:
         loc="upper right",
         fontsize=6.0,
         borderpad=0.1,
-        handlelength=1.6,
+        handlelength=2.4,
         handletextpad=0.3,
         labelspacing=0.15,
     )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    fig.savefig(out_dir / "b200_build_100k.pdf")
-    fig.savefig(out_dir / "b200_build_100k.png")
+    fig.savefig(out_dir / "b200_build_100k.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "b200_build_100k.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -791,7 +799,7 @@ def micro_ops() -> None:
     # Colour is the slowdown against the fastest tool of each operation, so every column spans
     # its own range instead of sharing one log axis from milliseconds to days.
     slowdown = np.log10(times / np.nanmin(times, axis=0))
-    fig, ax = plt.subplots(figsize=(2.9, 2.2), dpi=300)
+    fig, ax = plt.subplots(figsize=(2.65, 1.75), dpi=300)
     ax.imshow(
         np.ma.masked_invalid(slowdown), cmap="YlOrRd", vmin=0, vmax=5.5, aspect="auto"
     )
@@ -802,6 +810,8 @@ def micro_ops() -> None:
             text = (
                 f"{seconds:.2f}"
                 if seconds < 10
+                else f"{seconds:.1f}"
+                if seconds < 100
                 else f"{seconds:.0f}"
                 if seconds < 1e4
                 else f"{seconds / 1e3:.0f}k"
@@ -813,12 +823,12 @@ def micro_ops() -> None:
             text,
             ha="center",
             va="center",
-            fontsize=5.4,
+            fontsize=6.2,
             color="white" if dark else "black",
         )
-    ax.set_xticks(range(len(ops)), ops, fontsize=5.0)
+    ax.set_xticks(range(len(ops)), ops, fontsize=5.4)
     ax.xaxis.tick_top()
-    ax.set_yticks(range(len(rows)), [name for name, _ in rows], fontsize=5.6)
+    ax.set_yticks(range(len(rows)), [name for name, _ in rows], fontsize=6.4)
     ax.tick_params(length=0, pad=1.5)
     ax.set_xticks(np.arange(len(ops) + 1) - 0.5, minor=True)
     ax.set_yticks(np.arange(len(rows) + 1) - 0.5, minor=True)
@@ -828,8 +838,8 @@ def micro_ops() -> None:
     for spine in ax.spines.values():
         spine.set_visible(False)
     plt.tight_layout(pad=0.2)
-    fig.savefig(out_dir / "micro_ops_10k.pdf")
-    fig.savefig(out_dir / "micro_ops_10k.png")
+    fig.savefig(out_dir / "micro_ops_10k.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "micro_ops_10k.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     for name, vals in tools_list:
         print(
@@ -840,7 +850,7 @@ def micro_ops() -> None:
 
 def micro_energy(runs: list[dict]) -> None:
     """micro_energy_10k.pdf (100k RefSeq stage energy: above-idle dynamic + idle baseline = total)."""
-    fig, ax = plt.subplots(figsize=(2.55, 2.2), dpi=300)
+    fig, ax = plt.subplots(figsize=(2.25, 1.75), dpi=300)
     # (name, dyn_sketch_cpu, dyn_sketch_gpu, dyn_comp_cpu, dyn_comp_gpu, tot_energy), highest first
     # so the lowest is at the top.
     energy_rows = sorted(
@@ -885,7 +895,7 @@ def micro_energy(runs: list[dict]) -> None:
                 rf"\textbf{{$\rightarrow$ {dyn_tot / 1e3:.0f}/{tot / 1e3:.0f} MJ*}}",
                 va="center",
                 ha="right",
-                fontsize=5.8,
+                fontsize=6.3,
                 color="#222222",
             )
         else:
@@ -895,7 +905,7 @@ def micro_energy(runs: list[dict]) -> None:
                 f"{dyn_tot:.1f}/{tot:.1f}",
                 va="center",
                 ha="left",
-                fontsize=6.0,
+                fontsize=6.4,
             )
     ax.set_yticks(y)
     ax.set_yticklabels(names, fontsize=7.6)
@@ -907,7 +917,7 @@ def micro_energy(runs: list[dict]) -> None:
         frameon=False,
         loc="upper right",
         bbox_to_anchor=(1.1, 1.0),
-        fontsize=5.2,
+        fontsize=6.0,
         borderpad=0.0,
         handlelength=0.6,
         handletextpad=0.2,
@@ -916,8 +926,8 @@ def micro_energy(runs: list[dict]) -> None:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     plt.tight_layout(pad=0.3)
-    fig.savefig(out_dir / "micro_energy_10k.pdf")
-    fig.savefig(out_dir / "micro_energy_10k.png")
+    fig.savefig(out_dir / "micro_energy_10k.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_dir / "micro_energy_10k.png", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     for r in energy_rows[::-1]:
         print(f"{r[0]:15} dynamic {sum(r[1:5]):12.2f} kJ  total {r[5]:12.2f} kJ")

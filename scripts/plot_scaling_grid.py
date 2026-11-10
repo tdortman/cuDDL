@@ -34,7 +34,7 @@ import typer
 # Modern switches to its wide small-size designs at these sizes.
 mpl.rcParams.update(
     {
-        "font.size": 7,
+        "font.size": 7.4,
         "text.latex.preamble": r"\usepackage{libertine}\usepackage[libertine]{newtxmath}",
     }
 )
@@ -151,7 +151,7 @@ def main(
             },
         ),
     ]
-    fig, ax = plt.subplots(figsize=(2.35, 1.6))
+    fig, ax = plt.subplots(figsize=(2.35, 1.48))
     for (label, shares), marker in zip(stages, "osD^"):
         xs = sorted(shares)
         ax.plot(
@@ -188,7 +188,7 @@ def main(
         )
 
     # (b) Device-resident strong scaling for every genome count.
-    fig, ax = plt.subplots(figsize=(2.35, 1.6))
+    fig, ax = plt.subplots(figsize=(2.35, 1.48))
     most = max(r["ranks"] for r in searches[sizes[-1]]["runs"])
     ax.plot([1, most], [1, most], color="#999999", lw=0.6, ls="--", label="Ideal")
     for n, color in zip(sizes, colors):
@@ -224,16 +224,16 @@ def main(
     }
     nodes = sorted({k[1] for k in walls["cuDDL"]})
     shown = [nodes[0], nodes[-1]] if len(nodes) > 1 else nodes
-    fig, ax = plt.subplots(figsize=(2.35, 1.6))
-    for (label, series), color in zip(walls.items(), ["#2E86AB", "#6A4C93", "#E76F51"]):
-        for count, style in zip(shown, ["-", "--"]):
+    fig, ax = plt.subplots(figsize=(2.35, 1.48))
+    for (label, series), color in zip(walls.items(), ["#2E86AB", "#E76F51"]):
+        for count, style, marker in zip(shown, ["-", (0, (2.2, 1.2))], ["o", "s"]):
             points = sorted((n, s) for (n, c), s in series.items() if c == count)
             if points:
                 ax.plot(
                     *zip(*points),
                     ls=style,
-                    marker="o",
-                    ms=2,
+                    marker=marker,
+                    ms=2.2,
                     lw=0.9,
                     color=color,
                     label=f"{label}, {count} node{'s' if count > 1 else ''}",
@@ -242,7 +242,7 @@ def main(
     ax.set_yscale("log")
     ax.set_xlabel("Genomes")
     ax.set_ylabel("FASTA to results [s]")
-    ax.legend(frameon=False, fontsize=6, loc="upper left", handlelength=1.6)
+    ax.legend(frameon=False, fontsize=6, loc="upper left", handlelength=2.4)
     finish(ax, fig, out / "grid_e2e.pdf")
     for label, series in walls.items():
         for count in shown:
