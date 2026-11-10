@@ -320,7 +320,7 @@ class result_file {
             std::memcpy(out.data(), header.data(), sizeof(header));
             // Records and headers are whole 4-byte words, so the floats start word-aligned.
             auto* const floats = reinterpret_cast<float*>(out.data() + sizeof(header));
-            auto const copied = [&]() -> Result<void> {
+            auto copied = [&]() -> Result<void> {
                 detail::uplink_lock const uplink(stream.device().get());
                 if (pairs != 0U) {
                     CUDDL_CUDA_TRY(
