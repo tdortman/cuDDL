@@ -191,30 +191,38 @@ def kernel_throughputs(
         for stale in scratch.glob("kernel.ncu-rep*"):
             stale.unlink()
         # --kill ends the run once the launches are profiled, so the lane reports a failure;
-        # only the report matters here.
-        subprocess.run(
-            [
-                ncu,
-                "--target-processes",
-                "all",
-                "--replay-mode",
-                replay,
-                "--kernel-name",
-                f"regex:^{kernel['kernel']}$",
-                "--launch-skip",
-                str(skip),
-                "--launch-count",
-                str(count),
-                "--kill",
-                "yes",
-                "--metrics",
-                ",".join([DURATION, *METRICS.values()]),
-                "-o",
-                str(base),
-                *command,
-            ],
-            check=False,
-        )
+        # only the report matters here. Killed runs cannot remove their work directories, which
+        # hold the lanes' databases, so every run of the lane, one per replay pass, keeps them
+        # in a directory removed afterwards.
+        lane_tmp = scratch / "lane-tmp"
+        lane_tmp.mkdir()
+        try:
+            subprocess.run(
+                [
+                    ncu,
+                    "--target-processes",
+                    "all",
+                    "--replay-mode",
+                    replay,
+                    "--kernel-name",
+                    f"regex:^{kernel['kernel']}$",
+                    "--launch-skip",
+                    str(skip),
+                    "--launch-count",
+                    str(count),
+                    "--kill",
+                    "yes",
+                    "--metrics",
+                    ",".join([DURATION, *METRICS.values()]),
+                    "-o",
+                    str(base),
+                    *command,
+                ],
+                check=False,
+                env=os.environ | {"TMPDIR": str(lane_tmp)},
+            )
+        finally:
+            shutil.rmtree(lane_tmp)
         # Recent Nsight Compute versions write compressed .ncu-repz reports.
         report = next(scratch.glob("kernel.ncu-rep*"), None)
         if report is not None:
