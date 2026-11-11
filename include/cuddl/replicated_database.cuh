@@ -48,6 +48,8 @@ struct replica_search {
     /// `shard` assigns, so faster processes do more of the search; see
     /// @ref all_to_all_tile_queue. `shard.count` must still give the number of processes.
     std::function<uint64_t()> next_tile{};
+    /// What an exhaustive search stores for each pair; threshold searches deliver counts.
+    exhaustive_output output = exhaustive_output::counts;
 };
 
 /**
@@ -170,7 +172,8 @@ class replicated_database {
                   detail::device_pinned_pool(device, detail::pinned_placement::device_node)
               ),
               workspace(stream, cuda::device_default_memory_pool(device)),
-              results(stream, cuda::device_default_memory_pool(device)) {}
+              results(stream, cuda::device_default_memory_pool(device)),
+              similarities(stream, cuda::device_default_memory_pool(device)) {}
 
         // Declaration order is construction order: the stream outlives its users.
         cuda::stream stream;
@@ -179,9 +182,14 @@ class replicated_database {
         std::optional<index_type> index;
         cuda::device_buffer<uint8_t> workspace;
         cuda::device_buffer<packed_pairwise_counts> results;
+        cuda::device_buffer<float> similarities;
 
-        /// @brief Grows the search storage to @p requirements, keeping it across searches.
-        void reserve(batch_search_requirements const& requirements) {
+        /// @brief Grows the search storage to @p requirements, keeping it across searches, with
+        /// room for similarities when @p output asks for them.
+        void reserve(
+            batch_search_requirements const& requirements,
+            exhaustive_output output = exhaustive_output::counts
+        ) {
             auto const device = stream.device();
             if (workspace.size() < requirements.workspace_bytes) {
                 workspace = cuda::make_device_buffer<uint8_t>(
@@ -192,6 +200,10 @@ class replicated_database {
                 results = cuda::make_device_buffer<packed_pairwise_counts>(
                     stream, device, requirements.maximum_pair_count, cuda::no_init
                 );
+            }
+            if (output == exhaustive_output::similarities && similarities.size() < results.size()) {
+                similarities =
+                    cuda::make_device_buffer<float>(stream, device, results.size(), cuda::no_init);
             }
         }
     };
@@ -292,7 +304,8 @@ class replicated_database {
                 // exhaustive kernels run instead of counting matches only to discard nothing.
                 bool const exhaustive =
                     !options || (index == nullptr && options->minimum_matches == 0U);
-                r.reserve(CUDDL_TRY(r.database->all_to_all_search_requirements(index)));
+                auto const output = exhaustive ? split.output : exhaustive_output::counts;
+                r.reserve(CUDDL_TRY(r.database->all_to_all_search_requirements(index)), output);
                 auto const deliver = [&](batch_result_tile const& tile) {
                     replica_tile const delivered_tile{tile, r.stream, replica_index, &r.host};
                     if (!split.in_query_order) {
@@ -311,8 +324,12 @@ class replicated_database {
                 auto const results =
                     device_span<packed_pairwise_counts>{r.results.data(), r.results.size()};
                 if (exhaustive) {
+                    auto const similarities =
+                        output == exhaustive_output::similarities
+                            ? device_span<float>{r.similarities.data(), r.similarities.size()}
+                            : device_span<float>{};
                     CUDDL_TRY(r.database->search_all_to_all_async(
-                        workspace, results, deliver, {}, r.stream, tiles
+                        workspace, results, deliver, {}, r.stream, tiles, similarities
                     ));
                 } else {
                     CUDDL_TRY(r.database->search_all_to_all_async(

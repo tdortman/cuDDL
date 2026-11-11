@@ -2305,7 +2305,8 @@ constexpr uint32_t all_pairs_block_size = 512U;
 constexpr uint32_t all_pairs_word_parts = 4U;
 
 /// @brief Exactly compares the layout pairs selected by @p reference_mask, without match counts.
-/// A null mask selects every reference.
+/// A null mask selects every reference. Each pair's counts go to @p results and its weighted
+/// k-mer identity to @p similarities, each skipped when null.
 ///
 /// Cells and query staging follow @ref refine_batch_bitmap_kernel; warps claim
 /// @ref all_pairs_word_parts parts of a 32-reference word at a time. A warp takes a claim's
@@ -2320,6 +2321,7 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     uint32_t const* reference_planes,
     uint32_t reference_count,
     SearchResult* results,
+    float* similarities,
     uint32_t* cell_counter,
     uint32_t const* reference_mask
 ) {
@@ -2459,17 +2461,21 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
                 } else {
                     compare(cuda::std::false_type{});
                 }
-                // The slot implies the pair; only its counts are stored.
-                if (((selected_a >> lane) & 1U) != 0U) {
-                    results[batch_result_slot<UpperTriangle>(
-                        first_query + lane, reference_a, query_id_offset, reference_count
-                    )] = SearchResult::pack(mine_a.lower, mine_a.equal, mine_a.higher);
-                }
-                if (has_b && ((selected_b >> lane) & 1U) != 0U) {
-                    results[batch_result_slot<UpperTriangle>(
-                        first_query + lane, reference_b, query_id_offset, reference_count
-                    )] = SearchResult::pack(mine_b.lower, mine_b.equal, mine_b.higher);
-                }
+                // The slot implies the pair; only its counts or similarity are stored.
+                auto const store = [&](uint32_t reference, pairwise_counts const& counts) {
+                    auto const slot = batch_result_slot<UpperTriangle>(
+                        first_query + lane, reference, query_id_offset, reference_count
+                    );
+                    if (results != nullptr) {
+                        results[slot] =
+                            SearchResult::pack(counts.lower, counts.equal, counts.higher);
+                    }
+                    if (similarities != nullptr) {
+                        similarities[slot] = weighted_kmer_identity(counts);
+                    }
+                };
+                if (((selected_a >> lane) & 1U) != 0U) store(reference_a, mine_a);
+                if (has_b && ((selected_b >> lane) & 1U) != 0U) store(reference_b, mine_b);
             }
         }
     }

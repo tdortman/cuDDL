@@ -6,11 +6,11 @@
 // rank's GPU, `index` builds the index for a threshold search, and `search` is
 // cuddl::search_all_to_all across the ranks, writing this rank's tiles through a
 // cuddl::result_file to `rank-<r>.bin`. `download` is the part of the search spent copying
-// finished tiles to the host, converting them on the GPU first for similarity records, and
-// `write` the part spent waiting for the file: for a free host buffer while earlier tiles are
-// written, and for the flush at the end. The file's threads expand and write records while the
-// search continues. With `--write-streams S` above 1, stream s writes `rank-<r>.bin.<s>`, and
-// each tile goes whole to the next stream in turn.
+// finished tiles to the host, and `write` the part spent waiting for the file: for a free host
+// buffer while earlier tiles are written, and for the flush at the end. For similarity records,
+// exhaustive searches have the comparison kernels write each pair's similarity. The file's
+// threads expand and write records while the search continues. With `--write-streams S` above
+// 1, stream s writes `rank-<r>.bin.<s>`, and each tile goes whole to the next stream in turn.
 //
 // `--records similarity` (the default) writes cuddl::result_format::similarity, each pair's
 // weighted k-mer identity as a 4-byte float, and `--records counts` the 24-byte
@@ -189,7 +189,15 @@ int run(int argc, char** argv, ranks const& r) {
             CUDDL_UNWRAP(file.write(tile));
         };
         if (minimum_matches == 0) {
-            CUDDL_UNWRAP(cuddl::search_all_to_all(*group, on_tile, MPI_COMM_WORLD));
+            CUDDL_UNWRAP(
+                cuddl::search_all_to_all(
+                    *group,
+                    on_tile,
+                    MPI_COMM_WORLD,
+                    records == "counts" ? cuddl::exhaustive_output::counts
+                                        : cuddl::exhaustive_output::similarities
+                )
+            );
         } else {
             CUDDL_UNWRAP(
                 cuddl::search_all_to_all(

@@ -54,6 +54,15 @@ namespace detail {
 /// launches, CUB calls and function attributes target the stream's device, never the calling
 /// thread's current device. CCCL provides this only as an internal type.
 using device_scope = ::cuda::__ensure_current_context;
+
+/// @brief Weighted k-mer identity of one packed result, for conversions on the GPU.
+struct packed_identity {
+    uint32_t bucket_count;
+
+    __host__ __device__ float operator()(packed_pairwise_counts packed) const noexcept {
+        return weighted_kmer_identity(packed.unpack(bucket_count));
+    }
+};
 }  // namespace detail
 
 /// @brief Dense offsets favor query latency; sparse sorted keys reduce index memory and build time.
@@ -128,6 +137,16 @@ struct batch_search_result {
     friend bool operator==(batch_search_result const&, batch_search_result const&) = default;
 };
 
+/// @brief What an exhaustive all-to-all search stores for each pair.
+enum class exhaustive_output : uint8_t {
+    /// Its bucket counts, in @ref batch_result_tile::results.
+    counts,
+    /// Its @ref weighted_kmer_identity, in @ref batch_result_tile::similarities, written by the
+    /// comparison kernels themselves where they can. Half the bytes of the counts, and nothing
+    /// left to convert before a download.
+    similarities,
+};
+
 /**
  * @brief Non-owning view of one batch-search tile's results.
  *
@@ -146,7 +165,11 @@ struct batch_search_result {
  * the tile whose queries include `b`.
  */
 struct batch_result_tile {
+    /// Null when the tile holds @ref similarities instead.
     packed_pairwise_counts const* results{};
+    /// Each slot's @ref weighted_kmer_identity, from a search asked for
+    /// exhaustive_output::similarities; otherwise null.
+    float const* similarities{};
     /// Index match counts parallel to @ref results, when requested; otherwise null.
     uint32_t const* match_counts{};
     /// Passing pairs, when the tile applied a threshold; null when every slot is filled.
@@ -426,6 +449,9 @@ class host_batch_results {
  */
 [[nodiscard]] inline Result<void>
 download(batch_result_tile const& tile, cuda::stream_ref stream, host_batch_results& host) {
+    if (tile.results == nullptr && tile.similarities != nullptr) {
+        return Err(Error::invalid_argument("the tile holds similarities, not counts"));
+    }
     detail::device_scope const scope{stream};
     host.layout_ = tile;
     host.layout_.word_offsets = nullptr;
@@ -1666,6 +1692,10 @@ class reference_database_view {
      * @p on_tile receives each tile's @ref batch_result_tile. Before returning, it must consume
      * the tile synchronously or enqueue dependent work on @p stream because the supplied storage
      * is reused by the next tile. @p shard restricts the search to one part of the pairs.
+     *
+     * With @p similarities, which needs as many elements as @p results, tiles carry each pair's
+     * @ref weighted_kmer_identity there instead of counts (exhaustive_output::similarities);
+     * @p result_match_counts must then be empty.
      */
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
@@ -1674,11 +1704,18 @@ class reference_database_view {
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream,
-        all_to_all_shard shard = {}
+        all_to_all_shard shard = {},
+        device_span<float> similarities = {}
     ) const {
         auto tiles = CUDDL_TRY(all_to_all_tile_queue::make(metadata_.reference_count, shard));
         return search_all_to_all_async(
-            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, tiles
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            stream,
+            tiles,
+            similarities
         );
     }
 
@@ -1691,13 +1728,22 @@ class reference_database_view {
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream,
-        all_to_all_tile_queue& tiles
+        all_to_all_tile_queue& tiles,
+        device_span<float> similarities = {}
     ) const {
         device_scope const scope{stream};
         CUDDL_TRY(validate_stored_rows());
         CUDDL_TRY(validate_tile_queue(tiles));
         auto const requirements = CUDDL_TRY(all_to_all_search_requirements());
         CUDDL_TRY(validate_batch_outputs(requirements, results, result_match_counts));
+        if (!similarities.empty()) {
+            if (!result_match_counts.empty()) {
+                return Err(Error::invalid_argument("similarities come without match counts"));
+            }
+            if (similarities.size() < results.size()) {
+                return Err(Error::invalid_argument("similarity storage is smaller than results"));
+            }
+        }
         std::vector<all_to_all_tile_queue::tile> claimed;
         return pipeline_tiles(
             [&]() -> std::optional<uint32_t> {
@@ -1714,6 +1760,11 @@ class reference_database_view {
                 device_span<uint32_t> slot_matches,
                 cuda::stream_ref work) {
                 auto const tile = claimed[index];
+                // A slot's similarities sit at the same offset as its results.
+                auto* const slot_similarities =
+                    similarities.empty()
+                        ? nullptr
+                        : similarities.data() + (slot_results.data() - results.data());
                 return launch_batch_exhaustive<true>(
                     {},
                     tile.first_query_id,
@@ -1722,7 +1773,8 @@ class reference_database_view {
                     workspace,
                     slot_results,
                     slot_matches,
-                    work
+                    work,
+                    slot_similarities
                 );
             },
             on_tile,
@@ -2195,7 +2247,8 @@ class reference_database_view {
 
     /// @brief Compares a query tile with every reference, filling every slot. External queries
     /// are converted to bit-planes in @p workspace; all-to-all tiles read the database's own
-    /// planes.
+    /// planes. With @p similarities, every slot's weighted k-mer identity goes there and the
+    /// tile carries those instead of counts.
     template <bool AllToAll>
     [[nodiscard]] Result<batch_result_tile> launch_batch_exhaustive(
         device_span<score_type const> queries,
@@ -2205,7 +2258,8 @@ class reference_database_view {
         device_span<uint8_t> workspace,
         device_span<batch_result_type> results,
         device_span<uint32_t> result_match_counts,
-        cuda::stream_ref stream
+        cuda::stream_ref stream,
+        float* similarities = nullptr
     ) const {
         uint32_t const* query_planes = nullptr;
         if constexpr (AllToAll) {
@@ -2224,8 +2278,14 @@ class reference_database_view {
         }
         auto* cell_counter = reinterpret_cast<uint32_t*>(counter_address);
         CUDDL_CUDA_TRY(cudaMemsetAsync(cell_counter, 0, sizeof(uint32_t), stream.get()));
+        // The bit-sliced all-pairs kernel and the delta correction write similarities
+        // themselves; any other kernel's counts are converted once the tile is complete.
+        bool const fused = similarities != nullptr && detail::match_filter_supported<BucketCount> &&
+                           !row_major_all_pairs();
+        auto* const kernel_similarities = fused ? similarities : nullptr;
         if (deltas_.child_count != 0U && result_match_counts.empty() && corrects_deltas(stream)) {
-            // Bases are refined exactly; every child pair then follows from its base pair.
+            // Bases are refined exactly; every child pair then follows from its base pair, whose
+            // counts the correction reads.
             CUDDL_TRY((launch_refine<detail::refine_candidates::reference_mask, AllToAll>(
                 query_planes,
                 query_id_offset,
@@ -2238,7 +2298,8 @@ class reference_database_view {
                 stream,
                 0U,
                 nullptr,
-                cell_counter
+                cell_counter,
+                kernel_similarities
             )));
             auto const kernel =
                 detail::apply_reference_deltas_kernel<BucketCount, batch_result_type, AllToAll>;
@@ -2259,11 +2320,13 @@ class reference_database_view {
                 query_count,
                 metadata_.reference_count,
                 deltas_,
-                results.data()
+                results.data(),
+                kernel_similarities
             );
             CUDDL_CUDA_TRY(cudaGetLastError());
         } else {
             // Over every bucket with the full key, index match counts are the equal buckets.
+            // Similarities written by the kernel leave no counts to keep.
             CUDDL_TRY((launch_refine<detail::refine_candidates::all, AllToAll>(
                 query_planes,
                 query_id_offset,
@@ -2271,17 +2334,33 @@ class reference_database_view {
                 static_cast<uint32_t>(BucketCount),
                 uint16_t{0xffffU},
                 nullptr,
-                results,
+                fused ? device_span<batch_result_type>{} : results,
                 result_match_counts,
                 stream,
                 0U,
                 nullptr,
-                cell_counter
+                cell_counter,
+                kernel_similarities
             )));
         }
-        return make_tile(
+        auto tile = make_tile(
             results, result_match_counts, nullptr, query_id_offset, query_count, AllToAll
         );
+        if (similarities == nullptr) return tile;
+        if (auto const slots = tile.slot_count(); !fused && slots != 0U) {
+            CUDDL_CUDA_TRY(
+                cub::DeviceTransform::Transform(
+                    results.data(),
+                    similarities,
+                    slots,
+                    detail::packed_identity{static_cast<uint32_t>(BucketCount)},
+                    stream.get()
+                )
+            );
+        }
+        tile.results = nullptr;
+        tile.similarities = similarities;
+        return tile;
     }
 
     /// @brief True when the device can stage a delta-correction cell.
@@ -2313,7 +2392,8 @@ class reference_database_view {
 
     /// @brief Exactly compares query bit-planes with the selected references' planes, a group of
     /// queries per reference row read; see detail::refine_batch_bitmap_kernel. With
-    /// @p cell_counter, a zeroed word, blocks claim cells dynamically.
+    /// @p cell_counter, a zeroed word, blocks claim cells dynamically. @p similarities reaches
+    /// only @ref launch_all_pairs, which the caller makes sure runs.
     template <detail::refine_candidates Candidates, bool UpperTriangle>
     [[nodiscard]] Result<void> launch_refine(
         uint32_t const* query_planes,
@@ -2327,7 +2407,8 @@ class reference_database_view {
         cuda::stream_ref stream,
         uint32_t minimum_matches = 0U,
         uint32_t* pass_bits = nullptr,
-        uint32_t* cell_counter = nullptr
+        uint32_t* cell_counter = nullptr,
+        float* similarities = nullptr
     ) const {
         auto const counting = !result_match_counts.empty() || pass_bits != nullptr;
         if constexpr (
@@ -2341,6 +2422,7 @@ class reference_database_view {
                     query_id_offset,
                     query_count,
                     results,
+                    similarities,
                     stream,
                     cell_counter,
                     Candidates == detail::refine_candidates::reference_mask ? candidate_bits
@@ -2432,22 +2514,31 @@ class reference_database_view {
         return Result<uint16_t const*>::ok(rows);
     }
 
+    /// @brief Whether an ablation build runs a row-major kernel in @ref launch_all_pairs.
+    [[nodiscard]] static bool row_major_all_pairs() {
+        return detail::ablations_enabled &&
+               (detail::ablated("lop3-kernel") || detail::ablated("bit-slicing"));
+    }
+
     /// @brief Exactly compares the tile's pairs selected by @p reference_mask; a null mask selects
-    /// every reference. See detail::refine_all_pairs_kernel. With @p cell_counter, a zeroed word,
-    /// blocks claim cells dynamically.
+    /// every reference. See detail::refine_all_pairs_kernel, which stores the counts in
+    /// @p results and the similarities in @p similarities, skipping either when null; the
+    /// row-major ablation kernels store counts only. With @p cell_counter, a zeroed word, blocks
+    /// claim cells dynamically.
     template <bool UpperTriangle>
     [[nodiscard]] Result<void> launch_all_pairs(
         uint32_t const* query_planes,
         uint32_t query_id_offset,
         uint32_t query_count,
         device_span<batch_result_type> results,
+        float* similarities,
         cuda::stream_ref stream,
         uint32_t* cell_counter,
         uint32_t const* reference_mask
     ) const {
         if constexpr (detail::ablations_enabled) {
-            bool const naive = detail::ablated("lop3-kernel");
-            if (naive || detail::ablated("bit-slicing")) {
+            if (row_major_all_pairs()) {
+                bool const naive = detail::ablated("lop3-kernel");
                 auto const* rows = CUDDL_TRY(row_major_rows(stream));
                 auto const kernel = naive ? detail::row_major_all_pairs_kernel<
                                                 BucketCount,
@@ -2492,6 +2583,7 @@ class reference_database_view {
             planes_.data(),
             metadata_.reference_count,
             results.data(),
+            similarities,
             cell_counter,
             reference_mask
         );
@@ -3113,6 +3205,8 @@ class reference_database {
         );
     }
 
+    /// @brief Exhaustive search of every unique row pair, optionally into @p similarities; see
+    /// the database view's search_all_to_all_async.
     template <typename OnTile>
     [[nodiscard]] Result<void> search_all_to_all_async(
         device_span<uint8_t> workspace,
@@ -3120,10 +3214,17 @@ class reference_database {
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream,
-        all_to_all_shard shard = {}
+        all_to_all_shard shard = {},
+        device_span<float> similarities = {}
     ) const {
         return view().search_all_to_all_async(
-            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, shard
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            stream,
+            shard,
+            similarities
         );
     }
 
@@ -3136,10 +3237,17 @@ class reference_database {
         OnTile&& on_tile,
         device_span<uint32_t> result_match_counts,
         cuda::stream_ref stream,
-        all_to_all_tile_queue& tiles
+        all_to_all_tile_queue& tiles,
+        device_span<float> similarities = {}
     ) const {
         return view().search_all_to_all_async(
-            workspace, results, std::forward<OnTile>(on_tile), result_match_counts, stream, tiles
+            workspace,
+            results,
+            std::forward<OnTile>(on_tile),
+            result_match_counts,
+            stream,
+            tiles,
+            similarities
         );
     }
 

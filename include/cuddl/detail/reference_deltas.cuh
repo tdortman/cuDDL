@@ -441,7 +441,8 @@ build_reference_deltas(uint16_t const* rows, uint32_t count, cuda::stream_ref st
 }
 
 /// @brief Completes a refined tile from its bases' results: each (query, child) pair's counts
-/// are its (query, base) counts adjusted for the child's changed buckets.
+/// are its (query, base) counts adjusted for the child's changed buckets. With @p similarities,
+/// each child pair's weighted k-mer identity goes there instead of its counts to @p results.
 ///
 /// A block stages a group of queries bucket-major from their planes, then its warps take
 /// children of a child tile; each warp copies a child's records to shared memory while the
@@ -453,7 +454,8 @@ __global__ __launch_bounds__(delta_correction_warps * 32U, 1) void apply_referen
     uint32_t query_count,
     uint32_t reference_count,
     reference_delta_view deltas,
-    SearchResult* results
+    SearchResult* results,
+    float* similarities
 ) {
     constexpr uint32_t group = delta_query_group<BucketCount>;
     constexpr uint32_t slices = 32U / group;
@@ -596,17 +598,24 @@ __global__ __launch_bounds__(delta_correction_warps * 32U, 1) void apply_referen
                     empty_equal += __shfl_xor_sync(0xffffffffU, empty_equal, offset);
                 }
                 if (included && slice == 0U) {
-                    auto const counts = base.unpack(static_cast<uint32_t>(BucketCount));
-                    results[batch_result_slot<UpperTriangle>(
+                    auto const base_counts = base.unpack(static_cast<uint32_t>(BucketCount));
+                    pairwise_counts const counts{
+                        .lower = static_cast<uint32_t>(static_cast<int>(base_counts.lower) + lower),
+                        .equal = static_cast<uint32_t>(
+                            static_cast<int>(base_counts.equal) - lower - higher + empty_equal
+                        ),
+                        .higher =
+                            static_cast<uint32_t>(static_cast<int>(base_counts.higher) + higher),
+                    };
+                    auto const slot = batch_result_slot<UpperTriangle>(
                         query, child, query_id_offset, reference_count
-                    )] =
-                        SearchResult::pack(
-                            static_cast<uint32_t>(static_cast<int>(counts.lower) + lower),
-                            static_cast<uint32_t>(
-                                static_cast<int>(counts.equal) - lower - higher + empty_equal
-                            ),
-                            static_cast<uint32_t>(static_cast<int>(counts.higher) + higher)
-                        );
+                    );
+                    if (similarities != nullptr) {
+                        similarities[slot] = weighted_kmer_identity(counts);
+                    } else {
+                        results[slot] =
+                            SearchResult::pack(counts.lower, counts.equal, counts.higher);
+                    }
                 }
             }
             info = next_info;

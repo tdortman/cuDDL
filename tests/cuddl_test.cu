@@ -1556,6 +1556,47 @@ void expect_near_duplicate_exhaustive_searches(cuda::stream_ref stream, uint32_t
         database.search_all_to_all_async(all_workspace, all_results, all_tiles, {}, stream)
     );
     expect_oracle(all_tiles.results, rows, true);
+
+    // Similarities from the kernels, the delta correction's included, match the counts' ones.
+    auto all_similarities = cuda::make_device_buffer<float>(
+        stream, stream.device(), all.maximum_pair_count, cuda::no_init
+    );
+    std::vector<float> similarities;
+    CUDDL_UNWRAP(database.search_all_to_all_async(
+        all_workspace,
+        all_results,
+        [&](cuddl::batch_result_tile const& tile) {
+            EXPECT_EQ(tile.results, nullptr);
+            auto const at = similarities.size();
+            similarities.resize(at + tile.slot_count());
+            ASSERT_EQ(
+                cudaMemcpyAsync(
+                    similarities.data() + at,
+                    tile.similarities,
+                    tile.slot_count() * sizeof(float),
+                    cudaMemcpyDeviceToHost,
+                    stream.get()
+                ),
+                cudaSuccess
+            );
+            stream.sync();
+        },
+        {},
+        stream,
+        {},
+        all_similarities
+    ));
+    ASSERT_EQ(similarities.size(), all_tiles.results.size());
+    size_t mismatches = 0U;
+    for (size_t i = 0; i < similarities.size(); ++i) {
+        auto const expected = cuddl::weighted_kmer_identity(all_tiles.results[i].counts);
+        // Four ulps, as EXPECT_FLOAT_EQ allows: device and host may contract differently.
+        if (std::abs(similarities[i] - expected) >
+            4.0F * std::numeric_limits<float>::epsilon() * std::max(1.0F, std::abs(expected))) {
+            if (mismatches++ == 0U) ADD_FAILURE() << "first similarity mismatch at " << i;
+        }
+    }
+    EXPECT_EQ(mismatches, 0U);
 }
 
 TEST_F(ReferenceDatabaseTest, ExhaustiveSearchesOfNearDuplicateRowsMatchScalarOracle) {
@@ -1799,8 +1840,9 @@ TEST_F(ReferenceDatabaseTest, ReplicatedAllToAllMatchesSingleDatabase) {
 
 // A result file must hold exactly the pairs the search delivers, in either format, when replicas
 // hand it tiles concurrently and it spreads them over two files; similarity values must be the
-// pairs' weighted k-mer identities. Covers exhaustive tiles, converted on the GPU and copied
-// straight into the files' buffers, and threshold tiles, expanded on the host.
+// pairs' weighted k-mer identities. Covers exhaustive tiles of counts, converted on the GPU, and
+// of similarities written by the search, both copied straight into the files' buffers, and
+// threshold tiles, expanded on the host.
 TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     using group_type = cuddl::replicated_database<k_default, b_default>;
@@ -1821,11 +1863,13 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
     auto group = CUDDL_UNWRAP(group_type::adopt(std::move(replicas)));
     CUDDL_UNWRAP(group.build_index());
     uint32_t const minimum_matches = compatibility.indexed_bucket_count / 8U;
-    auto const search = [&](bool threshold, auto const& on_tile) {
+    auto const search = [&](bool threshold,
+                            auto const& on_tile,
+                            cuddl::exhaustive_output output = cuddl::exhaustive_output::counts) {
         if (threshold) {
             CUDDL_UNWRAP(group.search_all_to_all(on_tile, {.minimum_matches = minimum_matches}));
         } else {
-            CUDDL_UNWRAP(group.search_all_to_all(on_tile));
+            CUDDL_UNWRAP(group.search_all_to_all(on_tile, {.output = output}));
         }
     };
     auto const by_pair = [](auto const& a, auto const& b) {
@@ -1875,49 +1919,57 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
         EXPECT_EQ(counts.statistics().pairs, expected.size());
         EXPECT_EQ(counts.statistics().bytes, bytes);
 
-        auto similarity = CUDDL_UNWRAP(
-            cuddl::result_file::open(
-                base, {.format = cuddl::result_format::similarity, .streams = 2, .threads = 4}
-            )
-        );
-        search(threshold, [&](cuddl::replica_tile const& tile) {
-            CUDDL_UNWRAP(similarity.write(tile));
-        });
-        CUDDL_UNWRAP(similarity.finish());
-        std::vector<cuddl::similarity_record> records;
-        for (auto const& path : cuddl::result_file::files(base, 2)) {
-            auto const data = read(path);
-            if (threshold) {
-                ASSERT_EQ(data.size() % sizeof(cuddl::similarity_record), 0U);
-                auto const at = records.size();
-                records.resize(at + data.size() / sizeof(cuddl::similarity_record));
-                std::memcpy(records.data() + at, data.data(), data.size());
-                continue;
-            }
-            for (size_t at = 0; at < data.size();) {
-                std::array<uint32_t, 2> header{};
-                ASSERT_LE(at + sizeof(header), data.size());
-                std::memcpy(header.data(), data.data() + at, sizeof(header));
-                at += sizeof(header);
-                for (auto query = header[0]; query < header[0] + header[1]; ++query) {
-                    for (auto reference = query + 1U; reference < reference_count; ++reference) {
-                        ASSERT_LE(at + sizeof(float), data.size());
-                        float value = 0;
-                        std::memcpy(&value, data.data() + at, sizeof(value));
-                        at += sizeof(value);
-                        records.push_back({query, reference, value});
+        for (auto const output :
+             {cuddl::exhaustive_output::counts, cuddl::exhaustive_output::similarities}) {
+            if (threshold && output == cuddl::exhaustive_output::similarities) continue;
+            SCOPED_TRACE(static_cast<int>(output));
+            auto similarity = CUDDL_UNWRAP(
+                cuddl::result_file::open(
+                    base, {.format = cuddl::result_format::similarity, .streams = 2, .threads = 4}
+                )
+            );
+            search(
+                threshold,
+                [&](cuddl::replica_tile const& tile) { CUDDL_UNWRAP(similarity.write(tile)); },
+                output
+            );
+            CUDDL_UNWRAP(similarity.finish());
+            std::vector<cuddl::similarity_record> records;
+            for (auto const& path : cuddl::result_file::files(base, 2)) {
+                auto const data = read(path);
+                if (threshold) {
+                    ASSERT_EQ(data.size() % sizeof(cuddl::similarity_record), 0U);
+                    auto const at = records.size();
+                    records.resize(at + data.size() / sizeof(cuddl::similarity_record));
+                    std::memcpy(records.data() + at, data.data(), data.size());
+                    continue;
+                }
+                for (size_t at = 0; at < data.size();) {
+                    std::array<uint32_t, 2> header{};
+                    ASSERT_LE(at + sizeof(header), data.size());
+                    std::memcpy(header.data(), data.data() + at, sizeof(header));
+                    at += sizeof(header);
+                    for (auto query = header[0]; query < header[0] + header[1]; ++query) {
+                        for (auto reference = query + 1U; reference < reference_count;
+                             ++reference) {
+                            ASSERT_LE(at + sizeof(float), data.size());
+                            float value = 0;
+                            std::memcpy(&value, data.data() + at, sizeof(value));
+                            at += sizeof(value);
+                            records.push_back({query, reference, value});
+                        }
                     }
                 }
             }
-        }
-        std::ranges::sort(records, by_pair);
-        ASSERT_EQ(records.size(), expected.size());
-        for (size_t i = 0; i < expected.size(); ++i) {
-            ASSERT_EQ(records[i].query_id, expected[i].query_id) << i;
-            ASSERT_EQ(records[i].reference_id, expected[i].reference_id) << i;
-            ASSERT_FLOAT_EQ(
-                records[i].similarity, cuddl::weighted_kmer_identity(expected[i].counts)
-            ) << i;
+            std::ranges::sort(records, by_pair);
+            ASSERT_EQ(records.size(), expected.size());
+            for (size_t i = 0; i < expected.size(); ++i) {
+                ASSERT_EQ(records[i].query_id, expected[i].query_id) << i;
+                ASSERT_EQ(records[i].reference_id, expected[i].reference_id) << i;
+                ASSERT_FLOAT_EQ(
+                    records[i].similarity, cuddl::weighted_kmer_identity(expected[i].counts)
+                ) << i;
+            }
         }
     }
 }

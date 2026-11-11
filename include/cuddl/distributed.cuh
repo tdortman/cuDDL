@@ -469,15 +469,18 @@ template <typename Search>
  *
  * Every rank calls it with a replicated_database of the same rows. Each rank delivers the tiles
  * it claims to @p on_tile, as replicated_database::search_all_to_all does, and every pair is
- * delivered on exactly one rank. The ranks share one shared_tile_counter for the call.
+ * delivered on exactly one rank. The ranks share one shared_tile_counter for the call. @p output
+ * picks what the tiles hold for each pair.
  */
 template <uint32_t K, size_t BucketCount, typename Layout, typename OnTile>
 [[nodiscard]] Result<void> search_all_to_all(
     replicated_database<K, BucketCount, Layout>& group,
     OnTile&& on_tile,
-    MPI_Comm comm
+    MPI_Comm comm,
+    exhaustive_output output = exhaustive_output::counts
 ) {
     return detail::shared_search(comm, [&](replica_search split) {
+        split.output = output;
         return group.search_all_to_all(on_tile, std::move(split));
     });
 }

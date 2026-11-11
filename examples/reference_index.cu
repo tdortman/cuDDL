@@ -196,7 +196,10 @@ void search_all_to_all(
     };
     if (top_k == 0U) {
         run([&](cuddl::replica_tile const& tile) { writer.write(tile.tile, tile.stream); },
-            {.in_query_order = true});
+            {.in_query_order = true,
+             .output = records == cuddl::result_format::similarity
+                           ? cuddl::exhaustive_output::similarities
+                           : cuddl::exhaustive_output::counts});
         writer.finish();
         return;
     }
