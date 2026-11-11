@@ -95,6 +95,7 @@ import math
 import mmap
 import os
 import shutil
+import signal
 import statistics
 import struct
 import subprocess
@@ -123,6 +124,9 @@ DEFAULT_TOOLS = (
     "skani,dashing2,cub-exact"
 )
 TOOLS = tuple(DEFAULT_TOOLS.split(","))
+
+with suppress(Exception):
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(128 + s))
 
 
 class Topology(StrEnum):
@@ -427,6 +431,7 @@ def wall_of(
     log_tail: bool = False,
     fresh: Path | None = None,
     before: dict[str, tuple[int, int]] | None = None,
+    keep_output: bool = True,
 ) -> Marks:
     """Times @p command, a command or a group run back to back, per rep.
 
@@ -435,9 +440,9 @@ def wall_of(
 
     Files under @p fresh that differ from @p before (default: their state when the call starts)
     are deleted before every rep, so every rep writes new files, as a single run does; the last
-    rep's stay. On ext4, closing a rewritten truncated file writes its dirty pages back to the
-    drive (`auto_da_alloc`): on a PM9A3, 7.2 GB of cuDDL results took 1.4 s into a new file
-    and 5.8-6.1 s over the last one.
+    rep's stay unless @p keep_output is False. On ext4, closing a rewritten truncated file writes
+    its dirty pages back to the drive (`auto_da_alloc`): on a PM9A3, 7.2 GB of cuDDL results
+    took 1.4 s into a new file and 5.8-6.1 s over the last one.
     """
     groups: list[list[str]] = (
         [list(item) for item in command]
@@ -449,11 +454,12 @@ def wall_of(
         before = output_files(fresh)
     marks = Marks()
     marks.energy = []
-    for rep in range(warmups + samples):
-        if fresh is not None:
-            for path, state in output_files(fresh).items():
-                if before.get(path) != state:
-                    os.unlink(path)
+    try:
+        for rep in range(warmups + samples):
+            if fresh is not None:
+                for path, state in output_files(fresh).items():
+                    if before.get(path) != state:
+                        os.unlink(path)
         if prepare is not None:
             prepare()
         resident_parts: list[dict] = []
@@ -489,6 +495,12 @@ def wall_of(
                         "resident_ms": sum(p["resident_ms"] for p in resident_parts),
                     }
                 )
+    finally:
+        if fresh is not None and not keep_output:
+            for path, state in output_files(fresh).items():
+                if before.get(path) != state:
+                    with suppress(OSError):
+                        os.unlink(path)
     return marks
 
 
@@ -2675,11 +2687,14 @@ def main(
             # skani writes only the pairs past its ANI screen; it evaluated all of them.
             evaluated = count_pairs(references, query_list, topology)
             stride = report_stride(evaluated)
-            rows, reported = read_ani_rows(compare_outs, {}, stride)
+            try:
+                rows, reported = read_ani_rows(compare_outs, {}, stride)
+            finally:
+                for out in compare_outs:
+                    out.unlink(missing_ok=True)
             record_compare("skani", "cpu", marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_rows"] = reported
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
-
         if "cuddl" in selected:
             import json as jsonlib5
 
@@ -2778,6 +2793,7 @@ def main(
                 samples,
                 warmups,
                 fresh=work,
+                keep_output=False,
             )
             native_timings[("cuddl", "compare")] = {"wall": summarize(marks)}
             record_compare(
@@ -2844,20 +2860,23 @@ def main(
             stride = (
                 max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
             )
-            rows = [
-                {
-                    "query": str(query),
-                    "reference": str(reference),
-                    "jaccard": jaccard,
-                    "ani": mash_ani(jaccard, sketch_k["simdsketch"]),
-                }
-                for query, reference, jaccard in read_f32_pairs(
-                    ss_pairs,
-                    references,
-                    query_list if topology == "batch" else [],
-                    stride,
-                )
-            ]
+            try:
+                rows = [
+                    {
+                        "query": str(query),
+                        "reference": str(reference),
+                        "jaccard": jaccard,
+                        "ani": mash_ani(jaccard, sketch_k["simdsketch"]),
+                    }
+                    for query, reference, jaccard in read_f32_pairs(
+                        ss_pairs,
+                        references,
+                        query_list if topology == "batch" else [],
+                        stride,
+                    )
+                ]
+            finally:
+                ss_pairs.unlink(missing_ok=True)
             record_compare("simdsketch", "bucket-b8", marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
@@ -2964,22 +2983,25 @@ def main(
             stride = (
                 max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
             )
-            rows = [
-                {
-                    "query": str(query),
-                    "reference": str(reference),
-                    "jaccard": jaccard,
-                    # Mash ANI from the fitted Jaccard tracks alignment ANI more closely than
-                    # one minus the core distance (scripts/run_pairwise_accuracy.py).
-                    "ani": mash_ani(jaccard, sketch_k["pp-sketchlib"]),
-                }
-                for query, reference, jaccard in read_f32_pairs(
-                    pp_pairs,
-                    references,
-                    query_list if topology == "batch" else [],
-                    stride,
-                )
-            ]
+            try:
+                rows = [
+                    {
+                        "query": str(query),
+                        "reference": str(reference),
+                        "jaccard": jaccard,
+                        # Mash ANI from the fitted Jaccard tracks alignment ANI more closely than
+                        # one minus the core distance (scripts/run_pairwise_accuracy.py).
+                        "ani": mash_ani(jaccard, sketch_k["pp-sketchlib"]),
+                    }
+                    for query, reference, jaccard in read_f32_pairs(
+                        pp_pairs,
+                        references,
+                        query_list if topology == "batch" else [],
+                        stride,
+                    )
+                ]
+            finally:
+                pp_pairs.unlink(missing_ok=True)
             record_compare("pp-sketchlib", pp_variant, marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
@@ -3009,20 +3031,23 @@ def main(
             stride = (
                 max(1, (evaluated + match_rows - 1) // match_rows) if match_rows else 1
             )
-            rows = [
-                {
-                    "query": str(query),
-                    "reference": str(reference),
-                    "jaccard": None,
-                    "ani": ani,
-                }
-                for query, reference, ani in read_f32_pairs(
-                    bb_pairs,
-                    references,
-                    query_list if topology == "batch" else [],
-                    stride,
-                )
-            ]
+            try:
+                rows = [
+                    {
+                        "query": str(query),
+                        "reference": str(reference),
+                        "jaccard": None,
+                        "ani": ani,
+                    }
+                    for query, reference, ani in read_f32_pairs(
+                        bb_pairs,
+                        references,
+                        query_list if topology == "batch" else [],
+                        stride,
+                    )
+                ]
+            finally:
+                bb_pairs.unlink(missing_ok=True)
             record_compare("bbtools", "ddl", marks, rows, evaluated=evaluated)
             measurements[-1]["metrics"]["native_pair_row_stride"] = stride
 
@@ -3214,6 +3239,7 @@ def main(
                 samples,
                 warmups,
                 fresh=work,
+                keep_output=False,
             )
             native_timings[("cuddl", "search")] = {
                 "query": summarize(marks),
@@ -3250,8 +3276,10 @@ def main(
                 run_timed(f"{name}: passing pairs for accuracy", command)
                 # Searches with an index, threshold or top-k write 12-byte similarity records:
                 # query_id, reference_id and a float.
-                ids = array.array("I", out.read_bytes())
-                out.unlink()
+                try:
+                    ids = array.array("I", out.read_bytes())
+                finally:
+                    out.unlink(missing_ok=True)
                 scores = {}
                 for query_id, reference_id in zip(ids[0::3], ids[1::3]):
                     query = str(cli_queries[query_id])
@@ -3299,6 +3327,7 @@ def main(
                     samples,
                     warmups,
                     fresh=work,
+                    keep_output=False,
                 )
                 native_timings[("cuddl", "top-k")] = {
                     "query": summarize(top_marks),
