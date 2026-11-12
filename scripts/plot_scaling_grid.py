@@ -12,8 +12,8 @@ logs/ceilings.sh run. Writes three panels into OUTPUT_DIR:
   the 8-byte packed counts of every pair copied to the host, against one GPU's device-to-host
   bandwidth (nvbandwidth). End-to-end results: the 4-byte similarities of the m0 pipeline over
   the time its search spent downloading them, against the same bandwidth. Cold read: the
-  pipeline's gzip input over its first sketch phase after an eviction (r0, m20), against
-  buffered reads from the file system;
+  pipeline's gzip input over its first sketch phase after an eviction (r0, m20), against the
+  rate one node reads such files at while every storage target holding them is busy;
 - grid_strong.pdf: device-resident speedup over one GPU for every genome count;
 - grid_e2e.pdf: FASTA-to-results wall time against the genome count on one node and on the
   most nodes, for cuDDL (exhaustive all-to-all, median of r1-r3) and SimdSketch.
@@ -145,7 +145,7 @@ def main(
         (
             "Cold read (Lustre)",
             {
-                n: v / ceilings["filesystem_read_buffered"]
+                n: v / ceilings["filesystem_read_small_files"]
                 for (n, nodes), v in cold.items()
                 if nodes == 1
             },
