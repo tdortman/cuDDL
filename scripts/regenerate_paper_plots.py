@@ -424,6 +424,7 @@ def b200_inflate(csv: Path) -> None:
     ax.tick_params(axis="both", labelsize=7.5)
     ax.legend(
         loc="upper right",
+        bbox_to_anchor=(1.0, 1.08),
         frameon=False,
         fontsize=6.5,
         handlelength=1.0,
