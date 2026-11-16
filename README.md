@@ -8,11 +8,11 @@ Use it to estimate cardinality, containment, weighted k-mer identity, and k-mer-
 
 ## All-to-all comparison in under a second
 
-![Seconds to compare all pairs of 100,000 genomes on one workstation, log scale. cuDDL takes 0.456 s. SimdSketch takes 16.7 s, sketchlib.rust 98.7 s, pp-sketchlib 120 s, BBTools 179 s, RabbitSketch 193 s, Dashing2 204 s, HyperGen 2,438 s, and skani 12,338 s.](docs/images/all-to-all.svg)
+![Seconds to compare all pairs of 100,000 genomes on one workstation, log scale. cuDDL takes 0.456 s. SimdSketch takes 16.7 s, sketchlib.rust 98.7 s, pp-sketchlib 120 s, BBTools 179 s, RabbitSketch 193 s, Dashing2 204 s, HyperGen 2,244 s, and skani 12,338 s.](docs/images/all-to-all.svg)
 
-On a workstation with a 60-core Xeon w9-3595X and an RTX 5090, cuDDL compares all 5 billion pairs of 100,000 RefSeq bacterial genomes in 0.46 s. SimdSketch, the fastest of the other tools, takes 16.7 s on all 120 threads. The whole run, from FASTA files to 20 GB of similarity scores on disk, takes cuDDL 10.3 s and SimdSketch 58.4 s.
+On a workstation with a 60-core Xeon w9-3595X and an RTX 5090, cuDDL compares all 5 billion pairs of 100,000 RefSeq bacterial genomes in 0.46 s. SimdSketch, the fastest of the other tools, takes 16.7 s on all 120 threads. The whole run, from FASTA files to 20 GB of similarity scores written to a file, takes cuDDL 10.3 s and SimdSketch 58.4 s.
 
-Each bar times the comparison of sketches that are already in memory. Every CPU tool ran with 120 threads, and HyperGen and pp-sketchlib ran their GPU distance kernels on the same RTX 5090. Tools marked \* ran on 10,000 genomes and are extrapolated from that.
+Each bar times the comparison of sketches that are already in memory. Every CPU tool ran with 120 threads, including HyperGen, whose CPU mode beat its GPU mode. pp-sketchlib ran its GPU distance kernel on the same RTX 5090. Tools marked \* ran on 10,000 genomes and are extrapolated from that.
 
 ## How it works
 

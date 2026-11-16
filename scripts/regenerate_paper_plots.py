@@ -648,6 +648,8 @@ def micro_ops() -> list[tuple[str, list[float | None]]]:
         # cuDDL again after `cuddl-pipeline-benchmark` stopped requesting match counts.
         Path("results/mon03-micro-perf-100k-cuddl.json"),
         Path("results/mon03-micro-perf-10k-hypergen-skani.json"),
+        # HyperGen on every pair of 100k, replacing its rows from the 10k file above.
+        Path("results/mon03-micro-perf-100k-hypergen.json"),
         Path("results/mon03-micro-perf-10k-cub-exact.json"),
     ]:
         mon03.update(load_tool_ops(p))
@@ -655,7 +657,7 @@ def micro_ops() -> list[tuple[str, list[float | None]]]:
     for p in [
         Path("results/gh200-micro-perf-100k-cuddl.json"),
         Path("results/gh200-micro-perf-100k-pp-sketchlib.json"),
-        Path("results/gh200-micro-perf-10k-hypergen.json"),
+        Path("results/gh200-micro-perf-100k-hypergen.json"),
         Path("results/gh200-micro-perf-10k-cub-exact.json"),
     ]:
         gh200.update(load_tool_ops(p))
@@ -678,6 +680,14 @@ def micro_ops() -> list[tuple[str, list[float | None]]]:
             top_k and top_k * pairs,
             sketch[1] * genomes + compare[1] * pairs,
         ]
+
+    def measured(ops: dict, key: str) -> list[float | None]:
+        """A tool run on every pair of the 100k corpus."""
+        sketch, compare = ops[(key, "micro-sketch")], ops[(key, "micro-compare")]
+        search, top_k = (
+            ops.get((key, op), (None,))[0] for op in ("micro-search", "micro-top-k")
+        )
+        return [sketch[0], compare[0], search, top_k, sketch[1] + compare[1]]
 
     tools_list = [
         (
@@ -784,9 +794,9 @@ def micro_ops() -> list[tuple[str, list[float | None]]]:
                 ],
             ],
         ),
-        ("HyperGen (CPU)*", from_10k(mon03, "hypergen-cpu:hdc")),
-        ("HyperGen GPU* (Sys. A)", from_10k(mon03, "hypergen-gpu:hdc")),
-        ("HyperGen GPU* (Sys. B)", from_10k(gh200, "hypergen-gpu:hdc")),
+        ("HyperGen (CPU)", measured(mon03, "hypergen-cpu:hdc")),
+        ("HyperGen GPU (Sys. A)", measured(mon03, "hypergen-gpu:hdc")),
+        ("HyperGen GPU (Sys. B)", measured(gh200, "hypergen-gpu:hdc")),
         ("skani*", from_10k(mon03, "skani:cpu")),
         ("cub-exact* (Sys. A)", from_10k(mon03, "cub-exact:gpu-exact")),
         ("cub-exact* (Sys. B)", from_10k(gh200, "cub-exact:gpu-exact")),
@@ -933,10 +943,11 @@ def micro_energy(runs: list[dict]) -> None:
         dyn_tot = sum(r[1:5])
         tot = r[5]
         if tot > cap:
+            star = "*" if r[0].endswith("*") else ""
             ax.text(
                 cap - 6,
                 yi,
-                rf"\textbf{{$\rightarrow$ {dyn_tot / 1e3:.0f}/{tot / 1e3:.0f} MJ*}}",
+                rf"\textbf{{$\rightarrow$ {dyn_tot / 1e3:.0f}/{tot / 1e3:.0f} MJ{star}}}",
                 va="center",
                 ha="right",
                 fontsize=6.3,
@@ -1048,16 +1059,18 @@ def main(
     stage = existing(
         stage
         or [
-            # HyperGen, skani and cub-exact run every pair of 10k genomes and are
-            # extrapolated to 100k. pp-sketchlib runs at its five default k-mer lengths.
+            # skani and cub-exact run every pair of 10k genomes and are extrapolated to
+            # 100k. pp-sketchlib runs at its five default k-mer lengths.
             *(
                 Path(path)
                 for path in sorted(glob("results/mogon-*-micro-energy-100k-*.json"))
-                if not any(
-                    t in path for t in ("hypergen", "skani", "cub-exact", "k17,29")
-                )
+                if not any(t in path for t in ("skani", "cub-exact", "k17,29"))
             ),
-            *map(Path, sorted(glob("results/mogon-*-micro-energy-10k-*.json"))),
+            *(
+                Path(path)
+                for path in sorted(glob("results/mogon-*-micro-energy-10k-*.json"))
+                if "hypergen" not in path
+            ),
         ],
         "--stage",
     )
