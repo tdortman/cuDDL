@@ -13,6 +13,7 @@ INPUT                  = include, README.md
 FILE_PATTERNS          = *.cuh *.hpp
 RECURSIVE              = YES
 EXTENSION_MAPPING      = cuh=C++
+IMAGE_PATH             = docs/images
 
 # Extraction settings
 EXTRACT_ALL            = YES

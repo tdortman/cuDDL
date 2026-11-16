@@ -7,7 +7,8 @@
 #   "typer",
 # ]
 # ///
-"""Redraws the paper subfigures in paper/figures from the benchmark results files."""
+"""Redraws the paper subfigures in paper/figures and the README's docs/images/all-to-all.svg
+from the benchmark results files."""
 
 import json
 import sys
@@ -637,8 +638,10 @@ def load_tool_ops(path: Path) -> dict[tuple[str, str], tuple[float, float]]:
     return res
 
 
-def micro_ops() -> None:
-    """micro_ops_10k.pdf (100k RefSeq resident and E2E times across 5090 and GH200)."""
+def micro_ops() -> list[tuple[str, list[float | None]]]:
+    """micro_ops_10k.pdf (100k RefSeq resident and E2E times across 5090 and GH200).
+
+    Returns each row's label and its SKETCH, COMPARE, SEARCH, TOP-K, and E2E seconds."""
     mon03 = {}
     for p in [
         Path("results/mon03-micro-perf-100k.json"),
@@ -847,6 +850,46 @@ def micro_ops() -> None:
             f"{name:22} "
             + "  ".join(f"{s:10.4g} s" if s is not None else "      None" for s in vals)
         )
+    return tools_list
+
+
+def readme_all_to_all(tools: list[tuple[str, list[float | None]]]) -> None:
+    """docs/images/all-to-all.svg: each tool's 100k COMPARE time on System A, for the README.
+
+    One row per tool, its fastest variant, so every bar ran on the same workstation. cub-exact
+    is the exact k-mer baseline, not a released tool, so the README leaves it out."""
+    best: dict[str, float] = {}
+    for name, times in tools:
+        if "Sys. B" in name or name.startswith("cub-exact") or times[1] is None:
+            continue
+        tool = name.replace("*", "").split(" (")[0].removesuffix(" GPU")
+        tool += "*" if "*" in name else ""
+        best[tool] = min(best.get(tool, np.inf), times[1])
+    rows = sorted(best.items(), key=lambda row: row[1], reverse=True)
+    reference = best["cuDDL"]
+    fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    bars = ax.barh(
+        [name for name, _ in rows],
+        [seconds for _, seconds in rows],
+        color=[TOOLS["cuddl"][1] if name == "cuDDL" else "#9e9e9e" for name, _ in rows],
+    )
+    labels = [
+        (f"{seconds:.3g}" if seconds < 100 else f"{seconds:,.0f}")
+        + " s"
+        + ("" if name == "cuDDL" else rf", {seconds / reference:,.0f}$\times$ slower")
+        for name, seconds in rows
+    ]
+    ax.bar_label(bars, labels=labels, padding=3)
+    ax.set_xscale("log")
+    ax.set_xlim(right=max(best.values()) * 60)
+    ax.set_xlabel("Seconds to compare all pairs of 100,000 genomes, log scale")
+    ax.grid(axis="y", visible=False)
+    fig.tight_layout()
+    path = Path("docs/images/all-to-all.svg")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+
 
 
 def micro_energy(runs: list[dict]) -> None:
@@ -1027,7 +1070,7 @@ def main(
     b200_inflate(b200_csv)
     b200_build(b200_log, b200_input)
     io_backend_build(ablation)
-    micro_ops()
+    readme_all_to_all(micro_ops())
     micro_energy(runs)
     print(f"Regenerated all paper subfigures in {out_dir}.")
 
