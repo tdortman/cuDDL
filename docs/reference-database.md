@@ -397,6 +397,16 @@ A database row stores one 16-bit winner score per bucket, so rows take `referenc
 
 On the GPU, each group of 32 buckets is stored as 16 bit-planes, one per score bit. One comparison then covers 32 buckets in a handful of logic operations. `copy_scores_async` decodes the planes back to row-major scores. Index construction decodes them too, into a temporary buffer, so it needs extra device memory. Posting offsets are 32-bit, and index construction rejects databases with more postings than that.
 
+### How search uses the GPU
+
+Refinement compares all 16 score bits, whatever the index key mask. Each block stages up to 128 KiB of query rows in shared memory on Hopper, and 96 KiB on other architectures, then reuses every reference row across the staged queries. Rows that do not fit read from global memory. Refinement skips counting empty buckets only after it checks that every reference score is nonzero. Sparse rows always count them.
+
+Indexed counting walks short posting lists one per lane and medium lists one per warp. Only a list long enough to occupy every thread of a block goes to the block-wide queue.
+
+Large dense and sparse indexes also cache a reference bitmap for each posting list whose bitmap is no larger than the list. Batch search counts bitmap matches first, with saturating bit-sliced counters, and then adds the matches from the remaining posting lists. cuDDL rebuilds the cache on load, so the index file does not store it.
+
+On Hopper and newer GPUs that support it, posting lists and cached bitmaps request CUDA transparent memory compression. Other devices use ordinary device allocations. Compression changes only device storage, not the files on disk.
+
 ## Persist and reuse an index
 
 Include `<cuddl/reference_index_file.cuh>`. With `database` from the first example:
