@@ -339,6 +339,37 @@ TEST(SketchTest, ScoreEncodingClampsExtremeNlz) {
     (void)low;
 }
 
+TEST(SketchTest, ScoreStaysMonotoneBelowTopExponentTier) {
+    // Hashes below the top tier (NLZ > 31 for e=5, NLZ > 53 for e=6) saturate to the top score
+    // instead of wrapping their leading one into the mantissa.
+    using five_eleven = cuddl::register_layout<5, 11>;
+    for (uint64_t const h : {0ULL, 1ULL, 1ULL << 20U, (1ULL << 32U) - 1ULL}) {
+        EXPECT_EQ(score<five_eleven>(h), std::numeric_limits<uint16_t>::max()) << h;
+    }
+    auto const monotone = [](auto layout, std::initializer_list<uint64_t> ascending) {
+        uint16_t previous = std::numeric_limits<uint16_t>::max();
+        for (uint64_t const h : ascending) {
+            auto const s = score<decltype(layout)>(h);
+            EXPECT_LE(s, previous) << h;
+            previous = s;
+        }
+    };
+    monotone(
+        five_eleven{},
+        {0ULL,
+         (1ULL << 32U) - 1ULL,
+         1ULL << 32U,
+         (1ULL << 32U) + (1ULL << 21U),
+         (1ULL << 33U) - 1ULL,
+         1ULL << 33U,
+         1ULL << 40U}
+    );
+    monotone(
+        cuddl::default_register_layout{},
+        {0ULL, (1ULL << 10U) - 1ULL, 1ULL << 10U, (1ULL << 11U) - 1ULL, 1ULL << 11U, 1ULL << 40U}
+    );
+}
+
 TEST(SketchTest, FiveExponentElevenMantissaLayoutHasNoRuntimeState) {
     cuda::stream stream{cuda::devices[0]};
     using layout = cuddl::register_layout<5, 11>;
