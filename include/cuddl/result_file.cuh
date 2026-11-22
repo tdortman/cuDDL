@@ -141,6 +141,9 @@ struct result_file_options {
     bool durable = false;
     /// Threads that expand results into records; 0 uses every hardware thread.
     unsigned threads = 0;
+    /// Maximum rate in bytes per second at which the files together write to storage, counted
+    /// from the first write; 0 is unlimited. Direct, buffered and io_uring writes all honor it.
+    double max_write_bytes_per_second = 0;
 };
 
 /// @brief What a @ref result_file wrote and how long its callers waited for it.
@@ -196,6 +199,10 @@ class result_file {
     open(std::filesystem::path const& path, result_file_options options = {}) {
         if (options.streams == 0) {
             return Err(Error::invalid_argument("a result file needs at least one stream"));
+        }
+        if (!(options.max_write_bytes_per_second >= 0) ||
+            !std::isfinite(options.max_write_bytes_per_second)) {
+            return Err(Error::invalid_argument("the write rate cap must be finite and not negative"));
         }
         result_file file;
         try {
@@ -273,10 +280,14 @@ class result_file {
                     static_cast<void>(cudaHostUnregister(data));
                 };
             }
+            std::shared_ptr<detail::write_pacer> pacer;
+            if (options.max_write_bytes_per_second > 0) {
+                pacer = std::make_shared<detail::write_pacer>(options.max_write_bytes_per_second);
+            }
             for (auto const& file : paths) {
                 streams.push_back(
                     std::make_unique<detail::file_writer>(
-                        file, options.durable, (size_t{1} << 30) / paths.size(), hooks
+                        file, options.durable, (size_t{1} << 30) / paths.size(), hooks, pacer
                     )
                 );
             }

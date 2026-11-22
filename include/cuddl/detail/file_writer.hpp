@@ -41,6 +41,39 @@ struct file_extent_hooks {
     };
 };
 
+/// @brief Holds the writes of every @ref file_writer that shares it to an aggregate byte rate,
+/// counted from the first write: a block waits until the bytes of all blocks up to and including
+/// it fit the elapsed time.
+class write_pacer {
+   public:
+    /// @param bytes_per_second Positive rate across all sharing writers.
+    explicit write_pacer(double bytes_per_second) : rate_(bytes_per_second) {
+    }
+
+    void wait(size_t bytes) {
+        std::chrono::steady_clock::time_point due;
+        {
+            std::lock_guard lock(mutex_);
+            if (!started_) {
+                start_ = std::chrono::steady_clock::now();
+                started_ = true;
+            }
+            bytes_ += bytes;
+            due = start_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::duration<double>(static_cast<double>(bytes_) / rate_)
+                           );
+        }
+        std::this_thread::sleep_until(due);
+    }
+
+   private:
+    double const rate_;
+    std::mutex mutex_;
+    bool started_ = false;
+    std::chrono::steady_clock::time_point start_;
+    uint64_t bytes_ = 0;
+};
+
 /// @brief Writes a file from a thread of its own, so the caller produces the next bytes while
 /// earlier ones reach storage.
 ///
@@ -68,13 +101,19 @@ class file_writer {
     /// @param durable Whether @ref finish flushes the file to storage before returning.
     /// @param queued_limit Bytes reserved or appended but not yet written before @ref reserve
     /// and @ref append wait; a larger reservation waits only for all but one other.
+    /// @param pacer When set, every block waits on it before it is written.
     file_writer(
         std::filesystem::path const& path,
         bool durable,
         size_t queued_limit = size_t{1} << 30,
-        file_extent_hooks hooks = {}
+        file_extent_hooks hooks = {},
+        std::shared_ptr<write_pacer> pacer = nullptr
     )
-        : path_(path), queued_limit_(queued_limit), durable_(durable), hooks_(std::move(hooks)) {
+        : path_(path),
+          queued_limit_(queued_limit),
+          durable_(durable),
+          hooks_(std::move(hooks)),
+          pacer_(std::move(pacer)) {
         int const flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
         fd_ = ablated("direct-io") ? -1 : ::open(path.c_str(), flags | O_DIRECT, 0644);
         direct_ = fd_ != -1;
@@ -189,6 +228,15 @@ class file_writer {
         fd_ = -1;
         if (buffered_fd_ != -1 && ::close(buffered_fd_) != 0 && error == 0) error = errno;
         buffered_fd_ = -1;
+        if (error == 0 && durable_) {
+            auto parent = path_.parent_path();
+            if (parent.empty()) parent = ".";
+            int const dir_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dir_fd >= 0) {
+                if (::fsync(dir_fd) != 0 && errno != EINVAL && errno != EROFS) error = errno;
+                ::close(dir_fd);
+            }
+        }
         if (error != 0) fail("cannot write", error);
     }
 
@@ -359,6 +407,7 @@ class file_writer {
     void work() {
         std::vector<queued_block> slots(ring_ ? depth : 1U);
         std::vector<unsigned> idle;
+        std::vector<unsigned> fresh;
         for (unsigned slot = 0; slot < slots.size(); ++slot) idle.push_back(slot);
         auto const window = std::min(probe_window, queued_limit_);
         bool buffered = false, settled = buffered_fd_ == -1, tried = false;
@@ -375,6 +424,7 @@ class file_writer {
                     queue_.pop_front();
                     ++in_flight_;
                 }
+                if (pacer_) pacer_->wait(next.bytes);
                 auto const start = clock::now();
                 int const error = write_all(buffered_fd_, next);
                 window_seconds += seconds_since(start);
@@ -414,18 +464,18 @@ class file_writer {
                     queue_.pop_front();
                     ++in_flight_;
                     submitted += slots[idle.back()].bytes;
-                    if (ring_) {
-                        auto const& next = slots[idle.back()];
-                        ring_->write(
-                            fd_,
-                            next.data,
-                            static_cast<uint32_t>(next.bytes),
-                            next.offset,
-                            idle.back()
-                        );
-                    }
+                    fresh.push_back(idle.back());
                 }
             }
+            // Paced and queued outside the lock, which producers need while this thread sleeps.
+            for (auto const slot : fresh) {
+                auto const& next = slots[slot];
+                if (pacer_) pacer_->wait(next.bytes);
+                if (ring_) {
+                    ring_->write(fd_, next.data, static_cast<uint32_t>(next.bytes), next.offset, slot);
+                }
+            }
+            fresh.clear();
             if (idle.size() == slots.size()) continue;
             auto const start = clock::now();
             if (!ring_) {
@@ -480,6 +530,7 @@ class file_writer {
     int buffered_fd_ = -1;
     bool direct_ = false;
     file_extent_hooks hooks_;
+    std::shared_ptr<write_pacer> pacer_;
     std::unique_ptr<io_ring> ring_;
 
     // Producer state, guarded by append_mutex_, which a reservation holds until its commit.

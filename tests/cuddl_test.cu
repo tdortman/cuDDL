@@ -5817,6 +5817,38 @@ TEST(FileWriterTest, AppendsArriveInOrderOnEveryFileSystem) {
     EXPECT_THROW(full.finish(), std::system_error);
 }
 
+TEST(ResultFileTest, WriteRateCapBoundsDurationAcrossStreams) {
+    // About 64 MiB written through two files at 256 MB/s cannot finish sooner than 0.26 s,
+    // whether the blocks go out through direct writes (build tree) or the page cache (tmpfs).
+    constexpr size_t rows_per_write = 349'525;
+    constexpr size_t total_bytes = 8 * rows_per_write * sizeof(cuddl::batch_search_result);
+    constexpr double rate = 256e6;
+    EXPECT_FALSE(cuddl::result_file::open("/dev/null", {.max_write_bytes_per_second = -1.0}));
+    std::vector<cuddl::batch_search_result> rows(rows_per_write);
+    for (auto const& directory :
+         {std::filesystem::current_path(), std::filesystem::path("/dev/shm")}) {
+        SCOPED_TRACE(directory.string());
+        auto const path = directory / "cuddl_write_rate_test.bin";
+        auto file = CUDDL_UNWRAP(
+            cuddl::result_file::open(
+                path, {.streams = 2, .threads = 2, .max_write_bytes_per_second = rate}
+            )
+        );
+        auto const start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 8; ++i) {
+            CUDDL_UNWRAP(file.write(rows));
+        }
+        CUDDL_UNWRAP(file.finish());
+        auto const seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        EXPECT_GE(seconds, static_cast<double>(total_bytes) / rate);
+        EXPECT_EQ(file.statistics().bytes, total_bytes);
+        for (auto const& piece : cuddl::result_file::files(path, 2)) {
+            std::filesystem::remove(piece);
+        }
+    }
+}
+
 TEST(ReferenceDatabaseFileTest, PlainFastaSkipsPageableStaging) {
     // Plain FASTA reaches the device as gzip does. Host loaders, which on the gpu backend share
     // the device candidates with nvCOMP, hand it over from page-locked buffers.
