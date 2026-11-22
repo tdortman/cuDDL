@@ -89,6 +89,7 @@ struct prepared_sequence {
     std::string path;
     std::string sha256;
     uint64_t bases;
+    uint64_t offered_kmers;
     std::vector<uint64_t> unique_kmers;
     sketch_type sketch;
     std::optional<cuco::hyperloglog<uint64_t>> hll;
@@ -228,12 +229,14 @@ void require_header(std::vector<std::string> const& fields) {
         hll.emplace(cuco::hyperloglog<uint64_t>{cuco::precision{k_hll_precision}, {}, {}, stream});
         hll->add(device.data(), device.data() + parsed.kmers.size(), stream);
     }
+    auto const offered_kmers = static_cast<uint64_t>(parsed.kmers.size());
     std::sort(parsed.kmers.begin(), parsed.kmers.end());
     parsed.kmers.erase(std::unique(parsed.kmers.begin(), parsed.kmers.end()), parsed.kmers.end());
     return {
         .path = path,
         .sha256 = sha256,
         .bases = parsed.bases,
+        .offered_kmers = offered_kmers,
         .unique_kmers = std::move(parsed.kmers),
         .sketch = std::move(sketch),
         .hll = std::move(hll),
@@ -286,10 +289,10 @@ exact_pair_metrics(size_t left, size_t right, size_t intersection, double actual
 
 [[nodiscard]] metrics sketch_metrics(cuddl::pairwise_summary const& summary) {
     return {
-        .containment = require(sketch_type::containment(summary), "containment"),
-        .completeness = require(sketch_type::completeness(summary), "completeness"),
-        .wkid = require(sketch_type::wkid(summary), "WKID"),
-        .ani = require(sketch_type::ani(summary), "ANI"),
+        .containment = sketch_type::containment(summary).value_or(0.0),
+        .completeness = sketch_type::completeness(summary).value_or(0.0),
+        .wkid = sketch_type::wkid(summary).value_or(0.0),
+        .ani = sketch_type::ani(summary).value_or(0.0),
     };
 }
 
@@ -421,11 +424,21 @@ void emit_orientation(
     });
 }
 
-void emit_hll(json& measurements, json row, double left, double right, double union_size) {
+void emit_hll(
+    json& measurements,
+    json row,
+    double left_uncapped,
+    double left_offered,
+    double right_uncapped,
+    double right_offered,
+    double union_size
+) {
     auto& output = row["metrics"];
     for (auto const* field : {"lower", "equal", "higher", "both_empty"}) {
         output.erase(field);
     }
+    double const left = std::min(left_uncapped, left_offered);
+    double const right = std::min(right_uncapped, right_offered);
     // Inclusion-exclusion can leave the feasible interval because all three inputs are estimates.
     double const raw_intersection = left + right - union_size;
     double const intersection = std::clamp(raw_intersection, 0.0, std::min(left, right));
@@ -437,6 +450,12 @@ void emit_hll(json& measurements, json row, double left, double right, double un
         output[std::string{name} + "_absolute_error"] = std::abs(estimate - exact);
     };
     add("cardinality", left);
+    emit_variant_metric(
+        output,
+        "cardinality_uncapped",
+        left_uncapped,
+        static_cast<size_t>(output.at("exact_cardinality").get<double>())
+    );
     add("containment", intersection / left);
     add("completeness", std::min(1.0, left / right));
     add("wkid", wkid);
@@ -601,7 +620,9 @@ int main(int argc, char** argv) {
                     measurements,
                     measurements[first_orientation],
                     query_size,
+                    static_cast<double>(query.offered_kmers),
                     reference_size,
+                    static_cast<double>(reference.offered_kmers),
                     union_size
                 );
                 if (query.unique_kmers.size() != reference.unique_kmers.size()) {
@@ -609,7 +630,9 @@ int main(int argc, char** argv) {
                         measurements,
                         measurements[first_orientation + 1],
                         reference_size,
+                        static_cast<double>(reference.offered_kmers),
                         query_size,
+                        static_cast<double>(query.offered_kmers),
                         union_size
                     );
                 }

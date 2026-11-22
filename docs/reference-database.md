@@ -654,6 +654,8 @@ Each rank writes its tiles through a `cuddl::result_file`, whose threads write w
 
 `--records similarity` (the default) writes each pair's weighted k-mer identity, `equal / max(equal + min(lower, higher), 6)` (`cuddl::weighted_kmer_identity`), as a 4-byte float. In an exhaustive search the comparison kernels compute it, and each tile is written as its first query ID and query count (two `uint32`) followed by one float per pair, query-major, each query against every later reference; with 100,000 genomes that is 20 GB instead of 120 GB. A threshold search writes 12-byte records of query ID, reference ID and float. `--records counts` writes the 24-byte records of `cuddl-reference-index search --all-to-all`, with the raw bucket counts. On 3,000 genomes the two agree exactly, and every-pair download plus write took 31 against 173 ms. Every format stores each pair once, smaller ID first. The identity is symmetric, so to read `(a, b)` with `b < a`, look up `(b, a)`; a count record for `(b, a)` gives `(a, b)` with `lower` and `higher` swapped.
 
+`--records similarity16` writes `cuddl::result_format::similarity16`, 2 bytes per pair, converted on the GPU; the comparison kernels still compute the float identity first. `--write-rate-limit G` caps each rank's result files together at `G` GB/s (1 GB = 10⁹ bytes), counted from the first write; the default 0 is unlimited, and the JSON report records it as `write_rate_limit_gbps`. The cap is per rank, so a node's aggregate is `G` times its ranks per node.
+
 ```sh
 mpirun -n 16 build/benchmarks/cuddl-distributed-all-to-all-benchmark genomes/ \
   --minimum-matches 20 --output-dir /localscratch/out -o end-to-end.json

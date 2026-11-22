@@ -67,6 +67,12 @@ enum Command {
         shard: usize,
         #[arg(long, default_value_t = 1)]
         shards: usize,
+        /// Cache-blocking tile size (rows x cols). 0 keeps upstream's untiled row-by-row scan.
+        #[arg(long, default_value_t = 0)]
+        tile_size: usize,
+        /// Call sync_all() (fsync) on the output file before exit.
+        #[arg(long, default_value_t = false)]
+        fsync: bool,
         #[arg(long)]
         output: PathBuf,
     },
@@ -177,6 +183,8 @@ fn compare(
     queries: Option<&Path>,
     shard: usize,
     shards: usize,
+    tile_size: usize,
+    do_fsync: bool,
     output: &Path,
 ) -> Result<()> {
     if shards == 0 || shard >= shards {
@@ -215,6 +223,45 @@ fn compare(
                     *out = query.jaccard_similarity(reference);
                 }
             });
+    } else if tile_size > 0 && output == Path::new("/dev/null") {
+        // Memory-light cache-blocked discard path (avoids a 320 GB output buffer at 400k).
+        let mine: Vec<usize> = (shard..n).step_by(shards).collect();
+        let total_pairs: usize = mine.iter().map(|&i| n - 1 - i).sum();
+        tick = Instant::now();
+        let checksum: f64 = mine
+            .par_chunks(tile_size)
+            .map(|row_block| {
+                let Some(&first_i) = row_block.first() else {
+                    return 0.0;
+                };
+                let mut acc = 0.0f64;
+                let mut bj = first_i + 1;
+                while bj < n {
+                    let bj_end = (bj + tile_size).min(n);
+                    for &i in row_block {
+                        let start = bj.max(i + 1);
+                        if start >= bj_end {
+                            continue;
+                        }
+                        for reference in &refs[start..bj_end] {
+                            acc += refs[i].jaccard_similarity(reference) as f64;
+                        }
+                    }
+                    bj = bj_end;
+                }
+                acc
+            })
+            .sum();
+        let resident = tick.elapsed();
+        eprintln!(
+            "simdsketch_compare n={} tile_size={} pairs={} resident_ms={:.2} write_ms=0.00 fsync=false checksum={:.1}",
+            n,
+            tile_size,
+            total_pairs,
+            resident.as_secs_f64() * 1e3,
+            checksum
+        );
+        return emit_resident("sketches", resident);
     } else {
         let mine: Vec<usize> = (shard..n).step_by(shards).collect();
         similarities = vec![0f32; mine.iter().map(|&i| n - 1 - i).sum()];
@@ -226,18 +273,76 @@ fn compare(
             rest = tail;
         }
         tick = Instant::now();
-        rows.into_par_iter().for_each(|(i, row)| {
-            for (out, reference) in row.iter_mut().zip(&refs[i + 1..]) {
-                *out = refs[i].jaccard_similarity(reference);
-            }
-        });
+        if tile_size == 0 {
+            rows.into_par_iter().for_each(|(i, row)| {
+                for (out, reference) in row.iter_mut().zip(&refs[i + 1..]) {
+                    *out = refs[i].jaccard_similarity(reference);
+                }
+            });
+        } else {
+            // Cache-blocked upper triangle: each Rayon task holds a tile of `tile_size` query
+            // rows in L2/L3 and streams reference blocks of `tile_size` sketches against them.
+            rows.par_chunks_mut(tile_size).for_each(|row_block| {
+                let Some((first_i, _)) = row_block.first() else {
+                    return;
+                };
+                let j_min = *first_i + 1;
+                let mut bj = j_min;
+                while bj < n {
+                    let bj_end = (bj + tile_size).min(n);
+                    for (i, row) in row_block.iter_mut() {
+                        let start = bj.max(*i + 1);
+                        if start >= bj_end {
+                            continue;
+                        }
+                        let off = start - (*i + 1);
+                        let slice = &mut row[off..off + (bj_end - start)];
+                        for (out, reference) in slice.iter_mut().zip(&refs[start..bj_end]) {
+                            *out = refs[*i].jaccard_similarity(reference);
+                        }
+                    }
+                    bj = bj_end;
+                }
+            });
+        }
     }
     let resident = tick.elapsed();
-    let mut file = BufWriter::new(File::create(output)?);
-    for value in &similarities {
-        file.write_all(&value.to_le_bytes())?;
+    let write_tick = Instant::now();
+    let mut file = File::create(output)?;
+    #[cfg(target_endian = "little")]
+    {
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                similarities.as_ptr().cast::<u8>(),
+                similarities.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        for chunk in raw.chunks(8 << 20) {
+            file.write_all(chunk)?;
+        }
     }
-    file.flush()?;
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut buf = BufWriter::with_capacity(8 << 20, file);
+        for value in &similarities {
+            buf.write_all(&value.to_le_bytes())?;
+        }
+        buf.flush()?;
+        file = buf.into_inner()?;
+    }
+    if do_fsync {
+        file.sync_all()?;
+    }
+    let write_elapsed = write_tick.elapsed();
+    eprintln!(
+        "simdsketch_compare n={} tile_size={} pairs={} resident_ms={:.2} write_ms={:.2} fsync={}",
+        n,
+        tile_size,
+        similarities.len(),
+        resident.as_secs_f64() * 1e3,
+        write_elapsed.as_secs_f64() * 1e3,
+        do_fsync
+    );
     emit_resident("sketches", resident)
 }
 
@@ -261,6 +366,8 @@ fn main() -> Result<()> {
             queries,
             shard,
             shards,
+            tile_size,
+            fsync,
             output,
         } => compare(
             args.resident_bytes,
@@ -268,6 +375,8 @@ fn main() -> Result<()> {
             queries.as_deref(),
             shard,
             shards,
+            tile_size,
+            fsync,
             &output,
         ),
     }

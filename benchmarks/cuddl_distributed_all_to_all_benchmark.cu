@@ -13,8 +13,10 @@
 // 1, stream s writes `rank-<r>.bin.<s>`, and each tile goes whole to the next stream in turn.
 //
 // `--records similarity` (the default) writes cuddl::result_format::similarity, each pair's
-// weighted k-mer identity as a 4-byte float, and `--records counts` the 24-byte
-// cuddl::batch_search_result records with the raw bucket counts. Phases are separated by
+// weighted k-mer identity as a 4-byte float, `--records similarity16` the same as
+// `round(wkid * 65535)` in 2 bytes, converted on the GPU, and `--records counts` the 24-byte
+// cuddl::batch_search_result records with the raw bucket counts. `--write-rate-limit G` holds the
+// rank's files to G GB/s (1e9 bytes) together; 0 is unlimited. Phases are separated by
 // barriers; each rank records its own time per phase.
 
 #include "multi_gpu.cuh"
@@ -86,9 +88,22 @@ int run(int argc, char** argv, ranks const& r) {
     bool keep_output = false;
     bool direct_reads = false;
     unsigned write_streams = 3;
+    double write_rate_limit_gbps = 0;
     std::string records = "similarity";
-    app.add_option("--records", records, "Result records: similarity or raw bucket counts")
-        ->check(CLI::IsMember({"similarity", "counts"}));
+    app.add_option(
+           "--records",
+           records,
+           "Result records: similarity, similarity16, sparse-similarity, counts, packed-counts, or "
+           "ranked-counts"
+    )
+        ->check(CLI::IsMember(
+            {"similarity",
+             "similarity16",
+             "sparse-similarity",
+             "counts",
+             "packed-counts",
+             "ranked-counts"}
+        ));
     app.add_option("genomes", input, "Genome directory, or a file listing one path per line")
         ->required()
         ->check(CLI::ExistingPath);
@@ -120,6 +135,13 @@ int run(int argc, char** argv, ranks const& r) {
            "Result files this rank writes in parallel; a shared file system needs several"
     )
         ->check(CLI::PositiveNumber);
+    app.add_option(
+           "--write-rate-limit",
+           write_rate_limit_gbps,
+           "Maximum write rate of this rank's result files together, in GB/s (1e9 bytes); 0 is "
+           "unlimited"
+    )
+        ->check(CLI::NonNegativeNumber);
     app.add_option("-o,--output", output, "JSON report destination (written by rank 0)");
     try {
         app.parse(argc, argv);
@@ -171,32 +193,46 @@ int run(int argc, char** argv, ranks const& r) {
     if (discard) write_streams = 1;
     auto const path = discard ? fs::path(output_dir)
                               : fs::path(output_dir) / ("rank-" + std::to_string(r.rank) + ".bin");
+    auto const result_fmt = records == "counts"            ? cuddl::result_format::counts
+                            : records == "packed-counts"   ? cuddl::result_format::packed_counts
+                            : records == "ranked-counts"   ? cuddl::result_format::ranked_counts
+                            : records == "sparse-similarity"
+                                ? cuddl::result_format::sparse_similarity
+                            : records == "similarity16" ? cuddl::result_format::similarity16
+                                                        : cuddl::result_format::similarity;
+    auto const exhaustive_out =
+        (records == "similarity" || records == "similarity16" || records == "sparse-similarity")
+            ? cuddl::exhaustive_output::similarities
+            : cuddl::exhaustive_output::counts;
+    uint64_t peak_vram_bytes = 0;
+    auto const sample_vram = [&] {
+        size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            peak_vram_bytes = std::max(peak_vram_bytes, static_cast<uint64_t>(total_bytes - free_bytes));
+        }
+    };
+    sample_vram();
     cuddl::result_file_statistics written;
     meter.run("search", [&] {
         auto file = CUDDL_UNWRAP(
             cuddl::result_file::open(
                 path,
-                {.format = records == "counts" ? cuddl::result_format::counts
-                                               : cuddl::result_format::similarity,
+                {.format = result_fmt,
                  .streams = write_streams,
                  .durable = !discard,
-                 .threads = workers}
+                 .threads = workers,
+                 .max_write_bytes_per_second = write_rate_limit_gbps * 1e9}
             )
         );
         auto const on_tile = [&](cuddl::replica_tile const& tile) {
             // Waiting for the tile's search first keeps that wait out of the download time.
             tile.stream.sync();
             CUDDL_UNWRAP(file.write(tile));
+            sample_vram();
         };
         if (minimum_matches == 0) {
             CUDDL_UNWRAP(
-                cuddl::search_all_to_all(
-                    *group,
-                    on_tile,
-                    MPI_COMM_WORLD,
-                    records == "counts" ? cuddl::exhaustive_output::counts
-                                        : cuddl::exhaustive_output::similarities
-                )
+                cuddl::search_all_to_all(*group, on_tile, MPI_COMM_WORLD, exhaustive_out)
             );
         } else {
             CUDDL_UNWRAP(
@@ -225,6 +261,7 @@ int run(int argc, char** argv, ranks const& r) {
         {"write_ms", written.stall_seconds * 1e3},
         {"pairs", written.pairs},
         {"bytes_written", written.bytes},
+        {"peak_vram_bytes", peak_vram_bytes},
     };
     for (auto const& [name, ms] : meter.ms()) mine[name + "_ms"] = ms;
     auto detail = gather_json(mine, MPI_COMM_WORLD);
@@ -256,6 +293,7 @@ int run(int argc, char** argv, ranks const& r) {
         {"indexed", minimum_matches > 0},
         {"records", records},
         {"write_streams", write_streams},
+        {"write_rate_limit_gbps", write_rate_limit_gbps},
         {"pairs_total", pairs_total},
         {"bytes_written_total", bytes_total},
         {"wall_ms", wall_ms},
