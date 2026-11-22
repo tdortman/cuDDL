@@ -16,7 +16,7 @@ namespace cuddl::detail {
 ///
 /// They exist to measure what each optimisation contributes (`scripts/ablation.py`); results
 /// are the same either way. Other builds compile every switch out.
-inline constexpr std::array<std::string_view, 24> ablations{
+inline constexpr std::array<std::string_view, 26> ablations{
     "co-scheduling",       // nvCOMP claims a batch only if it finishes before the host loaders
     "read-depth",          // readers keep read_depth reads in flight, not one per loader
     "probe-depth",         // 4 * parallel_read_depth gzip probes in flight, not parallel_read_depth
@@ -29,8 +29,10 @@ inline constexpr std::array<std::string_view, 24> ablations{
     "simd-parsing",        // AVX2/AVX-512/NEON line scans, compaction, packing and gzip scans
     "base-packing",        // the CPU path packs bases into two-bit words before copying them
     "kmer-encoding",       // the GPU builds eight windows per thread from shared SWAR-packed tiles
+    "global-floor",        // CTAs periodically merge winners into a global pruning floor
     "deltas",              // near-duplicate rows corrected from a base row, not compared in full
     "bit-slicing",         // exhaustive search on bit-planes, not packed row-major 16-bit scores
+    "lop3-fusion",         // bit-sliced planes with 3-input LOP3.LUT, not 5-op 2-input bitwise PTX
     "lop3-kernel",         // the tiled LOP3 plane kernel, not one bucket per lane step
     "tile-queue",          // ranks claim all-to-all tiles from a shared counter, not a fixed split
     "progress-thread",     // rank 0 drives MPI progress for the shared tile counter

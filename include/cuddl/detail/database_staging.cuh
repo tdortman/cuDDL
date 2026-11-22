@@ -699,8 +699,8 @@ class database_stager {
             auto const resident = CUDDL_TRY(begin_resident(kernel_stream_));
             // The kernel keeps the default carveout: a 50% L1 split sped up filtered sketching on
             // an RTX 5090, but made `gpu`-backend builds 2.6 times slower beside nvCOMP's kernels.
-            auto launch = [&]<bool Filter, bool Naive>() {
-                add_sequence_batch_kernel<BucketCount, Layout, Filter, Naive>
+            auto launch = [&]<bool Filter, bool Naive, bool UseFloor>() {
+                add_sequence_batch_kernel<BucketCount, Layout, Filter, Naive, UseFloor>
                     <<<static_cast<uint32_t>(grid), 256, 0, kernel_stream_.get()>>>(
                         descriptors_.data(),
                         copied_chunks_.size(),
@@ -710,22 +710,24 @@ class database_stager {
                         blacklist_.value_or(blacklist_view{})
                     );
             };
-            auto const encode = [&]<bool Naive>() {
+            auto const encode = [&]<bool Naive, bool UseFloor>() {
                 if (blacklist_) {
-                    launch.template operator()<true, Naive>();
+                    launch.template operator()<true, Naive, UseFloor>();
                 } else {
-                    launch.template operator()<false, Naive>();
+                    launch.template operator()<false, Naive, UseFloor>();
                 }
             };
-            // Only ablation builds compile the naive encoder.
+            // Only ablation builds compile the naive encoder and floorless variant.
             if constexpr (ablations_enabled) {
                 if (ablated("kmer-encoding")) {
-                    encode.template operator()<true>();
+                    encode.template operator()<true, true>();
+                } else if (ablated("global-floor")) {
+                    encode.template operator()<false, false>();
                 } else {
-                    encode.template operator()<false>();
+                    encode.template operator()<false, true>();
                 }
             } else {
-                encode.template operator()<false>();
+                encode.template operator()<false, true>();
             }
             CUDDL_CUDA_TRY(cudaGetLastError());
             CUDDL_TRY(end_resident(resident, kernel_stream_));

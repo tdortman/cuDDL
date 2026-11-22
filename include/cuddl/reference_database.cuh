@@ -2280,7 +2280,7 @@ class reference_database_view {
         CUDDL_CUDA_TRY(cudaMemsetAsync(cell_counter, 0, sizeof(uint32_t), stream.get()));
         // The bit-sliced all-pairs kernel and the delta correction write similarities
         // themselves; any other kernel's counts are converted once the tile is complete.
-        bool const fused = similarities != nullptr && detail::match_filter_supported<BucketCount> &&
+        bool const fused = similarities != nullptr && detail::all_pairs_supported<BucketCount> &&
                            !row_major_all_pairs();
         auto* const kernel_similarities = fused ? similarities : nullptr;
         if (deltas_.child_count != 0U && result_match_counts.empty() && corrects_deltas(stream)) {
@@ -2414,7 +2414,7 @@ class reference_database_view {
         if constexpr (
             (Candidates == detail::refine_candidates::all ||
              Candidates == detail::refine_candidates::reference_mask) &&
-            detail::match_filter_supported<BucketCount>
+            detail::all_pairs_supported<BucketCount>
         ) {
             if (!counting) {
                 return launch_all_pairs<UpperTriangle>(
@@ -2430,21 +2430,40 @@ class reference_database_view {
                 );
             }
         }
+        bool const ablate_row_major =
+            detail::ablations_enabled && UpperTriangle && detail::ablated("lop3-kernel");
+        bool const ablate_no_lop3 =
+            detail::ablations_enabled && !ablate_row_major && detail::ablated("lop3-fusion");
+        uint16_t const* row_major_ptr = nullptr;
+        if (ablate_row_major) {
+            row_major_ptr = CUDDL_TRY(row_major_rows(stream));
+        }
         auto const select_kernel = [&]<uint32_t Group>() {
-            return counting ? detail::refine_batch_bitmap_kernel<
-                                  BucketCount,
-                                  true,
-                                  batch_result_type,
-                                  Candidates,
-                                  UpperTriangle,
-                                  Group>
-                            : detail::refine_batch_bitmap_kernel<
-                                  BucketCount,
-                                  false,
-                                  batch_result_type,
-                                  Candidates,
-                                  UpperTriangle,
-                                  Group>;
+            auto const pick = [&]<bool UseLop3, bool RowMajor>() {
+                return counting ? detail::refine_batch_bitmap_kernel<
+                                      BucketCount,
+                                      true,
+                                      batch_result_type,
+                                      Candidates,
+                                      UpperTriangle,
+                                      Group,
+                                      UseLop3,
+                                      RowMajor>
+                                : detail::refine_batch_bitmap_kernel<
+                                      BucketCount,
+                                      false,
+                                      batch_result_type,
+                                      Candidates,
+                                      UpperTriangle,
+                                      Group,
+                                      UseLop3,
+                                      RowMajor>;
+            };
+            if constexpr (detail::ablations_enabled) {
+                if (ablate_row_major) return pick.template operator()<true, true>();
+                if (ablate_no_lop3) return pick.template operator()<false, false>();
+            }
+            return pick.template operator()<true, false>();
         };
         auto kernel = select_kernel.template operator()<detail::bitmap_refine_group<BucketCount>>();
         auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
@@ -2488,7 +2507,8 @@ class reference_database_view {
             result_match_counts.empty() ? nullptr : result_match_counts.data(),
             minimum_matches,
             pass_bits,
-            cell_counter
+            cell_counter,
+            row_major_ptr
         );
         return cuda_try(cudaGetLastError());
     }
@@ -2564,10 +2584,26 @@ class reference_database_view {
                 return cuda_try(cudaGetLastError());
             }
         }
-        constexpr auto group = detail::bitmap_refine_group<BucketCount>;
-        constexpr auto shared_bytes = detail::bitmap_refine_dynamic_bytes<BucketCount>;
-        auto const kernel =
-            detail::refine_all_pairs_kernel<BucketCount, batch_result_type, UpperTriangle, group>;
+        constexpr auto group = detail::all_pairs_query_group<BucketCount>;
+        constexpr auto shared_bytes = detail::all_pairs_dynamic_bytes<BucketCount>;
+        auto const kernel = [&]() {
+            if constexpr (detail::ablations_enabled) {
+                if (detail::ablated("lop3-fusion")) {
+                    return detail::refine_all_pairs_kernel<
+                        BucketCount,
+                        batch_result_type,
+                        UpperTriangle,
+                        group,
+                        false>;
+                }
+            }
+            return detail::refine_all_pairs_kernel<
+                BucketCount,
+                batch_result_type,
+                UpperTriangle,
+                group,
+                true>;
+        }();
         CUDDL_CUDA_TRY(cudaFuncSetAttribute(
             reinterpret_cast<void const*>(kernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize,

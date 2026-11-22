@@ -40,7 +40,7 @@ __device__ __forceinline__ uint32_t load_shared_relaxed(uint32_t const* address)
 /// Each shared word holds eight two-bit bases and eight ambiguity bits. Threads reuse
 /// neighboring words to construct eight overlapping windows on both strands. @p Naive instead
 /// builds every window base by base with a branch per base, for ablation studies only.
-template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false>
+template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false, bool UseFloor = true>
 __device__ __forceinline__ void add_sequence_windows(
     char const* sequence,
     uint32_t windows,
@@ -244,6 +244,7 @@ __device__ __forceinline__ void add_sequence_windows(
         }
         __syncthreads();
         // Share accepted winners across CTAs before processing the remaining tiles.
+        if constexpr (UseFloor) {
         if ((++tiles == 4 || tiles % 16 == 0) && tile + tile_stride < windows) {
             using reduce = cub::BlockReduce<uint32_t, 256>;
             __shared__ typename reduce::TempStorage exchange_scratch;
@@ -268,6 +269,7 @@ __device__ __forceinline__ void add_sequence_windows(
             }
             __syncthreads();
             hash_ceiling = exchange_ceiling;
+        }
         }
     }
     __syncthreads();
@@ -300,7 +302,7 @@ struct sequence_batch_chunk {
 ///
 /// The register cap keeps the blacklist lookup from costing resident blocks: at 43 registers,
 /// a GH200 SM held five blocks instead of eight.
-template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false>
+template <size_t BucketCount, typename Layout, bool HasBlacklist = false, bool Naive = false, bool UseFloor = true>
 __global__ CUDDL_SEQUENCE_BATCH_REGISTER_CAP void add_sequence_batch_kernel(
     sequence_batch_chunk const* chunks,
     size_t chunk_count,
@@ -327,7 +329,7 @@ __global__ CUDDL_SEQUENCE_BATCH_REGISTER_CAP void add_sequence_batch_kernel(
         }
         __syncthreads();
         auto* target = registers + size_t{chunk.genome} * BucketCount;
-        add_sequence_windows<BucketCount, Layout, HasBlacklist, Naive>(
+        add_sequence_windows<BucketCount, Layout, HasBlacklist, Naive, UseFloor>(
             chunk.bases,
             chunk.windows,
             (block - first_block) * 2048,

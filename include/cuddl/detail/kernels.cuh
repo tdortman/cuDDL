@@ -1453,7 +1453,16 @@ plane_low_any(uint32_t const (&planes)[score_planes]) noexcept {
 /// @p reference_low_any. Only those two masks pass score_compatibility validation.
 ///
 /// @p ReferenceFull asserts every reference score is nonzero, so no bucket is both empty.
-template <bool CountMatches, bool ReferenceFull = false>
+/// @p MsbFirst sweeps from MSB to LSB (requiring a 4-input equality carry and 3 LOP3 ops/plane)
+/// for ablation against the default LSB-to-MSB 2-op/plane sweep. A nonzero @p MsbExitStride
+/// ends that sweep, every @p MsbExitStride planes, once no bucket of the warp is still equal;
+/// every lane of the warp must call it then.
+template <
+    bool CountMatches,
+    bool ReferenceFull = false,
+    bool UseLop3 = true,
+    bool MsbFirst = false,
+    uint32_t MsbExitStride = 0U>
 __device__ __forceinline__ void compare_plane_group(
     uint32_t const (&q)[score_planes],
     uint32_t const (&r)[score_planes],
@@ -1461,18 +1470,55 @@ __device__ __forceinline__ void compare_plane_group(
     uint32_t reference_low_any,
     uint16_t key_mask,
     uint32_t match_lanes,
-    plane_counts& counts
+    plane_counts& counts,
+    uint32_t no_fuse_zero = 0U
 ) noexcept {
     uint32_t lt = 0U;
     uint32_t ne = 0U;
     uint32_t low_ne = 0U;
-    _Pragma("unroll")
-    for (uint32_t p = 0; p < score_planes; ++p) {
-        if (p == score_planes - 1U) {
-            low_ne = ne;
+    if constexpr (MsbFirst) {
+        // MSB-to-LSB sweep: deciding lt requires the running equality mask eq as a 4th input
+        // alongside (q[p], r[p], lt), so even with 3-input LOP3.LUT each plane needs 3 logic ops:
+        //   t = eq & ~q[p] & r[p]  (1 LOP3)
+        //   lt |= t                (1 op)
+        //   eq &= ~(q[p] ^ r[p])   (1 LOP3)
+        uint32_t eq = ~0U;
+        _Pragma("unroll")
+        for (uint32_t step = 0; step < score_planes; ++step) {
+            auto const p = score_planes - 1U - step;
+            auto const win = eq & (~q[p] & r[p]);
+            lt |= win;
+            eq &= ~(q[p] ^ r[p]);
+            if constexpr (MsbExitStride != 0U) {
+                if ((step + 1U) % MsbExitStride == 0U && step + 1U < score_planes &&
+                    __all_sync(0xffffffffU, eq == 0U)) {
+                    break;
+                }
+            }
         }
-        lt = (~q[p] & r[p]) | (~(q[p] ^ r[p]) & lt);
-        ne |= q[p] ^ r[p];
+        ne = ~eq;
+    } else {
+        _Pragma("unroll")
+        for (uint32_t p = 0; p < score_planes; ++p) {
+            if (p == score_planes - 1U) {
+                low_ne = ne;
+            }
+            if constexpr (UseLop3) {
+                lt = (~q[p] & r[p]) | (~(q[p] ^ r[p]) & lt);
+                ne |= q[p] ^ r[p];
+            } else {
+                // 5-op 2-input bitwise circuit for (lt, ne) sharing t_xor = q ^ r:
+                // ne |= t_xor; lt ^= (lt ^ r) & t_xor. Folding a runtime-zero uniform value
+                // (no_fuse_zero == 0) into each intermediate makes every pair of consecutive
+                // operations depend on 4 live inputs so ptxas cannot collapse them into 3-input
+                // LOP3.LUT without adding extra ALU instructions or memory barriers.
+                auto const t_xor = (q[p] ^ r[p]) ^ no_fuse_zero;
+                ne = (ne | t_xor) ^ no_fuse_zero;
+                auto const t_d = (lt ^ r[p]) ^ no_fuse_zero;
+                auto const t_m = (t_d & t_xor) | no_fuse_zero;
+                lt = (lt ^ t_m) | no_fuse_zero;
+            }
+        }
     }
     counts.lower += static_cast<uint32_t>(__popc(lt));
     counts.differ += static_cast<uint32_t>(__popc(ne));
@@ -1838,7 +1884,9 @@ template <
     typename SearchResult,
     refine_candidates Candidates,
     bool UpperTriangle,
-    uint32_t QueryGroup>
+    uint32_t QueryGroup,
+    bool UseLop3 = true,
+    bool RowMajor = false>
 __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_kernel(
     uint32_t const* query_planes,
     uint32_t query_id_offset,
@@ -1852,7 +1900,8 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
     uint32_t* result_match_counts,
     uint32_t minimum_matches,
     uint32_t* pass_bits,
-    uint32_t* cell_counter
+    uint32_t* cell_counter,
+    uint16_t const* row_major_refs = nullptr
 ) {
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t group = QueryGroup;
@@ -1985,8 +2034,46 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                 uint32_t mine_equal = 0U;
                 uint32_t mine_empty = 0U;
                 uint32_t mine_matches = 0U;
+                auto const no_fuse_zero = static_cast<uint32_t>(query_count == 0xffffffffU);
                 auto const compare_members = [&](auto full) {
                     auto const compare_member = [&](uint32_t m) {
+                        if constexpr (RowMajor) {
+                            uint16_t const* qr =
+                                row_major_refs +
+                                static_cast<size_t>(query_id_offset + first_query + m) * BucketCount;
+                            uint16_t const* rr =
+                                row_major_refs + static_cast<size_t>(reference_id) * BucketCount;
+                            uint32_t lower = 0U;
+                            uint32_t equal = 0U;
+                            uint32_t empty = 0U;
+                            uint32_t matches = 0U;
+                            for (uint32_t b = lane; b < BucketCount; b += warp_width) {
+                                auto const qs = qr[b];
+                                auto const rs = rr[b];
+                                lower += static_cast<uint32_t>(qs < rs);
+                                equal += static_cast<uint32_t>(qs == rs && qs != 0U);
+                                empty += static_cast<uint32_t>(qs == 0U && rs == 0U);
+                                if constexpr (CountMatches) {
+                                    if (b < indexed_bucket_count && qs != 0U && rs != 0U &&
+                                        (qs & key_mask) == (rs & key_mask)) {
+                                        ++matches;
+                                    }
+                                }
+                            }
+                            lower = __reduce_add_sync(0xffffffffU, lower);
+                            equal = __reduce_add_sync(0xffffffffU, equal);
+                            empty = __reduce_add_sync(0xffffffffU, empty);
+                            if constexpr (CountMatches) {
+                                matches = __reduce_add_sync(0xffffffffU, matches);
+                            }
+                            if (lane == m) {
+                                mine_lower = lower;
+                                mine_equal = equal;
+                                mine_empty = empty;
+                                mine_matches = matches;
+                            }
+                            return;
+                        }
                         auto const* member =
                             member_planes + static_cast<size_t>(m) * (row_words / 4U);
                         plane_counts counts{};
@@ -1996,14 +2083,15 @@ __global__ __launch_bounds__(bitmap_refine_block_size) void refine_batch_bitmap_
                                                  uint32_t rg_low_any) {
                             uint32_t q[score_planes];
                             load_plane_group(member, bucket_group, q);
-                            compare_plane_group<CountMatches, decltype(full)::value>(
+                            compare_plane_group<CountMatches, decltype(full)::value, UseLop3>(
                                 q,
                                 rg,
                                 rg_any,
                                 rg_low_any,
                                 key_mask,
                                 bucket_group < indexed_groups ? ~0U : 0U,
-                                counts
+                                counts,
+                                no_fuse_zero
                             );
                         };
                         _Pragma("unroll")
@@ -2304,6 +2392,36 @@ constexpr uint32_t all_pairs_block_size = 512U;
 /// only lowers the clock; with power headroom it shortens the search.
 constexpr uint32_t all_pairs_word_parts = 4U;
 
+/// @brief Whether @ref refine_all_pairs_kernel supports @p BucketCount.
+template <size_t BucketCount>
+constexpr bool all_pairs_supported =
+    BucketCount >= 1024U && BucketCount % 1024U == 0U && BucketCount <= 8192U;
+
+/// @brief Bucket-group chunk size (2 groups of 32x32 = 2,048 buckets) for B-dimension tiling
+/// when BucketCount > 2,048. Matches the B = 2,048 inner loop exactly while staging 20 query
+/// rows (80 KiB) plus per-cell pair accumulators (15 KiB) in 95 KiB shared memory.
+constexpr uint32_t all_pairs_tile_chunk_groups = 2U;
+
+/// @brief Maximum 32-reference words per cell for B-dimension tiled all-pairs (96 references).
+constexpr uint32_t all_pairs_tiled_block_words = 3U;
+
+/// @brief Query group size for @ref refine_all_pairs_kernel. Larger sketches tile the bucket
+/// dimension in @ref all_pairs_tile_chunk_groups chunks so query reuse stays high and registers
+/// never spill.
+template <size_t BucketCount>
+constexpr uint32_t all_pairs_query_group =
+    BucketCount <= 2048U ? bitmap_refine_group<BucketCount> : 20U;
+
+/// @brief Dynamic shared memory bytes for @ref refine_all_pairs_kernel.
+template <size_t BucketCount>
+constexpr size_t all_pairs_dynamic_bytes =
+    BucketCount <= 2048U
+        ? bitmap_refine_dynamic_bytes<BucketCount>
+        : static_cast<size_t>(all_pairs_query_group<BucketCount>) *
+                  (all_pairs_tile_chunk_groups * 32U * 32U) * sizeof(uint16_t) +
+              static_cast<size_t>(all_pairs_query_group<BucketCount>) *
+                  (all_pairs_tiled_block_words * 32U) * sizeof(uint2);
+
 /// @brief Exactly compares the layout pairs selected by @p reference_mask, without match counts.
 /// A null mask selects every reference. Each pair's counts go to @p results and its weighted
 /// k-mer identity to @p similarities, each skipped when null.
@@ -2312,8 +2430,17 @@ constexpr uint32_t all_pairs_word_parts = 4U;
 /// @ref all_pairs_word_parts parts of a 32-reference word at a time. A warp takes a claim's
 /// references two at a time and keeps both references' planes in registers, so each query plane
 /// group read from shared memory serves two pairs, and the two comparisons give every warp
-/// independent logic chains to interleave.
-template <size_t BucketCount, typename SearchResult, bool UpperTriangle, uint32_t QueryGroup>
+/// independent logic chains to interleave. For BucketCount > 2,048, the kernel tiles across
+/// 1,024-bucket chunks so shared memory stays fixed at 64 KiB and reference planes stay in
+/// registers without spilling.
+template <
+    size_t BucketCount,
+    typename SearchResult,
+    bool UpperTriangle,
+    uint32_t QueryGroup,
+    bool UseLop3 = true,
+    bool MsbFirst = false,
+    uint32_t MsbExitStride = 0U>
 __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kernel(
     uint32_t const* query_planes,
     uint32_t query_id_offset,
@@ -2325,15 +2452,18 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
     uint32_t* cell_counter,
     uint32_t const* reference_mask
 ) {
-    static_assert(match_filter_supported<BucketCount>);
+    static_assert(all_pairs_supported<BucketCount>);
     constexpr uint32_t warp_width = 32;
     constexpr uint32_t group = QueryGroup;
     static_assert(group >= 1U && group <= warp_width);
     constexpr uint32_t row_words = static_cast<uint32_t>(BucketCount / 2U);
     constexpr uint32_t lane_groups = static_cast<uint32_t>(BucketCount / warp_width / warp_width);
-    constexpr uint32_t max_block_words = static_cast<uint32_t>(cuda::std::max<size_t>(
-        1U, refine_block_row_bytes / (BucketCount * sizeof(uint16_t)) / warp_width
-    ));
+    constexpr uint32_t max_block_words =
+        BucketCount <= 2048U
+            ? static_cast<uint32_t>(cuda::std::max<size_t>(
+                  1U, refine_block_row_bytes / (BucketCount * sizeof(uint16_t)) / warp_width
+              ))
+            : all_pairs_tiled_block_words;
     extern __shared__ uint4 all_pairs_query_planes[];
     __shared__ uint32_t next_word;
     constexpr uint32_t part_width = warp_width / all_pairs_word_parts;
@@ -2357,125 +2487,305 @@ __global__ __launch_bounds__(all_pairs_block_size, 1) void refine_all_pairs_kern
             query_planes + static_cast<size_t>(first_query) * row_words
         );
 
-        __syncthreads();
-        if (threadIdx.x == 0U) {
-            next_word = first_word * all_pairs_word_parts;
-        }
-        for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * (row_words / 4U);
-             i += all_pairs_block_size) {
-            all_pairs_query_planes[i] = group_planes[i];
-        }
-        __syncthreads();
+        if constexpr (BucketCount <= 2048U) {
+            __syncthreads();
+            if (threadIdx.x == 0U) {
+                next_word = first_word * all_pairs_word_parts;
+            }
+            for (auto i = static_cast<uint32_t>(threadIdx.x); i < group_size * (row_words / 4U);
+                 i += all_pairs_block_size) {
+                all_pairs_query_planes[i] = group_planes[i];
+            }
+            __syncthreads();
 
-        for (;;) {
-            uint32_t word = 0U;
-            if (lane == 0U) {
-                word = atomicAdd(&next_word, 1U);
-            }
-            word = __shfl_sync(0xffffffffU, word, 0);
-            auto const part = word % all_pairs_word_parts;
-            word /= all_pairs_word_parts;
-            if (word >= last_word) {
-                break;
-            }
-            // Lane m holds query m's selected references in this part of the word.
-            uint32_t bits = 0U;
-            if (lane < group_size) {
-                auto const first_reference = word * warp_width;
-                auto const left = reference_count - first_reference;
-                bits = left >= warp_width ? ~0U : (1U << left) - 1U;
-                bits &= ((1U << part_width) - 1U) << (part * part_width);
-                if constexpr (UpperTriangle) {
-                    auto const query_id = query_id_offset + first_query + lane;
-                    if (first_reference <= query_id) {
-                        auto const skipped = query_id - first_reference + 1U;
-                        bits &= skipped >= warp_width ? 0U : ~0U << skipped;
-                    }
+            for (;;) {
+                uint32_t word = 0U;
+                if (lane == 0U) {
+                    word = atomicAdd(&next_word, 1U);
                 }
-                if (reference_mask != nullptr) {
-                    bits &= reference_mask[word];
+                word = __shfl_sync(0xffffffffU, word, 0);
+                auto const part = word % all_pairs_word_parts;
+                word /= all_pairs_word_parts;
+                if (word >= last_word) {
+                    break;
                 }
-            }
-            auto remaining = __reduce_or_sync(0xffffffffU, bits);
-            while (remaining != 0U) {
-                auto const bit_a = static_cast<uint32_t>(__ffs(remaining) - 1);
-                remaining &= remaining - 1U;
-                auto const has_b = remaining != 0U;
-                auto const bit_b = has_b ? static_cast<uint32_t>(__ffs(remaining) - 1) : bit_a;
-                remaining &= remaining - 1U;
-                auto const reference_a = word * warp_width + bit_a;
-                auto const reference_b = word * warp_width + bit_b;
-                auto const* planes_a = reinterpret_cast<uint4 const*>(
-                    reference_planes + static_cast<size_t>(reference_a) * row_words
-                );
-                auto const* planes_b = reinterpret_cast<uint4 const*>(
-                    reference_planes + static_cast<size_t>(reference_b) * row_words
-                );
-                uint32_t a[lane_groups][score_planes];
-                uint32_t b[lane_groups][score_planes];
-                uint32_t a_any[lane_groups];
-                uint32_t b_any[lane_groups];
-                uint32_t nonzero = ~0U;
-                _Pragma("unroll")
-                for (uint32_t j = 0; j < lane_groups; ++j) {
-                    load_plane_group(planes_a, j * warp_width + lane, a[j]);
-                    load_plane_group(planes_b, j * warp_width + lane, b[j]);
-                    a_any[j] = plane_any(a[j]);
-                    b_any[j] = plane_any(b[j]);
-                    nonzero &= a_any[j] & b_any[j];
-                }
-                // Selections are prefixes of the query group, and B's includes A's.
-                auto const selected_a = __ballot_sync(0xffffffffU, (bits >> bit_a) & 1U);
-                auto const selected_b = __ballot_sync(0xffffffffU, (bits >> bit_b) & 1U);
-                auto const members = static_cast<uint32_t>(__popc(selected_b));
-                // Lane m keeps member m's totals for both references.
-                pairwise_counts mine_a{};
-                pairwise_counts mine_b{};
-                auto const compare = [&](auto full) {
-                    for (uint32_t m = 0U; m < members; ++m) {
-                        auto const* member =
-                            all_pairs_query_planes + static_cast<size_t>(m) * (row_words / 4U);
-                        plane_counts counts_a{};
-                        plane_counts counts_b{};
-                        _Pragma("unroll")
-                        for (uint32_t j = 0; j < lane_groups; ++j) {
-                            uint32_t q[score_planes];
-                            load_plane_group(member, j * warp_width + lane, q);
-                            compare_plane_group<false, decltype(full)::value>(
-                                q, a[j], a_any[j], 0U, 0U, 0U, counts_a
-                            );
-                            compare_plane_group<false, decltype(full)::value>(
-                                q, b[j], b_any[j], 0U, 0U, 0U, counts_b
-                            );
-                        }
-                        auto const total_a = counts_a.reduce<BucketCount, decltype(full)::value>();
-                        auto const total_b = counts_b.reduce<BucketCount, decltype(full)::value>();
-                        if (lane == m) {
-                            mine_a = total_a;
-                            mine_b = total_b;
+                // Lane m holds query m's selected references in this part of the word.
+                uint32_t bits = 0U;
+                if (lane < group_size) {
+                    auto const first_reference = word * warp_width;
+                    auto const left = reference_count - first_reference;
+                    bits = left >= warp_width ? ~0U : (1U << left) - 1U;
+                    bits &= ((1U << part_width) - 1U) << (part * part_width);
+                    if constexpr (UpperTriangle) {
+                        auto const query_id = query_id_offset + first_query + lane;
+                        if (first_reference <= query_id) {
+                            auto const skipped = query_id - first_reference + 1U;
+                            bits &= skipped >= warp_width ? 0U : ~0U << skipped;
                         }
                     }
-                };
-                if (__all_sync(0xffffffffU, nonzero == ~0U)) {
-                    compare(cuda::std::true_type{});
-                } else {
-                    compare(cuda::std::false_type{});
+                    if (reference_mask != nullptr) {
+                        bits &= reference_mask[word];
+                    }
                 }
-                // The slot implies the pair; only its counts or similarity are stored.
-                auto const store = [&](uint32_t reference, pairwise_counts const& counts) {
-                    auto const slot = batch_result_slot<UpperTriangle>(
-                        first_query + lane, reference, query_id_offset, reference_count
+                auto remaining = __reduce_or_sync(0xffffffffU, bits);
+                while (remaining != 0U) {
+                    auto const bit_a = static_cast<uint32_t>(__ffs(remaining) - 1);
+                    remaining &= remaining - 1U;
+                    auto const has_b = remaining != 0U;
+                    auto const bit_b = has_b ? static_cast<uint32_t>(__ffs(remaining) - 1) : bit_a;
+                    remaining &= remaining - 1U;
+                    auto const reference_a = word * warp_width + bit_a;
+                    auto const reference_b = word * warp_width + bit_b;
+                    auto const* planes_a = reinterpret_cast<uint4 const*>(
+                        reference_planes + static_cast<size_t>(reference_a) * row_words
                     );
-                    if (results != nullptr) {
-                        results[slot] =
-                            SearchResult::pack(counts.lower, counts.equal, counts.higher);
+                    auto const* planes_b = reinterpret_cast<uint4 const*>(
+                        reference_planes + static_cast<size_t>(reference_b) * row_words
+                    );
+                    uint32_t a[lane_groups][score_planes];
+                    uint32_t b[lane_groups][score_planes];
+                    uint32_t a_any[lane_groups];
+                    uint32_t b_any[lane_groups];
+                    uint32_t nonzero = ~0U;
+                    _Pragma("unroll")
+                    for (uint32_t j = 0; j < lane_groups; ++j) {
+                        load_plane_group(planes_a, j * warp_width + lane, a[j]);
+                        load_plane_group(planes_b, j * warp_width + lane, b[j]);
+                        a_any[j] = plane_any(a[j]);
+                        b_any[j] = plane_any(b[j]);
+                        nonzero &= a_any[j] & b_any[j];
                     }
-                    if (similarities != nullptr) {
-                        similarities[slot] = weighted_kmer_identity(counts);
+                    // Selections are prefixes of the query group, and B's includes A's.
+                    auto const selected_a = __ballot_sync(0xffffffffU, (bits >> bit_a) & 1U);
+                    auto const selected_b = __ballot_sync(0xffffffffU, (bits >> bit_b) & 1U);
+                    auto const members = static_cast<uint32_t>(__popc(selected_b));
+                    // Lane m keeps member m's totals for both references.
+                    pairwise_counts mine_a{};
+                    pairwise_counts mine_b{};
+                    auto const no_fuse_zero = static_cast<uint32_t>(query_count == 0xffffffffU);
+                    auto const compare = [&](auto full) {
+                        for (uint32_t m = 0U; m < members; ++m) {
+                            auto const* member =
+                                all_pairs_query_planes + static_cast<size_t>(m) * (row_words / 4U);
+                            plane_counts counts_a{};
+                            plane_counts counts_b{};
+                            _Pragma("unroll")
+                            for (uint32_t j = 0; j < lane_groups; ++j) {
+                                uint32_t q[score_planes];
+                                load_plane_group(member, j * warp_width + lane, q);
+                                compare_plane_group<
+                                    false, decltype(full)::value, UseLop3, MsbFirst, MsbExitStride>(
+                                    q, a[j], a_any[j], 0U, 0U, 0U, counts_a, no_fuse_zero
+                                );
+                                compare_plane_group<
+                                    false, decltype(full)::value, UseLop3, MsbFirst, MsbExitStride>(
+                                    q, b[j], b_any[j], 0U, 0U, 0U, counts_b, no_fuse_zero
+                                );
+                            }
+                            auto const total_a = counts_a.reduce<BucketCount, decltype(full)::value>();
+                            auto const total_b = counts_b.reduce<BucketCount, decltype(full)::value>();
+                            if (lane == m) {
+                                mine_a = total_a;
+                                mine_b = total_b;
+                            }
+                        }
+                    };
+                    if (__all_sync(0xffffffffU, nonzero == ~0U)) {
+                        compare(cuda::std::true_type{});
+                    } else {
+                        compare(cuda::std::false_type{});
                     }
-                };
-                if (((selected_a >> lane) & 1U) != 0U) store(reference_a, mine_a);
-                if (has_b && ((selected_b >> lane) & 1U) != 0U) store(reference_b, mine_b);
+                    // The slot implies the pair; only its counts or similarity are stored.
+                    auto const store = [&](uint32_t reference, pairwise_counts const& counts) {
+                        auto const slot = batch_result_slot<UpperTriangle>(
+                            first_query + lane, reference, query_id_offset, reference_count
+                        );
+                        if (results != nullptr) {
+                            results[slot] =
+                                SearchResult::pack(counts.lower, counts.equal, counts.higher);
+                        }
+                        if (similarities != nullptr) {
+                            similarities[slot] = weighted_kmer_identity(counts);
+                        }
+                    };
+                    if (((selected_a >> lane) & 1U) != 0U) store(reference_a, mine_a);
+                    if (has_b && ((selected_b >> lane) & 1U) != 0U) store(reference_b, mine_b);
+                }
+            }
+        } else {
+            // B-dimension tiled path (BucketCount > 2,048): stream 2,048-bucket chunks through
+            // 80 KiB shared memory, accumulating partial counts per cell in 15 KiB shared memory
+            // so the inner loop matches B = 2,048 without register spills.
+            constexpr uint32_t group_vec4s = warp_width * (score_planes / 4U);  // 128 uint4 = 2 KiB
+            constexpr uint32_t chunk_vec4s = all_pairs_tile_chunk_groups * group_vec4s;
+            constexpr uint32_t row_vec4s = row_words / 4U;
+            constexpr uint32_t chunk_buckets =
+                all_pairs_tile_chunk_groups * warp_width * warp_width;
+            auto* cell_acc =
+                reinterpret_cast<uint2*>(all_pairs_query_planes + static_cast<size_t>(group) * chunk_vec4s);
+            auto const no_fuse_zero = static_cast<uint32_t>(query_count == 0xffffffffU);
+
+            for (uint32_t cg = 0U; cg < lane_groups; cg += all_pairs_tile_chunk_groups) {
+                auto const is_first_chunk = (cg == 0U);
+                auto const is_last_chunk = (cg + all_pairs_tile_chunk_groups >= lane_groups);
+
+                __syncthreads();
+                if (threadIdx.x == 0U) {
+                    next_word = first_word * all_pairs_word_parts;
+                }
+                auto const total_vec4s = group_size * chunk_vec4s;
+                for (auto i = static_cast<uint32_t>(threadIdx.x); i < total_vec4s;
+                     i += all_pairs_block_size) {
+                    auto const qm = i / chunk_vec4s;
+                    auto const off = i % chunk_vec4s;
+                    all_pairs_query_planes[i] =
+                        group_planes[static_cast<size_t>(qm) * row_vec4s + cg * group_vec4s + off];
+                }
+                __syncthreads();
+
+                for (;;) {
+                    uint32_t word = 0U;
+                    if (lane == 0U) {
+                        word = atomicAdd(&next_word, 1U);
+                    }
+                    word = __shfl_sync(0xffffffffU, word, 0);
+                    auto const part = word % all_pairs_word_parts;
+                    word /= all_pairs_word_parts;
+                    if (word >= last_word) {
+                        break;
+                    }
+                    uint32_t bits = 0U;
+                    if (lane < group_size) {
+                        auto const first_reference = word * warp_width;
+                        auto const left = reference_count - first_reference;
+                        bits = left >= warp_width ? ~0U : (1U << left) - 1U;
+                        bits &= ((1U << part_width) - 1U) << (part * part_width);
+                        if constexpr (UpperTriangle) {
+                            auto const query_id = query_id_offset + first_query + lane;
+                            if (first_reference <= query_id) {
+                                auto const skipped = query_id - first_reference + 1U;
+                                bits &= skipped >= warp_width ? 0U : ~0U << skipped;
+                            }
+                        }
+                        if (reference_mask != nullptr) {
+                            bits &= reference_mask[word];
+                        }
+                    }
+                    auto remaining = __reduce_or_sync(0xffffffffU, bits);
+                    while (remaining != 0U) {
+                        auto const bit_a = static_cast<uint32_t>(__ffs(remaining) - 1);
+                        remaining &= remaining - 1U;
+                        auto const has_b = remaining != 0U;
+                        auto const bit_b = has_b ? static_cast<uint32_t>(__ffs(remaining) - 1) : bit_a;
+                        remaining &= remaining - 1U;
+                        auto const reference_a = word * warp_width + bit_a;
+                        auto const reference_b = word * warp_width + bit_b;
+                        auto const* planes_a = reinterpret_cast<uint4 const*>(
+                            reference_planes + static_cast<size_t>(reference_a) * row_words
+                        );
+                        auto const* planes_b = reinterpret_cast<uint4 const*>(
+                            reference_planes + static_cast<size_t>(reference_b) * row_words
+                        );
+                        uint32_t a[all_pairs_tile_chunk_groups][score_planes];
+                        uint32_t b[all_pairs_tile_chunk_groups][score_planes];
+                        uint32_t a_any[all_pairs_tile_chunk_groups];
+                        uint32_t b_any[all_pairs_tile_chunk_groups];
+                        uint32_t nonzero = ~0U;
+                        _Pragma("unroll")
+                        for (uint32_t j = 0U; j < all_pairs_tile_chunk_groups; ++j) {
+                            load_plane_group(planes_a, (cg + j) * warp_width + lane, a[j]);
+                            load_plane_group(planes_b, (cg + j) * warp_width + lane, b[j]);
+                            a_any[j] = plane_any(a[j]);
+                            b_any[j] = plane_any(b[j]);
+                            nonzero &= a_any[j] & b_any[j];
+                        }
+                        auto const selected_a = __ballot_sync(0xffffffffU, (bits >> bit_a) & 1U);
+                        auto const selected_b = __ballot_sync(0xffffffffU, (bits >> bit_b) & 1U);
+                        auto const members = static_cast<uint32_t>(__popc(selected_b));
+                        pairwise_counts mine_a{};
+                        pairwise_counts mine_b{};
+                        auto const compare_chunk = [&](auto full) {
+                            for (uint32_t m = 0U; m < members; ++m) {
+                                auto const* member =
+                                    all_pairs_query_planes + static_cast<size_t>(m) * chunk_vec4s;
+                                plane_counts counts_a{};
+                                plane_counts counts_b{};
+                                _Pragma("unroll")
+                                for (uint32_t j = 0U; j < all_pairs_tile_chunk_groups; ++j) {
+                                    uint32_t q[score_planes];
+                                    load_plane_group(member, j * warp_width + lane, q);
+                                    compare_plane_group<false, decltype(full)::value, UseLop3>(
+                                        q, a[j], a_any[j], 0U, 0U, 0U, counts_a, no_fuse_zero
+                                    );
+                                    compare_plane_group<false, decltype(full)::value, UseLop3>(
+                                        q, b[j], b_any[j], 0U, 0U, 0U, counts_b, no_fuse_zero
+                                    );
+                                }
+                                auto const ta =
+                                    counts_a.reduce<chunk_buckets, decltype(full)::value>();
+                                auto const tb =
+                                    counts_b.reduce<chunk_buckets, decltype(full)::value>();
+                                if (lane == m) {
+                                    mine_a = ta;
+                                    mine_b = tb;
+                                }
+                            }
+                        };
+                        if (__all_sync(0xffffffffU, nonzero == ~0U)) {
+                            compare_chunk(cuda::std::true_type{});
+                        } else {
+                            compare_chunk(cuda::std::false_type{});
+                        }
+
+                        auto const accumulate_or_store =
+                            [&](uint32_t bit, uint32_t reference, pairwise_counts const& c) {
+                                auto const local_ref = (word - first_word) * warp_width + bit;
+                                auto const acc_idx = local_ref * group + lane;
+                                auto const ld = (c.lower << 16U) | (c.lower + c.higher);
+                                auto const occ = chunk_buckets - c.both_empty;
+                                if (is_first_chunk) {
+                                    cell_acc[acc_idx] = make_uint2(ld, occ);
+                                } else if (!is_last_chunk) {
+                                    auto const prev = cell_acc[acc_idx];
+                                    cell_acc[acc_idx] = make_uint2(prev.x + ld, prev.y + occ);
+                                } else {
+                                    auto const prev = cell_acc[acc_idx];
+                                    auto const tot_ld = prev.x + ld;
+                                    auto const tot_occ = prev.y + occ;
+                                    auto const lower = tot_ld >> 16U;
+                                    auto const diff = tot_ld & 0xffffU;
+                                    pairwise_counts const final_counts{
+                                        .lower = lower,
+                                        .equal = tot_occ - diff,
+                                        .higher = diff - lower,
+                                        .both_empty = static_cast<uint32_t>(BucketCount) - tot_occ,
+                                    };
+                                    auto const slot = batch_result_slot<UpperTriangle>(
+                                        first_query + lane,
+                                        reference,
+                                        query_id_offset,
+                                        reference_count
+                                    );
+                                    if (results != nullptr) {
+                                        results[slot] = SearchResult::pack(
+                                            final_counts.lower,
+                                            final_counts.equal,
+                                            final_counts.higher
+                                        );
+                                    }
+                                    if (similarities != nullptr) {
+                                        similarities[slot] = weighted_kmer_identity(final_counts);
+                                    }
+                                }
+                            };
+                        if (((selected_a >> lane) & 1U) != 0U) {
+                            accumulate_or_store(bit_a, reference_a, mine_a);
+                        }
+                        if (has_b && ((selected_b >> lane) & 1U) != 0U) {
+                            accumulate_or_store(bit_b, reference_b, mine_b);
+                        }
+                    }
+                }
             }
         }
     }
