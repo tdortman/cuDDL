@@ -8,12 +8,14 @@
 #include <cuddl/reference_database.cuh>
 #include <cuddl/replicated_database.cuh>
 
+#include <cub/device/device_select.cuh>
 #include <cub/device/device_transform.cuh>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -33,17 +35,92 @@
 
 namespace cuddl {
 
+namespace detail {
+
+struct packed_to_ranked {
+    __host__ __device__ ranked_pairwise_counts
+    operator()(packed_pairwise_counts packed) const noexcept {
+        return ranked_pairwise_counts::from_packed(packed);
+    }
+};
+
+struct is_nonzero_float {
+    __host__ __device__ bool operator()(float value) const noexcept {
+        return value != 0.0f;
+    }
+};
+
+__global__ void
+pack_nonzero_bitmap_kernel(float const* values, size_t count, uint32_t* bitmap) {
+    constexpr uint32_t warp_width = 32U;
+    auto const words = (count + warp_width - 1U) / warp_width;
+    auto const lane = static_cast<uint32_t>(threadIdx.x) % warp_width;
+    auto const stride = static_cast<size_t>(gridDim.x) * (blockDim.x / warp_width);
+    for (auto w = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) / warp_width;
+         w < words;
+         w += stride) {
+        auto const idx = w * warp_width + lane;
+        auto const nz = (idx < count) && (values[idx] != 0.0f);
+        auto const mask = __ballot_sync(0xffffffffU, nz);
+        if (lane == 0U) {
+            bitmap[w] = mask;
+        }
+    }
+}
+
+/// @brief A WKID in [0, 1] as `round(wkid * 65535)`. The product of a float and 65535 is exact
+/// in double.
+__host__ __device__ inline uint16_t quantize_similarity(float similarity) noexcept {
+    return static_cast<uint16_t>(static_cast<double>(similarity) * 65535.0 + 0.5);
+}
+
+struct similarity_to_u16 {
+    __host__ __device__ uint16_t operator()(float similarity) const noexcept {
+        return quantize_similarity(similarity);
+    }
+};
+
+struct packed_identity_to_u16 {
+    uint32_t bucket_count;
+
+    __host__ __device__ uint16_t operator()(packed_pairwise_counts packed) const noexcept {
+        return quantize_similarity(packed_identity{bucket_count}(packed));
+    }
+};
+
+}  // namespace detail
+
 /// @brief How a @ref result_file stores each pair.
 enum class result_format : uint8_t {
     /// One 24-byte @ref batch_search_result per pair: query ID, reference ID and the lower,
     /// equal, higher and both-empty bucket counts, six little-endian `uint32`.
     counts,
+    /// One 8-byte @ref packed_pairwise_counts per pair for exhaustive tiles: each tile writes
+    /// its first query ID and query count (two `uint32`) followed by one packed `(L, E, H)` word
+    /// per pair in the tile's order (`Z = B - L - E - H`). Thresholded tiles fall back to
+    /// 24-byte @ref batch_search_result records.
+    packed_counts,
+    /// One 4-byte @ref ranked_pairwise_counts per pair for exhaustive tiles (`B <= 2952`):
+    /// lossless combinatorial rank of `(L, E, H, Z)` prefixed by the 8-byte tile header.
+    /// Thresholded tiles fall back to 24-byte @ref batch_search_result records.
+    ranked_counts,
     /// The pair's @ref weighted_kmer_identity as a 4-byte float, computed on the GPU. A tile
     /// that holds every pair is written as its first query ID and query count (two `uint32`)
     /// followed by one float per pair in the tile's order: query-major, each query against every
     /// later reference in an all-to-all search and against every reference otherwise. Every
     /// other pair is a 12-byte @ref similarity_record.
     similarity,
+    /// Lossless sparse encoding of the full float32 WKID tile: 16-byte header
+    /// `(first_query_id, query_count, pair_count, nonzero_count)`, followed by
+    /// `ceil(pair_count / 32)` `uint32` bitmap words (bit `i` set iff `wkid[i] != 0.0f`),
+    /// followed by `nonzero_count` packed `float` values in tile order. Thresholded tiles fall
+    /// back to 12-byte @ref similarity_record records.
+    sparse_similarity,
+    /// The pair's @ref weighted_kmer_identity as `round(wkid * 65535)`, a little-endian 2-byte
+    /// `uint16`, converted on the GPU before the download. A tile that holds every pair is
+    /// written as in @ref similarity, the 8-byte header followed by one `uint16` per pair in the
+    /// same order. Every other pair is a 12-byte @ref similarity_record with the exact float.
+    similarity16,
 };
 
 /// @brief One pair of a thresholded search in @ref result_format::similarity.
@@ -185,8 +262,10 @@ class result_file {
               pool(threads) {
             auto const paths = files(path, options.streams);
             detail::file_extent_hooks hooks;
-            if (format == result_format::similarity) {
-                // write_converted copies from the GPU straight into the files' memory.
+            if (format == result_format::similarity || format == result_format::sparse_similarity ||
+                format == result_format::similarity16 || format == result_format::packed_counts ||
+                format == result_format::ranked_counts) {
+                // Direct-DMA tile writers copy from the GPU straight into the files' memory.
                 hooks.allocated = [](char* data, size_t bytes) {
                     CUDDL_CUDA_CALL(cudaHostRegister(data, bytes, cudaHostRegisterPortable));
                 };
@@ -210,11 +289,23 @@ class result_file {
         }
 
         Result<void> write(batch_result_tile const& tile, cuda::stream_ref stream) {
-            if (tile.similarities != nullptr && format != result_format::similarity) {
+            if (tile.similarities != nullptr && !stores_similarities(format)) {
                 return Err(Error::invalid_argument("a counts file needs tiles that hold counts"));
+            }
+            if (format == result_format::similarity16 && tile.pass_bits == nullptr) {
+                return write_similarity16(tile, stream);
             }
             if (format == result_format::similarity && tile.pass_bits == nullptr) {
                 return write_converted(tile, stream);
+            }
+            if (format == result_format::sparse_similarity && tile.pass_bits == nullptr) {
+                return write_sparse_similarity(tile, stream);
+            }
+            if (format == result_format::packed_counts && tile.pass_bits == nullptr) {
+                return write_packed_counts(tile, stream);
+            }
+            if (format == result_format::ranked_counts && tile.pass_bits == nullptr) {
+                return write_ranked_counts(tile, stream);
             }
             slot* free = nullptr;
             {
@@ -256,6 +347,9 @@ class result_file {
             stop();
             slots.clear();
             converted.clear();
+            sparse_bufs.clear();
+            quantized.clear();
+            ranked.clear();
             if (failure) return Err(error_of(failure));
             try {
                 for (auto& file : streams) file->finish();
@@ -348,6 +442,393 @@ class result_file {
             return Ok();
         }
 
+        /// Converts the similarities of @p tile, which holds every pair, to 16 bits on the GPU
+        /// and copies those straight into the bytes a file reserves. Synchronises @p stream.
+        Result<void> write_similarity16(batch_result_tile const& tile, cuda::stream_ref stream) {
+            std::optional<cuda::device_buffer<uint16_t>>* scratch = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (failure) return Err(error_of(failure));
+                if (done) return Err(Error::invalid_argument("the result file is finished"));
+                scratch = &quantized[stream.get()];
+            }
+            detail::device_scope const scope{stream};
+            auto const pairs = static_cast<size_t>(tile.slot_count());
+            if (!*scratch || (*scratch)->size() < pairs) {
+                CUDDL_TRY(cuda_try([&] {
+                    scratch->emplace(
+                        cuda::make_device_buffer<uint16_t>(
+                            stream, stream.device(), pairs, cuda::no_init
+                        )
+                    );
+                }));
+            }
+            auto& file = next_stream();
+            std::array const header{tile.first_query_id, tile.query_count};
+            auto const waiting = clock::now();
+            std::span<char> out;
+            try {
+                out = file.reserve(sizeof(header) + pairs * sizeof(uint16_t));
+            } catch (std::exception const& error) {
+                return Err(Error::resource(error.what()));
+            }
+            auto const start = clock::now();
+            std::memcpy(out.data(), header.data(), sizeof(header));
+            auto* const words = reinterpret_cast<uint16_t*>(out.data() + sizeof(header));
+            auto copied = [&]() -> Result<void> {
+                detail::uplink_lock const uplink(stream.device().get());
+                if (pairs != 0U) {
+                    if (tile.similarities != nullptr) {
+                        CUDDL_CUDA_TRY(
+                            cub::DeviceTransform::Transform(
+                                tile.similarities,
+                                (*scratch)->data(),
+                                pairs,
+                                detail::similarity_to_u16{},
+                                stream.get()
+                            )
+                        );
+                    } else {
+                        CUDDL_CUDA_TRY(
+                            cub::DeviceTransform::Transform(
+                                tile.results,
+                                (*scratch)->data(),
+                                pairs,
+                                detail::packed_identity_to_u16{tile.bucket_count},
+                                stream.get()
+                            )
+                        );
+                    }
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            cuda::std::span{(*scratch)->data(), pairs},
+                            cuda::std::span{words, pairs}
+                        )
+                    );
+                }
+                CUDDL_CUDA_TRY(stream.sync());
+                return Ok();
+            }();
+            if (!copied) {
+                file.abandon();
+                return copied;
+            }
+            file.commit();
+            std::lock_guard lock(mutex);
+            statistics.stall_seconds += std::chrono::duration<double>(start - waiting).count();
+            statistics.download_seconds += seconds_since(start);
+            statistics.pairs += pairs;
+            statistics.bytes += out.size();
+            return Ok();
+        }
+
+        struct sparse_scratch {
+            std::optional<cuda::device_buffer<uint32_t>> bitmap;
+            std::optional<cuda::device_buffer<float>> nonzeros;
+            std::optional<cuda::device_buffer<uint8_t>> cub_temp;
+            std::optional<cuda::device_buffer<uint32_t>> num_selected;
+        };
+
+        /// Losslessly packs an exhaustive tile's float32 WKIDs on the GPU into a 1-bit nonzero
+        /// bitmap plus packed nonzero floats and copies only the compacted bytes straight into the
+        /// file's pinned write buffer. Synchronises @p stream.
+        Result<void> write_sparse_similarity(batch_result_tile const& tile, cuda::stream_ref stream) {
+            std::optional<cuda::device_buffer<float>>* scratch = nullptr;
+            sparse_scratch* sp = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (failure) return Err(error_of(failure));
+                if (done) return Err(Error::invalid_argument("the result file is finished"));
+                if (tile.similarities == nullptr) scratch = &converted[stream.get()];
+                sp = &sparse_bufs[stream.get()];
+            }
+            detail::device_scope const scope{stream};
+            auto const pairs = static_cast<size_t>(tile.slot_count());
+            auto const bitmap_words = (pairs + 31U) / 32U;
+            if (scratch != nullptr && (!*scratch || (*scratch)->size() < pairs)) {
+                CUDDL_TRY(cuda_try([&] {
+                    scratch->emplace(
+                        cuda::make_device_buffer<float>(
+                            stream, stream.device(), pairs, cuda::no_init
+                        )
+                    );
+                }));
+            }
+            if (!sp->bitmap || sp->bitmap->size() < bitmap_words) {
+                CUDDL_TRY(cuda_try([&] {
+                    sp->bitmap.emplace(
+                        cuda::make_device_buffer<uint32_t>(
+                            stream, stream.device(), std::max<size_t>(1U, bitmap_words), cuda::no_init
+                        )
+                    );
+                }));
+            }
+            if (!sp->nonzeros || sp->nonzeros->size() < pairs) {
+                CUDDL_TRY(cuda_try([&] {
+                    sp->nonzeros.emplace(
+                        cuda::make_device_buffer<float>(
+                            stream, stream.device(), std::max<size_t>(1U, pairs), cuda::no_init
+                        )
+                    );
+                }));
+            }
+            if (!sp->num_selected) {
+                CUDDL_TRY(cuda_try([&] {
+                    sp->num_selected.emplace(
+                        cuda::make_device_buffer<uint32_t>(stream, stream.device(), 1U, cuda::no_init)
+                    );
+                }));
+            }
+            float const* const source = scratch != nullptr ? (*scratch)->data() : tile.similarities;
+            uint32_t nonzero_count = 0U;
+            auto const gpu_start = clock::now();
+            if (pairs != 0U) {
+                if (scratch != nullptr) {
+                    CUDDL_CUDA_TRY(
+                        cub::DeviceTransform::Transform(
+                            tile.results,
+                            (*scratch)->data(),
+                            pairs,
+                            detail::packed_identity{tile.bucket_count},
+                            stream.get()
+                        )
+                    );
+                }
+                constexpr uint32_t threads_per_block = 256U;
+                constexpr uint32_t warps_per_block = threads_per_block / 32U;
+                auto const blocks = static_cast<uint32_t>(std::min<size_t>(
+                    (bitmap_words + warps_per_block - 1U) / warps_per_block, 65535U
+                ));
+                detail::pack_nonzero_bitmap_kernel<<<blocks, threads_per_block, 0, stream.get()>>>(
+                    source, pairs, sp->bitmap->data()
+                );
+                CUDDL_CUDA_TRY(cudaGetLastError());
+
+                size_t temp_bytes = 0;
+                CUDDL_CUDA_TRY(cub::DeviceSelect::If(
+                    nullptr,
+                    temp_bytes,
+                    source,
+                    sp->nonzeros->data(),
+                    sp->num_selected->data(),
+                    pairs,
+                    detail::is_nonzero_float{},
+                    stream.get()
+                ));
+                if (!sp->cub_temp || sp->cub_temp->size() < temp_bytes) {
+                    CUDDL_TRY(cuda_try([&] {
+                        sp->cub_temp.emplace(
+                            cuda::make_device_buffer<uint8_t>(
+                                stream, stream.device(), std::max<size_t>(1U, temp_bytes), cuda::no_init
+                            )
+                        );
+                    }));
+                }
+                CUDDL_CUDA_TRY(cub::DeviceSelect::If(
+                    sp->cub_temp->data(),
+                    temp_bytes,
+                    source,
+                    sp->nonzeros->data(),
+                    sp->num_selected->data(),
+                    pairs,
+                    detail::is_nonzero_float{},
+                    stream.get()
+                ));
+                CUDDL_CUDA_TRY(cuda::copy_bytes(
+                    stream,
+                    cuda::std::span{sp->num_selected->data(), 1U},
+                    cuda::std::span{&nonzero_count, 1U}
+                ));
+                CUDDL_CUDA_TRY(stream.sync());
+            }
+            auto const gpu_seconds = seconds_since(gpu_start);
+
+            auto& file = next_stream();
+            std::array<uint32_t, 4> const header{
+                tile.first_query_id,
+                tile.query_count,
+                static_cast<uint32_t>(pairs),
+                nonzero_count,
+            };
+            auto const bitmap_bytes = bitmap_words * sizeof(uint32_t);
+            auto const nonzero_bytes = static_cast<size_t>(nonzero_count) * sizeof(float);
+            auto const waiting = clock::now();
+            std::span<char> out;
+            try {
+                out = file.reserve(sizeof(header) + bitmap_bytes + nonzero_bytes);
+            } catch (std::exception const& error) {
+                return Err(Error::resource(error.what()));
+            }
+            auto const dl_start = clock::now();
+            std::memcpy(out.data(), header.data(), sizeof(header));
+            auto* const dst_bitmap = reinterpret_cast<uint32_t*>(out.data() + sizeof(header));
+            auto* const dst_nonzeros =
+                reinterpret_cast<float*>(out.data() + sizeof(header) + bitmap_bytes);
+            auto copied = [&]() -> Result<void> {
+                detail::uplink_lock const uplink(stream.device().get());
+                if (bitmap_words != 0U) {
+                    CUDDL_CUDA_TRY(cuda::copy_bytes(
+                        stream,
+                        cuda::std::span{sp->bitmap->data(), bitmap_words},
+                        cuda::std::span{dst_bitmap, bitmap_words}
+                    ));
+                }
+                if (nonzero_count != 0U) {
+                    CUDDL_CUDA_TRY(cuda::copy_bytes(
+                        stream,
+                        cuda::std::span{sp->nonzeros->data(), static_cast<size_t>(nonzero_count)},
+                        cuda::std::span{dst_nonzeros, static_cast<size_t>(nonzero_count)}
+                    ));
+                }
+                CUDDL_CUDA_TRY(stream.sync());
+                return Ok();
+            }();
+            if (!copied) {
+                file.abandon();
+                return copied;
+            }
+            file.commit();
+            std::lock_guard lock(mutex);
+            statistics.stall_seconds += std::chrono::duration<double>(dl_start - waiting).count();
+            statistics.download_seconds += gpu_seconds + seconds_since(dl_start);
+            statistics.pairs += pairs;
+            statistics.bytes += out.size();
+            return Ok();
+        }
+
+        /// Copies the packed 8-byte `(L, E, H)` counts of an exhaustive @p tile straight into the
+        /// bytes a file reserves, prefixed by the 8-byte `(first_query_id, query_count)` header.
+        Result<void> write_packed_counts(batch_result_tile const& tile, cuda::stream_ref stream) {
+            {
+                std::lock_guard lock(mutex);
+                if (failure) return Err(error_of(failure));
+                if (done) return Err(Error::invalid_argument("the result file is finished"));
+            }
+            detail::device_scope const scope{stream};
+            auto const pairs = static_cast<size_t>(tile.slot_count());
+            auto& file = next_stream();
+            std::array const header{tile.first_query_id, tile.query_count};
+            auto const waiting = clock::now();
+            std::span<char> out;
+            try {
+                out = file.reserve(sizeof(header) + pairs * sizeof(packed_pairwise_counts));
+            } catch (std::exception const& error) {
+                return Err(Error::resource(error.what()));
+            }
+            auto const start = clock::now();
+            std::memcpy(out.data(), header.data(), sizeof(header));
+            auto* const packed =
+                reinterpret_cast<packed_pairwise_counts*>(out.data() + sizeof(header));
+            auto copied = [&]() -> Result<void> {
+                detail::uplink_lock const uplink(stream.device().get());
+                if (pairs != 0U) {
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            cuda::std::span{tile.results, pairs},
+                            cuda::std::span{packed, pairs}
+                        )
+                    );
+                }
+                CUDDL_CUDA_TRY(stream.sync());
+                return Ok();
+            }();
+            if (!copied) {
+                file.abandon();
+                return copied;
+            }
+            file.commit();
+            std::lock_guard lock(mutex);
+            statistics.stall_seconds += std::chrono::duration<double>(start - waiting).count();
+            statistics.download_seconds += seconds_since(start);
+            statistics.pairs += pairs;
+            statistics.bytes += out.size();
+            return Ok();
+        }
+
+        /// Converts an exhaustive @p tile's counts on the GPU into 4-byte lossless combinatorial
+        /// ranks and copies them straight into the file's pinned write buffer.
+        Result<void> write_ranked_counts(batch_result_tile const& tile, cuda::stream_ref stream) {
+            if (tile.bucket_count > ranked_pairwise_counts::max_bucket_count) {
+                return Err(Error::invalid_argument(
+                    "ranked_counts requires bucket_count <= ranked_pairwise_counts::max_bucket_count"
+                ));
+            }
+            std::optional<cuda::device_buffer<ranked_pairwise_counts>>* scratch = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (failure) return Err(error_of(failure));
+                if (done) return Err(Error::invalid_argument("the result file is finished"));
+                scratch = &ranked[stream.get()];
+            }
+            detail::device_scope const scope{stream};
+            auto const pairs = static_cast<size_t>(tile.slot_count());
+            if (!*scratch || (*scratch)->size() < pairs) {
+                CUDDL_TRY(cuda_try([&] {
+                    scratch->emplace(
+                        cuda::make_device_buffer<ranked_pairwise_counts>(
+                            stream, stream.device(), pairs, cuda::no_init
+                        )
+                    );
+                }));
+            }
+            auto& file = next_stream();
+            std::array const header{tile.first_query_id, tile.query_count};
+            auto const waiting = clock::now();
+            std::span<char> out;
+            try {
+                out = file.reserve(sizeof(header) + pairs * sizeof(ranked_pairwise_counts));
+            } catch (std::exception const& error) {
+                return Err(Error::resource(error.what()));
+            }
+            auto const start = clock::now();
+            std::memcpy(out.data(), header.data(), sizeof(header));
+            auto* const dst =
+                reinterpret_cast<ranked_pairwise_counts*>(out.data() + sizeof(header));
+            auto copied = [&]() -> Result<void> {
+                detail::uplink_lock const uplink(stream.device().get());
+                if (pairs != 0U) {
+                    CUDDL_CUDA_TRY(
+                        cub::DeviceTransform::Transform(
+                            tile.results,
+                            (*scratch)->data(),
+                            pairs,
+                            detail::packed_to_ranked{},
+                            stream.get()
+                        )
+                    );
+                    CUDDL_CUDA_TRY(
+                        cuda::copy_bytes(
+                            stream,
+                            cuda::std::span{(*scratch)->data(), pairs},
+                            cuda::std::span{dst, pairs}
+                        )
+                    );
+                }
+                CUDDL_CUDA_TRY(stream.sync());
+                return Ok();
+            }();
+            if (!copied) {
+                file.abandon();
+                return copied;
+            }
+            file.commit();
+            std::lock_guard lock(mutex);
+            statistics.stall_seconds += std::chrono::duration<double>(start - waiting).count();
+            statistics.download_seconds += seconds_since(start);
+            statistics.pairs += pairs;
+            statistics.bytes += out.size();
+            return Ok();
+        }
+
+        /// Whether the format's thresholded tiles and host rows are 12-byte similarity records.
+        static bool stores_similarities(result_format format) noexcept {
+            return format == result_format::similarity ||
+                   format == result_format::sparse_similarity ||
+                   format == result_format::similarity16;
+        }
+
         static Error error_of(std::exception_ptr const& failure) {
             try {
                 std::rethrow_exception(failure);
@@ -409,7 +890,7 @@ class result_file {
 
         void write_tile(slot const& tile) {
             auto const results = tile.host->tile();
-            if (format == result_format::counts) {
+            if (!stores_similarities(format)) {
                 expand(results, [](batch_search_result const& result) { return result; });
             } else {
                 expand(results, [](batch_search_result const& result) {
@@ -459,7 +940,7 @@ class result_file {
 
         void write_rows(std::vector<batch_search_result> const& rows) {
             auto& file = next_stream();
-            if (format == result_format::counts) {
+            if (!stores_similarities(format)) {
                 file.append(
                     {reinterpret_cast<char const*>(rows.data()), rows.size() * sizeof(rows[0])}
                 );
@@ -488,6 +969,12 @@ class result_file {
         std::map<cudaStream_t, std::pair<std::array<slot, 2>, unsigned>> slots;
         /// Per stream, the GPU-side similarities of the last tile write_converted converted.
         std::map<cudaStream_t, std::optional<cuda::device_buffer<float>>> converted;
+        /// Per stream, GPU scratch buffers for lossless sparse-bitmap similarity compaction.
+        std::map<cudaStream_t, sparse_scratch> sparse_bufs;
+        /// Per stream, the GPU-side 16-bit similarities of the last tile write_similarity16 converted.
+        std::map<cudaStream_t, std::optional<cuda::device_buffer<uint16_t>>> quantized;
+        /// Per stream, the GPU-side 4-byte ranked counts of the last tile write_ranked_counts converted.
+        std::map<cudaStream_t, std::optional<cuda::device_buffer<ranked_pairwise_counts>>> ranked;
         std::deque<job> queue;
         std::mutex mutex;
         std::condition_variable queued, written;

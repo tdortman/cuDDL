@@ -1874,6 +1874,39 @@ TEST_F(ReferenceDatabaseTest, ReplicatedAllToAllMatchesSingleDatabase) {
 // pairs' weighted k-mer identities. Covers exhaustive tiles of counts, converted on the GPU, and
 // of similarities written by the search, both copied straight into the files' buffers, and
 // threshold tiles, expanded on the host.
+TEST(SketchTest, RankedPairwiseCountsRoundTripAndBounds) {
+    for (uint32_t const buckets : {2048U, cuddl::ranked_pairwise_counts::max_bucket_count}) {
+        uint64_t const total = cuddl::ranked_pairwise_counts::binom3(buckets + 3U);
+        EXPECT_LE(total, uint64_t{1} << 32U);
+        std::array<cuddl::pairwise_counts, 8> const edges{{
+            {0U, 0U, 0U, buckets},
+            {buckets, 0U, 0U, 0U},
+            {0U, buckets, 0U, 0U},
+            {0U, 0U, buckets, 0U},
+            {1U, 0U, 0U, buckets - 1U},
+            {0U, 1U, 0U, buckets - 1U},
+            {0U, 0U, 1U, buckets - 1U},
+            {buckets / 3U, buckets / 3U, buckets / 3U, buckets - 3U * (buckets / 3U)},
+        }};
+        for (auto const& c : edges) {
+            auto const r = cuddl::ranked_pairwise_counts::pack(c.lower, c.equal, c.higher);
+            EXPECT_LT(uint64_t{r.rank}, total);
+            EXPECT_EQ(r.unpack(buckets), c);
+        }
+        std::mt19937 rng(0x12345U ^ buckets);
+        for (size_t i = 0; i < 20000; ++i) {
+            uint32_t const l = rng() % (buckets + 1U);
+            uint32_t const e = rng() % (buckets - l + 1U);
+            uint32_t const h = rng() % (buckets - l - e + 1U);
+            cuddl::pairwise_counts const c{l, e, h, buckets - l - e - h};
+            auto const packed = cuddl::packed_pairwise_counts::pack(l, e, h);
+            auto const r = cuddl::ranked_pairwise_counts::from_packed(packed);
+            EXPECT_LT(uint64_t{r.rank}, total);
+            EXPECT_EQ(r.unpack(buckets), c);
+        }
+    }
+}
+
 TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
     using database_type = cuddl::reference_database<k_default, b_default>;
     using group_type = cuddl::replicated_database<k_default, b_default>;
@@ -1950,6 +1983,86 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
         EXPECT_EQ(counts.statistics().pairs, expected.size());
         EXPECT_EQ(counts.statistics().bytes, bytes);
 
+        if (!threshold) {
+            auto packed = CUDDL_UNWRAP(
+                cuddl::result_file::open(
+                    base,
+                    {.format = cuddl::result_format::packed_counts, .streams = 2, .threads = 4}
+                )
+            );
+            search(
+                false,
+                [&](cuddl::replica_tile const& tile) { CUDDL_UNWRAP(packed.write(tile)); },
+                cuddl::exhaustive_output::counts
+            );
+            CUDDL_UNWRAP(packed.finish());
+            std::vector<cuddl::batch_search_result> unpacked;
+            uint64_t packed_bytes = 0;
+            for (auto const& path : cuddl::result_file::files(base, 2)) {
+                auto const data = read(path);
+                packed_bytes += data.size();
+                for (size_t at = 0; at < data.size();) {
+                    std::array<uint32_t, 2> header{};
+                    ASSERT_LE(at + sizeof(header), data.size());
+                    std::memcpy(header.data(), data.data() + at, sizeof(header));
+                    at += sizeof(header);
+                    for (auto query = header[0]; query < header[0] + header[1]; ++query) {
+                        for (auto reference = query + 1U; reference < reference_count;
+                             ++reference) {
+                            ASSERT_LE(at + sizeof(cuddl::packed_pairwise_counts), data.size());
+                            cuddl::packed_pairwise_counts word{};
+                            std::memcpy(&word, data.data() + at, sizeof(word));
+                            at += sizeof(word);
+                            unpacked.push_back({query, reference, word.unpack(b_default)});
+                        }
+                    }
+                }
+            }
+            std::ranges::sort(unpacked, by_pair);
+            EXPECT_EQ(unpacked, expected);
+            EXPECT_EQ(packed.statistics().pairs, expected.size());
+            EXPECT_EQ(packed.statistics().bytes, packed_bytes);
+
+            auto ranked = CUDDL_UNWRAP(
+                cuddl::result_file::open(
+                    base,
+                    {.format = cuddl::result_format::ranked_counts, .streams = 2, .threads = 4}
+                )
+            );
+            search(
+                false,
+                [&](cuddl::replica_tile const& tile) { CUDDL_UNWRAP(ranked.write(tile)); },
+                cuddl::exhaustive_output::counts
+            );
+            CUDDL_UNWRAP(ranked.finish());
+            std::vector<cuddl::batch_search_result> unranked;
+            uint64_t ranked_bytes = 0;
+            for (auto const& path : cuddl::result_file::files(base, 2)) {
+                auto const data = read(path);
+                ranked_bytes += data.size();
+                for (size_t at = 0; at < data.size();) {
+                    std::array<uint32_t, 2> header{};
+                    ASSERT_LE(at + sizeof(header), data.size());
+                    std::memcpy(header.data(), data.data() + at, sizeof(header));
+                    at += sizeof(header);
+                    for (auto query = header[0]; query < header[0] + header[1]; ++query) {
+                        for (auto reference = query + 1U; reference < reference_count;
+                             ++reference) {
+                            ASSERT_LE(at + sizeof(cuddl::ranked_pairwise_counts), data.size());
+                            cuddl::ranked_pairwise_counts word{};
+                            std::memcpy(&word, data.data() + at, sizeof(word));
+                            at += sizeof(word);
+                            unranked.push_back({query, reference, word.unpack(b_default)});
+                        }
+                    }
+                }
+            }
+            std::ranges::sort(unranked, by_pair);
+            EXPECT_EQ(unranked, expected);
+            EXPECT_EQ(ranked.statistics().pairs, expected.size());
+            EXPECT_EQ(ranked.statistics().bytes, ranked_bytes);
+        }
+
         for (auto const output :
              {cuddl::exhaustive_output::counts, cuddl::exhaustive_output::similarities}) {
             if (threshold && output == cuddl::exhaustive_output::similarities) continue;
@@ -2000,6 +2113,155 @@ TEST_F(ReferenceDatabaseTest, ResultFileHoldsEverySearchedPair) {
                 ASSERT_FLOAT_EQ(
                     records[i].similarity, cuddl::weighted_kmer_identity(expected[i].counts)
                 ) << i;
+            }
+        }
+
+        if (!threshold) {
+            auto sparse = CUDDL_UNWRAP(
+                cuddl::result_file::open(
+                    base,
+                    {.format = cuddl::result_format::sparse_similarity, .streams = 2, .threads = 4}
+                )
+            );
+            search(
+                false,
+                [&](cuddl::replica_tile const& tile) { CUDDL_UNWRAP(sparse.write(tile)); },
+                cuddl::exhaustive_output::similarities
+            );
+            CUDDL_UNWRAP(sparse.finish());
+            std::vector<cuddl::similarity_record> sparse_records;
+            uint64_t sparse_bytes = 0;
+            for (auto const& path : cuddl::result_file::files(base, 2)) {
+                auto const data = read(path);
+                sparse_bytes += data.size();
+                for (size_t at = 0; at < data.size();) {
+                    std::array<uint32_t, 4> header{};
+                    ASSERT_LE(at + sizeof(header), data.size());
+                    std::memcpy(header.data(), data.data() + at, sizeof(header));
+                    at += sizeof(header);
+                    uint32_t const first_q = header[0];
+                    uint32_t const q_cnt = header[1];
+                    uint32_t const num_pairs = header[2];
+                    uint32_t const nz_count = header[3];
+                    size_t const bitmap_bytes = ((size_t{num_pairs} + 31U) / 32U) * sizeof(uint32_t);
+                    size_t const val_bytes = size_t{nz_count} * sizeof(float);
+                    ASSERT_LE(at + bitmap_bytes + val_bytes, data.size());
+                    uint32_t const* bitmap = reinterpret_cast<uint32_t const*>(data.data() + at);
+                    float const* values =
+                        reinterpret_cast<float const*>(data.data() + at + bitmap_bytes);
+                    at += bitmap_bytes + val_bytes;
+                    uint32_t idx = 0;
+                    uint32_t nz_cursor = 0;
+                    for (auto query = first_q; query < first_q + q_cnt; ++query) {
+                        for (auto reference = query + 1U; reference < reference_count;
+                             ++reference) {
+                            bool const bit = ((bitmap[idx >> 5U] >> (idx & 31U)) & 1U) != 0U;
+                            float const val = bit ? values[nz_cursor++] : 0.0f;
+                            sparse_records.push_back({query, reference, val});
+                            ++idx;
+                        }
+                    }
+                    ASSERT_EQ(idx, num_pairs);
+                    ASSERT_EQ(nz_cursor, nz_count);
+                }
+            }
+            std::ranges::sort(sparse_records, by_pair);
+            ASSERT_EQ(sparse_records.size(), expected.size());
+            EXPECT_EQ(sparse.statistics().pairs, expected.size());
+            EXPECT_EQ(sparse.statistics().bytes, sparse_bytes);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                ASSERT_EQ(sparse_records[i].query_id, expected[i].query_id) << i;
+                ASSERT_EQ(sparse_records[i].reference_id, expected[i].reference_id) << i;
+                ASSERT_FLOAT_EQ(
+                    sparse_records[i].similarity, cuddl::weighted_kmer_identity(expected[i].counts)
+                ) << i;
+            }
+        }
+
+        for (auto const output :
+             {cuddl::exhaustive_output::counts, cuddl::exhaustive_output::similarities}) {
+            if (threshold && output == cuddl::exhaustive_output::similarities) continue;
+            SCOPED_TRACE(static_cast<int>(output));
+            auto quantized = CUDDL_UNWRAP(
+                cuddl::result_file::open(
+                    base, {.format = cuddl::result_format::similarity16, .streams = 2, .threads = 4}
+                )
+            );
+            search(
+                threshold,
+                [&](cuddl::replica_tile const& tile) { CUDDL_UNWRAP(quantized.write(tile)); },
+                output
+            );
+            CUDDL_UNWRAP(quantized.finish());
+            std::vector<cuddl::similarity_record> records;
+            std::vector<uint16_t> words(expected.size(), 0xFFFFU);
+            uint64_t file_bytes = 0;
+            uint64_t tile_pairs = 0;
+            for (auto const& path : cuddl::result_file::files(base, 2)) {
+                auto const data = read(path);
+                file_bytes += data.size();
+                if (threshold) {
+                    // Thresholded tiles keep the exact float in 12-byte records.
+                    ASSERT_EQ(data.size() % sizeof(cuddl::similarity_record), 0U);
+                    auto const at = records.size();
+                    records.resize(at + data.size() / sizeof(cuddl::similarity_record));
+                    std::memcpy(records.data() + at, data.data(), data.size());
+                    continue;
+                }
+                for (size_t at = 0; at < data.size();) {
+                    std::array<uint32_t, 2> header{};
+                    ASSERT_LE(at + sizeof(header), data.size());
+                    std::memcpy(header.data(), data.data() + at, sizeof(header));
+                    at += sizeof(header);
+                    for (auto query = header[0]; query < header[0] + header[1]; ++query) {
+                        for (auto reference = query + 1U; reference < reference_count;
+                             ++reference) {
+                            ASSERT_LE(at + sizeof(uint16_t), data.size());
+                            // Little-endian on the wire, whatever the host.
+                            auto const value = static_cast<uint16_t>(
+                                static_cast<uint8_t>(data[at]) |
+                                (static_cast<uint8_t>(data[at + 1U]) << 8U)
+                            );
+                            at += sizeof(uint16_t);
+                            auto const slot = std::ranges::lower_bound(
+                                expected, std::pair{query, reference}, {}, [](auto const& r) {
+                                    return std::pair{r.query_id, r.reference_id};
+                                }
+                            );
+                            ASSERT_TRUE(slot != expected.end());
+                            ASSERT_EQ(slot->query_id, query);
+                            ASSERT_EQ(slot->reference_id, reference);
+                            words[static_cast<size_t>(slot - expected.begin())] = value;
+                            ++tile_pairs;
+                        }
+                    }
+                }
+            }
+            EXPECT_EQ(quantized.statistics().pairs, expected.size());
+            EXPECT_EQ(quantized.statistics().bytes, file_bytes);
+            if (threshold) {
+                std::ranges::sort(records, by_pair);
+                ASSERT_EQ(records.size(), expected.size());
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    ASSERT_EQ(records[i].query_id, expected[i].query_id) << i;
+                    ASSERT_EQ(records[i].reference_id, expected[i].reference_id) << i;
+                    ASSERT_FLOAT_EQ(
+                        records[i].similarity, cuddl::weighted_kmer_identity(expected[i].counts)
+                    ) << i;
+                }
+                continue;
+            }
+            ASSERT_EQ(tile_pairs, expected.size());
+            // Two bytes per pair plus one 8-byte header per tile.
+            EXPECT_EQ((file_bytes - 2U * expected.size()) % 8U, 0U);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                auto const exact = static_cast<double>(
+                                       cuddl::weighted_kmer_identity(expected[i].counts)
+                                   ) *
+                                   65535.0;
+                // The GPU's float may differ from the host's in the last place, which can move a
+                // value on a rounding boundary by one step.
+                ASSERT_NEAR(static_cast<double>(words[i]), std::round(exact), 1.0) << i;
             }
         }
     }
