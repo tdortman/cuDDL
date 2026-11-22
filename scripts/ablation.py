@@ -218,6 +218,7 @@ def build(
         Config("cpu base-packing", ["base-packing"], cpu),
         Config("gpu kmer-encoding", ["kmer-encoding"], gpu),
         Config("cpu kmer-encoding", ["kmer-encoding"], cpu),
+        Config("automatic", args=["--decompression", "automatic"]),
     ]
     # Each ablation compares the time of the stage its optimisation targets: the whole build
     # for loading and scheduling, the sketch kernels' GPU time for the k-mer encoder.
@@ -242,6 +243,7 @@ def build(
             "cpu",
             "kernel_seconds",
         ),
+        Ablation("Automatic backend (vs. cpu)", "cpu", "automatic"),
     ]
     if engine:
         configs.append(Config("gpu-cores", args=["--decompression", "gpu-cores"]))
@@ -403,6 +405,7 @@ def search(
         Config("exhaustive", args=exhaustive, own_gpu=False),
         Config("exhaustive deltas", ["deltas"], exhaustive, own_gpu=False),
         Config("exhaustive bit-slicing", ["bit-slicing"], exhaustive, own_gpu=False),
+        Config("exhaustive lop3-fusion", ["lop3-fusion"], exhaustive, own_gpu=False),
         Config("exhaustive lop3-kernel", ["lop3-kernel"], exhaustive, own_gpu=False),
         Config("exhaustive tile-queue", ["tile-queue"], exhaustive, own_gpu=False),
         Config(
@@ -442,6 +445,7 @@ def search(
     ablations = [
         Ablation("Near-duplicate deltas", "exhaustive deltas", "exhaustive"),
         Ablation("Bit-sliced scores", "exhaustive bit-slicing", "exhaustive"),
+        Ablation("LOP3 ternary fusion", "exhaustive lop3-fusion", "exhaustive"),
         Ablation("LOP3 plane kernel", "exhaustive lop3-kernel", "exhaustive"),
         Ablation("Shared tile queue", "exhaustive tile-queue", "exhaustive"),
         Ablation("MPI progress thread", "exhaustive progress-thread", "exhaustive"),
@@ -582,6 +586,7 @@ def e2e(
         ("Switch-serialised downloads", ["switch-downloads"], "every"),
         ("Near-duplicate deltas", ["deltas"], "every"),
         ("Bit-sliced scores", ["bit-slicing"], "every"),
+        ("LOP3 ternary fusion", ["lop3-fusion"], "every"),
         ("LOP3 plane kernel", ["lop3-kernel"], "every"),
         ("Shared tile queue", ["tile-queue"], "every"),
         ("MPI progress thread", ["progress-thread"], "every"),

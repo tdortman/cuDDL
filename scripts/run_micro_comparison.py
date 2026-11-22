@@ -922,6 +922,14 @@ def main(
             "and all logical CPUs.",
         ),
     ] = None,
+    simdsketch_tile_size: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="SimdSketch compare cache-blocking tile (--tile-size); 0 runs upstream's "
+            "untiled row-by-row scan.",
+        ),
+    ] = 0,
     output: Annotated[
         Path,
         typer.Option(help="Results JSON, in the schema the plot scripts read."),
@@ -2851,6 +2859,11 @@ def main(
                     str(ss_references),
                     "--output",
                     str(ss_pairs),
+                    *(
+                        ["--tile-size", str(simdsketch_tile_size)]
+                        if simdsketch_tile_size
+                        else []
+                    ),
                     *ss_query_args,
                 ],
                 resident=ss_compare_resident,

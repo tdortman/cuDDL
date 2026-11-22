@@ -3,6 +3,7 @@
 # also run as several jobs within ki-gpu-devel's two hours:
 #   compile  builds the ablation variants through scripts/ablation_builds.sh;
 #   micro, build, search, e2e  run that suite of scripts/ablation.py.
+# REPS overrides the repetition count for all measurement suites.
 # Each job writes results/ablation-mogon-<job>.jsonl. Submit from the project root.
 source .envrc
 set -euo pipefail
@@ -31,8 +32,23 @@ if [ ! -e $mgpu/refseq211-100k.cuddl ]; then
     --workers "$SLURM_CPUS_ON_NODE"
   cp "$S/db.cuddl" $mgpu/refseq211-100k.cuddl
 fi
-srun -N "$nodes" --ntasks="$nodes" mkdir -p "$S/out" "$S/sweep"
-srun -N "$nodes" --ntasks="$nodes" cp "$mgpu/refseq211-100k.cuddl" "$S/db.cuddl"
+per_node() {
+  srun -N "$nodes" --ntasks="$nodes" -c "${SLURM_CPUS_PER_TASK:-1}" \
+    -o "logs/%x-%j-%s.log" -e "logs/%x-%j-%s.log" "$@"
+}
+if want e2e || want search; then
+  per_node bash -c '
+    set -euo pipefail
+    usable=$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader |
+      awk '"'"'$0 != "Enabled" { ++n } END { print n+0 }'"'"')
+    if (( usable < $1 )); then
+      echo "$(hostname): $usable usable GPUs, need $1" >&2
+      exit 1
+    fi
+    mkdir -p "$2/out" "$2/sweep"
+    cp "$3" "$2/db.cuddl"
+  ' bash "$SLURM_NTASKS_PER_NODE" "$S" "$mgpu/refseq211-100k.cuddl"
+fi
 export UCX_RCACHE_ENABLE=n
 UCX_NET_DEVICES=$(for d in $(ibstat -l); do
   port=$(ibstat "$d" 1)
@@ -49,27 +65,28 @@ one_gpu=$(nvidia-smi --query-gpu=uuid,mig.mode.current --format=csv,noheader |
 
 if want micro; then
   CUDA_VISIBLE_DEVICES=$one_gpu abl micro $mgpu/genomes-1k-sample \
-    --stock-build build/ablation/stock-build --label "$label"
+    --stock-build build/ablation/stock-build --reps "${REPS:-3}" --label "$label"
 fi
 # A build is one process, so it gets the whole node.
 if want build; then
   CUDA_VISIBLE_DEVICES=$one_gpu abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" \
-    --scratch "$S" --label "$label"
+    --scratch "$S" --reps "${REPS:-3}" --label "$label"
   # The same builds reading every genome from Lustre.
   CUDA_VISIBLE_DEVICES=$one_gpu abl build $mgpu/genomes-100k --workers "$SLURM_CPUS_ON_NODE" \
-    --scratch "$S" --label "$label, Lustre" --uncached --reps 2 \
+    --scratch "$S" --label "$label, Lustre" --uncached --reps "${REPS:-2}" \
     --only "GPU decompression (nvCOMP)" --only "GPU/host co-scheduling" \
     --only "Read depth (gpu)" --only "Read depth (cpu)" --only "Probe depth"
 fi
 if want search; then
-  abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" --reps 2 \
-    --label "$label"
+  abl search "$S/db.cuddl" --write-dir "$S/sweep" --launcher "$launcher" --ranks "$ranks" \
+    --reps "${REPS:-2}" --label "$label"
 fi
 # The ranks of a node share all of its cores: one per GPU need not divide them, so each rank's
 # loader count rounds up and no core stays idle.
 if want e2e; then
+  per_node uv run --offline scripts/warm_page_cache.py "$mgpu/genomes-100k" --threads 16
   rank_workers=$(((SLURM_CPUS_ON_NODE + SLURM_NTASKS_PER_NODE - 1) / SLURM_NTASKS_PER_NODE))
   abl e2e $mgpu/genomes-100k --output-dir "$S/out" --launcher "$launcher" \
-    --workers "$rank_workers" --stock-build build/ablation/stock-build --reps 2 \
+    --workers "$rank_workers" --stock-build build/ablation/stock-build --reps "${REPS:-2}" \
     --label "$label"
 fi
