@@ -5,19 +5,17 @@
 # ///
 """Ranks optimisations by the speedup each brings, from the JSON lines of ablation.py.
 
-For every optimisation and machine, its speedup is the median time of the configuration without
-it over the median time of the one it is compared with, measured on the stage it targets and end
-to end (the `e2e` suite's wall time). The stage is the first of: the `micro` suite (a host stage
+For every optimisation and machine, divide the time without it by the reference time within
+each repetition, then take the median of the paired ratios. This applies to the target stage
+and end to end (the `e2e` suite's wall time). The stage is the first of: the `micro` suite (a host stage
 alone), the `build` suite (the build or its sketch kernels), the `search` suite (the search on
 resident sketches), and the `e2e` suite's time in the phase the optimisation targets (metrics
 `phase:NAME`).
 
 Draws a figure one ACM column wide, set in Linux Libertine like acmart, to be included at 100%
 scale: a stage panel and an end-to-end panel share one row per optimisation, ranked by the
-largest end-to-end speedup, with one marker per machine, labelled with its speedup, and lines
-spanning the speedups of repetitions paired by index. A row's markers are centred on it, one
-lane per machine measured in that panel. Speedups past an axis's cap sit at the cap as an
-arrow. Prints every speedup as a Markdown table, largest first.
+largest end-to-end speedup. Markers show median paired speedups. Each machine has one lane per row. The stage panel
+uses a log axis to show the full range. Prints every speedup as a Markdown table, largest first.
 """
 
 import json
@@ -35,11 +33,28 @@ import typer
 SCOPES = {"micro": "stage", "build": "stage", "search": "stage", "e2e": "end to end"}
 SUITE_ORDER = {"micro": 0, "build": 1, "search": 2, "e2e": 3}
 COLUMN_INCHES = 3.33  # an ACM two-column layout's column width
-ROW_INCHES = 0.22
-LANE_INCHES = 0.085  # two value labels this far apart do not touch
+ROW_INCHES = 0.185
+LANE_INCHES = 0.075  # two value labels this far apart do not touch
 FONT = 7.2
 VALUE_FONT = 6.0
 MARKERS = "osD^v"
+THRESHOLDED_OUTPUT = "Thresholded output"
+INDEX_VS_FILTER = "Index vs. filter"
+
+SHORT_LABELS = {
+    "Similarity records on the GPU": "4 B WKID vs. 24 B",
+    "Thresholded output": r"Thresholded ($m_{\min}{=}20$)",
+    "Index vs. filter": "Index vs. filter",
+    "Branchless k-mer encoding (gpu)": "SWAR sketch (gpu)",
+    "Branchless k-mer encoding (cpu)": "SWAR sketch (cpu)",
+    "Two-bit base packing": "2-bit base pack",
+    "SIMD FASTX parsing": "SIMD parsing",
+    "MPI progress thread": "MPI progress",
+    "LOP3 plane kernel": "LOP3 vs. scalar",
+    "Bit-sliced scores": "Bit-sliced vs. 16-bit",
+    "GPU decompression (nvCOMP)": "GPU nvCOMP",
+    "DNA-tuned libdeflate": "DNA libdeflate",
+}
 
 # acmart sets text in Linux Libertine. Computer Modern at these sizes switches to its wide
 # small-size designs, so labels would run wider than the paper's text.
@@ -96,15 +111,21 @@ def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
         mine = runs[(runs.suite == a["suite"]) & (runs.label == a["label"])]
         if a["metric"] not in mine:
             continue
-        without = (
-            mine[mine.config == a["without"]].set_index("rep")[a["metric"]].dropna()
-        )
-        reference = (
-            mine[mine.config == a["reference"]].set_index("rep")[a["metric"]].dropna()
-        )
-        if without.empty or reference.empty:
+        without = mine.loc[mine.config == a["without"], ["rep", a["metric"]]]
+        reference = mine.loc[mine.config == a["reference"], ["rep", a["metric"]]]
+        pairs = without.merge(
+            reference, on="rep", validate="one_to_one", suffixes=("_without", "_ref")
+        ).dropna()
+        if pairs.empty:
             continue
-        paired = (without / reference).dropna()
+        without = pairs[f'{a["metric"]}_without']
+        reference = pairs[f'{a["metric"]}_ref']
+        paired = without / reference
+        optimisation = a["optimisation"]
+        if optimisation == "Index filtering on the GPU":
+            optimisation = THRESHOLDED_OUTPUT
+        elif optimisation == "Inverted index":
+            optimisation = INDEX_VS_FILTER
         rows.append(
             {
                 "label": a["label"],
@@ -113,19 +134,21 @@ def speedups(runs: pd.DataFrame, ablations: pd.DataFrame) -> pd.DataFrame:
                 else SCOPES[a["suite"]],
                 "suite": a["suite"],
                 "metric": a["metric"],
-                "optimisation": a["optimisation"],
+                "optimisation": optimisation,
                 "stage": target_stage(
                     a["suite"], a["metric"], a["reference"], a["optimisation"]
                 ),
                 "with_s": reference.median(),
                 "without_s": without.median(),
-                "speedup": without.median() / reference.median(),
-                "low": paired.min() if not paired.empty else np.nan,
-                "high": paired.max() if not paired.empty else np.nan,
+                "speedup": paired.median(),
+                "low": paired.min(),
+                "high": paired.max(),
                 "reps": len(paired),
             }
         )
     table = pd.DataFrame(rows)
+    if table.empty:
+        return table
     table["order"] = table.suite.map(SUITE_ORDER)
     return (
         table.sort_values("order", kind="stable")
@@ -156,14 +179,17 @@ def main(
             "--top", help="Keep at most this many top optimisations by speedup"
         ),
     ] = 0,
-    stage_cap: Annotated[
-        float, typer.Option(help="Largest speedup the stage axis shows")
-    ] = 12.0,
     names: Annotated[
         list[str] | None,
         typer.Option("--name", help="Legend label for a machine label, as LABEL=NAME"),
     ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option("--exclude", help="Optimisation names to omit from the figure"),
+    ] = None,
 ) -> None:
+    if exclude is None:
+        exclude = ["Device-only pinned pools"]
     runs, ablations = load(results)
     table = speedups(runs, ablations)
     if table.empty:
@@ -177,6 +203,8 @@ def main(
     legend = dict(n.split("=", 1) for n in names or [])
     if legend:
         table = table[table.label.isin(legend)]
+    if exclude:
+        table = table[~table.optimisation.isin(exclude)]
 
     # An optimisation can also make a run slower, so the effect counts both ways.
     table = table.assign(effect=np.abs(np.log(table.speedup)))
@@ -196,9 +224,9 @@ def main(
         ).optimisation
     )
     noteworthy = table[table.optimisation.isin(e2e_noteworthy | stage_all)]
-    if "Index filtering on the GPU" in set(noteworthy.optimisation):
+    if THRESHOLDED_OUTPUT in set(noteworthy.optimisation) and INDEX_VS_FILTER in stage_all:
         noteworthy = noteworthy[
-            ~noteworthy.optimisation.isin({"Low-plane match filter", "Inverted index"})
+            noteworthy.optimisation != "Low-plane match filter"
         ]
     paired_opts = (
         set(table[table.scope == "stage"].optimisation)
@@ -253,13 +281,13 @@ def main(
         1,
         2,
         sharey=True,
-        figsize=(COLUMN_INCHES, 0.45 + rows_inches),
+        figsize=(COLUMN_INCHES, 0.42 + rows_inches),
         layout="constrained",
-        gridspec_kw={"wspace": 0.05, "width_ratios": [1.15, 0.85]},
+        gridspec_kw={"wspace": 0.08, "width_ratios": [1.12, 0.88]},
     )
     lane = LANE_INCHES / ROW_INCHES
     for ax, scope, title in zip(
-        axes, ("stage", "end to end"), ("stage speedup", "end-to-end speedup")
+        axes, ("stage", "end to end"), ("Stage (log)", "End-to-end")
     ):
         mine = table[table.scope == scope].copy()
         # Lanes from the top: the first machine sits highest in a row.
@@ -269,69 +297,64 @@ def main(
         mine["y"] = mine.optimisation.map(row) + ((count - 1) / 2 - index) * lane
         values = mine[["low", "speedup", "high"]].to_numpy()
         top = np.nanmax(values) if values.size else 2.0
-        cap = min(top, stage_cap) if scope == "stage" else top
-        right = cap * (
-            1.03
-            if (scope == "stage" and top > stage_cap)
-            else 1.32
-            if scope == "stage"
-            else 1.48
-        )
+        right = top * (1.85 if scope == "stage" else 1.48)
+        if scope == "stage":
+            ax.set_xscale("log")
         for label, i in machines.items():
             points = mine[mine.label == label]
             if points.empty:
                 continue
             y = points.y.to_numpy()
-            clipped = points.speedup > cap
-            x = points.speedup.clip(upper=cap)
-            ax.hlines(
-                y,
-                points.low.clip(upper=cap),
-                points.high.clip(upper=cap),
-                color=f"C{i}",
-                lw=0.8,
-                zorder=3,
-            )
+            xs = points.speedup.to_numpy()
+            ax.hlines(y, 1.0, xs, color=f"C{i}", lw=1.25, alpha=0.85, zorder=3)
             ax.plot(
-                x[~clipped],
-                y[~clipped],
+                xs,
+                y,
                 MARKERS[i % len(MARKERS)],
                 color=f"C{i}",
-                ms=3.2,
+                ms=3.1,
                 zorder=4,
             )
-            ax.plot(x[clipped], y[clipped], ">", color=f"C{i}", ms=3.4, zorder=4)
-            ends = np.fmax(points.high.clip(upper=cap), x)
-            for value, xi, yi, past in zip(points.speedup, ends, y, clipped):
+            for value, xi, yi in zip(xs, xs, y):
+                anchor_x = max(xi, 1.0) if scope == "stage" and xi < 1.0 else xi
                 ax.annotate(
                     times(value),
-                    (xi, yi),
-                    xytext=(-3, 0) if past else (2.5, 0),
+                    (anchor_x, yi),
+                    xytext=(2.6, 0),
                     textcoords="offset points",
-                    ha="right" if past else "left",
+                    ha="left",
                     va="center_baseline",
                     fontsize=VALUE_FONT,
                     color=f"C{i}",
                 )
-        ax.axvline(1, color="black", lw=0.55, zorder=2)
-        left = min(0.8, np.nanmin(values) * 0.95) if values.size else 0.8
+        ax.axvline(1, color="black", lw=0.6, zorder=2)
+        left = min(0.75, np.nanmin(values) * 0.90) if values.size else 0.75
         ax.set_xlim(left, right)
-        ticks = mpl.ticker.MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
-            left, right
-        )
-        # A tick within a fifth of the axis of 1x would print over it.
-        gap = 0.24 * (right - left)
-        ax.set_xticks(sorted({1.0, *(t for t in ticks if 1 + gap <= t <= right)}))
+        if scope == "stage":
+            candidates = (1, 2, 5, 10) if top <= 12 else (1, 5, 25, 125)
+            ax.set_xticks([t for t in candidates if t <= right * 0.92])
+            ax.xaxis.set_minor_locator(mpl.ticker.NullLocator())
+        else:
+            ax.set_xticks([t for t in (1, 2, 4, 6) if t <= right * 0.95])
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda v, _: f"{v:g}" + r"$\times$")
         )
         ax.tick_params(labelsize=FONT, length=2, pad=1.5)
-        ax.grid(True, axis="x", lw=0.3, alpha=0.5, zorder=1)
-        ax.set_xlabel(title, fontsize=FONT + 0.4, labelpad=1.5)
+        ax.grid(True, axis="x", lw=0.35, alpha=0.45, zorder=1)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_xlabel(
+            title,
+            fontsize=FONT + 0.3,
+            labelpad=1.5,
+        )
     axes[0].set_yticks(
-        range(len(order)), [pu.paper_text(o) for o in order], fontsize=FONT
+        range(len(order)),
+        [SHORT_LABELS.get(o, pu.paper_text(o)) for o in order],
+        fontsize=FONT,
     )
-    axes[0].tick_params(axis="y", length=0)
+    axes[0].tick_params(axis="y", length=0, pad=2.5)
+    axes[1].tick_params(axis="y", length=0)
     axes[0].set_ylim(-0.55, len(order) - 0.45)
     spans: list[tuple[int, int, str]] = []
     start = 0
@@ -340,20 +363,24 @@ def main(
             spans.append((start, idx, stage_of[order[start]]))
             if idx < len(order) - 1:
                 for ax in axes:
-                    ax.axhline(idx + 0.5, color="#9ca3af", lw=0.6, ls="--", zorder=2)
+                    ax.axhline(idx + 0.5, color="#9ca3af", lw=0.55, ls="--", zorder=2)
             start = idx + 1
     for b_idx, (s_i, e_i, _) in enumerate(spans):
         if b_idx % 2 == 1:
             for ax in axes:
                 ax.axhspan(s_i - 0.5, e_i + 0.5, color="#f3f4f6", zorder=0, lw=0)
     ax_r = axes[1].twinx()
+    ax_r.spines["top"].set_visible(False)
+    ax_r.spines["right"].set_visible(False)
+    ax_r.spines["left"].set_visible(False)
+    ax_r.spines["bottom"].set_visible(False)
     ax_r.set_ylim(-0.55, len(order) - 0.45)
     ax_r.set_yticks(
         [(s_i + e_i) / 2 for s_i, e_i, _ in spans],
         [r"\textit{" + pu.paper_text(st) + r"}" for _, _, st in spans],
-        fontsize=FONT,
+        fontsize=FONT - 0.2,
     )
-    ax_r.tick_params(axis="y", length=0, pad=3.5)
+    ax_r.tick_params(axis="y", length=0, pad=2.5)
     if len(machines) > 1:
         handles = [
             mpl.lines.Line2D(
@@ -361,10 +388,15 @@ def main(
             )
             for i in machines.values()
         ]
+        fig.canvas.draw()
+        x_mid = 0.5 * (axes[0].get_position().x0 + axes[1].get_position().x1)
+        y_top = axes[0].get_position().y1
         fig.legend(
             handles,
             [pu.paper_text(legend.get(label, label)) for label in machines],
-            loc="outside upper center",
+            loc="lower center",
+            bbox_to_anchor=(x_mid, y_top + 0.015),
+            bbox_transform=fig.transFigure,
             ncol=len(machines),
             fontsize=FONT,
             frameon=False,

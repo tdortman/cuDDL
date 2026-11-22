@@ -7,8 +7,9 @@
 logs/ceilings.sh run. Writes three panels into OUTPUT_DIR:
 
 - grid_saturation.pdf: on one GPU, each stage's throughput as a share of the hardware ceiling
-  that bounds it, against the genome count. Compare: device-resident pairs per second against
-  the ALU ceiling (alu-power-ceiling over the search's ALU warp instructions per pair). Download:
+  that bounds it, against the genome count. Compare: device-resident pairs per second with
+  near-duplicate deltas disabled (deltas-grid), so every pair runs the full kernel, against the
+  ALU ceiling (alu-power-ceiling over the kernel's ALU warp instructions per pair). Download:
   the 8-byte packed counts of every pair copied to the host, against one GPU's device-to-host
   bandwidth (nvbandwidth). End-to-end results: the 4-byte similarities of the m0 pipeline over
   the time its search spent downloading them, against the same bandwidth. Cold read: the
@@ -16,7 +17,8 @@ logs/ceilings.sh run. Writes three panels into OUTPUT_DIR:
   rate one node reads such files at while every storage target holding them is busy;
 - grid_strong.pdf: device-resident speedup over one GPU for every genome count;
 - grid_e2e.pdf: FASTA-to-results wall time against the genome count on one node and on the
-  most nodes, for cuDDL (exhaustive all-to-all, median of r1-r3) and SimdSketch.
+  most nodes, for cuDDL (exhaustive all-to-all, discard runs and synchronised NVMe where
+  available, medians of r1-r3) and SimdSketch.
 """
 
 import json
@@ -75,8 +77,9 @@ def main(
     ),
     gpu: Annotated[str, typer.Option(help="GPU tag in the result names")] = "a100",
     alu_per_pair: Annotated[
-        float, typer.Option(help="ALU warp instructions per pair (Nsight Compute)")
-    ] = 50.4,
+        float,
+        typer.Option(help="ALU warp instructions per pair of the delta-free kernel (Nsight Compute)"),
+    ] = 70.16,
     output_dir: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     out = pu.resolve_output_dir(output_dir, __file__)
@@ -99,6 +102,16 @@ def main(
         )
         / alu_per_pair
     )
+    deltas_off = {
+        int(row["references"]): row["pairs_per_second"]
+        for p in results.glob(f"mogon-{gpu}-deltas-grid-*.jsonl")
+        for line in p.read_text().splitlines()
+        if line.strip()
+        for row in [json.loads(line)]
+        if row["ablate"] == "deltas"
+    }
+    if not deltas_off:
+        raise typer.BadParameter(f"no mogon-{gpu}-deltas-grid-*.jsonl in {results}")
     searches = {
         size_of(p): json.loads(p.read_text())
         for p in results.glob(f"mogon-{gpu}-grid-search-*.json")
@@ -126,7 +139,7 @@ def main(
     stages = [
         (
             "Compare (GPU ALU)",
-            {n: single[n]["device"]["pairs_per_second"] / pairs_ceiling for n in sizes},
+            {n: deltas_off[n] / pairs_ceiling for n in sizes},
         ),
         (
             "Download (PCIe)",
@@ -238,6 +251,12 @@ def main(
                     color=color,
                     label=f"{label}, {count} node{'s' if count > 1 else ''}",
                 )
+    durable = sorted(results.glob(f"mogon-{gpu}-nvme-e2e-*-1x1-m0-nvme-r[123].json"))
+    for (n, _), seconds in median_by(durable, lambda r: r["wall_ms"] / 1e3).items():
+        ax.plot(
+            n, seconds, marker="D", ms=3.2, color="#2E86AB", label="cuDDL, 1 node NVMe"
+        )
+        typer.echo(f"cuDDL synchronised NVMe, 1 node: {size_label(n)} {seconds:.1f} s")
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Genomes")
