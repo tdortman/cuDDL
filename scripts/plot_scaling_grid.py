@@ -233,7 +233,7 @@ def main(
     simd = sorted(results.glob("mogon-epyc-grid-simdsketch-*.json"))
     walls = {
         "cuDDL": median_by(runs(0, "123"), lambda r: r["wall_ms"] / 1e3),
-        "SimdSketch": median_by(simd, lambda r: r["wall_s"]) if simd else {},
+        "SimdSketch (untiled)": median_by(simd, lambda r: r["wall_s"]) if simd else {},
     }
     nodes = sorted({k[1] for k in walls["cuDDL"]})
     shown = [nodes[0], nodes[-1]] if len(nodes) > 1 else nodes
@@ -261,7 +261,14 @@ def main(
     ax.set_yscale("log")
     ax.set_xlabel("Genomes")
     ax.set_ylabel("FASTA to results [s]")
-    ax.legend(frameon=False, fontsize=6, loc="upper left", handlelength=2.4)
+    ax.legend(
+        frameon=False,
+        fontsize=5.5,
+        loc="upper left",
+        handlelength=1.5,
+        handletextpad=0.4,
+        borderpad=0.1,
+    )
     finish(ax, fig, out / "grid_e2e.pdf")
     for label, series in walls.items():
         for count in shown:
