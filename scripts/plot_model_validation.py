@@ -124,7 +124,7 @@ def overlapped_terms(w: Workload) -> tuple[float, float, float]:
     return compare, download, write
 
 
-def predict(w: Workload) -> tuple[float, float, float]:
+def predict(w: Workload) -> tuple[float, float, float, float]:
     s = SYSTEMS[w.system]
     setup = w.setup_s if w.setup_s is not None else s.setup_s
     ingest = (w.ingest_s if w.ingest_s is not None else s.ingest_s) / w.nodes
@@ -132,7 +132,118 @@ def predict(w: Workload) -> tuple[float, float, float]:
     overlap = setup + ingest + max(terms)
     serial = setup + ingest + sum(terms)
     all_overlapped = setup + max(ingest, *terms)
-    return overlap, serial, all_overlapped
+    write_only = setup + ingest + terms[2]
+    return overlap, serial, all_overlapped, write_only
+
+
+def upfront_valid(w: Workload) -> bool:
+    """Upfront domain-of-validity predicate, evaluated before running or inspecting errors:
+    (1) dedicated local storage (excludes shared Lustre), and
+    (2) no NUMA-local cache eviction under zone_reclaim_mode=1 (on System C's 16x128 GiB NUMA
+        nodes, tmpfs requires interleaving so combined input and output fit per node)."""
+    if w.group == "lustre":
+        return False
+    if "tmpfs" in w.label and "interleave" not in w.label:
+        return False
+    return True
+
+
+def validate_cpu_pipeline(results: Path) -> tuple[list[tuple[str, float, float, float, float]], float, float]:
+    """Apply Equation (7) with T_download = 0 to cuDDL-CPU on Systems B (100k) and C (400k),
+    using isolated resident compare and isolated warm ingest rates, against Table 6."""
+    def load_jsonl(name: str) -> list[dict]:
+        return [json.loads(line) for line in (results / name).read_text().splitlines() if line.strip()]
+
+    # System B isolated CPU compare with deltas (RefSeq 211, tile 128, no write).
+    b_cmp_runs: list[float] = []
+    cur = ""
+    for rec in load_jsonl("gh200-cpu-overlap-tiles64-128.jsonl"):
+        if "compare_ms" not in rec:
+            cur = rec.get("label", "")
+        elif cur == "rs211-100k-A tile 128 dense --deltas" and not rec.get("o_direct") and not rec.get("fsync"):
+            b_cmp_runs.append(rec["total_ms"] / 1e3)
+    b_cmp_s = statistics.median(b_cmp_runs)
+
+    # System B isolated CPU warm ingest (new SIMD sketcher, runs new-1 and new-2).
+    b_ing_runs, b_list_runs = [], []
+    cur = ""
+    for rec in load_jsonl("gh200-cpu-sketch-ingest-100k.jsonl"):
+        if "run" in rec:
+            cur = rec["run"]
+        elif cur in ("new-1", "new-2") and "ingest_s" in rec:
+            b_ing_runs.append(rec["ingest_s"])
+            b_list_runs.append(rec["list_s"])
+    b_ing_s = statistics.median(b_ing_runs)
+    b_list_s = statistics.median(b_list_runs)
+
+    b_res = load_jsonl("gh200-cpu-final-100k.jsonl")
+    b_e2e = load_jsonl("gh200-cpu-pipeline-final-100k.jsonl")
+    b_res_dense = statistics.median(r["total_ms"] / 1e3 for r in b_res if r["format"] == "dense")
+    b_res_sparse = statistics.median(r["total_ms"] / 1e3 for r in b_res if r["format"] == "sparse")
+    b_e2e_dense = statistics.median(r["end_to_end_ms"] / 1e3 for r in b_e2e if r["format"] == "dense")
+    b_e2e_sparse = statistics.median(r["end_to_end_ms"] / 1e3 for r in b_e2e if r["format"] == "sparse")
+    b_dense_bytes = next(r["bytes"] for r in b_e2e if r["format"] == "dense")
+    b_sparse_bytes = next(r["bytes"] for r in b_e2e if r["format"] == "sparse")
+
+    # System C isolated CPU compare with deltas (400k, tile 512, no write).
+    c_cmp_s = statistics.median(
+        r["total_ms"] / 1e3 for r in load_jsonl("mogon-cpu-overlap-timing-875225.jsonl")
+        if not r.get("o_direct") and "total_ms" in r
+    )
+    # System C isolated CPU warm ingest (new SIMD sketcher, runs new-1 and new-2).
+    c_ing_runs, c_list_runs = [], []
+    cur = ""
+    for rec in load_jsonl("mogon-cpu-sketch-ingest-400k.jsonl"):
+        if "run" in rec:
+            cur = rec["run"]
+        elif cur in ("new-1", "new-2") and "ingest_s" in rec:
+            c_ing_runs.append(rec["ingest_s"])
+            c_list_runs.append(rec["list_s"])
+    c_ing_s = statistics.median(c_ing_runs)
+    c_list_s = statistics.median(c_list_runs)
+
+    c_res = load_jsonl("mogon-cpu-final15-400k-875327.jsonl")
+    c_e2e = load_jsonl("mogon-cpu-pipeline-final15-400k-875327.jsonl")
+    c_res_dense = statistics.median(r["total_ms"] / 1e3 for r in c_res if r["format"] == "dense")
+    c_res_sparse = statistics.median(r["total_ms"] / 1e3 for r in c_res if r["format"] == "sparse")
+    c_e2e_dense = statistics.median(r["end_to_end_ms"] / 1e3 for r in c_e2e if r["format"] == "dense")
+    c_e2e_sparse = statistics.median(r["end_to_end_ms"] / 1e3 for r in c_e2e if r["format"] == "sparse")
+    c_dense_bytes = next(r["bytes"] for r in c_e2e if r["format"] == "dense")
+    c_sparse_bytes = next(r["bytes"] for r in c_e2e if r["format"] == "sparse")
+
+    b_bw, c_bw = SYSTEMS["B"].write_bytes_per_s, SYSTEMS["C"].write_bytes_per_s
+    b_gpu_base = SYSTEMS["B"].setup_s + SYSTEMS["B"].ingest_s
+    c_gpu_base = SYSTEMS["C"].setup_s + SYSTEMS["C"].ingest_s
+
+    cases = [
+        ("B 100k dense res", max(b_cmp_s, b_dense_bytes / b_bw), b_res_dense, b_dense_bytes / b_bw, 13.49),
+        ("B 100k sparse res", max(b_cmp_s, b_sparse_bytes / b_bw), b_res_sparse, b_sparse_bytes / b_bw, 4.13),
+        ("B 100k dense E2E", b_list_s + b_ing_s + max(b_cmp_s, b_dense_bytes / b_bw), b_e2e_dense,
+         b_gpu_base + b_dense_bytes / b_bw, 19.95),
+        ("B 100k sparse E2E", b_list_s + b_ing_s + max(b_cmp_s, b_sparse_bytes / b_bw), b_e2e_sparse,
+         b_gpu_base + b_sparse_bytes / b_bw, 10.58),
+        ("C 400k dense res", max(c_cmp_s, c_dense_bytes / c_bw), c_res_dense, c_dense_bytes / c_bw, 261.5),
+        ("C 400k sparse res", max(c_cmp_s, c_sparse_bytes / c_bw), c_res_sparse, c_sparse_bytes / c_bw, 85.0),
+        ("C 400k dense E2E", c_list_s + c_ing_s + max(c_cmp_s, c_dense_bytes / c_bw), c_e2e_dense,
+         c_gpu_base + c_dense_bytes / c_bw, 330.7),
+        ("C 400k sparse E2E", c_list_s + c_ing_s + max(c_cmp_s, c_sparse_bytes / c_bw), c_e2e_sparse,
+         c_gpu_base + c_sparse_bytes / c_bw, 156.5),
+    ]
+    typer.echo(
+        f"CPU pipeline validation (B cmp={b_cmp_s:.2f}s ing={b_ing_s:.2f}s; "
+        f"C cmp={c_cmp_s:.2f}s ing={c_ing_s:.2f}s):"
+    )
+    res_err, e2e_err = [], []
+    for label, pred, meas, gpu_pred, gpu_meas in cases:
+        err = pred / meas - 1
+        (res_err if "res" in label else e2e_err).append(err)
+        typer.echo(
+            f"  {label:20s} pred {pred:7.2f}s vs meas {meas:7.2f}s ({100 * err:+5.1f}%)  "
+            f"GPU speedup pred {pred / gpu_pred:.2f}x vs meas {meas / gpu_meas:.2f}x"
+        )
+    res_mape, e2e_mape = mape(res_err), mape(e2e_err)
+    typer.echo(f"CPU MAPE: resident {res_mape:.1f}% (n=4), E2E {e2e_mape:.1f}% (n=4)")
+    return cases, res_mape, e2e_mape
 
 
 def streamed(bytes_per_pair: float, compare_pairs_per_s: float, dt: float = 0.01) -> float:
@@ -321,9 +432,9 @@ def main(
         runs = w.runs
         if not runs:
             raise typer.BadParameter(f"no runs for {w.label}")
-        overlap, serial, all_over = predict(w)
+        overlap, serial, all_over, write_only = predict(w)
         median = statistics.median(runs)
-        rows.append((w, overlap, serial, all_over, median, min(runs), max(runs), runs))
+        rows.append((w, overlap, serial, all_over, median, min(runs), max(runs), runs, write_only))
         per_run = ", ".join(f"{100 * (overlap / r - 1):+.1f}" for r in runs)
         typer.echo(f"{w.label:30s} overlap {overlap:7.2f} serial {serial:7.2f} all {all_over:7.2f} "
                    f"median {median:7.2f} ({min(runs):.2f}-{max(runs):.2f}, n={len(runs)}) "
@@ -340,8 +451,12 @@ def main(
         return w.group not in ("excluded", "lustre")
 
     groups = {
+        "upfront valid (predicate)": upfront_valid,
+        "upfront valid extrapolated": lambda w: w.extrapolated and upfront_valid(w),
+        "non-interleaved tmpfs": lambda w: "tmpfs" in w.label and "interleave" not in w.label,
         "headline (local, cache intact)": headline,
         "headline without write caps": lambda w: headline(w) and "cap" not in w.label,
+        "compare/null-bound (T_cmp>T_wr)": lambda w: headline(w) and overlapped_terms(w)[0] > overlapped_terms(w)[2],
         "all runs": lambda w: True,
         "all but Lustre": lambda w: w.group != "lustre",
         "100k": lambda w: not w.extrapolated,
@@ -359,8 +474,10 @@ def main(
         per_run = [r[1] / v - 1 for r in rows if select(r[0]) for v in r[7]]
         count = sum(select(r[0]) for r in rows)
         phase = [max(overlapped_terms(r[0])) / statistics.median(r[7].search) - 1 for r in rows if select(r[0])]
-        typer.echo(f"MAPE {name:30s} n={count:2d} overlap {mape(errors(select, 1)):5.1f}% "
-                   f"serial {mape(errors(select, 2)):5.1f}% all-overlapped {mape(errors(select, 3)):5.1f}%  "
+        wr_phase = [overlapped_terms(r[0])[2] / statistics.median(r[7].search) - 1 for r in rows if select(r[0])]
+        typer.echo(f"MAPE {name:32s} n={count:2d} overlap {mape(errors(select, 1)):5.1f}% "
+                   f"serial {mape(errors(select, 2)):5.1f}% all-overlapped {mape(errors(select, 3)):5.1f}% "
+                   f"write-only {mape(errors(select, 8)):5.1f}% (s:{mape(wr_phase):4.1f}%)  "
                    f"per-run overlap error {100 * min(per_run):+.1f}% to {100 * max(per_run):+.1f}%  "
                    f"bias {100 * statistics.fmean(errors(select, 1)):+.1f}%  "
                    f"search phase MAPE {mape(phase):.1f}% bias {100 * statistics.fmean(phase):+.1f}% "
@@ -396,22 +513,31 @@ def main(
                           ("m20", 64_282_249_944 / PAIRS_400K, m20_rate)):
         typer.echo(f"streamed ingest, C 400k {name}: {streamed(b, rate):.1f} s")
 
+    cpu_cases, cpu_res_mape, cpu_e2e_mape = validate_cpu_pipeline(results)
+
     overlap_head = mape(errors(headline, 1))
     serial_head = mape(errors(headline, 2))
     overlap_all = mape(errors(groups["all runs"], 1))
     count_all = len(rows)
     count_head = sum(headline(r[0]) for r in rows)
 
-    fig, ax = plt.subplots(figsize=(3.35, 1.95), constrained_layout=True)
-    lo, hi = 6.2, 1300.0
+    fig, ax = plt.subplots(figsize=(3.35, 2.22), constrained_layout=True)
+    lo, hi = 4.0, 1300.0
     xs = np.geomspace(lo, hi, 200)
     ax.fill_between(xs, xs * 0.95, xs * 1.05, color="#E5E7EB", alpha=0.75, zorder=0)
     ax.plot(xs, xs, color="#374151", lw=1.0, ls="--", zorder=1)
-    colours = {"100k": "#0072B2", "400k": "#D55E00", "tmpfs": "#009E73", "excluded": "#6B7280", "lustre": "#CC79A7"}
-    for w, ov, sr, _all, meas, mn, mx, _runs in rows:
+    colours = {
+        "100k": "#0072B2",
+        "400k": "#D55E00",
+        "tmpfs": "#009E73",
+        "cpu": "#7B2CBF",
+        "excluded": "#6B7280",
+        "lustre": "#CC79A7",
+    }
+    for w, ov, sr, _all, meas, mn, mx, _runs, _wr in rows:
         if w.group in ("excluded", "lustre"):
             ax.scatter([meas], [ov], facecolors="none", edgecolors=colours[w.group],
-                       marker="D" if w.group == "excluded" else "v", s=18, lw=0.8, zorder=5)
+                       marker="D" if w.group == "excluded" else "v", s=20, lw=0.85, zorder=5)
             continue
         kind = "tmpfs" if w.group in ("tmpfs", "cold start") and "tmpfs" in w.label else (
             "400k" if w.extrapolated else "100k")
@@ -421,28 +547,32 @@ def main(
             ax.plot([mn, mx], [ov, ov], color="#111827", lw=1.1, zorder=4)
         ax.scatter([meas], [ov], color=colours[kind], marker={"100k": "o", "400k": "s", "tmpfs": "D"}[kind],
                    s=22 if kind == "tmpfs" else 26, edgecolors="white", lw=0.55, zorder=5)
+    for _label, pred, meas, _gp, _gm in cpu_cases:
+        ax.scatter([meas], [pred], color=colours["cpu"], marker="*", s=46, edgecolors="white", lw=0.4, zorder=6)
     handles = [
-        mpl.lines.Line2D([], [], color=colours["100k"], marker="o", ms=4.5, lw=0, label=r"100k (Sys.\,A/B)"),
-        mpl.lines.Line2D([], [], color=colours["400k"], marker="s", ms=4.4, lw=0, label=r"400k or 3 nodes (Sys.\,C)"),
-        mpl.lines.Line2D([], [], color=colours["tmpfs"], marker="D", ms=3.8, lw=0, label=r"400k, tmpfs (Sys.\,C)"),
+        mpl.lines.Line2D([], [], color=colours["100k"], marker="o", ms=4.5, lw=0, label=r"100k GPU (Sys.\,A/B)"),
+        mpl.lines.Line2D([], [], color=colours["400k"], marker="s", ms=4.4, lw=0, label=r"400k or 3-node GPU (Sys.\,C)"),
+        mpl.lines.Line2D([], [], color=colours["tmpfs"], marker="D", ms=3.8, lw=0, label=r"400k GPU, tmpfs (Sys.\,C)"),
+        mpl.lines.Line2D([], [], color=colours["cpu"], marker="*", ms=6.2, lw=0, label=r"\texttt{cuDDL-CPU} (Sys.\,B/C)"),
         mpl.lines.Line2D([], [], color=colours["excluded"], marker="D", mfc="none", ms=3.8, lw=0,
                          label=r"Cache reclaimed in run"),
         mpl.lines.Line2D([], [], color=colours["lustre"], marker="v", mfc="none", ms=4.0, lw=0,
                          label=r"Output to Lustre"),
         mpl.lines.Line2D([], [], color="#6B7280", marker="^", mfc="white", ms=4.4, lw=0.8, label=r"Serial sum"),
     ]
-    ax.legend(handles=handles, loc="upper left", frameon=False, fontsize=6.2, handlelength=1.2,
-              labelspacing=0.28, borderpad=0.2)
+    ax.legend(handles=handles, loc="upper left", frameon=False, fontsize=5.9, handlelength=1.2,
+              labelspacing=0.25, borderpad=0.2)
     ax.text(0.97, 0.05,
-            rf"Overlap MAPE ({count_head}): \textbf{{{overlap_head:.1f}\%}}" + "\n"
-            + rf"Serial MAPE: {serial_head:.1f}\%" + "\n" + rf"All {count_all} workloads: {overlap_all:.1f}\%",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=6.3, color="#111827",
+            rf"GPU overlap ({count_head}): \textbf{{{overlap_head:.1f}\%}}" + "\n"
+            + rf"CPU res.\,/ E2E (8): \textbf{{{cpu_res_mape:.1f}\% / {cpu_e2e_mape:.1f}\%}}" + "\n"
+            + rf"Serial: {serial_head:.1f}\% \quad All {count_all} GPU: {overlap_all:.1f}\%",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=6.0, color="#111827",
             bbox=dict(facecolor="white", edgecolor="#D1D5DB", lw=0.6, boxstyle="round,pad=0.28"))
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
-    ticks = [10, 30, 100, 300, 1000]
+    ticks = [5, 10, 30, 100, 300, 1000]
     ax.set_xticks(ticks)
     ax.set_yticks(ticks)
     ax.set_xticklabels([str(t) for t in ticks], fontsize=7.2)
